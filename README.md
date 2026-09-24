@@ -155,16 +155,27 @@ Serves the AASA JSON used by iOS to validate universal links for contact
 sharing. Lists both dev (`com.leviwilkerson.jwtimedev`) and prod
 (`com.leviwilkerson.jwtime`) bundle IDs, prefixed with `APPLE_TEAM_ID`.
 
-Matches any URL under `/c/*`.
+Matches `/c` with a non-empty fragment (`/c#<payload>`) and, for links shared
+by older app versions, any URL under `/c/*`.
+
+### `/c`
+
+Universal-link landing page for shared WitnessWork contacts
+(`/c#<payload>`). iOS hands the link off to the WitnessWork app when
+installed; otherwise this endpoint serves a fallback HTML page with an App
+Store CTA.
+
+The payload is an opaque gzip + base64url–encoded contact export produced by
+the app. It rides in the URL fragment, which clients never send, so the worker
+never sees it; the page's inline script builds the
+`witnesswork://import-contact/<payload>` "Open app" link in the browser.
 
 ### `/c/:payload`
 
-Universal-link landing page for shared WitnessWork contacts. iOS hands the
-request off to the WitnessWork app when installed; otherwise this endpoint
-serves a fallback HTML page with an App Store CTA.
-
-The `payload` segment is an opaque gzip + base64url–encoded contact export
-produced by the app — the worker never decodes it.
+Legacy links from older app versions, with the payload in the path. Serves the
+same page with a server-rendered "Open app" link; the payload stays out of
+`og:url` and the other meta tags, and Sentry events redact it to
+`/c/[redacted]`. The worker never decodes it.
 
 ### Notes Import (`/notes-import*`)
 
