@@ -146,14 +146,23 @@ const probeProviderHealth = async (
     author
   )}/${encodeURIComponent(slug)}/endpoints`
 
-  const res = await fetchFn(url, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  })
-  if (!res.ok) {
-    throw new Error(`OpenRouter endpoints API returned ${res.status}`)
+  const controller = new AbortController()
+  // Bound both response headers and body consumption; a stalled metadata probe
+  // must not hold the public status endpoint open until the app's 8s timeout.
+  const timeout = setTimeout(() => controller.abort(), 2_000)
+  try {
+    const res = await fetchFn(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      throw new Error(`OpenRouter endpoints API returned ${res.status}`)
+    }
+    const body = (await res.json()) as OpenRouterEndpointsResponse
+    return anyAllowlistedProviderHealthy(body, config.providers)
+  } finally {
+    clearTimeout(timeout)
   }
-  const body = (await res.json()) as OpenRouterEndpointsResponse
-  return anyAllowlistedProviderHealthy(body, config.providers)
 }
 
 const KILL_SWITCH_OFF = new Set(['false', 'off', '0', 'no', 'disabled'])

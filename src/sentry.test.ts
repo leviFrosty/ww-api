@@ -132,3 +132,27 @@ describe('Sentry scrubbers', () => {
     expect(config.beforeSendTransaction!(event, {})).toEqual(snapshot)
   })
 })
+
+describe('trace sampling', () => {
+  const sample = (name: string, development = false, parentSampled?: boolean) =>
+    createSentryConfig({ APP_ATTEST_ENVIRONMENT: development ? 'development' : 'production' } as Environment)
+      .tracesSampler!({ name, transactionContext: { name }, parentSampled })
+
+  it.each(['GET /notes-import/status', 'GET /geocode', 'GET /autocomplete', 'GET /health', 'GET /c/private-payload', 'GET /unknown'])(
+    'samples routine transaction %s at 10%, including sampled parents', (name) => {
+      expect(sample(name)).toBe(0.1)
+      expect(sample(name, false, true)).toBe(0.1)
+    }
+  )
+  it.each(['POST /notes-import', 'POST /notes-import/kickoff', 'POST /notes-import/challenge', 'POST /notes-import/attest', 'GET /notes-import/id/events'])(
+    'retains import transaction %s even with an unsampled parent', (name) => {
+      expect(sample(name, false, false)).toBe(1)
+    }
+  )
+  it('keeps full tracing on dev without changing error sampling or redaction', () => {
+    expect(sample('GET /notes-import/status', true)).toBe(1)
+    expect(config.sampleRate).toBeUndefined()
+    expect(config.beforeSend).toBeTypeOf('function')
+    expect(config.beforeSendTransaction).toBeTypeOf('function')
+  })
+})

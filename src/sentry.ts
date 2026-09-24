@@ -74,7 +74,17 @@ export function createSentryConfig(environment: Environment): CloudflareOptions 
     // (`pnpm run sentry:sourcemaps` — the git commit sha). Sentry resolves
     // minified stack frames against the artifacts uploaded for this release.
     release: environment.SENTRY_RELEASE,
-    tracesSampleRate: 1.0,
+    // Use our route policy even when a caller propagates a sampling decision.
+    // Error capture is independent of trace sampling and remains at 100%.
+    tracesSampler: ({ name }) => {
+      if (environment.APP_ATTEST_ENVIRONMENT === 'development') return 1;
+      // @sentry/cloudflare 8 names its root span "METHOD /path".
+      const path = name.split(' ')[1];
+      const isImportOperation =
+        path === '/notes-import' ||
+        (path?.startsWith('/notes-import/') && path !== '/notes-import/status');
+      return isImportOperation ? 1 : 0.1;
+    },
     sendDefaultPii: false,
     beforeSend: scrubEvent,
     beforeSendTransaction: scrubEvent,
