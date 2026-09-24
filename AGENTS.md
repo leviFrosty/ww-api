@@ -113,6 +113,28 @@ pnpm run admin:reset-usage --dev <meterId>   # development
 `ADMIN_API_TOKEN` and `ADMIN_API_TOKEN_DEV` must match separate Wrangler
 `ADMIN_API_TOKEN` secrets in prod/dev. Never reuse the development bypass token.
 
+## Status caching and trace sampling
+
+`GET /notes-import/status` reuses completed public responses in each Worker
+isolate for up to 30 seconds, scoped to the current environment. Degraded
+fail-open responses without limits are not cached. The response uses
+`Cache-Control: no-store`; no CDN or browser cache should add another window.
+The app shares concurrent availability probes and may reuse a valid result for
+another 30 seconds. Together these UI hints can lag by up to 60 seconds beyond
+existing KV propagation/cache delays (limits and minimum version use 60-second
+KV edge caching). This is a reuse window, not automatic client polling.
+
+Import enforcement bypasses the public-response cache and still checks the
+kill-switch and authoritative allowances. The OpenRouter metadata probe has a
+2-second deadline covering both headers and body consumption. Worker requests
+do not share pending I/O promises; simultaneous cold misses may probe separately.
+
+Sentry traces retain 100% of development and Notes Import operation traffic.
+Production status, HERE proxy, health, contact-link and other routine routes use
+10% trace sampling, overriding propagated parent sampling decisions. Error
+capture and contact-data redaction remain unchanged; Cloudflare logging retains
+its existing sampling configuration.
+
 ## Checks before deploy
 
 ```bash

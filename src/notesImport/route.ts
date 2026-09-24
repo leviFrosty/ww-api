@@ -13,6 +13,7 @@ import { isSupporter, RevenueCatError } from '../revenuecat'
 import type { CreditDecision, CreditsSnapshot } from '../credits'
 import { runNotesImportModel } from './llm'
 import { getNotesImportStatus } from './status'
+import { getPublicNotesImportStatus } from './publicStatus'
 import {
   appAttestLifecycle,
   appAttestProtocolVersion,
@@ -261,14 +262,9 @@ const subKey = (token: string) => `notes-import:sub:${token}`
  * a manual KV kill-switch plus OpenRouter's free provider-health metadata.
  */
 export async function handleNotesImportStatusRequest(ctx: AppContext) {
-  const config = getNotesImportConfig(ctx.env)
-  const status = await getNotesImportStatus({
-    kv: ctx.env.NOTES_KV,
-    env: ctx.env,
-    apiKey: ctx.env.OPENROUTER_API_KEY,
-    config,
-  })
-  return ctx.json(status)
+  const status = await getPublicNotesImportStatus(ctx.env)
+  // Keep intermediary/browser caches from adding another freshness window.
+  return ctx.json(status, 200, { 'Cache-Control': 'no-store' })
 }
 
 /** POST /notes-import/challenge — issue an App Attest challenge (v1 or v2). */
