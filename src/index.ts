@@ -8,7 +8,11 @@ import type {
 } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { proxyRequestToHereApi } from "./proxy";
-import { handleAasaRequest, handleContactLinkRequest } from "./contactLink";
+import {
+  handleAasaRequest,
+  handleContactLinkRequest,
+  handleLegacyContactLinkRequest,
+} from "./contactLink";
 import {
   handleChallengeRequest,
   handleAttestRequest,
@@ -103,7 +107,10 @@ app.post("/admin/notes-import/reset", handleNotesImportAdminResetRequest);
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.
 app.get("/.well-known/apple-app-site-association", handleAasaRequest);
-app.get("/c/:payload", handleContactLinkRequest);
+// Shared contacts ride in the fragment (`/c#<payload>`), which never reaches
+// the worker. `/c/:payload` keeps links from older app versions working.
+app.get("/c", handleContactLinkRequest);
+app.get("/c/:payload", handleLegacyContactLinkRequest);
 app.notFound(handleNotFound);
 app.onError(handleApplicationError);
 

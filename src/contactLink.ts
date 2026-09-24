@@ -1,18 +1,26 @@
 import type { AppContext } from './types'
 import { HTTP_STATUS } from './config'
+import { nameTransactionAfterRoute } from './sentry'
 
 /**
  * Contact-share universal link handlers.
  *
- * Flow: the WitnessWork app encodes a contact (gzip + base64url) into a path
- * segment and shares a URL like:
+ * Flow: the WitnessWork app encodes a contact (gzip + base64url) into the URL
+ * fragment and shares a URL like:
  *
- *   https://ww-proxy.leviwilkerson.com/c/<payload>
+ *   https://ww-proxy.leviwilkerson.com/c#<payload>
+ *
+ * Clients never send a fragment to a server, so link previews and the
+ * fallback page only ever request the bare `/c` — the contact stays out of
+ * this worker's requests, logs and Sentry.
  *
  * - iOS with the app installed: the OS intercepts the tap via the AASA file
  *   this worker serves and hands the URL to the app, which decodes and imports.
  * - iOS without the app / other platforms: the fallback HTML renders with a
  *   "Get WitnessWork" CTA linking to the App Store.
+ *
+ * Older app versions put the payload in the path (`/c/<payload>`). Those links
+ * are already out in the wild, so they keep working.
  *
  * The AASA lists BOTH the dev and prod bundle IDs so development builds also
  * intercept these links on devices where they're installed.
@@ -21,10 +29,17 @@ import { HTTP_STATUS } from './config'
 const PROD_BUNDLE_ID = 'com.leviwilkerson.jwtime'
 const DEV_BUNDLE_ID = 'com.leviwilkerson.jwtimedev'
 const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
-const CONTACT_LINK_PATH_PREFIX = '/c/'
+const CONTACT_LINK_PATH = '/c'
+const LEGACY_CONTACT_LINK_PATH_PREFIX = `${CONTACT_LINK_PATH}/`
 const SITE_ORIGIN = 'https://ww-proxy.leviwilkerson.com'
+const CANONICAL_URL = `${SITE_ORIGIN}${CONTACT_LINK_PATH}`
 const OG_IMAGE_URL = `${SITE_ORIGIN}/assets/og-image.png`
 const APPLE_TOUCH_ICON_URL = `${SITE_ORIGIN}/assets/apple-touch-icon.png`
+const IMPORT_DEEP_LINK_PREFIX = 'witnesswork://import-contact/'
+/** The app's payload encoding: unpadded base64url. */
+const BASE64URL = /^[A-Za-z0-9_-]+$/
+const OPEN_APP_LINK_ID = 'open-app'
+const OPEN_APP_LABEL = 'Open app (already installed)'
 
 /**
  * WitnessWork brand palette — mirrors `lightModeColors` in
@@ -47,9 +62,23 @@ const OG_DESCRIPTION =
   'A contact was shared with you from WitnessWork — the service time and contact management app for Jehovah\u2019s Witnesses.'
 
 /**
+ * Builds the "Open app" deep link in the browser from the fragment. Only a
+ * base64url payload makes it into the href; anything else leaves the link
+ * hidden.
+ */
+const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
+  var payload = location.hash.slice(1);
+  if (!${BASE64URL}.test(payload)) return;
+  var link = document.getElementById('${OPEN_APP_LINK_ID}');
+  link.href = '${IMPORT_DEEP_LINK_PREFIX}' + payload;
+  link.hidden = false;
+})();`
+
+/**
  * Apple strongly recommends `components` over the legacy `paths` array. Both
- * still work, but `components` supports per-pattern exclusions and query
- * matchers. We match any URL whose path begins with `/c/`.
+ * still work, but `components` supports per-pattern exclusions and query and
+ * fragment matchers. We match `/c` with a non-empty fragment (`?*` = at least
+ * one character), plus any path under `/c/` for links from older app versions.
  */
 function buildAasaPayload(teamId: string): object {
   const appIDs = [
@@ -61,7 +90,10 @@ function buildAasaPayload(teamId: string): object {
       details: [
         {
           appIDs,
-          components: [{ '/': `${CONTACT_LINK_PATH_PREFIX}*` }],
+          components: [
+            { '/': CONTACT_LINK_PATH, '#': '?*' },
+            { '/': `${LEGACY_CONTACT_LINK_PATH_PREFIX}*` },
+          ],
         },
       ],
     },
@@ -84,22 +116,46 @@ export function handleAasaRequest(context: AppContext) {
 }
 
 /**
- * Fallback HTML for taps that reach the worker (app not installed, non-iOS,
- * or Safari address-bar hit). Kept self-contained — no external fonts, no
- * JS — so iMessage's rich-link sniffer can render a fast preview.
+ * `/c` — the fallback page for fragment links. The payload never reaches the
+ * worker, so the page's inline script builds the "Open app" link instead.
  */
 export function handleContactLinkRequest(context: AppContext) {
-  const payload = context.req.param('payload')
-  const safePayload = payload ? encodeURIComponent(payload) : ''
-  const deepLink = `witnesswork://import-contact/${safePayload}`
-  const pageUrl = `${SITE_ORIGIN}${CONTACT_LINK_PATH_PREFIX}${safePayload}`
+  nameTransactionAfterRoute(context)
+  return context.html(
+    renderFallbackPage(`<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${OPEN_APP_LABEL}</a>
+    <script>${OPEN_APP_FROM_FRAGMENT_SCRIPT}</script>`)
+  )
+}
 
-  const html = `<!doctype html>
+/**
+ * `/c/<payload>` — links shared by older app versions. The payload is already
+ * in the request, so the "Open app" link is rendered here, but it never goes
+ * into meta tags, which link-preview services store.
+ */
+export function handleLegacyContactLinkRequest(context: AppContext) {
+  nameTransactionAfterRoute(context)
+  const payload = context.req.param('payload') ?? ''
+  const openAppLink = BASE64URL.test(payload)
+    ? `<a class="secondary" href="${IMPORT_DEEP_LINK_PREFIX}${payload}">${OPEN_APP_LABEL}</a>`
+    : ''
+  return context.html(renderFallbackPage(openAppLink))
+}
+
+/**
+ * Fallback HTML for taps that reach the worker (app not installed, non-iOS,
+ * or Safari address-bar hit). Kept self-contained — no external fonts — so
+ * iMessage's rich-link sniffer can render a fast preview. `og:url` is always
+ * the bare canonical URL, and `no-referrer` keeps legacy page URLs out of the
+ * Referer header of follow-up requests.
+ */
+function renderFallbackPage(openAppLink: string): string {
+  return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex">
+  <meta name="referrer" content="no-referrer">
   <title>${OG_TITLE}</title>
   <meta name="description" content="${OG_DESCRIPTION}">
   <meta name="theme-color" content="${BRAND.accentBackground}">
@@ -108,7 +164,7 @@ export function handleContactLinkRequest(context: AppContext) {
   <meta property="og:site_name" content="WitnessWork">
   <meta property="og:title" content="${OG_TITLE}">
   <meta property="og:description" content="${OG_DESCRIPTION}">
-  <meta property="og:url" content="${pageUrl}">
+  <meta property="og:url" content="${CANONICAL_URL}">
   <meta property="og:image" content="${OG_IMAGE_URL}">
   <meta property="og:image:width" content="1024">
   <meta property="og:image:height" content="1024">
@@ -124,6 +180,7 @@ export function handleContactLinkRequest(context: AppContext) {
 
   <style>
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
       background: ${BRAND.accentBackground};
@@ -194,12 +251,8 @@ export function handleContactLinkRequest(context: AppContext) {
     <h1>${OG_TITLE}</h1>
     <p>Install WitnessWork to import the shared contact. If you already have the app, it should have opened automatically.</p>
     <a class="btn" href="${APP_STORE_URL}">Get WitnessWork</a>
-    <a class="secondary" href="${deepLink}">Open app (already installed)</a>
+    ${openAppLink}
   </div>
 </body>
 </html>`
-
-  return context.html(html)
 }
-
-export { CONTACT_LINK_PATH_PREFIX }
