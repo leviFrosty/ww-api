@@ -40,3 +40,13 @@ NOTES_IMPORT_WINDOW_DAYS=30
 
 # Optional minimum app version for Notes Import (client-side gate; see AGENTS.md).
 # NOTES_IMPORT_MIN_APP_VERSION=1.42.0
+
+# --- Buddies relay ----------------------------------------------------------
+
+# Kill-switch fallback when KV `buddies:enabled` is absent.
+BUDDIES_ENABLED=true
+
+# APNs token auth (.p8 key). Unset = pushes are skipped. APNs requires
+# HTTP/2, so verify real pushes on the deployed dev worker.
+# APNS_KEY_ID=ABCDE12345
+# APNS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"

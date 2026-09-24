@@ -166,6 +166,29 @@ export interface Environment {
 
   /** Dedicated admin reset credential. Secret; distinct per prod/dev worker. */
   ADMIN_API_TOKEN?: string;
+
+  // --- Buddies relay -------------------------------------------------------
+
+  /**
+   * One SQLite DO per `inboxId`: owner key, slots, cards, events, devices,
+   * roster, nonce cache, per-inbox `seq`, and open-invite bookkeeping.
+   */
+  BUDDY_INBOX: DurableObjectNamespace<import('./buddies/inboxDO').BuddyInbox>;
+
+  /** One SQLite DO per `inviteId`, deleted once the invite ends or expires. */
+  BUDDY_INVITE: DurableObjectNamespace<import('./buddies/inviteDO').BuddyInvite>;
+
+  /** Per-IP limiter for the unsigned `invite/fetch` and `invite/claim` ops. */
+  BUDDIES_RATE_LIMITER: RateLimit;
+
+  /** Kill-switch fallback (`"true"` enables) when KV `buddies:enabled` is absent. */
+  BUDDIES_ENABLED?: string;
+
+  /** APNs auth key id (secret). Pushes are skipped when unset. */
+  APNS_KEY_ID?: string;
+
+  /** APNs `.p8` auth key, PKCS#8 PEM (secret). Pushes are skipped when unset. */
+  APNS_PRIVATE_KEY?: string;
 }
 
 export type AppContext = Context<{ Bindings: Environment }>;

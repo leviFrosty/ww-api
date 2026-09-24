@@ -27,12 +27,16 @@ import {
   handleNotesImportAdminResetRequest,
 } from "./notesImport/route";
 import { Sentry, createSentryConfig } from "./sentry";
+import { createBuddiesRoutes } from "./buddies/route";
+import { handleBuddyInvitePage } from "./buddies/invitePage";
 
 // Durable Object classes must be re-exported from the entry module so Wrangler
 // can bind them (see wrangler.toml [[durable_objects.bindings]] + migrations).
 export { NotesImportRun } from "./notesImport/runDO";
 export { NotesImportIndex } from "./notesImport/indexDO";
 export { AppAttestIdentity } from "./appAttest/identityDO";
+export { BuddyInbox } from "./buddies/inboxDO";
+export { BuddyInvite } from "./buddies/inviteDO";
 
 const app = new Hono<{ Bindings: Environment }>();
 
@@ -111,6 +115,11 @@ app.get("/.well-known/apple-app-site-association", handleAasaRequest);
 // the worker. `/c/:payload` keeps links from older app versions working.
 app.get("/c", handleContactLinkRequest);
 app.get("/c/:payload", handleLegacyContactLinkRequest);
+// Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Unsigned ops are
+// rate-limited by IP inside the handler (BUDDIES_RATE_LIMITER).
+app.route("/buddies/v1", createBuddiesRoutes());
+// Buddy invite no-app fallback; the invite secret stays in the URL fragment.
+app.get("/b", handleBuddyInvitePage);
 app.notFound(handleNotFound);
 app.onError(handleApplicationError);
 
