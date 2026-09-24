@@ -116,6 +116,12 @@ head_sampling_rate = 1
 APP_ATTEST_ENVIRONMENT = "production"
 # iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
+# Extra bundle ids (comma-separated) also accepted for App Attest — here the
+# internal-TestFlight "WitnessWork Beta" app, which always uses Apple's
+# production App Attest environment and talks to this prod worker. Each key is
+# bound to the bundle id it attested with; its assertions verify only against
+# that id. Pre-binding keys default to IOS_BUNDLE_ID. Not set for [env.dev].
+IOS_ADDITIONAL_BUNDLE_IDS = "com.leviwilkerson.jwtimebeta"
 # RevenueCat entitlement that denotes a Supporter (server-side check).
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.

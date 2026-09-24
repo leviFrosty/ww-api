@@ -18,6 +18,11 @@ export interface DeviceKeyRecord {
   uuid: string
   environment: 'development' | 'production'
   attestedAt: number
+  /**
+   * Bundle id the key attested against. Absent on records written before
+   * bundle binding; those are bound to the primary `IOS_BUNDLE_ID`.
+   */
+  bundleId?: string
 }
 
 const keyStoreKey = (keyId: string) => `key:${keyId}`
@@ -35,7 +40,9 @@ const parseKeyRecord = (raw: string): DeviceKeyRecord | null => {
       typeof value.uuid !== 'string' ||
       (value.environment !== 'development' &&
         value.environment !== 'production') ||
-      !Number.isFinite(value.attestedAt)
+      !Number.isFinite(value.attestedAt) ||
+      (value.bundleId !== undefined &&
+        (typeof value.bundleId !== 'string' || value.bundleId === ''))
     ) {
       return null
     }

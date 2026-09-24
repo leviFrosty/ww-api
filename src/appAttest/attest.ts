@@ -37,7 +37,11 @@ export interface VerifyAttestationCryptographyArgs {
   /** Exact domain-separated client data whose SHA-256 was passed to `attestKey`. */
   clientData: string
   teamId: string
-  bundleId: string
+  /**
+   * Bundle ids this Worker accepts. The attestation's rpIdHash must match
+   * exactly one; the matched id is returned so the caller can bind the key to it.
+   */
+  bundleIds: readonly string[]
   /** When true, reject development-environment (`appattestdevelop`) attestations. */
   requireProduction?: boolean
 }
@@ -46,6 +50,8 @@ export interface VerifiedAttestation {
   /** Base64url SPKI of the attested P-256 public key. */
   spki: string
   environment: 'development' | 'production'
+  /** The accepted bundle id whose App ID (`<TeamID>.<BundleID>`) the key attested. */
+  bundleId: string
 }
 
 const verify = async ({
@@ -53,7 +59,7 @@ const verify = async ({
   keyId,
   clientData,
   teamId,
-  bundleId,
+  bundleIds,
   requireProduction = false,
 }: VerifyAttestationCryptographyArgs): Promise<VerifiedAttestation> => {
   let att
@@ -139,9 +145,15 @@ const verify = async ({
     })
   }
 
-  // 5. rpIdHash must hash our app id; attestation sign-count must be 0.
-  const expectedRpId = await appIdRpHash(teamId, bundleId)
-  if (!bytesEqual(parsed.rpIdHash, expectedRpId)) {
+  // 5. rpIdHash must hash one of our app ids; attestation sign-count must be 0.
+  let bundleId: string | null = null
+  for (const candidate of bundleIds) {
+    if (bytesEqual(parsed.rpIdHash, await appIdRpHash(teamId, candidate))) {
+      bundleId = candidate
+      break
+    }
+  }
+  if (bundleId == null) {
     throw new AppAttestError('rpIdHash mismatch (wrong app id)', {
       reason: 'attestation_invalid',
     })
@@ -159,7 +171,7 @@ const verify = async ({
     })
   }
 
-  return { spki: bytesToBase64Url(spki), environment }
+  return { spki: bytesToBase64Url(spki), environment, bundleId }
 }
 
 /**

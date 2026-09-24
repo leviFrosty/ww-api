@@ -3,6 +3,7 @@ import type { Environment } from '../types'
 import { randomToken, sha256Hex, timingSafeEqual } from '../crypto'
 import { buildAssertionClientData } from './clientData'
 import { deleteChallenge, hasChallenge } from './challenge'
+import { acceptedBundleIds } from './appId'
 import { AppAttestError, type AppAttestFailure } from './errors'
 import {
   deleteKeyRecord,
@@ -62,6 +63,12 @@ interface IdentityRecord {
   environment: 'development' | 'production'
   attestedAt: number
   recoveryVerifier: string | null
+  /**
+   * Bundle id the active key attested against; its assertions verify against
+   * this App ID only. Null for keys stored before bundle binding, which are
+   * bound to the primary `IOS_BUNDLE_ID`.
+   */
+  bundleId: string | null
 }
 
 interface OperationRecord {
@@ -202,9 +209,19 @@ export class AppAttestIdentity extends DurableObject<Environment> {
          sign_count            INTEGER NOT NULL CHECK (sign_count >= 0),
          environment           TEXT NOT NULL,
          attested_at           INTEGER NOT NULL,
-         recovery_verifier     TEXT
+         recovery_verifier     TEXT,
+         bundle_id             TEXT
        )`
     )
+    // Identities created before bundle binding lack the column; NULL there
+    // means "bound to the primary IOS_BUNDLE_ID".
+    const hasBundleIdColumn = ctx.storage.sql
+      .exec<{ name: string }>('PRAGMA table_info(identity)')
+      .toArray()
+      .some((column) => column.name === 'bundle_id')
+    if (!hasBundleIdColumn) {
+      ctx.storage.sql.exec('ALTER TABLE identity ADD COLUMN bundle_id TEXT')
+    }
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS operation (
          operation_id          TEXT PRIMARY KEY,
@@ -392,7 +409,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
           tokenHash: token.tokenHash,
         }),
         teamId: this.#environment.APPLE_TEAM_ID,
-        bundleId: this.#environment.IOS_BUNDLE_ID,
+        bundleIds: acceptedBundleIds(this.#environment),
         requireProduction: this.#requireProduction(),
       })
     } catch (error) {
@@ -427,7 +444,8 @@ export class AppAttestIdentity extends DurableObject<Environment> {
         if (
           decision.value === 'already_bound' &&
           current &&
-          current.spki !== attested.spki
+          (current.spki !== attested.spki ||
+            this.#boundBundleId(current) !== attested.bundleId)
         ) {
           return failure(
             'attestation_invalid',
@@ -447,6 +465,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
             environment: attested.environment,
             attestedAt: this.#dependencies.now(),
             recoveryVerifier: token.verifier,
+            bundleId: attested.bundleId,
           }
           this.#insertIdentity(identity)
           this.#enqueueIdentityMirror(identity)
@@ -475,11 +494,13 @@ export class AppAttestIdentity extends DurableObject<Environment> {
           )
           this.ctx.storage.sql.exec(
             `UPDATE identity
-             SET key_id = ?, spki = ?, sign_count = 0, environment = ?, attested_at = ?
+             SET key_id = ?, spki = ?, sign_count = 0, environment = ?,
+                 bundle_id = ?, attested_at = ?
              WHERE singleton = 1`,
             request.keyId,
             attested.spki,
             attested.environment,
+            attested.bundleId,
             this.#dependencies.now()
           )
           const rotatedIdentity = this.#readIdentity()
@@ -589,7 +610,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
           tokenHash: token.tokenHash,
         }),
         teamId: this.#environment.APPLE_TEAM_ID,
-        bundleId: this.#environment.IOS_BUNDLE_ID,
+        bundleId: this.#assertionBundleId(identity),
       })
     } catch (error) {
       return this.#completeFailure<V2RegistrationResponse>(
@@ -722,7 +743,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
         spki: identity.spki,
         clientData: buildV2AssertionClientData(request),
         teamId: this.#environment.APPLE_TEAM_ID,
-        bundleId: this.#environment.IOS_BUNDLE_ID,
+        bundleId: this.#assertionBundleId(identity),
       })
     } catch (error) {
       return this.#completeFailure<V2AssertionResponse>(
@@ -821,7 +842,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
         keyId: request.keyId,
         clientData: request.challenge,
         teamId: this.#environment.APPLE_TEAM_ID,
-        bundleId: this.#environment.IOS_BUNDLE_ID,
+        bundleIds: acceptedBundleIds(this.#environment),
         requireProduction: this.#requireProduction(),
       })
     } catch (error) {
@@ -868,6 +889,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
           environment: attested.environment,
           attestedAt: this.#dependencies.now(),
           recoveryVerifier: null,
+          bundleId: attested.bundleId,
         })
       }
       // Same-key v1 re-registration deliberately leaves the existing row alone:
@@ -926,7 +948,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
           contentHash: request.contentHash,
         }),
         teamId: this.#environment.APPLE_TEAM_ID,
-        bundleId: this.#environment.IOS_BUNDLE_ID,
+        bundleId: this.#assertionBundleId(identity),
       })
     } catch (error) {
       return fromCryptographyError(error, 'assertion')
@@ -1165,6 +1187,25 @@ export class AppAttestIdentity extends DurableObject<Environment> {
     return { ok: true, value: 'rotated' }
   }
 
+  /** The bundle id an identity's key is bound to (legacy keys: the primary). */
+  #boundBundleId(identity: IdentityRecord): string {
+    return identity.bundleId ?? acceptedBundleIds(this.#environment)[0]
+  }
+
+  /**
+   * Assertions verify only against the App ID the key attested with — never
+   * any accepted id. A bound id later removed from configuration fails closed.
+   */
+  #assertionBundleId(identity: IdentityRecord): string {
+    const bundleId = this.#boundBundleId(identity)
+    if (!acceptedBundleIds(this.#environment).includes(bundleId)) {
+      throw new AppAttestError('key is bound to an app id that is not accepted', {
+        reason: 'assertion_invalid',
+      })
+    }
+    return bundleId
+  }
+
   #inactiveKeyFailure(): { ok: false; error: AppAttestFailure } {
     return failure(
       'key_not_active',
@@ -1236,6 +1277,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       environment: legacyRecord.environment,
       attestedAt: legacyRecord.attestedAt,
       recoveryVerifier: null,
+      bundleId: legacyRecord.bundleId ?? null,
     }
     if (options.deferOwnerlessImport && owner == null) {
       return { identity: importedIdentity, owner: legacyKeyId }
@@ -1259,10 +1301,11 @@ export class AppAttestIdentity extends DurableObject<Environment> {
         environment: string
         attestedAt: number
         recoveryVerifier: string | null
+        bundleId: string | null
       }>(
         `SELECT uuid, key_id AS keyId, spki, sign_count AS signCount,
                 environment, attested_at AS attestedAt,
-                recovery_verifier AS recoveryVerifier
+                recovery_verifier AS recoveryVerifier, bundle_id AS bundleId
          FROM identity WHERE singleton = 1`
       )
       .toArray()
@@ -1278,15 +1321,16 @@ export class AppAttestIdentity extends DurableObject<Environment> {
     this.ctx.storage.sql.exec(
       `INSERT INTO identity (
          singleton, uuid, key_id, spki, sign_count, environment,
-         attested_at, recovery_verifier
-       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
+         attested_at, recovery_verifier, bundle_id
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
       identity.uuid,
       identity.keyId,
       identity.spki,
       identity.signCount,
       identity.environment,
       identity.attestedAt,
-      identity.recoveryVerifier
+      identity.recoveryVerifier,
+      identity.bundleId
     )
   }
 
@@ -1450,6 +1494,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       uuid: identity.uuid,
       environment: identity.environment,
       attestedAt: identity.attestedAt,
+      ...(identity.bundleId == null ? {} : { bundleId: identity.bundleId }),
     }
     this.#enqueueMirrorAction(
       'put_key',

@@ -52,7 +52,7 @@ function openAppLinkAt(page: string, hash: string) {
 }
 
 describe('apple-app-site-association', () => {
-  it('matches fragment links and legacy path links for both apps', async () => {
+  it('matches fragment links and legacy path links for every app variant', async () => {
     const response = await request('/.well-known/apple-app-site-association')
 
     expect(response.status).toBe(200)
@@ -63,6 +63,7 @@ describe('apple-app-site-association', () => {
           {
             appIDs: [
               'TEAM123456.com.leviwilkerson.jwtime',
+              'TEAM123456.com.leviwilkerson.jwtimebeta',
               'TEAM123456.com.leviwilkerson.jwtimedev',
             ],
             components: [{ '/': '/c', '#': '?*' }, { '/': '/c/*' }],

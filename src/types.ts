@@ -71,8 +71,19 @@ export interface Environment {
   /** Explicit Worker environment; production fails closed if a dev bypass exists. */
   APP_ATTEST_ENVIRONMENT: 'development' | 'production';
 
-  /** iOS bundle id, e.g. `com.leviwilkerson.jwtime`. Part of the App Attest app id. */
+  /**
+   * Primary iOS bundle id, e.g. `com.leviwilkerson.jwtime`. Part of the App
+   * Attest app id; keys stored without a bound bundle id verify against it.
+   */
   IOS_BUNDLE_ID: string;
+
+  /**
+   * Optional comma-separated extra bundle ids whose App Attest keys are also
+   * accepted (prod: the internal TestFlight beta `com.leviwilkerson.jwtimebeta`).
+   * Each key is bound to the bundle id it attested with; its assertions verify
+   * only against that id.
+   */
+  IOS_ADDITIONAL_BUNDLE_IDS?: string;
 
   /** RevenueCat entitlement id that denotes a Supporter. Default `Supporter`. */
   REVENUECAT_ENTITLEMENT_ID?: string;

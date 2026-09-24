@@ -22,11 +22,13 @@ import { nameTransactionAfterRoute } from './sentry'
  * Older app versions put the payload in the path (`/c/<payload>`). Those links
  * are already out in the wild, so they keep working.
  *
- * The AASA lists BOTH the dev and prod bundle IDs so development builds also
- * intercept these links on devices where they're installed.
+ * The AASA lists the prod, beta (internal TestFlight), and dev bundle IDs so
+ * beta and development builds also intercept these links on devices where
+ * they're installed.
  */
 
 const PROD_BUNDLE_ID = 'com.leviwilkerson.jwtime'
+const BETA_BUNDLE_ID = 'com.leviwilkerson.jwtimebeta'
 const DEV_BUNDLE_ID = 'com.leviwilkerson.jwtimedev'
 const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
 const CONTACT_LINK_PATH = '/c'
@@ -83,6 +85,7 @@ const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
 function buildAasaPayload(teamId: string): object {
   const appIDs = [
     `${teamId}.${PROD_BUNDLE_ID}`,
+    `${teamId}.${BETA_BUNDLE_ID}`,
     `${teamId}.${DEV_BUNDLE_ID}`,
   ]
   return {
