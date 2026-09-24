@@ -96,6 +96,8 @@ function buildAasaPayload(teamId: string): object {
           components: [
             { '/': CONTACT_LINK_PATH, '#': '?*' },
             { '/': `${LEGACY_CONTACT_LINK_PATH_PREFIX}*` },
+            // Buddy invite `/b#1<secret>`: the secret stays in the fragment.
+            { '/': '/b', '#': '1?*' },
           ],
         },
       ],

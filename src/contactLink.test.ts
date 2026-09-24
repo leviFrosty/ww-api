@@ -66,7 +66,11 @@ describe('apple-app-site-association', () => {
               'TEAM123456.com.leviwilkerson.jwtimebeta',
               'TEAM123456.com.leviwilkerson.jwtimedev',
             ],
-            components: [{ '/': '/c', '#': '?*' }, { '/': '/c/*' }],
+            components: [
+              { '/': '/c', '#': '?*' },
+              { '/': '/c/*' },
+              { '/': '/b', '#': '1?*' },
+            ],
           },
         ],
       },
