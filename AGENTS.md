@@ -30,6 +30,21 @@ to the dev iOS bundle id `com.leviwilkerson.jwtimedev` (from witness-work
 `app.config.ts`, `IS_DEV` branch) and is the only place
 `NOTES_IMPORT_DEV_BYPASS_TOKEN` should ever be set — **never on prod.**
 
+### App Attest bundle ids
+
+Prod accepts App Attest keys from two apps: the App Store app
+(`IOS_BUNDLE_ID = com.leviwilkerson.jwtime`) and the internal-TestFlight
+"WitnessWork Beta" app (`IOS_ADDITIONAL_BUNDLE_IDS = com.leviwilkerson.jwtimebeta`,
+comma-separated, top-level `[vars]` only). TestFlight builds always use Apple's
+production App Attest environment, so Beta talks to the prod worker, not dev.
+
+An attestation must match one accepted App ID (`<APPLE_TEAM_ID>.<bundle id>`);
+the matched bundle id is stored on the key's `AppAttestIdentity` row (and its
+KV mirror), and every later assertion for that key verifies against that bound
+id only. Keys stored before binding (NULL / absent) are bound to
+`IOS_BUNDLE_ID`. Removing a bundle id from config makes its bound keys fail
+closed. `APP_ATTEST_ENVIRONMENT` is independent of the bundle id.
+
 Note: in Wrangler, `vars`, `kv_namespaces`, and `ratelimits` are **not inherited**
 by a named env, so they are repeated under `[env.dev]` in `wrangler.toml`. Keep
 them in sync with the top-level prod config when adding new bindings.

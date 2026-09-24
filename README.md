@@ -152,8 +152,9 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 ### `/.well-known/apple-app-site-association`
 
 Serves the AASA JSON used by iOS to validate universal links for contact
-sharing. Lists both dev (`com.leviwilkerson.jwtimedev`) and prod
-(`com.leviwilkerson.jwtime`) bundle IDs, prefixed with `APPLE_TEAM_ID`.
+sharing. Lists the prod (`com.leviwilkerson.jwtime`), beta
+(`com.leviwilkerson.jwtimebeta`), and dev (`com.leviwilkerson.jwtimedev`) bundle
+IDs, prefixed with `APPLE_TEAM_ID`.
 
 Matches `/c` with a non-empty fragment (`/c#<payload>`) and, for links shared
 by older app versions, any URL under `/c/*`.
