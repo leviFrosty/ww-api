@@ -144,7 +144,11 @@ describe('Sentry reporting', () => {
     )
 
     await request(`/c/${PAYLOAD}`, {
-      env: { ...ENV, SENTRY_DSN: 'https://public@o0.ingest.sentry.io/0' },
+      env: {
+        ...ENV,
+        APP_ATTEST_ENVIRONMENT: 'development',
+        SENTRY_DSN: 'https://public@o0.ingest.sentry.io/0',
+      },
       headers: { referer: `${ORIGIN}/c/${PAYLOAD}` },
     })
 
