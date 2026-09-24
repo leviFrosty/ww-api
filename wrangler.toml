@@ -59,6 +59,8 @@ NOTES_IMPORT_FREE_CREDITS_SUPPORTER = "-1"
 NOTES_IMPORT_MAX_REFINEMENTS = "5"
 NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
+# Buddies kill-switch fallback when KV `buddies:enabled` is absent. On in dev.
+BUDDIES_ENABLED = "true"
 
 # Separate KV so dev never shares prod runtime policy or App Attest v1 mirrors.
 # Create with: wrangler kv namespace create NOTES_KV --env dev
@@ -81,6 +83,14 @@ class_name = "NotesImportIndex"
 name = "APP_ATTEST_IDENTITY"
 class_name = "AppAttestIdentity"
 
+[[env.dev.durable_objects.bindings]]
+name = "BUDDY_INBOX"
+class_name = "BuddyInbox"
+
+[[env.dev.durable_objects.bindings]]
+name = "BUDDY_INVITE"
+class_name = "BuddyInvite"
+
 [[env.dev.migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -89,12 +99,25 @@ new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
 tag = "v2"
 new_sqlite_classes = ["AppAttestIdentity"]
 
+[[env.dev.migrations]]
+tag = "v3"
+new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
+
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "2001"   # distinct from prod's 1001
 
   [env.dev.ratelimits.simple]
   limit = 60
+  period = 60
+
+# Buddies unsigned ops (invite/fetch, invite/claim), keyed by client IP.
+[[env.dev.ratelimits]]
+name = "BUDDIES_RATE_LIMITER"
+namespace_id = "2002"   # distinct from prod's 1002
+
+  [env.dev.ratelimits.simple]
+  limit = 30
   period = 60
 
 # Cloudflare Workers Observability — not inherited, so repeated for dev.
@@ -136,6 +159,9 @@ NOTES_IMPORT_FREE_CREDITS_SUPPORTER = "-1"
 NOTES_IMPORT_MAX_REFINEMENTS = "5"
 NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
+# Buddies kill-switch fallback when KV `buddies:enabled` is absent. Off in prod
+# until App Attest lands on inbox/register and invite/* (see AGENTS.md).
+BUDDIES_ENABLED = "false"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state
@@ -168,6 +194,15 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 #   wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"1.42.0"}'
 #   wrangler kv key delete --binding NOTES_KV notes-import:min-version   # remove the floor
 # (add `--env dev` for the dev worker).
+#
+# Buddies kill switch (cacheTtl 60): enabled iff the value is "true"; an absent
+# key falls back to BUDDIES_ENABLED. inbox/delete, slot/remove and slot/leave
+# always work. The relay also caches its APNs provider token here
+# (`buddies:apns-token`).
+#   wrangler kv key put --binding NOTES_KV buddies:enabled true    # on
+#   wrangler kv key put --binding NOTES_KV buddies:enabled false   # off
+#   wrangler kv key delete --binding NOTES_KV buddies:enabled      # use the var
+# (add `--env dev` for the dev worker).
 [[kv_namespaces]]
 binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"
@@ -178,6 +213,15 @@ namespace_id = "1001"
 
   [ratelimits.simple]
   limit = 60
+  period = 60
+
+# Buddies unsigned ops (invite/fetch, invite/claim), keyed by client IP.
+[[ratelimits]]
+name = "BUDDIES_RATE_LIMITER"
+namespace_id = "1002"
+
+  [ratelimits.simple]
+  limit = 30
   period = 60
 
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
@@ -195,6 +239,16 @@ class_name = "NotesImportIndex"
 name = "APP_ATTEST_IDENTITY"
 class_name = "AppAttestIdentity"
 
+# Buddies relay — one inbox DO per inboxId, one invite DO per inviteId, both
+# SQLite-backed. See docs/buddies-protocol.md. Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "BUDDY_INBOX"
+class_name = "BuddyInbox"
+
+[[durable_objects.bindings]]
+name = "BUDDY_INVITE"
+class_name = "BuddyInvite"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -204,6 +258,10 @@ tag = "v2"
 new_sqlite_classes = ["AppAttestIdentity"]
 # AppAttestIdentity becomes authoritative at this cutover. Never roll production
 # back to a pre-v2/KV-authoritative Worker; ship a forward fix instead.
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
 
 [observability]
 enabled = true
@@ -219,3 +277,6 @@ logs.persist = true
 # wrangler secret put ADMIN_API_TOKEN                # dedicated prod reset token
 # wrangler secret put ADMIN_API_TOKEN --env dev      # DIFFERENT dev reset token
 # Generate each admin token with: openssl rand -base64 32
+# Buddies pushes (APNs token auth); without both, the relay skips pushes:
+# wrangler secret put APNS_KEY_ID [--env dev]          # 10-char key id of the .p8
+# wrangler secret put APNS_PRIVATE_KEY [--env dev]     # .p8 PEM contents: < AuthKey_XXXX.p8

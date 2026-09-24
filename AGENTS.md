@@ -150,6 +150,56 @@ Production status, HERE proxy, health, contact-link and other routine routes use
 capture and contact-data redaction remain unchanged; Cloudflare logging retains
 its existing sampling configuration.
 
+## Buddies
+
+`POST /buddies/v1/{op}` is the Buddies relay, built to the wire contract in
+[`docs/buddies-protocol.md`](docs/buddies-protocol.md) (the witness-work repo
+holds the canonical copy). Code lives in `src/buddies/`. `GET /b` is the
+no-app fallback page for invite links, and the AASA matches `/b#1…`.
+
+- **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
+  SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
+  migration `v3`, `BUDDIES_RATE_LIMITER` (30/min per IP for `invite/fetch` and
+  `invite/claim`; namespace 1002 prod, 2002 dev), and the `BUDDIES_ENABLED` var
+  (`"false"` prod, `"true"` dev).
+- **Secrets** (per environment): `APNS_KEY_ID` and `APNS_PRIVATE_KEY` (the
+  `.p8` PEM). `APPLE_TEAM_ID` is the JWT issuer and `IOS_BUNDLE_ID` the APNs
+  topic. Without the two APNs secrets the relay still works but skips pushes,
+  logging once per isolate.
+- **Kill switch**: KV `buddies:enabled` in `NOTES_KV`. `"true"` enables, any
+  other value disables, and an absent key falls back to `BUDDIES_ENABLED`. The
+  read is edge-cached for 60 seconds. `inbox/delete`, `slot/remove`, and
+  `slot/leave` work even when disabled.
+- **Push**: `src/apns.ts` is the feature-neutral APNs sender (provider token
+  cached in KV `apns:provider-token`, one outcome per notification, one
+  retry for network errors, 429, 5xx, and rejected provider tokens).
+  `src/buddies/push.ts` builds the Buddies payload and deletes unregistered
+  devices. Other features should build on `sendApnsNotifications`, not on the
+  Buddies layer.
+- **Privacy**: every id travels in the body. Never log or report bodies, blobs,
+  ids, or tokens. APNs requests use the `fetch` captured before Sentry wraps
+  the global, so device tokens in APNs URLs stay out of Sentry spans. The dev
+  worker's 100% Workers traces do record subrequest URLs, APNs included.
+- **Not yet built** (required before any production rollout): App Attest on
+  `inbox/register` and `invite/*` (`attest` is accepted and ignored), and
+  Notification Service Extension payloads.
+
+Dev deploy (first time):
+
+```bash
+wrangler secret put APNS_KEY_ID --env dev
+wrangler secret put APNS_PRIVATE_KEY --env dev < AuthKey_XXXXXXXXXX.p8
+pnpm run deploy:dev   # applies the v3 migration to ww-proxy-dev
+# Optional; dev is already on via BUDDIES_ENABLED:
+wrangler kv key put --binding NOTES_KV buddies:enabled true --env dev
+```
+
+Production takes the same two secrets without `--env dev`, and the `v3`
+migration applies on the next `pnpm run deploy`. Buddies stays off there
+(`BUDDIES_ENABLED = "false"`) until the KV key flips it. The AASA `/b` entry
+only goes live with a prod deploy. iOS caches the AASA, so ship it at least one
+app version before the invite UI.
+
 ## Checks before deploy
 
 ```bash
