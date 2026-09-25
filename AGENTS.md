@@ -200,6 +200,22 @@ migration applies on the next `pnpm run deploy`. Buddies stays off there
 only goes live with a prod deploy. iOS caches the AASA, so ship it at least one
 app version before the invite UI.
 
+## App Store ratings (paywall social proof)
+
+`GET /app-store/ratings` returns `{averageRating, ratingCount, countryCount,
+updatedAt}` for the app's paywall. App Store Connect's API only exposes written
+reviews, so totals come from Apple's public iTunes lookup, summed across all
+175 storefronts (`src/appStoreRatings/storefronts.ts`, from ASC
+`/v1/territories`). The hourly cron (`[triggers]`) sweeps 40 storefronts per run
+into `NOTES_KV` (`app-store-ratings:state`), publishes
+`app-store-ratings:summary` when a full sweep finishes, then rests until that
+sweep is 24 hours old. A failed storefront lookup keeps its previous value.
+
+The route serves from the colo Cache API (`s-maxage` 6h) with a 1h edge-cached
+KV read on a miss, and returns `503 no-store` until the first sweep completes
+(~5 hours after the first deploy). The app persists the body for 7 days and
+falls back to a bundled snapshot until then.
+
 ## Checks before deploy
 
 ```bash

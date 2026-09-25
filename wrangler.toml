@@ -45,6 +45,9 @@ routes = []
 [env.dev.version_metadata]
 binding = "CF_VERSION_METADATA"
 
+[env.dev.triggers]
+crons = ["17 * * * *"]
+
 [env.dev.vars]
 # Explicitly permits development App Attest receipts and the simulator bypass.
 APP_ATTEST_ENVIRONMENT = "development"
@@ -203,9 +206,18 @@ BUDDIES_ENABLED = "false"
 #   wrangler kv key put --binding NOTES_KV buddies:enabled false   # off
 #   wrangler kv key delete --binding NOTES_KV buddies:enabled      # use the var
 # (add `--env dev` for the dev worker).
+#
+# Also holds the paywall's App Store ratings (`app-store-ratings:state` sweep
+# progress + `app-store-ratings:summary`), refreshed by the cron below. See
+# src/appStoreRatings/ratings.ts.
 [[kv_namespaces]]
 binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"
+
+# App Store ratings sweep: BATCH_SIZE storefronts per run, resting once a
+# full sweep completes until it is a day old. Repeated under [env.dev.triggers].
+[triggers]
+crons = ["17 * * * *"]
 
 [[ratelimits]]
 name = "RATE_LIMITER"

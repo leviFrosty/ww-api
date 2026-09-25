@@ -34,6 +34,7 @@ export interface Environment {
    * `APP_ATTEST_IDENTITY`.
    * Never notes text or model output (ADR 0008). The per-identity credit meter
    * moved OUT of KV into the `NotesImportIndex` DO (atomic, strongly consistent).
+   * Also holds the public App Store ratings sweep (`app-store-ratings:*`).
    */
   NOTES_KV: KVNamespace;
 
