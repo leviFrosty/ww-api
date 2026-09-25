@@ -513,9 +513,9 @@ describe('caps and rate limits', () => {
     })
   })
 
-  it('limits invite creation to 5 per 24 hours, counting deleted invites', async () => {
+  it('limits invite creation to 20 per 24 hours, counting deleted invites', async () => {
     const owner = await Owner.create(h)
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 20; i++) {
       const invite = await createInvite(owner)
       expect(invite.response.status).toBe(200)
       await owner.send('invite/delete', { inviteId: invite.inviteId })
@@ -525,7 +525,7 @@ describe('caps and rate limits', () => {
       status: 429,
       body: { error: 'rate_limited' },
     })
-    advance(20 * HOUR_MS)
+    advance(5 * HOUR_MS)
     expect((await createInvite(owner)).response.status).toBe(200)
   })
 
