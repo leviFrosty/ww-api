@@ -26,6 +26,8 @@ import {
   handleNotesImportDestroyRequest,
   handleNotesImportAdminResetRequest,
 } from "./notesImport/route";
+import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
+import { runRatingsSweepStep } from "./appStoreRatings/ratings";
 import { Sentry, createSentryConfig } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
@@ -92,6 +94,8 @@ app.use("/admin/*", rateLimitMiddleware);
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
 app.get("/health", handleHealthCheckRequest);
+// Paywall social proof (App Store ratings), edge-cached; refreshed by cron.
+app.get("/app-store/ratings", handleAppStoreRatingsRequest);
 // Notes Import: availability probe, App Attest handshake + the metered call.
 app.get("/notes-import/status", handleNotesImportStatusRequest);
 app.post("/notes-import/challenge", handleChallengeRequest);
@@ -132,6 +136,14 @@ export default Sentry.withSentry(
       context: ExecutionContext
     ): Promise<Response> {
       return app.fetch(request, environment, context);
+    },
+    async scheduled(
+      _controller: ScheduledController,
+      environment: Environment,
+      context: ExecutionContext
+    ): Promise<void> {
+      // Hourly (wrangler.toml [triggers]); idle once a daily sweep is done.
+      context.waitUntil(runRatingsSweepStep({ kv: environment.NOTES_KV }));
     },
   } satisfies ExportedHandler<Environment>
 );
