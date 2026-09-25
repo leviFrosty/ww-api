@@ -124,6 +124,112 @@ describe('GET /c/:payload (legacy)', () => {
   })
 })
 
+describe('contact link localization', () => {
+  it.each([
+    ['en-us', 'Open this contact in WitnessWork'],
+    ['de-de', 'Diesen Kontakt in WitnessWork öffnen'],
+    ['es-es', 'Abre este contacto en WitnessWork'],
+    ['fr-fr', 'Ouvrir ce contact dans WitnessWork'],
+    ['it-it', 'Apri questo contatto in WitnessWork'],
+    ['ja-jp', 'この連絡先をWitnessWorkで開く'],
+    ['ko-kr', 'WitnessWork에서 이 연락처 열기'],
+    ['nl-nl', 'Open dit contact in WitnessWork'],
+    ['pt-br', 'Abra este contato no WitnessWork'],
+    ['pt-pt', 'Abra este contacto no WitnessWork'],
+    ['ru-ru', 'Откройте этот контакт в WitnessWork'],
+    ['vi-vn', 'Mở liên hệ này trong WitnessWork'],
+    ['zh-hant-tw', '在WitnessWork中開啟此聯絡人'],
+    ['zh-hans-cn', '在WitnessWork中打开此联系人'],
+    ['sw-ke', 'Fungua anwani hii katika WitnessWork'],
+    ['uk-ua', 'Відкрийте цей контакт у WitnessWork'],
+    ['bem-zm', 'Isuleni uyu muntu muli WitnessWork'],
+    ['rw-rw', 'Fungura iyi aderesi muri WitnessWork'],
+  ])('renders %s on both routes, including preview titles', async (locale, title) => {
+    for (const path of ['/c', `/c/${PAYLOAD}`]) {
+      const response = await request(`${path}?lang=${locale}`, {
+        headers: { 'Accept-Language': 'en-US' },
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-language')).toBe(locale)
+      expect(response.headers.get('vary')).toContain('Accept-Language')
+      const page = await response.text()
+      expect(page).toContain(`<html lang="${locale}">`)
+      expect(page).toContain(`<title>${title}</title>`)
+      expect(page).toContain(`<h1>${title}</h1>`)
+      expect(page).toContain(`<meta property="og:title" content="${title}">`)
+      expect(page).toContain(`<meta name="twitter:title" content="${title}">`)
+      expect(ogUrl(page)).toBe(CANONICAL_URL)
+      expect(page.slice(0, page.indexOf('</head>'))).not.toContain(PAYLOAD)
+    }
+  })
+
+  it('translates instructions, buttons, descriptions and image labels', async () => {
+    const response = await request('/c', { headers: { 'Accept-Language': 'es-MX' } })
+    const page = await response.text()
+    const description = 'Han compartido un contacto contigo desde WitnessWork — la aplicación de gestión del tiempo de predicación y de contactos para los testigos de Jehová.'
+    for (const meta of ['name="description"', 'property="og:description"', 'name="twitter:description"']) {
+      expect(page).toContain(`<meta ${meta} content="${description}">`)
+    }
+    expect(page).toContain('<meta property="og:locale" content="es_ES">')
+    expect(page).toContain('<p>Instala WitnessWork para importar el contacto compartido. Si ya tienes la aplicación, debería haberse abierto automáticamente.</p>')
+    expect(page).toContain('>Descargar WitnessWork</a>')
+    expect(page).toContain('>Abrir la aplicación (ya instalada)</a>')
+    expect(page).toContain('alt="Icono de la aplicación WitnessWork"')
+    expect(page).toContain('property="og:image:alt" content="Icono de la aplicación WitnessWork"')
+    expect(page).toContain('name="twitter:image:alt" content="Icono de la aplicación WitnessWork"')
+    expect(openAppLinkAt(page, `#${PAYLOAD}`).href).toBe(`witnesswork://import-contact/${PAYLOAD}`)
+  })
+
+  it.each([
+    [undefined, 'en-us'],
+    ['xx-XX, fr-CA;q=0.8, en;q=0.5', 'fr-fr'],
+    ['de;q=0.2, ja;q=0.9', 'ja-jp'],
+    ['de;q=0, ko;q=0.8', 'ko-kr'],
+    ['fr;q=bogus, es;q=1.1, it;q=0.5', 'it-it'],
+    ['ru;q=0.7, uk;q=0.7', 'ru-ru'],
+    ['PT-pt', 'pt-pt'],
+    ['pt', 'pt-br'],
+    ['zh-TW', 'zh-hant-tw'],
+    ['zh-HK', 'zh-hant-tw'],
+    ['zh-Hant', 'zh-hant-tw'],
+    ['zh-Hans-TW', 'zh-hans-cn'],
+    ['zh-CN', 'zh-hans-cn'],
+    ['zh', 'zh-hans-cn'],
+    ['*', 'en-us'],
+    ['xx-XX', 'en-us'],
+    ['constructor, __proto__', 'en-us'],
+  ])('negotiates Accept-Language %s as %s', async (header, locale) => {
+    const response = await request('/c', {
+      headers: header ? { 'Accept-Language': header } : undefined,
+    })
+    expect(response.headers.get('content-language')).toBe(locale)
+    expect(await response.text()).toContain(`<html lang="${locale}">`)
+  })
+
+  it('normalizes explicit language and falls back safely for invalid values', async () => {
+    for (const value of ['xx-XX', '"><script>alert(1)</script>', 'constructor', '__proto__']) {
+      const response = await request(`/c?lang=${encodeURIComponent(value)}`, {
+        headers: { 'Accept-Language': 'fr' },
+      })
+      expect(response.headers.get('content-language')).toBe('fr-fr')
+      expect(await response.text()).not.toContain(value)
+    }
+    const response = await request('/c?lang=ZH-Hant', {
+      headers: { 'Accept-Language': 'en' },
+    })
+    expect(response.headers.get('content-language')).toBe('zh-hant-tw')
+    expect(await response.text()).toContain('property="og:locale" content="zh_TW"')
+  })
+
+  it('keeps the localized legacy deep link and rejects invalid payloads', async () => {
+    const page = await html(`/c/${PAYLOAD}?lang=pt-pt`)
+    expect(page).toContain(`href="witnesswork://import-contact/${PAYLOAD}">Abrir aplicação (já instalada)</a>`)
+    const invalid = await html('/c/%22%3E%3Cb%3Ehi?lang=pt-pt')
+    expect(invalid).not.toContain('witnesswork://import-contact/')
+    expect(invalid).not.toContain('<b>hi')
+  })
+})
+
 describe('Sentry reporting', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
