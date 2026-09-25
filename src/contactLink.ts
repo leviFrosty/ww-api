@@ -1,6 +1,11 @@
 import type { AppContext } from './types'
 import { HTTP_STATUS } from './config'
 import { nameTransactionAfterRoute } from './sentry'
+import {
+  contactLinkTranslations,
+  resolveContactLinkLocale,
+  type ContactLinkLocale,
+} from './contactLinkLocales'
 
 /**
  * Contact-share universal link handlers.
@@ -41,7 +46,6 @@ const IMPORT_DEEP_LINK_PREFIX = 'witnesswork://import-contact/'
 /** The app's payload encoding: unpadded base64url. */
 const BASE64URL = /^[A-Za-z0-9_-]+$/
 const OPEN_APP_LINK_ID = 'open-app'
-const OPEN_APP_LABEL = 'Open app (already installed)'
 
 /**
  * WitnessWork brand palette — mirrors `lightModeColors` in
@@ -58,10 +62,6 @@ const BRAND = {
   card: '#FFFFFF',
   border: '#dbdbdb',
 } as const
-
-const OG_TITLE = 'Open this contact in WitnessWork'
-const OG_DESCRIPTION =
-  'A contact was shared with you from WitnessWork — the service time and contact management app for Jehovah\u2019s Witnesses.'
 
 /**
  * Builds the "Open app" deep link in the browser from the fragment. Only a
@@ -126,8 +126,9 @@ export function handleAasaRequest(context: AppContext) {
  */
 export function handleContactLinkRequest(context: AppContext) {
   nameTransactionAfterRoute(context)
+  const locale = contactLinkLocale(context)
   return context.html(
-    renderFallbackPage(`<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${OPEN_APP_LABEL}</a>
+    renderFallbackPage(locale, `<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${escapeHtml(contactLinkTranslations[locale].openApp)}</a>
     <script>${OPEN_APP_FROM_FRAGMENT_SCRIPT}</script>`)
   )
 }
@@ -139,11 +140,31 @@ export function handleContactLinkRequest(context: AppContext) {
  */
 export function handleLegacyContactLinkRequest(context: AppContext) {
   nameTransactionAfterRoute(context)
+  const locale = contactLinkLocale(context)
   const payload = context.req.param('payload') ?? ''
   const openAppLink = BASE64URL.test(payload)
-    ? `<a class="secondary" href="${IMPORT_DEEP_LINK_PREFIX}${payload}">${OPEN_APP_LABEL}</a>`
+    ? `<a class="secondary" href="${IMPORT_DEEP_LINK_PREFIX}${payload}">${escapeHtml(contactLinkTranslations[locale].openApp)}</a>`
     : ''
-  return context.html(renderFallbackPage(openAppLink))
+  return context.html(renderFallbackPage(locale, openAppLink))
+}
+
+function contactLinkLocale(context: AppContext): ContactLinkLocale {
+  const locale = resolveContactLinkLocale(
+    context.req.query('lang'),
+    context.req.header('Accept-Language')
+  )
+  context.header('Content-Language', locale)
+  context.header('Vary', 'Accept-Language', { append: true })
+  return locale
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 /**
@@ -153,32 +174,41 @@ export function handleLegacyContactLinkRequest(context: AppContext) {
  * the bare canonical URL, and `no-referrer` keeps legacy page URLs out of the
  * Referer header of follow-up requests.
  */
-function renderFallbackPage(openAppLink: string): string {
+function renderFallbackPage(locale: ContactLinkLocale, openAppLink: string): string {
+  const messages = contactLinkTranslations[locale]
+  const title = escapeHtml(messages.title)
+  const description = escapeHtml(messages.description)
+  const imageAlt = escapeHtml(messages.imageAlt)
+  // Open Graph uses language_TERRITORY rather than BCP 47 script subtags.
+  const [language] = locale.split('-')
+  const territory = locale.split('-').at(-1)!.toUpperCase()
   return `<!doctype html>
-<html lang="en">
+<html lang="${locale}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex">
   <meta name="referrer" content="no-referrer">
-  <title>${OG_TITLE}</title>
-  <meta name="description" content="${OG_DESCRIPTION}">
+  <title>${title}</title>
+  <meta name="description" content="${description}">
   <meta name="theme-color" content="${BRAND.accentBackground}">
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="WitnessWork">
-  <meta property="og:title" content="${OG_TITLE}">
-  <meta property="og:description" content="${OG_DESCRIPTION}">
+  <meta property="og:locale" content="${language}_${territory}">
+  <meta property="og:title" content="${title}">
+  <meta property="og:description" content="${description}">
   <meta property="og:url" content="${CANONICAL_URL}">
   <meta property="og:image" content="${OG_IMAGE_URL}">
   <meta property="og:image:width" content="1024">
   <meta property="og:image:height" content="1024">
-  <meta property="og:image:alt" content="WitnessWork app icon">
+  <meta property="og:image:alt" content="${imageAlt}">
 
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="${OG_TITLE}">
-  <meta name="twitter:description" content="${OG_DESCRIPTION}">
+  <meta name="twitter:title" content="${title}">
+  <meta name="twitter:description" content="${description}">
   <meta name="twitter:image" content="${OG_IMAGE_URL}">
+  <meta name="twitter:image:alt" content="${imageAlt}">
 
   <link rel="apple-touch-icon" href="${APPLE_TOUCH_ICON_URL}">
   <link rel="icon" type="image/png" href="${APPLE_TOUCH_ICON_URL}">
@@ -252,10 +282,10 @@ function renderFallbackPage(openAppLink: string): string {
 </head>
 <body>
   <div class="card">
-    <img class="icon" src="${APPLE_TOUCH_ICON_URL}" alt="WitnessWork" width="88" height="88">
-    <h1>${OG_TITLE}</h1>
-    <p>Install WitnessWork to import the shared contact. If you already have the app, it should have opened automatically.</p>
-    <a class="btn" href="${APP_STORE_URL}">Get WitnessWork</a>
+    <img class="icon" src="${APPLE_TOUCH_ICON_URL}" alt="${imageAlt}" width="88" height="88">
+    <h1>${title}</h1>
+    <p>${escapeHtml(messages.instructions)}</p>
+    <a class="btn" href="${APP_STORE_URL}">${escapeHtml(messages.getApp)}</a>
     ${openAppLink}
   </div>
 </body>

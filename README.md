@@ -166,6 +166,19 @@ Universal-link landing page for shared WitnessWork contacts
 installed; otherwise this endpoint serves a fallback HTML page with an App
 Store CTA.
 
+The page, accessibility labels, and Open Graph/Twitter preview strings support
+the same 18 locales as `witness-work/src/lib/locales.ts`. Pass `?lang=pt-pt`
+before the fragment (`/c?lang=pt-pt#<payload>`) to choose a language explicitly;
+otherwise the worker uses `Accept-Language` preferences, including quality
+weights, and defaults to English (`en-us`). Unsupported or malformed `lang`
+values fall back to browser preferences. Regional variants fall back to the
+same language; Portuguese defaults to `pt-br`, and Chinese uses Simplified
+unless Traditional script or a Taiwan/Hong Kong/Macau region is requested.
+Responses include `Content-Language` and `Vary: Accept-Language`. Preview
+crawlers without a language preference receive English unless `lang` is set.
+The canonical `og:url` remains the bare `/c`, without language or contact data.
+The same localization rules apply to legacy `/c/:payload` links.
+
 The payload is an opaque gzip + base64url–encoded contact export produced by
 the app. It rides in the URL fragment, which clients never send, so the worker
 never sees it; the page's inline script builds the
