@@ -126,7 +126,7 @@ The relay keeps `inviteId → creator inboxId` only until the invite is deleted 
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | Slots + open invites per inbox             | 5                                                                      |
 | Open invites per inbox                     | 3                                                                      |
-| Invite creations per inbox                 | 5 per 24 h                                                             |
+| Invite creations per inbox                 | 20 per 24 h                                                            |
 | Writes per slot (`card/put` + `event/put`) | 60 per hour                                                            |
 | Pushes per slot                            | 10 per 24 h, at least 60 s apart (extra events are stored, not pushed) |
 | Devices per inbox                          | 10                                                                     |
