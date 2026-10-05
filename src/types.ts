@@ -227,6 +227,16 @@ export interface Environment {
 
   /** APNs `.p8` auth key, PKCS#8 PEM (secret). Pushes are skipped when unset. */
   APNS_PRIVATE_KEY?: string;
+
+  // --- Route planning ------------------------------------------------------
+
+  /**
+   * One SQLite DO per account id holding only the timestamps of its route
+   * optimizations from the last 24 hours (per-account daily/minute limits).
+   */
+  ROUTE_PLANNING_QUOTA: DurableObjectNamespace<
+    import('./routePlanning/quotaDO').RoutePlanningQuota
+  >;
 }
 
 export type AppContext = Context<{ Bindings: Environment }>;

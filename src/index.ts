@@ -31,6 +31,7 @@ import { runRatingsSweepStep } from "./appStoreRatings/ratings";
 import { Sentry, createSentryConfig } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
+import { createRoutePlanningRoutes } from "./routePlanning/route";
 
 // Durable Object classes must be re-exported from the entry module so Wrangler
 // can bind them (see wrangler.toml [[durable_objects.bindings]] + migrations).
@@ -40,6 +41,7 @@ export { AppAttestIdentity } from "./appAttest/identityDO";
 export { PlayIntegrityChallenges } from "./playIntegrity/challengeDO";
 export { BuddyInbox } from "./buddies/inboxDO";
 export { BuddyInvite } from "./buddies/inviteDO";
+export { RoutePlanningQuota } from "./routePlanning/quotaDO";
 
 const app = new Hono<{ Bindings: Environment }>();
 
@@ -91,6 +93,7 @@ app.use("/autocomplete", rateLimitMiddleware);
 app.use("/notes-import", rateLimitMiddleware);
 app.use("/notes-import/*", rateLimitMiddleware);
 app.use("/admin/*", rateLimitMiddleware);
+app.use("/route-planning/*", rateLimitMiddleware);
 
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);
@@ -125,6 +128,9 @@ app.get("/c/:payload", handleLegacyContactLinkRequest);
 app.route("/buddies/v1", createBuddiesRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 app.get("/b", handleBuddyInvitePage);
+// Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
+// with per-account limits in the RoutePlanningQuota DO.
+app.route("/route-planning", createRoutePlanningRoutes());
 app.notFound(handleNotFound);
 app.onError(handleApplicationError);
 

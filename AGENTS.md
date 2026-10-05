@@ -267,6 +267,47 @@ KV read on a miss, and returns `503 no-store` until the first sweep completes
 (~5 hours after the first deploy). The app persists the body for 7 days and
 falls back to a bundled snapshot until then.
 
+## Route planning
+
+`POST /route-planning/optimize` backs the app's Supporter-only "Plan today's
+route". Code lives in `src/routePlanning/`; README documents the contract.
+
+- **HERE product**: Waypoints Sequence v8 (`findsequence2`), one transaction per
+  request up to 100 stops (2,500 free a month on the Base Plan, then about $5.83
+  per 1,000). `mode=fastest;car;traffic:enabled`, `departure=now`, no `end` (the
+  route finishes at the last stop). Matrix Routing would cost about 5 × N
+  transactions plus our own solver, and Tour Planning bills every location.
+- **Gate**: `isSupporter()` against the request's `accountId` (the RevenueCat
+  app user id). Fails closed: a RevenueCat error returns 503
+  `supporter_check_failed`, never a route. No App Attest, so Android works too;
+  the account id is an unguessable UUID, and the per-account limits bound what
+  a leaked one could spend. On the dev worker the shared `x-ww-dev-bypass`
+  token (`NOTES_IMPORT_DEV_BYPASS_TOKEN`) skips the RevenueCat check; production
+  ignores it.
+- **Limits** (`ROUTE_PLANNING_LIMITS` in `src/routePlanning/config.ts`): 10
+  stops per request, and per account 10 optimizations in any rolling 24 hours
+  and 3 per minute. Enforced by the `RoutePlanningQuota` SQLite DO (binding
+  `ROUTE_PLANNING_QUOTA`, migration `v5`, one instance per account id, which
+  stores only optimization timestamps and deletes itself a day after the
+  newest). Every call that reaches HERE counts, including `no_route` answers.
+  The per-IP `RATE_LIMITER` also applies.
+- **Kill switch**: KV `route-planning:enabled` in `NOTES_KV`. `"false"` turns
+  optimizing off (503 `unavailable`; the app says it's temporarily unavailable);
+  absent or anything else leaves it on. Edge-cached for 60 seconds.
+
+  ```bash
+  wrangler kv key put --binding NOTES_KV route-planning:enabled false   # off
+  wrangler kv key delete --binding NOTES_KV route-planning:enabled      # on
+  ```
+
+- **Privacy**: HERE receives only coordinates under opaque ids, in a form POST
+  body so they never appear in a URL. RevenueCat and HERE calls use the fetch
+  captured before Sentry wraps the global, so the account id (in RevenueCat's
+  URL) and the HERE key stay out of trace spans. Nothing logs bodies,
+  coordinates, or account ids.
+
+The first deploy applies the `v5` migration (prod and `--env dev`).
+
 ## Checks before deploy
 
 ```bash
