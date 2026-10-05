@@ -238,7 +238,7 @@ pnpm exec wrangler secret put ADMIN_API_TOKEN --env dev  # use a DIFFERENT value
 Each environment's `NOTES_KV` may contain `notes-import:limits`:
 
 ```json
-{"importsFree":5,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
+{"importsFree":3,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
 ```
 
 Allowance values are integer `-1` (unlimited), `0` (none), or positive finite;

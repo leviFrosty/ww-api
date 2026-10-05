@@ -141,7 +141,7 @@ Allowance policy lives in each environment's `NOTES_KV` under
 `notes-import:limits` and is edge-cached for 60 seconds. Its JSON shape is:
 
 ```json
-{"importsFree":5,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
+{"importsFree":3,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
 ```
 
 Each field independently resolves KV → the matching `wrangler.toml` env var →

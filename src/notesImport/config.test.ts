@@ -78,7 +78,7 @@ describe('getNotesImportConfig — environment-only knobs', () => {
 describe('resolveNotesImportLimits — KV > env > defaults per field', () => {
   it('uses the five code defaults', async () => {
     await expect(resolveNotesImportLimits(baseEnv, limitsKv(null))).resolves.toEqual({
-      importsFree: 5,
+      importsFree: 3,
       importsSupporter: -1,
       refinementsFree: 5,
       refinementsSupporter: -1,
@@ -221,7 +221,7 @@ describe('resolveNotesImportLimits — KV > env > defaults per field', () => {
       }) as LimitsKv['get'],
     }
     await expect(resolveNotesImportLimits(baseEnv, kv)).resolves.toMatchObject({
-      importsFree: 5,
+      importsFree: 3,
       windowDays: 30,
     })
     expect(warn).toHaveBeenCalledOnce()

@@ -117,7 +117,7 @@ export interface LimitsKv {
 }
 
 const LIMITS_DEFAULTS: NotesImportLimits = {
-  importsFree: 5,
+  importsFree: 3,
   importsSupporter: -1,
   refinementsFree: 5,
   refinementsSupporter: -1,
