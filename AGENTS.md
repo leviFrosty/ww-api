@@ -49,6 +49,57 @@ Note: in Wrangler, `vars`, `kv_namespaces`, and `ratelimits` are **not inherited
 by a named env, so they are repeated under `[env.dev]` in `wrangler.toml`. Keep
 them in sync with the top-level prod config when adding new bindings.
 
+### Android Notes Import (Play Integrity)
+
+Android authenticates Notes Import with Google Play Integrity standard requests
+instead of App Attest (witness-work ADR 0016; code in `src/playIntegrity/`). A
+request opts in with `attestationProvider: "play-integrity"` on the existing
+`/notes-import/challenge`, `/kickoff`, and `/verify` routes; bodies without it
+take the unchanged App Attest paths. Challenges live in the
+`PLAY_INTEGRITY_CHALLENGES` Durable Object (migration `v4`), never in
+`AppAttestIdentity`. The worker decodes each token through Google's
+`decodeIntegrityToken` with a service account, then requires the request
+binding, `PLAY_RECOGNIZED`, and `MEETS_DEVICE_INTEGRITY`. Licensing is not
+required.
+
+Android stays off until all three are set per environment; only then does
+`GET /notes-import/status` advertise `capabilities.playIntegrity`:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `ANDROID_PACKAGE_NAME` | var | `com.leviwilkerson.jwtime` |
+| `PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER` | var | Google Cloud project number (not the id) |
+| `PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON` | secret | Service-account JSON key |
+| `ANDROID_CERT_SHA256_DIGESTS` | var, optional | base64url SHA-256 of the Play app-signing certificate |
+| `PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT` | var, optional | `MEETS_DEVICE_INTEGRITY` (default), `MEETS_BASIC_INTEGRITY`, `MEETS_STRONG_INTEGRITY` |
+
+One-time setup:
+
+1. Google Cloud: enable **Google Play Integrity API** in a project and note
+   its project number.
+2. Play Console → WitnessWork → **Protected with Play** → Play Integrity API →
+   **Link Cloud project** (that project). The default responses already
+   include `MEETS_DEVICE_INTEGRITY`; basic/strong need an opt-in under Change
+   responses.
+3. Same project: IAM & Admin → Service Accounts → create one (no role needed)
+   → Keys → Add key → JSON.
+4. `wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON < key.json` (and
+   `--env dev`), then delete the downloaded key.
+5. Uncomment and fill the two vars in `wrangler.toml` under `[vars]` and
+   `[env.dev.vars]`. Optionally pin the certificate from Play Console → App
+   integrity → App signing:
+   `echo "<SHA-256 with colons>" | tr -d ':' | xxd -r -p | base64 | tr '+/' '-_' | tr -d '='`.
+6. `pnpm run deploy:dev`, then `pnpm run deploy` (applies `v4`).
+
+Development builds (`com.leviwilkerson.jwtimedev`) aren't on Play and
+emulators fail device integrity, so exercise real tokens with a
+Play-installed `com.leviwilkerson.jwtime` build (an internal testing track);
+use the dev bypass otherwise. Failures return `attestation_failed` with a
+stable `reason`: `device_integrity_failed`, `app_not_recognized`,
+`integrity_token_invalid`, `integrity_unavailable` (Google, credentials, or
+quota; reported to Sentry), or a challenge reason. The default quota is 10,000
+decodes per day; request more through Google's quota form before it matters.
+
 ## Deploying to dev (one-time setup)
 
 ```bash

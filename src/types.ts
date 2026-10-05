@@ -63,6 +63,14 @@ export interface Environment {
     import('./notesImport/indexDO').NotesImportIndex
   >;
 
+  /**
+   * Android's Play Integrity challenges (witness-work ADR 0016), one SQLite
+   * instance per install uuid. Single-use and short-lived; no tokens/verdicts.
+   */
+  PLAY_INTEGRITY_CHALLENGES: DurableObjectNamespace<
+    import('./playIntegrity/challengeDO').PlayIntegrityChallenges
+  >;
+
   /** OpenRouter API key (secret). Routed ZDR-only to the inference host. */
   OPENROUTER_API_KEY: string;
 
@@ -85,6 +93,35 @@ export interface Environment {
    * only against that id.
    */
   IOS_ADDITIONAL_BUNDLE_IDS?: string;
+
+  // --- Android / Play Integrity (ADR 0016) -------------------------------
+  // Android Notes Import stays unavailable until the first three are all set.
+
+  /** Android application id whose tokens are accepted, e.g. `com.leviwilkerson.jwtime`. */
+  ANDROID_PACKAGE_NAME?: string;
+
+  /**
+   * Google Cloud project number linked to the app in Play Console. Not
+   * secret: advertised on GET /notes-import/status so the app can prepare
+   * standard integrity requests.
+   */
+  PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER?: string;
+
+  /** Service-account JSON key in the linked Cloud project (secret). */
+  PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON?: string;
+
+  /**
+   * Optional comma-separated base64url SHA-256 digests of the Play app-signing
+   * certificate. When set, the token's certificate must match one of them.
+   */
+  ANDROID_CERT_SHA256_DIGESTS?: string;
+
+  /**
+   * `MEETS_DEVICE_INTEGRITY` (default), `MEETS_BASIC_INTEGRITY`, or
+   * `MEETS_STRONG_INTEGRITY`. Basic and strong labels must be opted into in
+   * Play Console before Play returns them.
+   */
+  PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT?: string;
 
   /** @deprecated Ignored; Supporter status follows witness-work ADR 0014. */
   REVENUECAT_ENTITLEMENT_ID?: string;
@@ -210,10 +247,14 @@ export interface ErrorResponse {
   error: string;
   /** Stable machine-readable code so the app can branch (e.g. show the paywall). */
   code?: string;
-  /** Stable App Attest failure reason (additive to the legacy `code`). */
-  reason?: import('./appAttest/errors').AppAttestReason;
+  /** Stable App Attest or Play Integrity failure reason (additive to `code`). */
+  reason?:
+    | import('./appAttest/errors').AppAttestReason
+    | import('./playIntegrity/errors').PlayIntegrityReason;
   /** Recovery-safe next action; transient failures never request key rotation. */
-  action?: import('./appAttest/errors').AppAttestAction;
+  action?:
+    | import('./appAttest/errors').AppAttestAction
+    | import('./playIntegrity/errors').PlayIntegrityAction;
   /**
    * Underlying error detail, surfaced ONLY to dev-bypass callers (i.e. DEV app
    * builds) so the real cause of an otherwise-opaque failure (e.g. `model_error`)

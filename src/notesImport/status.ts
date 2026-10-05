@@ -6,6 +6,8 @@ import {
 } from './config'
 import type { Environment } from '../types'
 import { APP_ATTEST_PROTOCOL_VERSION } from '../appAttest/protocol'
+import { playIntegrityConfig } from '../playIntegrity/config'
+import { PLAY_INTEGRITY_PROTOCOL_VERSION } from '../playIntegrity/protocol'
 
 /** The KV subset this module uses — keeps it trivially mockable in tests. */
 export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
@@ -59,6 +61,14 @@ export interface NotesImportCapabilities {
   appAttest: {
     protocolVersions: readonly [1, typeof APP_ATTEST_PROTOCOL_VERSION]
   }
+  /**
+   * Present only when this worker can verify Android requests (ADR 0016).
+   * Android keeps Notes Import closed while it is absent.
+   */
+  playIntegrity?: {
+    protocolVersions: readonly [typeof PLAY_INTEGRITY_PROTOCOL_VERSION]
+    cloudProjectNumber: string
+  }
 }
 
 export type NotesImportStatusResponse = NotesImportStatusState & {
@@ -71,8 +81,19 @@ export type NotesImportStatusResponse = NotesImportStatusState & {
   minAppVersion?: string
 }
 
-const NOTES_IMPORT_CAPABILITIES: NotesImportCapabilities = {
-  appAttest: { protocolVersions: [1, APP_ATTEST_PROTOCOL_VERSION] },
+const notesImportCapabilities = (env: Environment): NotesImportCapabilities => {
+  const playIntegrity = playIntegrityConfig(env)
+  return {
+    appAttest: { protocolVersions: [1, APP_ATTEST_PROTOCOL_VERSION] },
+    ...(playIntegrity
+      ? {
+          playIntegrity: {
+            protocolVersions: [PLAY_INTEGRITY_PROTOCOL_VERSION],
+            cloudProjectNumber: playIntegrity.cloudProjectNumber,
+          },
+        }
+      : {}),
+  }
 }
 
 const ENABLED_KEY = 'notes-import:enabled'
@@ -301,7 +322,7 @@ export const getNotesImportStatus = async (
   ])
   return {
     ...state,
-    capabilities: NOTES_IMPORT_CAPABILITIES,
+    capabilities: notesImportCapabilities(dependencies.env),
     ...(minAppVersion ? { minAppVersion } : {}),
   }
 }

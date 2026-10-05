@@ -37,6 +37,7 @@ import { handleBuddyInvitePage } from "./buddies/invitePage";
 export { NotesImportRun } from "./notesImport/runDO";
 export { NotesImportIndex } from "./notesImport/indexDO";
 export { AppAttestIdentity } from "./appAttest/identityDO";
+export { PlayIntegrityChallenges } from "./playIntegrity/challengeDO";
 export { BuddyInbox } from "./buddies/inboxDO";
 export { BuddyInvite } from "./buddies/inviteDO";
 

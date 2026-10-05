@@ -65,6 +65,13 @@ NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. On in dev.
 BUDDIES_ENABLED = "true"
+# Android Notes Import (witness-work ADR 0016). Stays off until the package,
+# the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
+# are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
+# real tokens here with a Play-installed com.leviwilkerson.jwtime build.
+ANDROID_PACKAGE_NAME = "com.leviwilkerson.jwtime"
+PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
+ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 
 # Separate KV so dev never shares prod runtime policy or App Attest v1 mirrors.
 # Create with: wrangler kv namespace create NOTES_KV --env dev
@@ -88,6 +95,10 @@ name = "APP_ATTEST_IDENTITY"
 class_name = "AppAttestIdentity"
 
 [[env.dev.durable_objects.bindings]]
+name = "PLAY_INTEGRITY_CHALLENGES"
+class_name = "PlayIntegrityChallenges"
+
+[[env.dev.durable_objects.bindings]]
 name = "BUDDY_INBOX"
 class_name = "BuddyInbox"
 
@@ -106,6 +117,10 @@ new_sqlite_classes = ["AppAttestIdentity"]
 [[env.dev.migrations]]
 tag = "v3"
 new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
+
+[[env.dev.migrations]]
+tag = "v4"
+new_sqlite_classes = ["PlayIntegrityChallenges"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -166,6 +181,18 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. Off in prod
 # until App Attest lands on inbox/register and invite/* (see AGENTS.md).
 BUDDIES_ENABLED = "false"
+# Android Notes Import via Play Integrity (witness-work ADR 0016; setup steps in
+# AGENTS.md). Android stays off until the package, the Cloud project number,
+# and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
+# endpoint advertises `capabilities.playIntegrity` only then. Not inherited by
+# [env.dev].
+ANDROID_PACKAGE_NAME = "com.leviwilkerson.jwtime"
+PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
+# Optional: pin the Play app-signing certificate (base64url SHA-256, as the
+# verdict reports it; comma-separated), and/or change the device requirement
+# (MEETS_DEVICE_INTEGRITY default; BASIC/STRONG need Play Console opt-in).
+ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
+# PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT = "MEETS_DEVICE_INTEGRITY"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state
@@ -252,6 +279,12 @@ class_name = "NotesImportIndex"
 name = "APP_ATTEST_IDENTITY"
 class_name = "AppAttestIdentity"
 
+# Android Play Integrity challenges, one SQLite DO per install uuid. Repeated
+# under [env.dev] above.
+[[durable_objects.bindings]]
+name = "PLAY_INTEGRITY_CHALLENGES"
+class_name = "PlayIntegrityChallenges"
+
 # Buddies relay — one inbox DO per inboxId, one invite DO per inviteId, both
 # SQLite-backed. See docs/buddies-protocol.md. Repeated under [env.dev] above.
 [[durable_objects.bindings]]
@@ -276,6 +309,10 @@ new_sqlite_classes = ["AppAttestIdentity"]
 tag = "v3"
 new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
 
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["PlayIntegrityChallenges"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1 # optional. default = 1.
@@ -293,3 +330,5 @@ logs.persist = true
 # Buddies pushes (APNs token auth); without both, the relay skips pushes:
 # wrangler secret put APNS_KEY_ID [--env dev]          # 10-char key id of the .p8
 # wrangler secret put APNS_PRIVATE_KEY [--env dev]     # .p8 PEM contents: < AuthKey_XXXX.p8
+# Android Notes Import (ADR 0016): the Play Integrity service-account JSON key:
+# wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON [--env dev] < play-integrity-key.json
