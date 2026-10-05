@@ -28,7 +28,7 @@ const CONFIG: NotesImportConfig = {
 
 const ENV = {} as Environment
 const DEFAULT_PUBLIC_LIMITS = {
-  imports: { free: 5, supporter: null },
+  imports: { free: 3, supporter: null },
   refinements: { free: 5, supporter: null },
   windowDays: 30,
 }
