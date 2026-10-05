@@ -25,5 +25,9 @@ Thumbs.db
 *.swo
 *~
 
-# Agents
-.claude
+# Agents (skills live in .agents/skills; .claude/skills is a symlink to them)
+.claude/*
+!.claude/skills
+
+# Agent verification loop (scripts/verify/dev.mjs): state, logs, evidence
+.verify/

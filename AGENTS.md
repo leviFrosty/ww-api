@@ -132,6 +132,9 @@ wrangler dev                 # local runtime
 wrangler dev --remote --env dev   # Cloudflare edge with dev bindings
 ```
 
+For verification, agents use the `verify-ww-api` loop below instead: it runs an
+isolated worker on 8790-8799, and 8787 belongs to the user's own `wrangler dev`.
+
 Neither gives a stable public URL for an iOS device — use the deployed
 `--env dev` worker (or a `cloudflared` tunnel) for real-device App Attest tests.
 
@@ -316,6 +319,12 @@ pnpm exec tsc --noEmit
 wrangler deploy --dry-run            # prod build
 wrangler deploy --env dev --dry-run  # dev build
 ```
+
+## Verification loop
+
+Before claiming backend work is done, run the `verify-ww-api` loop
+(`.agents/skills/verify-ww-api/SKILL.md`): `node scripts/verify/dev.mjs up`,
+`doctor`, `pnpm test:e2e`, `pnpm fuzz:buddies` for relay changes, then `down`.
 
 ## Sentry source maps
 
