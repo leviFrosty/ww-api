@@ -264,6 +264,42 @@ permanent hash replay and refinement records survive. Missing configuration or
 bad auth returns 404. Data Studio remains the manual emergency fallback. Never
 reuse `NOTES_IMPORT_DEV_BYPASS_TOKEN` as the admin secret.
 
+### `POST /route-planning/optimize`
+
+Supporter-only shortest driving order for the app's "Plan today's route". Sends
+the stops to HERE Waypoints Sequence v8 (`findsequence2`), which returns the
+fastest visiting order (live traffic, open path ending at the last stop) for one
+transaction per request.
+
+**Request** (JSON; any other field is rejected):
+
+```json
+{
+  "accountId": "<app account id>",
+  "start": { "lat": 39.1031, "lng": -84.512 },
+  "stops": [{ "lat": 39.11, "lng": -84.5 }, { "lat": 39.12, "lng": -84.49 }]
+}
+```
+
+1–10 stops. HERE receives only the coordinates, under opaque ids (`start`,
+`s0`…), in a form POST body. The account id is used only for the RevenueCat
+Supporter check and the per-account limits; neither it nor the coordinates are
+logged or stored.
+
+**Response:**
+
+```json
+{ "order": [1, 0], "distanceMeters": 4321, "durationSeconds": 601, "remainingToday": 9 }
+```
+
+`order` lists indices into `stops` in visiting order.
+
+**Errors** carry `{ "error", "code" }`: `bad_request` (400), `payload_too_large`
+(413), `supporter_required` (403), `supporter_check_failed` (503 — RevenueCat
+unreachable; fails closed), `unavailable` (503 — kill switch), `daily_limit` /
+`rate_limited` (429, with `retryAfterSeconds` and `Retry-After`), `no_route`
+(422), `upstream_error` (502).
+
 ### `/health`
 
 Health check endpoint.

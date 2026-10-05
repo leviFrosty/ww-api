@@ -106,6 +106,10 @@ class_name = "BuddyInbox"
 name = "BUDDY_INVITE"
 class_name = "BuddyInvite"
 
+[[env.dev.durable_objects.bindings]]
+name = "ROUTE_PLANNING_QUOTA"
+class_name = "RoutePlanningQuota"
+
 [[env.dev.migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -121,6 +125,10 @@ new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
 [[env.dev.migrations]]
 tag = "v4"
 new_sqlite_classes = ["PlayIntegrityChallenges"]
+
+[[env.dev.migrations]]
+tag = "v5"
+new_sqlite_classes = ["RoutePlanningQuota"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -235,6 +243,12 @@ ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 #   wrangler kv key delete --binding NOTES_KV buddies:enabled      # use the var
 # (add `--env dev` for the dev worker).
 #
+# Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
+# absent key (or a failed read) leaves it on. Per-account limits always apply.
+#   wrangler kv key put --binding NOTES_KV route-planning:enabled false   # off
+#   wrangler kv key delete --binding NOTES_KV route-planning:enabled      # on
+# (add `--env dev` for the dev worker).
+#
 # Also holds the paywall's App Store ratings (`app-store-ratings:state` sweep
 # progress + `app-store-ratings:summary`), refreshed by the cron below. See
 # src/appStoreRatings/ratings.ts.
@@ -295,6 +309,12 @@ class_name = "BuddyInbox"
 name = "BUDDY_INVITE"
 class_name = "BuddyInvite"
 
+# Route planning — one quota DO per account id (timestamps of its last 24 hours
+# of optimizations only). Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "ROUTE_PLANNING_QUOTA"
+class_name = "RoutePlanningQuota"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -312,6 +332,10 @@ new_sqlite_classes = ["BuddyInbox", "BuddyInvite"]
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["PlayIntegrityChallenges"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["RoutePlanningQuota"]
 
 [observability]
 enabled = true
