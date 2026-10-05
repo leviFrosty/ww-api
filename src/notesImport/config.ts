@@ -41,6 +41,10 @@ export interface NotesImportConfig {
   emptyWindowSeconds: number
   /** Free Empty Imports allowed per {@link emptyWindowSeconds} before soft degrade. Default 5. */
   emptyWindowLimit: number
+  /**
+   * @deprecated Ignored by `isSupporter` (witness-work ADR 0014). Remove once
+   * no caller passes it.
+   */
   entitlementId: string
   devBypassToken: string | null
   /** Reject development App Attest attestations in the production Worker. */
