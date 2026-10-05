@@ -86,7 +86,7 @@ export interface Environment {
    */
   IOS_ADDITIONAL_BUNDLE_IDS?: string;
 
-  /** RevenueCat entitlement id that denotes a Supporter. Default `Supporter`. */
+  /** @deprecated Ignored; Supporter status follows witness-work ADR 0014. */
   REVENUECAT_ENTITLEMENT_ID?: string;
 
   /** Override the model slug. Default `deepseek/deepseek-v4-flash`. */

@@ -39,6 +39,15 @@ deterministic counts line ("3 contacts · 5 visits") is shown as a subtitle in a
 state once a result exists.
 _Avoid_: title (when ambiguous), name, description.
 
+**Supporter**:
+A user who gets the Supporter allowances (unlimited by default). Who counts is
+defined once, in witness-work ADR 0014
+(`docs/adr/0014-supporter-status-rule.md`): an active subscription (including
+a promotional grant) or a `Lifetime Supporter` grant, never a one-time Tip.
+`isSupporter()` in `src/revenuecat.ts` implements it for the server and must
+agree with the app's `supporterSinceDate`.
+_Avoid_: keying Supporter status on one RevenueCat entitlement name.
+
 ### Lifecycle states
 
 An Import is always in exactly one of these. This is the canonical user-facing

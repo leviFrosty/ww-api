@@ -53,6 +53,7 @@ crons = ["17 * * * *"]
 APP_ATTEST_ENVIRONMENT = "development"
 # Dev iOS bundle id (witness-work app.config.ts IS_DEV branch).
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtimedev"
+# Deprecated and ignored: Supporter status follows witness-work ADR 0014.
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Runtime-limit env fallbacks. Named environments do not inherit [vars], so all
 # five are explicitly repeated here. KV `notes-import:limits` overrides each
@@ -148,7 +149,7 @@ IOS_BUNDLE_ID = "com.leviwilkerson.jwtime"
 # bound to the bundle id it attested with; its assertions verify only against
 # that id. Pre-binding keys default to IOS_BUNDLE_ID. Not set for [env.dev].
 IOS_ADDITIONAL_BUNDLE_IDS = "com.leviwilkerson.jwtimebeta"
-# RevenueCat entitlement that denotes a Supporter (server-side check).
+# Deprecated and ignored: Supporter status follows witness-work ADR 0014.
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.
 NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash-0731"
