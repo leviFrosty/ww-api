@@ -35,6 +35,16 @@ import {
   type V2AssertionChallengeRequest,
   type V2AssertionFinalRequest,
 } from '../appAttest/protocol'
+import {
+  PlayIntegrityError,
+  isPlayIntegrityRequest,
+  issuePlayIntegrityChallenge,
+  parsePlayIntegrityAssertionRequest,
+  parsePlayIntegrityChallengeRequest,
+  verifyPlayIntegrityAssertion,
+  type PlayIntegrityReason,
+} from '../playIntegrity'
+import type { PlayIntegrityAction } from '../playIntegrity/errors'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
 import { handleAdminResetRequest, isValidMeterId } from './admin'
 import {
@@ -51,8 +61,8 @@ const err = (
   code?: string,
   detail?: string,
   credits?: CreditsSnapshot,
-  reason?: AppAttestReason,
-  action?: AppAttestAction
+  reason?: AppAttestReason | PlayIntegrityReason,
+  action?: AppAttestAction | PlayIntegrityAction
 ) => {
   const body: ErrorResponse = { error }
   if (code) body.code = code
@@ -254,6 +264,77 @@ const verifyV2Assertion = async (
   }
 }
 
+const playIntegrityFailureResponse = (
+  ctx: AppContext,
+  error: PlayIntegrityError
+): Response => {
+  // Stable reason and policy detail only; never the token or verdict payload.
+  console.warn(
+    'notes-import Play Integrity rejected:',
+    error.reason,
+    error.message
+  )
+  if (error.reason === 'storage_unavailable') Sentry.captureException(error)
+  return err(
+    ctx,
+    error.status,
+    error.message,
+    error.status >= 500 ? 'server_error' : 'attestation_failed',
+    undefined,
+    undefined,
+    error.reason,
+    error.action
+  )
+}
+
+const playIntegrityDependencies = {
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+  now: () => Date.now(),
+  report: (error: Error) => {
+    Sentry.captureException(error)
+  },
+}
+
+/** Android's protected-request check (ADR 0016); null when it passed. */
+const verifyPlayIntegrityRecord = async (
+  ctx: AppContext,
+  record: Record<string, unknown>,
+  purpose: AppAttestAssertionPurpose
+): Promise<Response | null> => {
+  const request = parsePlayIntegrityAssertionRequest(record, purpose)
+  if (!request) {
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_REQUEST,
+      'Invalid Play Integrity request',
+      'bad_request',
+      undefined,
+      undefined,
+      'invalid_request',
+      'none'
+    )
+  }
+  try {
+    await verifyPlayIntegrityAssertion(
+      ctx.env,
+      request,
+      playIntegrityDependencies
+    )
+    return null
+  } catch (e) {
+    if (e instanceof PlayIntegrityError) {
+      return playIntegrityFailureResponse(ctx, e)
+    }
+    Sentry.captureException(e)
+    return err(
+      ctx,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Auth error',
+      'server_error'
+    )
+  }
+}
+
 const subKey = (token: string) => `notes-import:sub:${token}`
 
 /**
@@ -275,6 +356,26 @@ export async function handleChallengeRequest(ctx: AppContext) {
     return appAttestBadRequest(ctx, 'Invalid JSON body')
   }
   const record = asRecord(parsed.value)
+  if (record && isPlayIntegrityRequest(record)) {
+    const request = parsePlayIntegrityChallengeRequest(record)
+    if (!request) {
+      return appAttestBadRequest(ctx, 'Invalid Play Integrity challenge')
+    }
+    try {
+      return ctx.json(await issuePlayIntegrityChallenge(ctx.env, request))
+    } catch (e) {
+      if (e instanceof PlayIntegrityError) {
+        return playIntegrityFailureResponse(ctx, e)
+      }
+      Sentry.captureException(e)
+      return err(
+        ctx,
+        HTTP_STATUS.INTERNAL_SERVER_ERROR,
+        'Challenge error',
+        'server_error'
+      )
+    }
+  }
   const isV2Assertion =
     record?.protocolVersion === 2 && record.operation === 'assert'
   const v2AssertionRequest = isV2Assertion
@@ -313,6 +414,19 @@ export async function handleAttestRequest(ctx: AppContext) {
   }
   const body = asRecord(parsed)
   if (!body) return appAttestBadRequest(ctx, 'Invalid JSON body')
+  // Play Integrity has no key to register; every request carries a token.
+  if (isPlayIntegrityRequest(body)) {
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_REQUEST,
+      'Play Integrity has no registration step',
+      'bad_request',
+      undefined,
+      undefined,
+      'unsupported_protocol',
+      'none'
+    )
+  }
 
   // Keep the deployed v1 request gate and top-level error text unchanged.
   if (appAttestProtocolVersion(body) === 1) {
@@ -389,6 +503,28 @@ export async function handleNotesImportVerifyRequest(ctx: AppContext) {
       return ctx.json({ ok: true, protocolVersion: 2, operationId })
     }
     return ctx.json({ ok: true })
+  }
+
+  if (isPlayIntegrityRequest(body)) {
+    // Same no-payload probe contract as App Attest v2 verify.
+    if (body.requestHash !== body.contentHash) {
+      return appAttestBadRequest(
+        ctx,
+        'requestHash must equal contentHash for Play Integrity verify'
+      )
+    }
+    const failure = await verifyPlayIntegrityRecord(
+      ctx,
+      body,
+      NOTES_IMPORT_VERIFY_PURPOSE
+    )
+    if (failure) return failure
+    return ctx.json({
+      ok: true,
+      attestationProvider: 'play-integrity',
+      protocolVersion: 1,
+      operationId: body.operationId,
+    })
   }
 
   const uuid = asString(body.uuid)
@@ -662,7 +798,44 @@ async function authenticateAndGate(
     config.devBypassToken != null &&
     timingSafeEqual(bypassHeader, config.devBypassToken)
 
-  if (!devBypass) {
+  if (!devBypass && isPlayIntegrityRequest(record)) {
+    if (assertionPurpose == null) {
+      return {
+        ok: false,
+        response: err(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'Play Integrity is not supported on the legacy synchronous endpoint',
+          'bad_request',
+          undefined,
+          undefined,
+          'unsupported_protocol',
+          'none'
+        ),
+      }
+    }
+    // The token binds the canonical payload hash, so it must be authoritative.
+    const expectedRequestHash = await computeNotesImportRequestHash({
+      notesText,
+      context: body.context,
+      refinement: body.refinement ?? null,
+    })
+    if (body.requestHash !== expectedRequestHash) {
+      return {
+        ok: false,
+        response: appAttestBadRequest(
+          ctx,
+          'requestHash does not match the Notes Import payload'
+        ),
+      }
+    }
+    const failure = await verifyPlayIntegrityRecord(
+      ctx,
+      record,
+      assertionPurpose
+    )
+    if (failure) return { ok: false, response: failure }
+  } else if (!devBypass) {
     if (
       assertionPurpose == null &&
       appAttestProtocolVersion(body) === 2
