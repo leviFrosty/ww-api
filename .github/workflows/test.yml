@@ -1,0 +1,68 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Typecheck, unit, e2e, fuzz
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      # `wrangler dev --local` needs no Cloudflare credentials. The launcher
+      # generates synthetic dev-bypass/admin tokens; HERE and OpenRouter keys
+      # are absent, so the e2e suite skips the paid paths.
+      - name: Start local worker
+        run: node scripts/verify/dev.mjs up
+
+      - name: Doctor
+        run: node scripts/verify/dev.mjs doctor
+
+      - name: End-to-end tests
+        run: pnpm test:e2e
+
+      - name: Fuzz Buddies relay
+        run: pnpm fuzz:buddies --runs 100 --seed "$GITHUB_RUN_ID"
+
+      - name: Stop local worker
+        if: always()
+        run: node scripts/verify/dev.mjs down
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-evidence
+          path: |
+            .verify/artifacts/
+            .verify/wrangler.log
+          if-no-files-found: ignore
+          include-hidden-files: true
