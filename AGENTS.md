@@ -52,7 +52,7 @@ them in sync with the top-level prod config when adding new bindings.
 ### Android Notes Import (Play Integrity)
 
 Android authenticates Notes Import with Google Play Integrity standard requests
-instead of App Attest (witness-work ADR 0016; code in `src/playIntegrity/`). A
+instead of App Attest (witness-work ADR 0017; code in `src/playIntegrity/`). A
 request opts in with `attestationProvider: "play-integrity"` on the existing
 `/notes-import/challenge`, `/kickoff`, and `/verify` routes; bodies without it
 take the unchanged App Attest paths. Challenges live in the

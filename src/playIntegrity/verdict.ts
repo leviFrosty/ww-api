@@ -64,7 +64,7 @@ const reject = (
 ): VerdictResult => ({ ok: false, reason, detail })
 
 /**
- * Applies ADR 0016's policy to a decoded payload. Binding and freshness come
+ * Applies ADR 0017's policy to a decoded payload. Binding and freshness come
  * first: a payload for another app, request, or time is invalid regardless of
  * its verdicts. Device integrity is checked before app recognition because Play
  * leaves the app verdict UNEVALUATED on devices that fail integrity.

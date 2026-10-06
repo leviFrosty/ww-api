@@ -62,7 +62,7 @@ export interface NotesImportCapabilities {
     protocolVersions: readonly [1, typeof APP_ATTEST_PROTOCOL_VERSION]
   }
   /**
-   * Present only when this worker can verify Android requests (ADR 0016).
+   * Present only when this worker can verify Android requests (ADR 0017).
    * Android keeps Notes Import closed while it is absent.
    */
   playIntegrity?: {

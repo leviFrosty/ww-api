@@ -295,7 +295,7 @@ const playIntegrityDependencies = {
   },
 }
 
-/** Android's protected-request check (ADR 0016); null when it passed. */
+/** Android's protected-request check (ADR 0017); null when it passed. */
 const verifyPlayIntegrityRecord = async (
   ctx: AppContext,
   record: Record<string, unknown>,
