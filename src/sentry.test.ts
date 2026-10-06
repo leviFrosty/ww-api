@@ -121,6 +121,29 @@ describe('Sentry scrubbers', () => {
     })
   })
 
+  it('drops the Buddies live-socket auth headers from events and transactions', () => {
+    const headers = () => ({
+      'x-buddies-p': 'eyJpbmJveElkIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSJ9',
+      'X-Buddies-S': 'c2lnbmF0dXJl',
+      upgrade: 'websocket',
+    })
+    const error: ErrorEvent = {
+      type: undefined,
+      request: { url: 'https://ww-proxy.test/buddies/v1/inbox/live', headers: headers() },
+    }
+    const transaction: TransactionEvent = {
+      type: 'transaction',
+      request: { url: 'https://ww-proxy.test/buddies/v1/inbox/live', headers: headers() },
+    }
+
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual({
+      upgrade: 'websocket',
+    })
+    expect(
+      (config.beforeSendTransaction!(transaction, {}) as TransactionEvent).request?.headers
+    ).toEqual({ upgrade: 'websocket' })
+  })
+
   it('leaves events without contact links untouched', () => {
     const event: TransactionEvent = {
       type: 'transaction',

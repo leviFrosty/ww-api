@@ -15,6 +15,7 @@ import {
   buddies,
   http,
   localKv,
+  openLive,
   sendSigned,
   sendUnsigned,
   writeTranscript,
@@ -268,6 +269,71 @@ describe('relay limits and abuse', () => {
   })
 })
 
+describe('live socket', () => {
+  it('says hello, signals each change, answers ping, and closes when the inbox is deleted', async () => {
+    const owner = await RelayOwner.register()
+    const writerKey = await SigningKey.generate()
+    const slotId = randomId()
+    expect((await owner.send('slot/add', { slotId, writerPub: writerKey.publicKey })).status).toBe(200)
+    const writer = new RelayWriter(owner.inboxId, slotId, writerKey)
+
+    const attempt = await openLive(await owner.liveHeaders())
+    expect(attempt.status).toBe(101)
+    if (attempt.status !== 101 || !('connection' in attempt)) return
+    const live = attempt.connection
+    expect(JSON.parse(await live.next())).toEqual({ type: 'hello', seq: 0 })
+
+    const put = await writer.send('event/put', {
+      eventId: randomId(),
+      kind: 'plan.invite',
+      blob: blobOfSize(48),
+      push: true,
+    })
+    expect(put.body).toEqual({ ok: true, seq: 1 })
+    expect(JSON.parse(await live.next())).toEqual({ type: 'changed', seq: 1 })
+    expect((await writer.send('card/put', { blob: blobOfSize(64) })).body).toEqual({ ok: true, seq: 2 })
+    expect(JSON.parse(await live.next())).toEqual({ type: 'changed', seq: 2 })
+    // Read back: the signal's seq is what inbox/sync reports.
+    const synced = await owner.sync(0)
+    expect(synced.body.seq).toBe(2)
+    expect(synced.body.events).toHaveLength(1)
+
+    live.send('ping')
+    expect(await live.next()).toBe('pong')
+
+    expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
+    expect(await live.closed).toEqual({ code: 4001, reason: 'gone' })
+    live.end()
+  })
+
+  it('refuses plain GETs, POSTs, bad signatures, and replays without upgrading', async () => {
+    const owner = await RelayOwner.register()
+    const headers = await owner.liveHeaders()
+    const { upgrade: _upgrade, ...plain } = headers
+
+    const notUpgraded = await http('GET', '/buddies/v1/inbox/live', { headers: plain })
+    expect(notUpgraded.status).toBe(426)
+    expect(notUpgraded.body).toEqual({ error: 'upgrade_required' })
+    expect((await http('POST', '/buddies/v1/inbox/live', { body: {} })).status).toBe(404)
+
+    const first = await openLive(headers)
+    expect(first.status).toBe(101)
+    if ('connection' in first) first.connection.end()
+    expect(await openLive(headers)).toEqual({ status: 409, body: { error: 'replay' } })
+
+    const stranger = await SigningKey.generate()
+    expect(await openLive(await owner.liveHeaders(stranger))).toEqual({
+      status: 401,
+      body: { error: 'bad_signature' },
+    })
+    expect(await openLive({ upgrade: 'websocket' })).toEqual({
+      status: 400,
+      body: { error: 'bad_request' },
+    })
+    await owner.send('inbox/delete')
+  })
+})
+
 describe.skipIf(!LOCAL_LAUNCHER)('kill switch (local KV)', () => {
   it('disables everything except leave/delete, then recovers', async () => {
     const owner = await RelayOwner.register()
@@ -278,6 +344,7 @@ describe.skipIf(!LOCAL_LAUNCHER)('kill switch (local KV)', () => {
       expect(blocked.status).toBe(503)
       expect(blocked.body).toEqual({ error: 'disabled' })
       expect((await owner.sync()).body).toEqual({ error: 'disabled' })
+      expect(await openLive(await owner.liveHeaders())).toEqual({ status: 503, body: { error: 'disabled' } })
       expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
     } finally {
       localKv('delete', 'buddies:enabled')

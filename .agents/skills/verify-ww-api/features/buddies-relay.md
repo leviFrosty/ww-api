@@ -15,6 +15,7 @@ Buddies lets two publishers share upcoming Plans through a blind relay. Each per
 - `leave` removes the slot, its card, and its events from both inboxes through `slot/remove` and `slot/leave`.
 - `delete` wipes the inbox with `inbox/delete`. Sync then returns 404 `not_found`.
 - `kill-switch` makes every op return 503 `disabled` when KV `buddies:enabled` is `false`, except `inbox/delete`, `slot/remove`, and `slot/leave`.
+- `live` upgrades `GET /buddies/v1/inbox/live` (signed headers `x-buddies-p`/`x-buddies-s`) to a WebSocket that sends `hello`, then `changed` with the inbox `seq` after each write, answers `ping` with `pong`, and closes with 4001 `gone` on `inbox/delete`. A plain GET gets 426 and the kill switch 503.
 
 ## How to get to it (user POV)
 
@@ -33,6 +34,7 @@ Preconditions:
 - **Unsigned probe.** Fetch an unknown invite. Run `curl -s -X POST $URL/buddies/v1/invite/fetch -H "cf-connecting-ip: 198.18.3.1" -d "{\"p\":\"$(printf '{"inviteId":"AAAAAAAAAAAAAAAAAAAAAA"}' | base64 | tr '+/' '-_' | tr -d '=')\"}"`. The body is `{"error":"not_found"}` with status 404.
 - **Malformed envelope.** Run `curl -s -X POST $URL/buddies/v1/inbox/sync -H "cf-connecting-ip: 198.18.3.2" -d '{"p":"!!"}'`. The body is `{"error":"bad_request"}` with status 400.
 - **Limits and abuse.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "relay limits"`. The 31st `invite/fetch` from one IP gets 429, the 4th open invite gets 429, and unknown ops get 404.
+- **Live socket.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "live socket"`. It opens a socket with `openLive` (a raw handshake in `src/test/e2e.ts`, so refusals keep their status and body), reads `hello` and `changed` back against `inbox/sync`, checks `ping`/`pong`, the 4001 close, and the 426/401/409/400 refusals.
 - **Kill switch.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "kill switch"`. `inbox/register` and `inbox/sync` return 503 `disabled`, `inbox/delete` still returns `{"ok":true}`, and the switch is restored afterwards.
 - **Fuzz.** Run `pnpm fuzz:buddies --runs 300`. The last lines read `fuzz: canary intact, health after ok` and `fuzz: ok`.
 - **Proof.** Keep `.verify/artifacts/e2e-buddies-*.json` (every envelope and response) and `.verify/artifacts/fuzz-*.json`, which must have `failures: []` and `canary.intact: true`.
@@ -44,3 +46,4 @@ Preconditions:
 - Each slot allows 60 `card/put` and `event/put` writes per hour, and each inbox allows 20 invite creations per day. Long manual sessions on one identity hit `rate_limited` (429), so use fresh identities.
 - Under `wrangler dev` only, the request after a cancelled chunked upload gets a canned proxy 503 (or hangs, for a GET). The fuzzer drains and retries it and counts it as `devProxyRetries`; it is not a worker bug.
 - The kill-switch test edits shared local KV. Don't run e2e and the fuzzer at the same time.
+- After the server closes a live socket, `wrangler dev` keeps the TCP connection about 10 s, so a standard WebSocket client fires `close` late even though the close frame arrived at once. `openLive` resolves `closed` on the frame.

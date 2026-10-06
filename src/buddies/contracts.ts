@@ -31,6 +31,25 @@ export const BUDDIES_WRITER_OPS = [
 
 export const BUDDIES_UNSIGNED_OPS = ['invite/fetch', 'invite/claim'] as const
 
+/**
+ * The owner's live socket, `GET /buddies/v1/inbox/live`. Signed and verified
+ * like an owner op, but carried in request headers on a WebSocket upgrade, so
+ * it is not in `BUDDIES_OPS` and has no POST route.
+ */
+export const BUDDIES_LIVE_OP = 'inbox/live'
+/** Request headers that carry the live upgrade's `p` and `s`. */
+export const BUDDIES_LIVE_HEADERS = {
+  payload: 'x-buddies-p',
+  signature: 'x-buddies-s',
+} as const
+/** Close codes the relay sends on live sockets. */
+export const BUDDIES_LIVE_CLOSE = {
+  /** The inbox was deleted or wiped for inactivity. */
+  gone: { code: 4001, reason: 'gone' },
+  /** A newer socket for the inbox pushed this one past the cap. */
+  replaced: { code: 4002, reason: 'replaced' },
+} as const
+
 export type BuddiesOwnerOp = (typeof BUDDIES_OWNER_OPS)[number]
 export type BuddiesWriterOp = (typeof BUDDIES_WRITER_OPS)[number]
 export type BuddiesUnsignedOp = (typeof BUDDIES_UNSIGNED_OPS)[number]
@@ -39,6 +58,9 @@ export type BuddiesSignedOp =
   | BuddiesOwnerOp
   | BuddiesWriterOp
 export type BuddiesOp = BuddiesSignedOp | BuddiesUnsignedOp
+export type BuddiesLiveOp = typeof BUDDIES_LIVE_OP
+/** Every op a signature can name: the signed POST ops and the live socket. */
+export type BuddiesSigningOp = BuddiesSignedOp | BuddiesLiveOp
 
 export const BUDDIES_OPS: readonly BuddiesOp[] = [
   'inbox/register',
@@ -65,6 +87,8 @@ export const BUDDIES_ERROR_STATUS = {
   limit: 429,
   rate_limited: 429,
   disabled: 503,
+  /** `inbox/live` without a WebSocket upgrade. */
+  upgrade_required: 426,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
@@ -100,8 +124,11 @@ export const BUDDIES_LIMITS = {
   writeWindowMs: HOUR_MS,
   pushesPerSlot: 10,
   pushWindowMs: DAY_MS,
+  /** Immediate kinds skip it; `pushesPerSlot` still applies to them. */
   pushSpacingMs: MINUTE_MS,
   devices: 10,
+  /** Open `inbox/live` sockets per inbox; past it the oldest is replaced. */
+  liveSockets: 10,
   badClaims: 5,
   eventRetentionMs: 30 * DAY_MS,
   /** Invites are deleted at `expiresAt` plus this grace. */
@@ -128,6 +155,26 @@ export const BUDDIES_LIMITS = {
    */
   syncEventChars: 4 * 1_024 * KIB,
 } as const
+
+/**
+ * Kinds that invite someone or answer them (confirm a pairing, reply to a
+ * share, invite to a Plan or Follow-up, ask to join) alert right away instead
+ * of waiting out the 60 s push spacing, but still count toward the daily cap.
+ * Updates and cancellations keep the spacing. `invite.claimed` is a relay
+ * event outside the slot budget altogether.
+ */
+export const BUDDIES_IMMEDIATE_PUSH_KINDS: ReadonlySet<string> = new Set([
+  'pair.confirmed',
+  'share.reply',
+  'plan.invite',
+  'followup.invite',
+])
+/** `join.request.<tag>`: the tag is per buddy, so it matches by prefix. */
+export const BUDDIES_IMMEDIATE_PUSH_PREFIX = 'join.request.'
+
+export const isImmediatePushKind = (kind: string): boolean =>
+  BUDDIES_IMMEDIATE_PUSH_KINDS.has(kind) ||
+  kind.startsWith(BUDDIES_IMMEDIATE_PUSH_PREFIX)
 
 export const BUDDIES_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
 const B64U_PATTERN = /^[A-Za-z0-9_-]*$/
@@ -316,6 +363,7 @@ export interface BuddiesPayloads {
   'slot/leave': SlotPayload
   'invite/fetch': InviteFetchPayload
   'invite/claim': InviteClaimPayload
+  'inbox/live': InboxFields
 }
 
 type Fields = Record<string, unknown>
@@ -340,7 +388,10 @@ const withBlob = <T extends object>(
 }
 
 type PayloadParsers = {
-  [K in BuddiesOp]: (payload: Fields, now: number) => BuddiesPayloads[K] | null
+  [K in BuddiesOp | BuddiesLiveOp]: (
+    payload: Fields,
+    now: number
+  ) => BuddiesPayloads[K] | null
 }
 
 /**
@@ -423,6 +474,7 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
     if (!claimSecret || claimSecret.length !== 32 || !claimBlob) return null
     return { inviteId: p.inviteId, claimSecret, blob: claimBlob }
   },
+  'inbox/live': inboxFields,
 }
 
 // --- Durable Object call shapes -------------------------------------------

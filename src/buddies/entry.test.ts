@@ -20,7 +20,7 @@ afterAll(() => {
 })
 
 describe('Worker entry', () => {
-  it('mounts the Buddies relay, the /b page, and exports both Durable Objects', async () => {
+  it('mounts the Buddies relay, its live socket, the /b page, and exports both Durable Objects', async () => {
     const entry = await import('../index')
     expect(typeof entry.BuddyInbox).toBe('function')
     expect(typeof entry.BuddyInvite).toBe('function')
@@ -57,6 +57,17 @@ describe('Worker entry', () => {
 
     expect(
       (await call('/buddies/v1/nope', { method: 'POST', body: '{}' })).status
+    ).toBe(404)
+
+    // The live socket is GET-only and honors the kill switch.
+    const live = await call('/buddies/v1/inbox/live', {
+      headers: { upgrade: 'websocket' },
+    })
+    expect(live.status).toBe(503)
+    expect(await live.json()).toEqual({ error: 'disabled' })
+    expect(
+      (await call('/buddies/v1/inbox/live', { method: 'POST', body: '{}' }))
+        .status
     ).toBe(404)
     const page = await call('/b')
     expect(page.status).toBe(200)

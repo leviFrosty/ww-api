@@ -1,6 +1,10 @@
 import { bytesToBase64Url } from '../crypto'
 import { signedMessage } from '../buddies/envelope'
-import type { BuddiesSignedOp } from '../buddies/contracts'
+import {
+  BUDDIES_LIVE_HEADERS,
+  BUDDIES_LIVE_OP,
+  type BuddiesSigningOp,
+} from '../buddies/contracts'
 
 /** Client-side helpers for Buddies tests: keys, ids, and signed envelopes. */
 
@@ -57,7 +61,7 @@ export interface Envelope {
 
 /** Builds `{p, s}` over exact payload bytes (optionally pre-serialized). */
 export const envelope = async (
-  op: BuddiesSignedOp,
+  op: BuddiesSigningOp,
   payload: Record<string, unknown> | string,
   key: SigningKey
 ): Promise<Envelope> => {
@@ -65,6 +69,22 @@ export const envelope = async (
     typeof payload === 'string' ? payload : JSON.stringify(payload)
   )
   return { p: b64u(bytes), s: b64u(await key.sign(signedMessage(op, bytes))) }
+}
+
+/**
+ * Headers for the `inbox/live` upgrade: the signed envelope's `p` and `s`.
+ * `payload` must hold `inboxId`, `ts`, and `nonce`.
+ */
+export const liveHeaders = async (
+  payload: Record<string, unknown> | string,
+  key: SigningKey
+): Promise<Record<string, string>> => {
+  const { p, s } = await envelope(BUDDIES_LIVE_OP, payload, key)
+  return {
+    upgrade: 'websocket',
+    [BUDDIES_LIVE_HEADERS.payload]: p,
+    [BUDDIES_LIVE_HEADERS.signature]: s ?? '',
+  }
 }
 
 export const unsignedEnvelope = (

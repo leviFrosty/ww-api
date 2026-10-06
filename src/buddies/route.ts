@@ -5,10 +5,10 @@ import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ALWAYS_ALLOWED_OPS,
   BUDDIES_ERROR_STATUS,
+  BUDDIES_LIVE_OP,
   BUDDIES_OPS,
   BUDDIES_PAYLOAD_PARSERS,
   BUDDIES_UNSIGNED_OPS,
-  decodeSignature,
   ok,
   type BuddiesErrorCode,
   type BuddiesOp,
@@ -19,16 +19,25 @@ import {
   type PushJob,
   type Signed,
 } from './contracts'
-import { parseEnvelope, readEnvelopeText, type Envelope } from './envelope'
+import {
+  isWebSocketUpgrade,
+  parseEnvelope,
+  readEnvelopeText,
+  readLiveCall,
+  signedCall,
+  type Envelope,
+} from './envelope'
 import { isBuddiesEnabled } from './killSwitch'
 import { defaultApnsDependencies, type ApnsDependencies } from '../apns'
 import { deliverPushJob } from './push'
 
 /**
- * `POST /buddies/v1/{op}` — the Buddies relay (see docs/buddies-protocol.md).
+ * `POST /buddies/v1/{op}` — the Buddies relay (docs/buddies-protocol.md) —
+ * and `GET /buddies/v1/inbox/live`, the owner's live socket.
  *
- * Privacy: every id travels in the body, and nothing here logs or reports the
- * body, the payload, or any value from it. Errors are `{ "error": "<code>" }`.
+ * Privacy: every id travels in the body (or, for the live socket, in headers),
+ * and nothing here logs or reports the body, headers, payload, or any value
+ * from them. Errors are `{ "error": "<code>" }`.
  */
 
 export interface BuddiesRouteDependencies {
@@ -128,15 +137,8 @@ const runSigned = async <K extends BuddiesSignedOp>(
   env: Environment,
   envelope: Envelope
 ): Promise<Outcome> => {
-  const payload = BUDDIES_PAYLOAD_PARSERS[op](envelope.payload, Date.now())
-  if (!payload) return { ok: false, error: 'bad_request' }
-  const signature = decodeSignature(envelope.signature)
-  if (!signature) return { ok: false, error: 'bad_signature' }
-  return SIGNED_OPS[op](env, {
-    ...payload,
-    payloadBytes: envelope.payloadBytes,
-    signature,
-  })
+  const call = signedCall(op, envelope, Date.now())
+  return call.ok ? SIGNED_OPS[op](env, call.value) : call
 }
 
 const runUnsigned = async <K extends BuddiesUnsignedOp>(
@@ -191,6 +193,27 @@ const handleBuddiesOp = async (
   }
 }
 
+/**
+ * Upgrades to the owner's live socket. The signed envelope rides in the
+ * `x-buddies-p` / `x-buddies-s` headers because a WebSocket upgrade has no
+ * body (and ids never go in URLs). The Worker only checks its shape to find
+ * the inbox; the inbox DO verifies it and accepts the socket.
+ */
+const handleLive = async (c: AppContext): Promise<Response> => {
+  try {
+    if (!(await isBuddiesEnabled(c.env))) return errorResponse(c, 'disabled')
+    if (!isWebSocketUpgrade(c.req.raw))
+      return errorResponse(c, 'upgrade_required')
+    const call = readLiveCall(c.req.raw.headers, Date.now())
+    if (!call.ok) return errorResponse(c, call.error)
+    return await inbox(c.env, call.value.inboxId).fetch(c.req.raw)
+  } catch (error) {
+    console.error('buddies: request failed', { op: BUDDIES_LIVE_OP })
+    Sentry.captureException(error)
+    return c.json({ error: 'internal' }, 500)
+  }
+}
+
 /** Mounted at `/buddies/v1` by the Worker entry point. */
 export const createBuddiesRoutes = (
   deps: BuddiesRouteDependencies = { apns: defaultApnsDependencies }
@@ -199,5 +222,6 @@ export const createBuddiesRoutes = (
   for (const op of BUDDIES_OPS) {
     routes.post(`/${op}`, (c) => handleBuddiesOp(c, op, deps))
   }
+  routes.get(`/${BUDDIES_LIVE_OP}`, handleLive)
   return routes
 }
