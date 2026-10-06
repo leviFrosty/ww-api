@@ -5,10 +5,131 @@ import { DatabaseSync } from 'node:sqlite'
  * DO code runs its actual SQL instead of pattern-matched fakes. Mirrors the
  * SQLite storage API surface our DOs use: `sql.exec` (one statement, cursors),
  * `transactionSync` (rolls back on throw), alarms, and `deleteAll()` (which, as
- * before compatibility date 2026-02-24, leaves the alarm in place).
+ * before compatibility date 2026-02-24, leaves the alarm in place). Also the
+ * WebSocket Hibernation API: `acceptWebSocket`, `getWebSockets`, and
+ * `setWebSocketAutoResponse`, with the runtime globals it needs below.
  */
 
 type Row = Record<string, unknown>
+
+// --- WebSockets -------------------------------------------------------------
+
+const OPEN = 1
+const CLOSING = 2
+const CLOSED = 3
+
+/** The handlers the runtime calls on a Durable Object for accepted sockets. */
+interface SocketHandlers {
+  webSocketMessage?(ws: WebSocket, message: string): unknown
+  webSocketClose?(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    wasClean: boolean
+  ): unknown
+}
+
+/** Where an accepted (server) end reports traffic: its Durable Object. */
+interface SocketHost {
+  message(server: FakeWebSocket, message: string): void
+  closed(server: FakeWebSocket, code: number, reason: string): void
+}
+
+/**
+ * One end of a fake `WebSocketPair`. What one end sends lands in the other's
+ * `received`, unless the other end was accepted by a Durable Object: then the
+ * object gets it as the runtime would deliver it, auto-response first. A
+ * client end answers a close right away; an accepted end waits for its
+ * object's `webSocketClose` to call `close()`.
+ */
+export class FakeWebSocket {
+  readyState = OPEN
+  peer!: FakeWebSocket
+  /** Messages delivered to this end, in order. */
+  readonly received: string[] = []
+  /** The code and reason the other end closed with. */
+  closedBy: { code: number; reason: string } | null = null
+  host: SocketHost | null = null
+  #attachment: unknown = null
+
+  send(message: string): void {
+    if (this.readyState !== OPEN) throw new TypeError('WebSocket is not open')
+    if (this.peer.host) this.peer.host.message(this.peer, message)
+    else this.peer.received.push(message)
+  }
+
+  close(code = 1000, reason = ''): void {
+    if (this.readyState === CLOSED) throw new TypeError('WebSocket is closed')
+    if (this.readyState === CLOSING) {
+      // Answering the peer's close completes the handshake.
+      this.readyState = CLOSED
+      this.peer.readyState = CLOSED
+      return
+    }
+    this.readyState = CLOSING
+    const peer = this.peer
+    peer.readyState = CLOSING
+    peer.closedBy = { code, reason }
+    if (peer.host) peer.host.closed(peer, code, reason)
+    else peer.close(code, reason)
+  }
+
+  serializeAttachment(value: unknown): void {
+    this.#attachment = structuredClone(value)
+  }
+
+  deserializeAttachment(): unknown {
+    return structuredClone(this.#attachment)
+  }
+
+  /** Received messages parsed as JSON. */
+  messages<T = unknown>(): T[] {
+    return this.received.map((message) => JSON.parse(message) as T)
+  }
+}
+
+export class FakeWebSocketPair {
+  0: FakeWebSocket
+  1: FakeWebSocket
+
+  constructor() {
+    const client = new FakeWebSocket()
+    const server = new FakeWebSocket()
+    client.peer = server
+    server.peer = client
+    this[0] = client
+    this[1] = server
+  }
+}
+
+export class FakeWebSocketRequestResponsePair {
+  constructor(
+    readonly request: string,
+    readonly response: string
+  ) {}
+}
+
+/** Workers' `Response`, which (unlike Node's) takes 101 and `webSocket`. */
+export class WorkersResponse extends Response {
+  readonly webSocket: FakeWebSocket | null
+
+  constructor(
+    body?: BodyInit | null,
+    init?: ResponseInit & { webSocket?: FakeWebSocket | null }
+  ) {
+    const upgrade = init?.status === 101
+    super(body, upgrade ? { ...init, status: 200 } : init)
+    this.webSocket = init?.webSocket ?? null
+    if (upgrade) Object.defineProperty(this, 'status', { value: 101 })
+  }
+}
+
+/** Runtime globals the Hibernation API needs; install with `vi.stubGlobal`. */
+export const WORKERS_WEBSOCKET_GLOBALS = {
+  WebSocketPair: FakeWebSocketPair,
+  WebSocketRequestResponsePair: FakeWebSocketRequestResponsePair,
+  Response: WorkersResponse,
+}
 
 const cursor = (rows: Row[]) => {
   let index = 0
@@ -39,6 +160,10 @@ const cursor = (rows: Row[]) => {
 
 export interface SqliteState {
   state: DurableObjectState
+  /** Routes accepted sockets' traffic to the object's handlers. */
+  attach(handlers: SocketHandlers): void
+  /** Accepted (server) ends, including closed ones. */
+  sockets(): FakeWebSocket[]
   alarm(): number | null
   /** The runtime clears the alarm just before invoking `alarm()`. */
   clearAlarm(): void
@@ -105,6 +230,23 @@ export const createSqliteState = (name: string): SqliteState => {
     },
   }
 
+  const sockets: FakeWebSocket[] = []
+  let autoResponse: FakeWebSocketRequestResponsePair | null = null
+  let handlers: SocketHandlers | null = null
+  const host: SocketHost = {
+    message: (server, message) => {
+      // Answered by the runtime; the object never wakes.
+      if (autoResponse && message === autoResponse.request) {
+        server.send(autoResponse.response)
+        return
+      }
+      handlers?.webSocketMessage?.(server as never, message)
+    },
+    closed: (server, code, reason) => {
+      handlers?.webSocketClose?.(server as never, code, reason, true)
+    },
+  }
+
   const state = {
     id: {
       name,
@@ -114,10 +256,24 @@ export const createSqliteState = (name: string): SqliteState => {
     storage,
     blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
     waitUntil: () => undefined,
+    acceptWebSocket: (ws: FakeWebSocket) => {
+      ws.host = host
+      sockets.push(ws)
+    },
+    // Disconnected sockets drop out of the list.
+    getWebSockets: () => sockets.filter((ws) => ws.readyState !== CLOSED),
+    setWebSocketAutoResponse: (pair?: FakeWebSocketRequestResponsePair) => {
+      autoResponse = pair ?? null
+    },
+    getWebSocketAutoResponse: () => autoResponse,
   } as unknown as DurableObjectState
 
   return {
     state,
+    attach: (object) => {
+      handlers = object
+    },
+    sockets: () => [...sockets],
     alarm: () => alarmAt,
     clearAlarm: () => {
       alarmAt = null
@@ -150,7 +306,7 @@ export interface FakeNamespace<T> {
 
 /**
  * A namespace whose stubs call the object's public methods with structured
- * clones of the arguments and result, like Workers RPC.
+ * clones of the arguments and result, like Workers RPC (`fetch` excepted).
  */
 export const createNamespace = <T extends object>(
   construct: (state: DurableObjectState) => T
@@ -163,6 +319,7 @@ export const createNamespace = <T extends object>(
     if (!entry) {
       const storage = createSqliteState(name)
       entry = { storage, object: construct(storage.state) }
+      storage.attach(entry.object as SocketHandlers)
       objects.set(name, entry)
     }
     return entry
@@ -175,6 +332,15 @@ export const createNamespace = <T extends object>(
         get(_, property) {
           if (property === 'then' || typeof property === 'symbol')
             return undefined
+          // `fetch` passes the Request and Response through, uncloned.
+          if (property === 'fetch') {
+            return (request: Request) =>
+              (
+                ensure(name).object as {
+                  fetch(request: Request): Promise<Response>
+                }
+              ).fetch(request)
+          }
           return async (...args: unknown[]) => {
             const target = ensure(name).object as Record<string, unknown>
             const method = target[property]

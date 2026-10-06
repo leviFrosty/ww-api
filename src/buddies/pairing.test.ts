@@ -353,6 +353,7 @@ it('pairs two people end to end: register → invite → claim → confirm → c
         alert: { title: 'Buddy request', body: 'Someone accepted your invite' },
         sound: 'default',
         'thread-id': 'buddies',
+        'content-available': 1,
       },
       ww: { kind: 'invite.claimed' },
     },

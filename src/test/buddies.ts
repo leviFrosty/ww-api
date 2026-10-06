@@ -6,13 +6,19 @@ import { resetApnsState } from '../apns'
 import type { BuddiesSignedOp } from '../buddies/contracts'
 import type { Environment } from '../types'
 import { makeMemoryKv, type MemoryKv } from './memoryKv'
-import { createNamespace, type FakeNamespace } from './durableObjects'
+import {
+  WORKERS_WEBSOCKET_GLOBALS,
+  createNamespace,
+  type FakeNamespace,
+  type FakeWebSocket,
+} from './durableObjects'
 import {
   SigningKey,
   b64u,
   blobOfSize,
   envelope,
   hexToken,
+  liveHeaders,
   randomBytes,
   randomId,
 } from './buddiesClient'
@@ -22,8 +28,8 @@ export * from './buddiesClient'
 /**
  * End-to-end harness for the Buddies relay: the real Hono routes, the real
  * Durable Object classes on SQLite, an in-memory KV, a counting rate limiter,
- * and a recording APNs `fetch`. Requires `vi.mock('cloudflare:workers')` in
- * the calling test file.
+ * a recording APNs `fetch`, and fake Workers WebSockets (stubbed globals).
+ * Requires `vi.mock('cloudflare:workers')` in the calling test file.
  */
 
 export const TEAM_ID = 'TEAMID1234'
@@ -40,6 +46,14 @@ export interface ApiResponse {
   status: number
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any
+}
+
+/** An `inbox/live` answer: the client end on 101, else the JSON error. */
+export interface LiveResponse {
+  status: number
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any
+  socket: FakeWebSocket | null
 }
 
 export interface HarnessOptions {
@@ -69,6 +83,8 @@ export interface Harness {
     key: SigningKey,
     payload: Record<string, unknown>
   ): Promise<ApiResponse>
+  /** `inbox/live` with these request headers; GET unless `method` says. */
+  live(headers: Record<string, string>, method?: string): Promise<LiveResponse>
   /** Awaits every `waitUntil` task (push delivery). */
   flush(): Promise<void>
 }
@@ -84,6 +100,8 @@ export const createHarness = async (
   options: HarnessOptions = {}
 ): Promise<Harness> => {
   resetApnsState()
+  for (const [name, value] of Object.entries(WORKERS_WEBSOCKET_GLOBALS))
+    vi.stubGlobal(name, value)
   const kv = makeMemoryKv()
   if (options.kvEnabled != null)
     await kv.put('buddies:enabled', options.kvEnabled)
@@ -156,6 +174,9 @@ export const createHarness = async (
     send: async () => {
       throw new Error('replaced below')
     },
+    live: async () => {
+      throw new Error('replaced below')
+    },
     flush: async () => {
       while (pending.length) await Promise.all(pending.splice(0))
     },
@@ -196,6 +217,25 @@ export const createHarness = async (
       executionCtx
     )
     return { status: response.status, body: await response.json() }
+  }
+
+  harness.live = async (headers, method = 'GET') => {
+    const response = (await routes.request(
+      '/inbox/live',
+      { method, headers: { 'cf-connecting-ip': '203.0.113.7', ...headers } },
+      env,
+      executionCtx
+    )) as Response & { webSocket?: FakeWebSocket | null }
+    if (response.status === 101)
+      return { status: 101, body: null, socket: response.webSocket ?? null }
+    const text = await response.text()
+    let body: unknown = text
+    try {
+      body = JSON.parse(text)
+    } catch {
+      // Not JSON (e.g. Hono's plain 404).
+    }
+    return { status: response.status, body, socket: null }
   }
 
   harness.send = async (op, key, payload) =>
@@ -240,6 +280,16 @@ export class Owner {
 
   sync(since = 0): Promise<ApiResponse> {
     return this.send('inbox/sync', { since })
+  }
+
+  /** Opens a live socket; `fields` override the signed payload's. */
+  async connect(fields: Record<string, unknown> = {}): Promise<LiveResponse> {
+    return this.harness.live(
+      await liveHeaders(
+        { inboxId: this.inboxId, ts: Date.now(), nonce: randomId(), ...fields },
+        this.key
+      )
+    )
   }
 
   registerDevice(

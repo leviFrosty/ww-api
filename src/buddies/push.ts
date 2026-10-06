@@ -17,7 +17,11 @@ import type { PushJob, PushTarget } from './contracts'
 
 export type PushEnv = ApnsEnv & Pick<Environment, 'BUDDY_INBOX'>
 
-/** The exact alert payload from the contract. No user content. */
+/**
+ * The exact alert payload from the contract. No user content.
+ * `content-available` also lets iOS wake the app to sync before it's opened;
+ * the push stays an `alert` (apns-push-type) at the default priority 10.
+ */
 export const buildBuddiesPayload = (
   kind: string,
   target: Pick<PushTarget, 'title' | 'body'>
@@ -26,6 +30,7 @@ export const buildBuddiesPayload = (
     alert: { title: target.title, body: target.body },
     sound: 'default',
     'thread-id': 'buddies',
+    'content-available': 1,
   },
   ww: { kind },
 })

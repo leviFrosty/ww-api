@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { BUDDIES_PAYLOAD_PARSERS, decodeSignature } from './contracts'
+import {
+  BUDDIES_OPS,
+  BUDDIES_PAYLOAD_PARSERS,
+  decodeSignature,
+  isImmediatePushKind,
+} from './contracts'
 import { bytesToBase64Url } from '../crypto'
 
 const NOW = Date.UTC(2026, 8, 23)
@@ -238,5 +243,33 @@ describe('invite/create expiry and inbox/sync cursor', () => {
     expect(parse('inbox/sync', { ...signed, since: -1 })).toBeNull()
     expect(parse('inbox/sync', { ...signed, since: 1.5 })).toBeNull()
     expect(parse('inbox/sync', { ...signed })).toBeNull()
+  })
+})
+
+describe('inbox/live', () => {
+  it('takes only the inbox fields and is not a POST op', () => {
+    expect(parse('inbox/live', { ...signed, since: 3 })).toEqual(signed)
+    expect(parse('inbox/live', { ...signed, inboxId: 'x' })).toBeNull()
+    expect(BUDDIES_OPS).not.toContain('inbox/live')
+  })
+})
+
+describe('immediate push kinds', () => {
+  it.each([
+    ['pair.confirmed', true],
+    ['share.reply', true],
+    ['plan.invite', true],
+    ['followup.invite', true],
+    ['join.request.a1b2c3d4e5f6', true],
+    ['invite.claimed', false],
+    ['plan.update', false],
+    ['plan.cancel', false],
+    ['followup.update', false],
+    ['followup.cancel', false],
+    ['join.cancel', false],
+    ['join.request', false],
+    ['plan.joined', false],
+  ])('%s skips the push spacing: %s', (kind, immediate) => {
+    expect(isImmediatePushKind(kind)).toBe(immediate)
   })
 })

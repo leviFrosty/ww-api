@@ -109,9 +109,15 @@ describe('deliverPushJob', () => {
         alert: { title: 'Buddy request', body: 'Someone accepted your invite' },
         sound: 'default',
         'thread-id': 'buddies',
+        'content-available': 1,
       },
       ww: { kind: 'invite.claimed' },
     })
+    // Still an alert push at the default priority; content-available only
+    // lets iOS wake the app to sync.
+    const headers = new Headers(requests[0].init.headers)
+    expect(headers.get('apns-push-type')).toBe('alert')
+    expect(headers.get('apns-priority')).toBeNull()
     expect(JSON.parse(String(requests[1].init.body)).aps.alert).toEqual({
       title: 'Hola',
       body: 'Cuerpo',

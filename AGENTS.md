@@ -229,8 +229,19 @@ no-app fallback page for invite links, and the AASA matches `/b#1…`.
   retry for network errors, 429, 5xx, and rejected provider tokens).
   `src/buddies/push.ts` builds the Buddies payload and deletes unregistered
   devices. Other features should build on `sendApnsNotifications`, not on the
-  Buddies layer.
-- **Privacy**: every id travels in the body. Never log or report bodies, blobs,
+  Buddies layer. Alerts carry `content-available: 1` so iOS can wake the app
+  to sync. Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
+  skip the 60 s per-slot spacing but still count toward the daily cap.
+- **Live socket**: `GET /buddies/v1/inbox/live` upgrades to a WebSocket. The
+  owner-signed envelope (op `inbox/live`) rides in the `x-buddies-p` and
+  `x-buddies-s` headers. The inbox DO accepts it with the Hibernation API
+  (`ping` gets `pong` without waking it, at most 10 sockets per inbox) and
+  sends `{"type":"changed","seq":…}` after each write that changes
+  `inbox/sync`. Sentry events drop `x-buddies-*` headers. Under `wrangler
+  dev`, the TCP connection lingers about 10 s after a server-sent close frame;
+  the frame itself arrives at once.
+- **Privacy**: every id travels in the body (for the live socket, in headers;
+  never the URL). Never log or report bodies, headers, blobs,
   ids, or tokens. APNs requests use the `fetch` captured before Sentry wraps
   the global, so device tokens in APNs URLs stay out of Sentry spans. The dev
   worker's 100% Workers traces do record subrequest URLs, APNs included.

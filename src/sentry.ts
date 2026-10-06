@@ -45,7 +45,23 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
   return value;
 }
 
+/**
+ * The Buddies live socket sends its signed envelope (which holds the inbox
+ * id) in `x-buddies-*` request headers, and the SDK copies request headers
+ * into events. Drop them outright.
+ */
+const BUDDIES_HEADER = /^x-buddies-/i;
+
+function dropBuddiesHeaders(event: Event): void {
+  const headers = event.request?.headers;
+  if (!headers) return;
+  for (const name of Object.keys(headers)) {
+    if (BUDDIES_HEADER.test(name)) delete headers[name];
+  }
+}
+
 function scrubEvent<T extends Event>(event: T): T {
+  dropBuddiesHeaders(event);
   return scrubStrings(event) as T;
 }
 

@@ -1,11 +1,16 @@
 import { spawnSync } from 'node:child_process'
+import { randomBytes as nodeRandomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import type { Socket } from 'node:net'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { BuddiesSignedOp } from '../buddies/contracts'
 import {
   SigningKey,
   envelope,
+  liveHeaders,
   randomId,
   unsignedEnvelope,
   type Envelope,
@@ -193,6 +198,14 @@ export class RelayOwner {
   sync(since = 0) {
     return this.send('inbox/sync', { since })
   }
+
+  /** Signed `inbox/live` upgrade headers (fresh nonce each call). */
+  liveHeaders(key: SigningKey = this.key) {
+    return liveHeaders(
+      { inboxId: this.inboxId, ts: Date.now(), nonce: randomId() },
+      key
+    )
+  }
 }
 
 /** A buddy's write capability into one recipient inbox slot. */
@@ -211,3 +224,149 @@ export class RelayWriter {
     })
   }
 }
+
+// --- Buddies live socket ----------------------------------------------------
+
+export interface LiveConnection {
+  /** The next text message, in order. */
+  next(timeoutMs?: number): Promise<string>
+  /** The close frame the server sent. */
+  closed: Promise<{ code: number; reason: string }>
+  send(text: string): void
+  end(): void
+}
+
+export type LiveAttempt =
+  | { status: 101; connection: LiveConnection }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  | { status: number; body: any }
+
+/** A masked client frame (FIN set), as RFC 6455 requires of clients. */
+const clientFrame = (opcode: number, payload: Buffer): Buffer => {
+  const mask = nodeRandomBytes(4)
+  const masked = Buffer.from(payload.map((byte, i) => byte ^ mask[i % 4]))
+  const length = payload.length
+  const header =
+    length < 126
+      ? Buffer.from([0x80 | opcode, 0x80 | length])
+      : Buffer.from([0x80 | opcode, 0x80 | 126, length >> 8, length & 255])
+  return Buffer.concat([header, mask, masked])
+}
+
+const liveConnection = (socket: Socket, head: Buffer): LiveConnection => {
+  const messages: string[] = []
+  const waiters: Array<() => void> = []
+  let resolveClosed: (close: { code: number; reason: string }) => void
+  const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+    resolveClosed = resolve
+  })
+  let buffer = Buffer.alloc(0)
+  const read = (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk])
+    for (;;) {
+      if (buffer.length < 2) return
+      const opcode = buffer[0] & 0x0f
+      let length = buffer[1] & 0x7f
+      let offset = 2
+      if (length === 126) {
+        if (buffer.length < 4) return
+        length = buffer.readUInt16BE(2)
+        offset = 4
+      } else if (length === 127) {
+        if (buffer.length < 10) return
+        length = Number(buffer.readBigUInt64BE(2))
+        offset = 10
+      }
+      if (buffer.length < offset + length) return
+      const payload = buffer.subarray(offset, offset + length)
+      buffer = buffer.subarray(offset + length)
+      if (opcode === 1) {
+        messages.push(payload.toString('utf8'))
+        for (const wake of waiters.splice(0)) wake()
+      } else if (opcode === 8) {
+        resolveClosed({
+          code: payload.length >= 2 ? payload.readUInt16BE(0) : 1005,
+          reason: payload.subarray(2).toString('utf8'),
+        })
+        socket.write(clientFrame(8, payload.subarray(0, 2)))
+      }
+    }
+  }
+  socket.on('data', read)
+  socket.on('error', () => undefined)
+  if (head.length) read(head)
+
+  let taken = 0
+  return {
+    closed,
+    next: (timeoutMs = 5_000) =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`no live message within ${timeoutMs} ms`)),
+          timeoutMs
+        )
+        const check = () => {
+          if (taken < messages.length) {
+            clearTimeout(timer)
+            resolve(messages[taken++])
+          } else waiters.push(check)
+        }
+        check()
+      }),
+    send: (text) => socket.write(clientFrame(1, Buffer.from(text, 'utf8'))),
+    end: () => socket.destroy(),
+  }
+}
+
+/**
+ * `GET /buddies/v1/inbox/live` as a raw WebSocket handshake, so refusals keep
+ * their status and JSON body. Header values never reach the transcript.
+ */
+export const openLive = (headers: Record<string, string>): Promise<LiveAttempt> =>
+  new Promise((resolve, reject) => {
+    const url = new URL(`${BASE_URL}/buddies/v1/inbox/live`)
+    const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
+      url,
+      {
+        headers: {
+          connection: 'Upgrade',
+          'sec-websocket-version': '13',
+          'sec-websocket-key': nodeRandomBytes(16).toString('base64'),
+          'cf-connecting-ip': nextIp(),
+          ...headers,
+        },
+        timeout: 10_000,
+      }
+    )
+    const started = Date.now()
+    const record = (status: number, response: string) =>
+      transcript.push({
+        method: 'GET',
+        path: '/buddies/v1/inbox/live',
+        headers: Object.keys(headers),
+        status,
+        response: clip(response),
+        ms: Date.now() - started,
+      })
+    request.on('upgrade', (response, socket, head) => {
+      record(response.statusCode ?? 101, '(websocket)')
+      resolve({ status: 101, connection: liveConnection(socket, head) })
+    })
+    request.on('response', (response) => {
+      let text = ''
+      response.on('data', (chunk) => (text += chunk))
+      response.on('end', () => {
+        record(response.statusCode ?? 0, text)
+        let body: unknown = text
+        try {
+          body = JSON.parse(text)
+        } catch {
+          // plain text
+        }
+        resolve({ status: response.statusCode ?? 0, body })
+      })
+    })
+    request.on('timeout', () => request.destroy(new Error('live handshake timed out')))
+    request.on('error', reject)
+    request.end()
+  })

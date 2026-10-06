@@ -376,6 +376,7 @@ describe('events and pushes', () => {
         alert: { title: 'Plans', body: 'Mom plans to come' },
         sound: 'default',
         'thread-id': 'buddies',
+        'content-available': 1,
       },
       ww: { kind: 'plan.joined' },
     })
@@ -577,6 +578,78 @@ describe('caps and rate limits', () => {
     await buddy.putEvent({ push: true })
     await h.flush()
     expect(h.pushes).toHaveLength(12)
+  })
+
+  it('lets invitations and answers skip the 60 s spacing, but not updates or cancels', async () => {
+    const immediate = [
+      'pair.confirmed',
+      'share.reply',
+      'plan.invite',
+      'followup.invite',
+      'join.request.a1b2c3d4e5f6',
+    ]
+    const spaced = [
+      'plan.update',
+      'plan.cancel',
+      'followup.update',
+      'followup.cancel',
+      'join.cancel',
+    ]
+    const owner = await Owner.create(h)
+    await owner.registerDevice(
+      randomId(),
+      Object.fromEntries(
+        [...immediate, ...spaced].map((kind) => [
+          kind,
+          { title: 't', body: kind },
+        ])
+      )
+    )
+    const buddy = await owner.addWriter()
+    const kinds = () =>
+      h.pushes.map((push) => (push.body as { ww: { kind: string } }).ww.kind)
+
+    await buddy.putEvent({ kind: 'plan.update', push: true })
+    for (const kind of immediate) {
+      advance(1_000)
+      await buddy.putEvent({ kind, push: true })
+    }
+    for (const kind of spaced) {
+      advance(1_000)
+      await buddy.putEvent({ kind, push: true })
+    }
+    await h.flush()
+    expect(kinds()).toEqual(['plan.update', ...immediate])
+
+    // The spacing runs from the last alert, immediate or not.
+    advance(MINUTE_MS - 5_000)
+    await buddy.putEvent({ kind: 'plan.cancel', push: true })
+    advance(5_000)
+    await buddy.putEvent({ kind: 'plan.cancel', push: true })
+    await h.flush()
+    expect(kinds()).toEqual(['plan.update', ...immediate, 'plan.cancel'])
+    expect((await owner.sync()).body.events).toHaveLength(13)
+  })
+
+  it('still caps immediate kinds at 10 alerts per slot per day', async () => {
+    const owner = await Owner.create(h)
+    await owner.registerDevice(randomId(), {
+      'share.reply': { title: 'Plans', body: 'A buddy answered' },
+    })
+    const buddy = await owner.addWriter()
+
+    for (let i = 0; i < 12; i++) {
+      advance(1_000)
+      await buddy.putEvent({ kind: 'share.reply', push: true })
+    }
+    await h.flush()
+    expect(h.pushes).toHaveLength(10)
+    expect((await owner.sync()).body.events).toHaveLength(12)
+
+    advance(DAY_MS)
+    await buddy.putEvent({ kind: 'share.reply', push: true })
+    await h.flush()
+    expect(h.pushes).toHaveLength(11)
   })
 
   it('keeps 10 devices per inbox, evicting the least recently registered', async () => {

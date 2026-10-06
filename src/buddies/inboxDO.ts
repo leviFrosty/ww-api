@@ -2,15 +2,19 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import type { ApnsEnvironment } from '../apns'
 import {
+  BUDDIES_ERROR_STATUS,
   BUDDIES_LIMITS as LIMITS,
+  BUDDIES_LIVE_CLOSE,
+  BUDDIES_LIVE_OP,
   INVITE_CLAIMED_KIND,
   RELAY_SLOT_ID,
   fail,
+  isImmediatePushKind,
   isPlainObject,
   ok,
   type BuddiesErrorCode,
   type BuddiesResult,
-  type BuddiesSignedOp,
+  type BuddiesSigningOp,
   type CardPutPayload,
   type DeviceRegisterPayload,
   type DeviceUnregisterPayload,
@@ -32,7 +36,11 @@ import {
   type SyncResponse,
   type SyncSlot,
 } from './contracts'
-import { verifyBuddiesSignature } from './envelope'
+import {
+  isWebSocketUpgrade,
+  readLiveCall,
+  verifyBuddiesSignature,
+} from './envelope'
 
 type Empty = Record<string, never>
 
@@ -70,6 +78,31 @@ type KeyRef = 'owner' | 'writer'
 type KeyedCall = InboxFields & { slotId?: string }
 
 const INVITE_DELETE_RETRY_MS = 60_000
+
+/** `WebSocket.READY_STATE_OPEN`. */
+const SOCKET_OPEN = 1
+
+/** Stored on each live socket; survives hibernation. */
+type LiveAttachment = { openedAt: number }
+
+const openedAt = (ws: WebSocket): number => {
+  const attachment = ws.deserializeAttachment() as LiveAttachment | null
+  return attachment?.openedAt ?? 0
+}
+
+/** Live sockets carry only these tiny signals, never content. */
+type LiveMessage = { type: 'hello' | 'changed'; seq: number }
+
+const closeQuietly = (ws: WebSocket, code: number, reason: string): void => {
+  try {
+    ws.close(code, reason)
+  } catch {
+    // Already closing or gone.
+  }
+}
+
+const liveError = (error: BuddiesErrorCode): Response =>
+  Response.json({ error }, { status: BUDDIES_ERROR_STATUS[error] })
 
 /**
  * Every table is created on first registration, never for a probe: an
@@ -161,9 +194,21 @@ const SCHEMA = [
  *
  * Signed ops verify first (the only await), then run their checks and writes in
  * one synchronous transaction, so caps and `seq` stay exact under concurrency.
+ *
+ * The owner's devices can hold live sockets here (`inbox/live`, Hibernation
+ * API). After every committed write that changes what `inbox/sync` returns,
+ * each socket gets `{"type":"changed","seq":…}` and the app syncs as usual.
  */
 export class BuddyInbox extends DurableObject<Environment> {
   #schemaReady = false
+
+  constructor(ctx: DurableObjectState, env: Environment) {
+    super(ctx, env)
+    // Keepalives get their answer from the runtime without waking the object.
+    ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('ping', 'pong')
+    )
+  }
 
   // --- Owner ops ----------------------------------------------------------
 
@@ -278,7 +323,8 @@ export class BuddyInbox extends DurableObject<Environment> {
   async addSlot(call: Signed<SlotAddPayload>): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('slot/add', call, 'owner')
     if (!auth.ok) return auth
-    return this.#commit(call, 'owner', auth.value, (now) => {
+    let added = false
+    const result = this.#commit(call, 'owner', auth.value, (now) => {
       const existing = this.#writerPub(call.slotId)
       if (existing != null)
         return existing === call.writerPub ? ok({}) : fail('conflict')
@@ -294,17 +340,23 @@ export class BuddyInbox extends DurableObject<Environment> {
         call.writerPub,
         now
       )
+      added = true
       return ok({})
     })
+    if (added) this.#broadcastChanged()
+    return result
   }
 
   async removeSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('slot/remove', call, 'owner')
     if (!auth.ok) return auth
-    return this.#commit(call, 'owner', auth.value, () => {
-      this.#deleteSlot(call.slotId)
+    let removed = false
+    const result = this.#commit(call, 'owner', auth.value, () => {
+      removed = this.#deleteSlot(call.slotId)
       return ok({})
     })
+    if (removed) this.#broadcastChanged()
+    return result
   }
 
   async putRoster(
@@ -312,7 +364,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   ): Promise<BuddiesResult<{ seq: number }>> {
     const auth = await this.#authenticate('roster/put', call, 'owner')
     if (!auth.ok) return auth
-    return this.#commit(call, 'owner', auth.value, () => {
+    const result = this.#commit(call, 'owner', auth.value, () => {
       const seq = this.#nextSeq()
       this.#sql.exec(
         `INSERT INTO roster (singleton, blob, seq) VALUES (1, ?, ?)
@@ -322,6 +374,8 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
       return ok({ seq })
     })
+    if (result.ok) this.#broadcastChanged()
+    return result
   }
 
   async createInvite(
@@ -427,7 +481,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   ): Promise<BuddiesResult<{ seq: number }>> {
     const auth = await this.#authenticate('card/put', call, 'writer')
     if (!auth.ok) return auth
-    return this.#commit(call, 'writer', auth.value, (now) => {
+    const result = this.#commit(call, 'writer', auth.value, (now) => {
       if (!this.#recordWrite(call.slotId, now)) return fail('rate_limited')
       const seq = this.#nextSeq()
       this.#sql.exec(
@@ -441,6 +495,8 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
       return ok({ seq })
     })
+    if (result.ok) this.#broadcastChanged()
+    return result
   }
 
   async putEvent(
@@ -470,7 +526,10 @@ export class BuddyInbox extends DurableObject<Environment> {
         : null
       return ok({ seq, push })
     })
-    if (inserted) await this.#ensureAlarm(Date.now())
+    if (inserted) {
+      this.#broadcastChanged()
+      await this.#ensureAlarm(Date.now())
+    }
     return result
   }
 
@@ -485,13 +544,66 @@ export class BuddyInbox extends DurableObject<Environment> {
       call.signature
     )
     if (!valid) return fail('bad_signature')
+    let removed = false
     const result = this.#commit(call, 'writer', key.value, () => {
-      this.#deleteSlot(call.slotId)
+      removed = this.#deleteSlot(call.slotId)
       return ok({})
     })
+    if (removed) this.#broadcastChanged()
     if (!result.ok && (result.error === 'gone' || result.error === 'not_found'))
       return ok({})
     return result
+  }
+
+  // --- Live socket ---------------------------------------------------------
+
+  /**
+   * `GET inbox/live`, forwarded by the Worker. Verifies the owner's signed
+   * headers (stale and replay checks included), accepts the socket with the
+   * Hibernation API, and greets it with the current `seq`. Opening a socket is
+   * not owner activity for the 180-day retention.
+   */
+  async fetch(request: Request): Promise<Response> {
+    if (!isWebSocketUpgrade(request)) return liveError('upgrade_required')
+    const call = readLiveCall(request.headers, Date.now())
+    if (!call.ok) return liveError(call.error)
+    const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
+    if (!auth.ok) return liveError(auth.error)
+    const admitted = this.#commit(
+      call.value,
+      'owner',
+      auth.value,
+      () => ok(this.#meta()?.seq ?? 0),
+      { activity: false }
+    )
+    if (!admitted.ok) return liveError(admitted.error)
+
+    const [client, server] = Object.values(new WebSocketPair())
+    this.ctx.acceptWebSocket(server)
+    const attachment: LiveAttachment = { openedAt: Date.now() }
+    server.serializeAttachment(attachment)
+    // One socket per device is typical; past the cap the oldest make way.
+    const others = this.#liveSockets()
+      .filter((ws) => ws !== server)
+      .sort((a, b) => openedAt(a) - openedAt(b))
+    const excess = others.length + 1 - LIMITS.liveSockets
+    const { code, reason } = BUDDIES_LIVE_CLOSE.replaced
+    for (const ws of others.slice(0, Math.max(0, excess)))
+      closeQuietly(ws, code, reason)
+    this.#signal(server, { type: 'hello', seq: admitted.value })
+    return new Response(null, { status: 101, webSocket: client })
+  }
+
+  /** Sockets only listen; anything but the auto-answered `ping` is ignored. */
+  webSocketMessage(): void {}
+
+  /** Completes the close the client started. */
+  webSocketClose(ws: WebSocket): void {
+    closeQuietly(ws, 1000, '')
+  }
+
+  webSocketError(ws: WebSocket): void {
+    closeQuietly(ws, 1011, '')
   }
 
   // --- Relay-internal (Worker and invite DO only) ---------------------------
@@ -548,7 +660,10 @@ export class BuddyInbox extends DurableObject<Environment> {
       inserted = true
       return { status: 'delivered', push: this.#claimPush(meta.inboxId) }
     })
-    if (inserted) await this.#ensureAlarm(now)
+    if (inserted) {
+      this.#broadcastChanged()
+      await this.#ensureAlarm(now)
+    }
     return delivery
   }
 
@@ -605,7 +720,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async #authenticate(
-    op: BuddiesSignedOp,
+    op: BuddiesSigningOp,
     call: Signed<KeyedCall>,
     ref: KeyRef
   ): Promise<BuddiesResult<string>> {
@@ -623,13 +738,15 @@ export class BuddyInbox extends DurableObject<Environment> {
   /**
    * After the signature check: the verifying key must be unchanged, `ts` fresh,
    * and the nonce unseen, then `work` runs in the same transaction. Owner ops
-   * also count as owner activity for the 180-day retention.
+   * also count as owner activity for the 180-day retention unless `activity`
+   * is false (the live socket).
    */
   #commit<T>(
     call: KeyedCall & SignedFields,
     ref: KeyRef,
     verifiedKey: string,
-    work: (now: number) => BuddiesResult<T>
+    work: (now: number) => BuddiesResult<T>,
+    { activity = ref === 'owner' }: { activity?: boolean } = {}
   ): BuddiesResult<T> {
     const now = Date.now()
     return this.ctx.storage.transactionSync((): BuddiesResult<T> => {
@@ -638,7 +755,7 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (key.value !== verifiedKey) return fail('bad_signature')
       const denied = this.#admit(call, now)
       if (denied) return fail(denied)
-      if (ref === 'owner') this.#touch(now)
+      if (activity) this.#touch(now)
       return work(now)
     })
   }
@@ -780,7 +897,8 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
-   * Push budget per slot: 10 per 24 h, at least 60 s apart. Over budget, the
+   * Push budget per slot: 10 per 24 h, at least 60 s apart, except that
+   * immediate kinds (`isImmediatePushKind`) skip the spacing. Over budget, the
    * event is still stored; it just doesn't alert.
    */
   #reservePush(
@@ -806,7 +924,13 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
       .one()
     if (pushes >= LIMITS.pushesPerSlot) return null
-    if (last != null && now - last < LIMITS.pushSpacingMs) return null
+    if (
+      last != null &&
+      now - last < LIMITS.pushSpacingMs &&
+      !isImmediatePushKind(kind)
+    ) {
+      return null
+    }
     this.#sql.exec(
       'INSERT INTO slot_push (slot_id, at) VALUES (?, ?)',
       slotId,
@@ -855,12 +979,55 @@ export class BuddyInbox extends DurableObject<Environment> {
     return targets
   }
 
-  #deleteSlot(slotId: string): void {
+  /** Deletes a slot with its card and events; false when there was none. */
+  #deleteSlot(slotId: string): boolean {
+    const existed = this.#writerPub(slotId) != null
     this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM event WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
+    return existed
+  }
+
+  // --- Live-socket helpers -------------------------------------------------
+
+  #liveSockets(): WebSocket[] {
+    return this.ctx
+      .getWebSockets()
+      .filter((ws) => ws.readyState === SOCKET_OPEN)
+  }
+
+  #signal(ws: WebSocket, message: LiveMessage): void {
+    try {
+      ws.send(JSON.stringify(message))
+    } catch {
+      // A socket mid-close; its close handler cleans up.
+    }
+  }
+
+  /**
+   * Tells every live socket that `inbox/sync` would now return something new.
+   * Called only after the write committed, and never fails it. `seq` is the
+   * inbox head; slot changes alone don't advance it.
+   */
+  #broadcastChanged(): void {
+    try {
+      const sockets = this.#liveSockets()
+      if (!sockets.length) return
+      const message: LiveMessage = {
+        type: 'changed',
+        seq: this.#meta()?.seq ?? 0,
+      }
+      for (const ws of sockets) this.#signal(ws, message)
+    } catch {
+      // The write already committed; a socket problem must not surface.
+    }
+  }
+
+  #closeLiveSockets(close: { code: number; reason: string }): void {
+    for (const ws of this.#liveSockets())
+      closeQuietly(ws, close.code, close.reason)
   }
 
   /**
@@ -1016,6 +1183,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     // Before compatibility date 2026-02-24, deleteAll() keeps the alarm.
     await this.ctx.storage.deleteAlarm()
     this.#schemaReady = false
+    this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.gone)
     const unique = new Map(invites.map((invite) => [invite.inviteId, invite]))
     await this.#deleteInvites([...unique.values()], now)
   }
