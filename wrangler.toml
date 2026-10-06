@@ -65,7 +65,7 @@ NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. On in dev.
 BUDDIES_ENABLED = "true"
-# Android Notes Import (witness-work ADR 0016). Stays off until the package,
+# Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
 # real tokens here with a Play-installed com.leviwilkerson.jwtime build.
@@ -181,7 +181,7 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. Off in prod
 # until App Attest lands on inbox/register and invite/* (see AGENTS.md).
 BUDDIES_ENABLED = "false"
-# Android Notes Import via Play Integrity (witness-work ADR 0016; setup steps in
+# Android Notes Import via Play Integrity (witness-work ADR 0017; setup steps in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
 # endpoint advertises `capabilities.playIntegrity` only then. Not inherited by
@@ -330,5 +330,5 @@ logs.persist = true
 # Buddies pushes (APNs token auth); without both, the relay skips pushes:
 # wrangler secret put APNS_KEY_ID [--env dev]          # 10-char key id of the .p8
 # wrangler secret put APNS_PRIVATE_KEY [--env dev]     # .p8 PEM contents: < AuthKey_XXXX.p8
-# Android Notes Import (ADR 0016): the Play Integrity service-account JSON key:
+# Android Notes Import (ADR 0017): the Play Integrity service-account JSON key:
 # wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON [--env dev] < play-integrity-key.json

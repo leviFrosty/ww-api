@@ -9,7 +9,7 @@ import {
 import { isValidMeterId } from '../notesImport/admin'
 
 /**
- * Wire protocol for Android's Play Integrity path (witness-work ADR 0016).
+ * Wire protocol for Android's Play Integrity path (witness-work ADR 0017).
  *
  * It reuses the Notes Import challenge → protected-request shape of App Attest
  * v2, but a request opts in only through `attestationProvider`. A body without

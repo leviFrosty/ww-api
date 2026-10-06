@@ -64,7 +64,7 @@ export interface Environment {
   >;
 
   /**
-   * Android's Play Integrity challenges (witness-work ADR 0016), one SQLite
+   * Android's Play Integrity challenges (witness-work ADR 0017), one SQLite
    * instance per install uuid. Single-use and short-lived; no tokens/verdicts.
    */
   PLAY_INTEGRITY_CHALLENGES: DurableObjectNamespace<
@@ -94,7 +94,7 @@ export interface Environment {
    */
   IOS_ADDITIONAL_BUNDLE_IDS?: string;
 
-  // --- Android / Play Integrity (ADR 0016) -------------------------------
+  // --- Android / Play Integrity (ADR 0017) -------------------------------
   // Android Notes Import stays unavailable until the first three are all set.
 
   /** Android application id whose tokens are accepted, e.g. `com.leviwilkerson.jwtime`. */
