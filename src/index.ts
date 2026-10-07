@@ -42,6 +42,7 @@ export { PlayIntegrityChallenges } from "./playIntegrity/challengeDO";
 export { BuddyInbox } from "./buddies/inboxDO";
 export { BuddyInvite } from "./buddies/inviteDO";
 export { RoutePlanningQuota } from "./routePlanning/quotaDO";
+export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
 
 const app = new Hono<{ Bindings: Environment }>();
 
@@ -123,8 +124,8 @@ app.get("/.well-known/apple-app-site-association", handleAasaRequest);
 // the worker. `/c/:payload` keeps links from older app versions working.
 app.get("/c", handleContactLinkRequest);
 app.get("/c/:payload", handleLegacyContactLinkRequest);
-// Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Unsigned ops are
-// rate-limited by IP inside the handler (BUDDIES_RATE_LIMITER).
+// Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
+// rate-limited per caller inside the handler (src/buddies/limits.ts).
 app.route("/buddies/v1", createBuddiesRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 app.get("/b", handleBuddyInvitePage);

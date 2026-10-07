@@ -53,7 +53,7 @@ node scripts/verify/dev.mjs kv get app-store-ratings:summary
 node scripts/verify/dev.mjs kv delete buddies:enabled
 ```
 
-- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min on `/notes-import*`, `/geocode`, `/autocomplete`, `/admin/*`, and 30/min on Buddies `invite/fetch` and `invite/claim`. The e2e helpers and the fuzzer already do this.
+- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min on `/notes-import*`, `/geocode`, `/autocomplete`, `/admin/*`, and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
 - Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl.
 - KV edits take effect on the next request (no 60 s edge cache locally).
 
@@ -67,13 +67,13 @@ pnpm fuzz:buddies --seed 42 --case 17   # replay one failing case
 
 The seed decides each case's mutation and its parameters. Ids, keys, and nonces are fresh every run, so you can replay a seed against the same persisted state.
 
-There are 17 generators:
+There are 18 generators:
 
 - **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `s`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
 - **Bad payloads:** a wrong-typed field, a missing field, malformed envelopes (bad JSON, base64, UTF-8), unicode and huge strings.
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
-- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe.
+- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
 
 The oracle checks every request:
 

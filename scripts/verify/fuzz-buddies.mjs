@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import {
   ALL_OPS,
   SIGNED_OPS,
+  WIRE_EDGE_LIMITS,
   WIRE_LIMITS as L,
   b64u,
   fromB64u,
@@ -207,7 +208,7 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
   if (error && json?.error !== error) {
     throw new FuzzFailure(`expected error "${error}", got ${JSON.stringify(json)}`, exchange)
   }
-  return { status: response.status, json, text }
+  return { status: response.status, json, text, headers: response.headers }
 }
 
 const signed = async (op, key, payload) =>
@@ -665,6 +666,42 @@ const GENERATORS = {
       expect: burned ? [404] : [200],
       note: burned ? 'right secret after burn' : 'right secret before burn',
     })
+  },
+
+  /**
+   * Per-caller edge limits: a fresh caller (an IPv4 address, or rotating
+   * addresses in one IPv6 /64) gets `limit` answers, then 429 `rate_limited`
+   * with Retry-After. Up to 2 × limit + 1 requests, since the limiter counts
+   * in fixed minutes and a boundary may fall mid-burst.
+   */
+  'caller-limits': async (rng) => {
+    const tier = rng.pick(['unsigned', 'register'])
+    const limit = WIRE_EDGE_LIMITS[tier]
+    const word = () => randomBytes(2).toString('hex')
+    const v6 = rng.bool()
+    const prefix = `2001:db8:${word()}:${word()}`
+    const v4 = `100.${64 + (randomBytes(1)[0] & 63)}.${randomBytes(1)[0]}.${randomBytes(1)[0]}`
+    const owner = { key: await newKey(), inboxId: rid() }
+    const expected = tier === 'unsigned' ? 404 : 200
+    for (let i = 0; i < 2 * limit + 1; i++) {
+      const headers = { 'cf-connecting-ip': v6 ? `${prefix}:${word()}:${word()}:${word()}:${word()}` : v4 }
+      const request =
+        tier === 'unsigned'
+          ? { op: 'invite/fetch', body: unsignedEnvelope({ inviteId: rid() }) }
+          : { op: 'inbox/register', body: await signed('inbox/register', owner.key, { inboxId: owner.inboxId, ownerPub: owner.key.publicKey }) }
+      const response = await send({
+        ...request,
+        headers,
+        expect: i < limit ? [expected] : [expected, 429],
+        note: `${tier} request ${i + 1} from ${v6 ? 'one /64' : 'one IPv4'}`,
+      })
+      if (response.status === 429) {
+        if (response.json?.error !== 'rate_limited' || response.headers.get('retry-after') !== '60')
+          throw new FuzzFailure('edge refusal without rate_limited + Retry-After: 60', caseLog.at(-1))
+        return
+      }
+    }
+    throw new FuzzFailure(`no 429 after ${2 * limit + 1} ${tier} requests from one caller`, caseLog.at(-1))
   },
 
   /** Concurrent same-eventId writes dedupe to one seq. */
