@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import type { ApnsEnvironment } from '../apns'
+import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ERROR_STATUS,
   BUDDIES_LIMITS as LIMITS,
@@ -106,7 +107,8 @@ const liveError = (error: BuddiesErrorCode): Response =>
 
 /**
  * Every table is created on first registration, never for a probe: an
- * unregistered or wiped inbox stores nothing. `meta` is the existence marker.
+ * unregistered inbox stores nothing, and a wiped one keeps only its
+ * `owner_tombstone`. `meta` is the existence marker.
  */
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS meta (
@@ -187,13 +189,33 @@ const SCHEMA = [
 ] as const
 
 /**
+ * The owner key's hash, written by every wipe and kept with no expiry, so only
+ * that key can register this `inboxId` again. Not in `SCHEMA`: it holds nothing
+ * else, and an inbox that was never wiped doesn't have it.
+ */
+const TOMBSTONE_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_tombstone (
+   singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
+   owner_key_hash TEXT NOT NULL
+ )`
+
+const encoder = new TextEncoder()
+
+/** b64u SHA-256 of a domain label and the canonical b64u `ownerPub`. */
+const ownerKeyHash = async (ownerPub: string): Promise<string> =>
+  bytesToBase64Url(
+    await sha256Bytes(encoder.encode(`ww-buddies/v1/inbox-owner\n${ownerPub}`))
+  )
+
+/**
  * One SQLite Durable Object per `inboxId`: the owner key, slots (buddies'
  * writer keys), Buddy Cards, events, devices, the encrypted roster, the nonce
  * cache, the per-inbox `seq`, and open-invite bookkeeping. It holds ciphertext,
- * random ids, public keys, and push tokens only.
+ * random ids, public keys, and push tokens only. A wiped inbox keeps a hash of
+ * its owner key, which binds the `inboxId` to that key for good.
  *
- * Signed ops verify first (the only await), then run their checks and writes in
- * one synchronous transaction, so caps and `seq` stay exact under concurrency.
+ * Signed ops verify (and hash, for the tombstone) first, the only awaits, then
+ * run their checks and writes in one synchronous transaction, so caps, `seq`,
+ * and the owner binding stay exact under concurrency.
  *
  * The owner's devices can hold live sockets here (`inbox/live`, Hibernation
  * API). After every committed write that changes what `inbox/sync` returns,
@@ -220,6 +242,7 @@ export class BuddyInbox extends DurableObject<Environment> {
       call.signature
     )
     if (!valid) return fail('bad_signature')
+    const keyHash = await ownerKeyHash(call.ownerPub)
 
     const now = Date.now()
     const result = this.ctx.storage.transactionSync(
@@ -227,6 +250,9 @@ export class BuddyInbox extends DurableObject<Environment> {
         if (this.#isStale(call, now)) return fail('stale')
         const meta = this.#meta()
         if (meta && meta.ownerPub !== call.ownerPub) return fail('conflict')
+        // A wiped inbox stays bound to its owner's key.
+        const tombstone = this.#tombstone()
+        if (tombstone != null && tombstone !== keyHash) return fail('conflict')
         this.#ensureSchema()
         if (!this.#claimNonce(call, now)) return fail('replay')
         if (meta) {
@@ -259,9 +285,11 @@ export class BuddyInbox extends DurableObject<Environment> {
   async deleteInbox(call: Signed<InboxFields>): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('inbox/delete', call, 'owner')
     if (!auth.ok) return auth
+    // Hash before the commit, so no other await sits between it and the wipe.
+    const tombstone = await ownerKeyHash(auth.value)
     const admitted = this.#commit(call, 'owner', auth.value, () => ok({}))
     if (!admitted.ok) return admitted
-    await this.#wipe(Date.now())
+    await this.#wipe(Date.now(), tombstone)
     return ok({})
   }
 
@@ -691,10 +719,15 @@ export class BuddyInbox extends DurableObject<Environment> {
   async alarm(): Promise<void> {
     const now = Date.now()
     if (!this.#ready()) return
-    const meta = this.#meta()
-    if (meta && now - meta.lastActiveAt >= LIMITS.inboxInactivityMs) {
-      await this.#wipe(now)
-      return
+    const idle = this.#idleOwnerPub(now)
+    if (idle) {
+      const tombstone = await ownerKeyHash(idle)
+      // Hashing let other requests in: wipe only if still idle.
+      if (this.#idleOwnerPub(now) === idle) {
+        await this.#wipe(now, tombstone)
+        return
+      }
+      if (!this.#ready()) return
     }
     this.ctx.storage.transactionSync(() => this.#prune(now))
     await this.#retryInviteDeletes(now)
@@ -702,8 +735,7 @@ export class BuddyInbox extends DurableObject<Environment> {
       !this.#meta() &&
       !this.#count('SELECT COUNT(*) AS n FROM pending_invite_delete')
     ) {
-      await this.ctx.storage.deleteAll()
-      this.#schemaReady = false
+      await this.#deleteAllButTombstone(this.#tombstone())
       return
     }
     await this.#ensureAlarm(now)
@@ -830,6 +862,34 @@ export class BuddyInbox extends DurableObject<Environment> {
            FROM meta WHERE singleton = 1`
         )
         .toArray()[0] ?? null
+    )
+  }
+
+  /** The owner key of an inbox past the inactivity limit, else null. */
+  #idleOwnerPub(now: number): string | null {
+    const meta = this.#meta()
+    return meta && now - meta.lastActiveAt >= LIMITS.inboxInactivityMs
+      ? meta.ownerPub
+      : null
+  }
+
+  /** The wiped owner's key hash; null if this inbox was never wiped. */
+  #tombstone(): string | null {
+    const exists =
+      this.#sql
+        .exec(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'owner_tombstone'"
+        )
+        .toArray().length > 0
+    if (!exists) return null
+    return (
+      this.#sql
+        .exec<{
+          hash: string
+        }>(
+          'SELECT owner_key_hash AS hash FROM owner_tombstone WHERE singleton = 1'
+        )
+        .toArray()[0]?.hash ?? null
     )
   }
 
@@ -1158,10 +1218,11 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * Deletes everything (slots, cards, events, devices, roster) and every invite
-   * this inbox created. Local state goes first so concurrent ops see a missing
-   * inbox; invite deletions that fail are retried from the alarm.
+   * this inbox created, keeping only `tombstone` (the owner's key hash). Local
+   * state goes first so concurrent ops see a missing inbox; invite deletions
+   * that fail are retried from the alarm.
    */
-  async #wipe(now: number): Promise<void> {
+  async #wipe(now: number, tombstone: string): Promise<void> {
     const invites: PendingInviteDelete[] = []
     if (this.#ready()) {
       const meta = this.#meta()
@@ -1179,13 +1240,31 @@ export class BuddyInbox extends DurableObject<Environment> {
       }
       invites.push(...this.#pendingInviteDeletes())
     }
-    await this.ctx.storage.deleteAll()
+    await this.#deleteAllButTombstone(tombstone)
     // Before compatibility date 2026-02-24, deleteAll() keeps the alarm.
     await this.ctx.storage.deleteAlarm()
-    this.#schemaReady = false
     this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.gone)
     const unique = new Map(invites.map((invite) => [invite.inviteId, invite]))
     await this.#deleteInvites([...unique.values()], now)
+  }
+
+  /**
+   * `deleteAll()`, then writes `tombstone` back. No other event runs in
+   * between, so no request ever sees a wiped inbox without its binding.
+   */
+  async #deleteAllButTombstone(tombstone: string | null): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.deleteAll()
+      if (tombstone == null) return
+      this.ctx.storage.transactionSync(() => {
+        this.#sql.exec(TOMBSTONE_SCHEMA)
+        this.#sql.exec(
+          'INSERT OR REPLACE INTO owner_tombstone (singleton, owner_key_hash) VALUES (1, ?)',
+          tombstone
+        )
+      })
+    })
+    this.#schemaReady = false
   }
 
   #pendingInviteDeletes(): PendingInviteDelete[] {
