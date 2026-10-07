@@ -311,7 +311,9 @@ describe('closing', () => {
     await h.inboxes.fireAlarm(owner.inboxId)
 
     expect(socket.closedBy).toEqual({ code: 4001, reason: 'gone' })
-    expect(h.inboxes.storage(owner.inboxId).tables()).toEqual([])
+    expect(h.inboxes.storage(owner.inboxId).tables()).toEqual([
+      'owner_tombstone',
+    ])
   })
 
   it('keeps 10 sockets per inbox, replacing the oldest with 4002', async () => {

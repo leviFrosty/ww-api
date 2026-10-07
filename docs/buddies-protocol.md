@@ -66,9 +66,9 @@ Payload fields listed are **in addition** to `ts` and `nonce` for signed ops.
 
 | Op                  | Payload                                                                                                  | Response      | Notes                                                                                                                                                                 |
 | ------------------- | -------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `inbox/register`    | `inboxId`, `ownerPub`, `attest?`                                                                         | `{ ok }`      | Idempotent for the same `ownerPub`; `conflict` if different. `attest` is reserved (ignored in MVP).                                                                   |
+| `inbox/register`    | `inboxId`, `ownerPub`, `attest?`                                                                         | `{ ok }`      | Idempotent for the same `ownerPub`; `conflict` if different, even after the inbox was wiped. `attest` is reserved (ignored in MVP).                                   |
 | `inbox/sync`        | `inboxId`, `since` (int ≥ 0)                                                                             | see below     | Touches `lastActiveAt`.                                                                                                                                               |
-| `inbox/delete`      | `inboxId`                                                                                                | `{ ok }`      | Wipes the inbox (slots, cards, events, devices, roster) and every open invite it created. Allowed even when disabled.                                                 |
+| `inbox/delete`      | `inboxId`                                                                                                | `{ ok }`      | Wipes the inbox (slots, cards, events, devices, roster) and every open invite it created, keeping only a hash of the owner key. Allowed even when disabled.           |
 | `device/register`   | `inboxId`, `deviceId`, `apnsToken` (hex), `apnsEnvironment` (`"sandbox"` \| `"production"`), `templates` | `{ ok }`      | Upsert by `deviceId`. Max 10 devices per inbox (oldest evicted). `templates` is `{ [kind]: { title, body } }`, strings ≤ 200 chars — already localized by the device. |
 | `device/unregister` | `inboxId`, `deviceId`                                                                                    | `{ ok }`      | Idempotent.                                                                                                                                                           |
 | `slot/add`          | `inboxId`, `slotId`, `writerPub`                                                                         | `{ ok }`      | Registers a buddy's writer key. Idempotent for the same key. `limit` when `slots + open invites ≥ 5`.                                                                 |
@@ -133,8 +133,11 @@ The relay keeps `inviteId → creator inboxId` only until the invite is deleted 
 | Events                                     | Deleted 30 days after creation                                         |
 | Invites                                    | Deleted at `expiresAt` (plus a short grace)                            |
 | Inbox                                      | Wiped after 180 days without an owner op                               |
+| Owner key hash of a wiped inbox            | Kept, with no expiry (see below)                                       |
 
 Unsigned ops are rate-limited by client IP.
+
+A wipe (180 days without an owner op, or `inbox/delete`) keeps one value: `b64u(SHA-256(UTF-8("ww-buddies/v1/inbox-owner\n" + ownerPub)))`, with `ownerPub` the owner's canonical `b64u` key. It is pseudonymous (linking it to anyone takes their public key), it is all that's kept, and it never expires, since an expiry would let another key take the `inboxId` over. Only that key can register the `inboxId` again; every other op treats the inbox as unknown, as before. The app derives `inboxId` and `ownerPub` from the same root seed, so an owner who comes back (after the inactivity wipe, or on another device) registers with the same key. Delete-all also deletes the seed, so later use of Buddies starts a new inbox; the old one keeps only the hash.
 
 ## Push delivery
 

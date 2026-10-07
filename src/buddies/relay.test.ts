@@ -3,6 +3,7 @@ import {
   DAY_MS,
   Owner,
   SigningKey,
+  b64u,
   blobOfSize,
   createHarness,
   envelope,
@@ -930,7 +931,10 @@ describe('inbox/delete', () => {
 
     expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
 
-    expect(h.inboxes.storage(owner.inboxId).tables()).toEqual([])
+    // Only the owner key's hash is left (see "inbox ownership across wipes").
+    expect(h.inboxes.storage(owner.inboxId).tables()).toEqual([
+      'owner_tombstone',
+    ])
     expect(h.inboxes.storage(owner.inboxId).alarm()).toBeNull()
     for (const invite of [open, claimed]) {
       expect((await fetchInvite(invite.inviteId)).status).toBe(404)
@@ -964,7 +968,152 @@ describe('inbox/delete', () => {
 
     advance(MINUTE_MS)
     await h.inboxes.fireAlarm(owner.inboxId)
-    expect(storage.tables()).toEqual([])
+    expect(storage.tables()).toEqual(['owner_tombstone'])
+  })
+})
+
+describe('inbox ownership across wipes', () => {
+  /** What a wiped inbox keeps: SHA-256 of the label and the canonical key. */
+  const ownerKeyHash = async (ownerPub: string) =>
+    b64u(
+      new Uint8Array(
+        await crypto.subtle.digest(
+          'SHA-256',
+          new TextEncoder().encode(`ww-buddies/v1/inbox-owner\n${ownerPub}`)
+        )
+      )
+    )
+
+  const registerAs = (key: SigningKey, inboxId: string) =>
+    h.send('inbox/register', key, { inboxId, ownerPub: key.publicKey })
+
+  const wipes = {
+    'inbox/delete': async (owner: Owner) => {
+      expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
+    },
+    'the 180-day inactivity wipe': async (owner: Owner) => {
+      advance(180 * DAY_MS)
+      await h.inboxes.fireAlarm(owner.inboxId)
+    },
+  }
+
+  for (const [name, wipe] of Object.entries(wipes)) {
+    describe(`after ${name}`, () => {
+      it('keeps only a hash of the owner key, with no alarm', async () => {
+        const owner = await Owner.create(h)
+        await owner.addWriter()
+        const storage = h.inboxes.storage(owner.inboxId)
+        expect(storage.tables()).not.toContain('owner_tombstone')
+
+        await wipe(owner)
+
+        expect(storage.tables()).toEqual(['owner_tombstone'])
+        expect(storage.query('SELECT * FROM owner_tombstone')).toEqual([
+          {
+            singleton: 1,
+            owner_key_hash: await ownerKeyHash(owner.key.publicKey),
+          },
+        ])
+        expect(storage.alarm()).toBeNull()
+      })
+
+      it('lets only the same key register the inbox again', async () => {
+        const owner = await Owner.create(h)
+        const buddy = await owner.addWriter()
+        await wipe(owner)
+        const storage = h.inboxes.storage(owner.inboxId)
+
+        const intruder = await SigningKey.generate()
+        expect(await registerAs(intruder, owner.inboxId)).toEqual({
+          status: 409,
+          body: { error: 'conflict' },
+        })
+        // A refused registration stores nothing.
+        expect(storage.tables()).toEqual(['owner_tombstone'])
+
+        // Everything else still sees no inbox, exactly as before the binding.
+        expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+        expect(await buddy.putCard()).toEqual({
+          status: 404,
+          body: { error: 'not_found' },
+        })
+        expect((await buddy.send('slot/leave')).body).toEqual({ ok: true })
+
+        expect(await registerAs(owner.key, owner.inboxId)).toEqual({
+          status: 200,
+          body: { ok: true },
+        })
+        expect((await owner.sync()).body).toMatchObject({ seq: 0, slots: [] })
+        // Until the owner restores the slot, the buddy's writes are gone.
+        expect(await buddy.putCard()).toEqual({
+          status: 410,
+          body: { error: 'gone' },
+        })
+        expect(await registerAs(intruder, owner.inboxId)).toEqual({
+          status: 409,
+          body: { error: 'conflict' },
+        })
+
+        await owner.send('slot/add', {
+          slotId: buddy.slotId,
+          writerPub: buddy.key.publicKey,
+        })
+        expect((await buddy.putCard()).status).toBe(200)
+      })
+    })
+  }
+
+  it('stays bound through a second wipe after the owner comes back', async () => {
+    const owner = await Owner.create(h)
+    await wipes['the 180-day inactivity wipe'](owner)
+    expect((await registerAs(owner.key, owner.inboxId)).status).toBe(200)
+    await wipes['inbox/delete'](owner)
+
+    const intruder = await SigningKey.generate()
+    expect((await registerAs(intruder, owner.inboxId)).status).toBe(409)
+    expect((await registerAs(owner.key, owner.inboxId)).status).toBe(200)
+  })
+
+  it('stays bound after the alarm finishes failed invite cleanup', async () => {
+    const owner = await Owner.create(h)
+    const invite = await createInvite(owner)
+    h.invites.failNextReply(invite.inviteId)
+    await wipes['inbox/delete'](owner)
+    const storage = h.inboxes.storage(owner.inboxId)
+    expect(storage.tables()).toContain('pending_invite_delete')
+
+    const intruder = await SigningKey.generate()
+    expect((await registerAs(intruder, owner.inboxId)).status).toBe(409)
+
+    advance(MINUTE_MS)
+    await h.inboxes.fireAlarm(owner.inboxId)
+    expect(storage.tables()).toEqual(['owner_tombstone'])
+    expect(storage.alarm()).toBeNull()
+    expect((await registerAs(intruder, owner.inboxId)).status).toBe(409)
+    expect((await registerAs(owner.key, owner.inboxId)).status).toBe(200)
+  })
+
+  it('does not wipe an inbox that became active while the alarm hashed its key', async () => {
+    const owner = await Owner.create(h)
+    advance(180 * DAY_MS)
+    const digest = crypto.subtle.digest.bind(crypto.subtle)
+    let synced: Promise<unknown> | null = null
+    const spy = vi
+      .spyOn(crypto.subtle, 'digest')
+      .mockImplementation(async (algorithm, data) => {
+        // The owner syncs while the alarm awaits the tombstone hash.
+        synced ??= owner.sync()
+        await synced
+        return digest(algorithm, data)
+      })
+    await h.inboxes.fireAlarm(owner.inboxId)
+    spy.mockRestore()
+
+    expect(await synced).toMatchObject({ status: 200 })
+    const storage = h.inboxes.storage(owner.inboxId)
+    expect(storage.tables()).toContain('meta')
+    expect(storage.alarm()).toBe(Date.now() + 180 * DAY_MS)
+    expect((await owner.sync()).status).toBe(200)
   })
 })
 
@@ -1056,7 +1205,7 @@ describe('retention', () => {
 
     advance(100 * DAY_MS)
     await h.inboxes.fireAlarm(owner.inboxId)
-    expect(storage.tables()).toEqual([])
+    expect(storage.tables()).toEqual(['owner_tombstone'])
     expect((await owner.sync()).body).toEqual({ error: 'not_found' })
   })
 

@@ -4,7 +4,7 @@ Buddies lets two publishers share upcoming Plans through a blind relay. Each per
 
 ## Sub-features
 
-- `register` makes `inbox/register` idempotent per key and returns `conflict` for a different key.
+- `register` makes `inbox/register` idempotent per key and returns `conflict` for a different key, even after the inbox was wiped.
 - `device` makes `device/register` upsert a device and its push templates. Pushes are skipped locally because there are no APNs keys.
 - `invite` runs `invite/create` → `invite/fetch` (`status:"open"`) → `invite/claim` → `invite/fetch` (`status:"claimed"`) → `invite/delete` → `invite/fetch` (404).
 - `claim-event` appends an `invite.claimed` event (`slotId:""`, `eventId` = inviteId, the claim blob) to the creator's inbox.
@@ -13,7 +13,7 @@ Buddies lets two publishers share upcoming Plans through a blind relay. Each per
 - `auth` rejects a foreign key with 401 `bad_signature`, a reused nonce with 409 `replay`, a `ts` outside ±5 min with 401 `stale`, and an unknown slot with 410 `gone`.
 - `limits` caps open invites at 3, slots plus invites at 5, and unsigned ops at 30/min per IP. Five wrong claim secrets burn an invite.
 - `leave` removes the slot, its card, and its events from both inboxes through `slot/remove` and `slot/leave`.
-- `delete` wipes the inbox with `inbox/delete`. Sync then returns 404 `not_found`.
+- `delete` wipes the inbox with `inbox/delete`. Sync then returns 404 `not_found`, and only the same key can register the inbox again.
 - `kill-switch` makes every op return 503 `disabled` when KV `buddies:enabled` is `false`, except `inbox/delete`, `slot/remove`, and `slot/leave`.
 - `live` upgrades `GET /buddies/v1/inbox/live` (signed headers `x-buddies-p`/`x-buddies-s`) to a WebSocket that sends `hello`, then `changed` with the inbox `seq` after each write, answers `ping` with `pong`, and closes with 4001 `gone` on `inbox/delete`. A plain GET gets 426 and the kill switch 503.
 
@@ -31,6 +31,7 @@ Preconditions:
 - `.verify/state.json` exists, so the e2e helpers resolve the URL.
 
 - **Pair two people.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "pairing happy path"`. This registers Levi and Maria, creates, fetches, and claims an invite, confirms, and exchanges cards, a roster, leave, and delete. It passes with a read-back after every write.
+- **Ownership after delete-all.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "delete-all"`. Other keys racing and following `inbox/delete` get 409 `conflict`, the buddy's `card/put` gets 404 `not_found`, the owner's key registers again (200, empty sync), and the buddy then gets 410 `gone` until the slot is restored. The 180-day wipe can't be reached over HTTP; unit tests in `src/buddies/relay.test.ts` cover it.
 - **Unsigned probe.** Fetch an unknown invite. Run `curl -s -X POST $URL/buddies/v1/invite/fetch -H "cf-connecting-ip: 198.18.3.1" -d "{\"p\":\"$(printf '{"inviteId":"AAAAAAAAAAAAAAAAAAAAAA"}' | base64 | tr '+/' '-_' | tr -d '=')\"}"`. The body is `{"error":"not_found"}` with status 404.
 - **Malformed envelope.** Run `curl -s -X POST $URL/buddies/v1/inbox/sync -H "cf-connecting-ip: 198.18.3.2" -d '{"p":"!!"}'`. The body is `{"error":"bad_request"}` with status 400.
 - **Limits and abuse.** Run `pnpm test:e2e src/e2e/buddies.e2e.test.ts -t "relay limits"`. The 31st `invite/fetch` from one IP gets 429, the 4th open invite gets 429, and unknown ops get 404.

@@ -231,6 +231,43 @@ describe('pairing happy path', () => {
   })
 })
 
+describe('inbox ownership across delete-all', () => {
+  it('lets only the owner key register a deleted inbox again', async () => {
+    const owner = await RelayOwner.register()
+    const writerKey = await SigningKey.generate()
+    const writer = new RelayWriter(owner.inboxId, randomId(), writerKey)
+    const slot = { slotId: writer.slotId, writerPub: writerKey.publicKey }
+    expect((await owner.send('slot/add', slot)).body).toEqual({ ok: true })
+    expect((await writer.send('card/put', { blob: blobOfSize(8) })).status).toBe(200)
+
+    const register = async (key: SigningKey) =>
+      sendSigned('inbox/register', key, { inboxId: owner.inboxId, ownerPub: key.publicKey })
+    const intruders = await Promise.all(Array.from({ length: 4 }, () => SigningKey.generate()))
+
+    // Other keys racing the delete land before it (live owner) or after it (tombstone).
+    const [deleted, ...raced] = await Promise.all([
+      owner.send('inbox/delete'),
+      ...intruders.map((key) => register(key)),
+    ])
+    expect(deleted.body).toEqual({ ok: true })
+    for (const attempt of raced) expect(attempt.body).toEqual({ error: 'conflict' })
+
+    expect((await register(intruders[0])).body).toEqual({ error: 'conflict' })
+    expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+    const wiped = await writer.send('card/put', { blob: blobOfSize(8) })
+    expect([wiped.status, wiped.body]).toEqual([404, { error: 'not_found' }])
+
+    const back = await register(owner.key)
+    expect([back.status, back.body]).toEqual([200, { ok: true }])
+    expect((await owner.sync()).body).toEqual({ ok: true, seq: 0, slots: [], cards: [], events: [], roster: null })
+    const unslotted = await writer.send('card/put', { blob: blobOfSize(8) })
+    expect([unslotted.status, unslotted.body]).toEqual([410, { error: 'gone' }])
+    expect((await register(intruders[1])).body).toEqual({ error: 'conflict' })
+
+    expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
+  })
+})
+
 describe('relay limits and abuse', () => {
   it('rate limits unsigned ops per client IP at 30/min', async () => {
     const ip = `203.0.113.${Math.floor(Math.random() * 250) + 1}`
