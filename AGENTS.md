@@ -213,9 +213,33 @@ no-app fallback page for invite links, and the AASA matches `/b#1…`.
 
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
-  migration `v3`, `BUDDIES_RATE_LIMITER` (30/min per IP for `invite/fetch` and
-  `invite/claim`; namespace 1002 prod, 2002 dev), and the `BUDDIES_ENABLED` var
-  (`"false"` prod, `"true"` dev).
+  migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
+  caller), migration `v6`, four per-caller rate limiters (below), and the
+  `BUDDIES_ENABLED` var (`"false"` prod, `"true"` dev).
+- **Abuse limits**: all in `BUDDIES_ABUSE_LIMITS` (`src/buddies/limits.ts`),
+  each with its sizing rationale. They only stop scripted abuse; size them
+  from the heaviest real use with at least 10× headroom. Hits log
+  `buddies: limit hit {op, limit}` (nothing else), so tune from Workers Logs.
+  - Per caller, in the Worker before any DO wakes: the client IP (IPv6 by
+    /64), never the target inbox. `BUDDIES_RATE_LIMITER` 120/min for
+    `invite/fetch` + `invite/claim`, `BUDDIES_REGISTER_LIMITER` 60/min for
+    `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync` +
+    `inbox/live`, `BUDDIES_WRITE_LIMITER` 600/min for every other op
+    (namespaces 1002-1005 prod, 2002-2005 dev; `limits.test.ts` keeps
+    `wrangler.toml` equal to the constants). Refusals are 429 `rate_limited`
+    with `Retry-After: 60`. The Worker also refuses stale `ts` and badly
+    signed `inbox/register` before any DO. A limiter outage lets requests
+    through.
+  - `inbox/register`: 2,000 validly signed calls per caller per rolling day
+    (`BuddyRegistrationQuota`, hourly counts under a hashed caller key).
+  - Per inbox, after the signature check: stored events per slot (10,000,
+    16 MiB) and per inbox (128 MiB). `event/put` past them is 429
+    `rate_limited`; nothing stored is dropped. `slot_usage` keeps the running
+    totals. Each signer (the owner, or a writer slot) gets 10,000 / 1,000
+    requests that take effect per 10 minutes (in memory). Sync pages stop at
+    10,000 events as well as 4 MiB.
+  - Only requests that take effect record a nonce, so refused ones add no
+    rows; replay protection is unchanged.
 - **Secrets** (per environment): `APNS_KEY_ID` and `APNS_PRIVATE_KEY` (the
   `.p8` PEM). `APPLE_TEAM_ID` is the JWT issuer and `IOS_BUNDLE_ID` the APNs
   topic. Without the two APNs secrets the relay still works but skips pushes,

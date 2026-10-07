@@ -55,7 +55,7 @@ Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "error": "<code>" }` w
 | 409  | `conflict`      | Inbox already registered with a different key; invite already claimed |
 | 410  | `gone`          | Slot does not exist (buddy removed you)                               |
 | 429  | `limit`         | A count cap was hit (slots, invites, devices)                         |
-| 429  | `rate_limited`  | A rate limit was hit                                                  |
+| 429  | `rate_limited`  | A rate limit or a stored-event cap was hit; may carry `Retry-After`   |
 | 503  | `disabled`      | Kill switch is off                                                    |
 
 ## Operations
@@ -122,12 +122,18 @@ The relay keeps `inviteId → creator inboxId` only until the invite is deleted 
 
 ## Limits and retention
 
+Stored-event caps count a slot's events (by number and by base64url bytes) until they expire. An `event/put` past a cap fails with `rate_limited` and stores nothing; stored events are never dropped to make room, and room comes back as they expire. Cards and the roster are replaced in place, so only their blob sizes cap them.
+
+Every op is also rate-limited per caller (the client IP, IPv6 by /64), never per target inbox. Unsigned invite ops, `inbox/register` (also capped per caller per day), reads (`inbox/sync` and `inbox/live`), and every other signed op each have their own budget, sized far above real use. A refused request gets 429 `rate_limited`, usually with `Retry-After` in seconds. Clients treat it like any transient failure and retry later, never in a tight loop.
+
 | Item                                       | Limit                                                                  |
 | ------------------------------------------ | ---------------------------------------------------------------------- |
 | Slots + open invites per inbox             | 5                                                                      |
 | Open invites per inbox                     | 3                                                                      |
 | Invite creations per inbox                 | 20 per 24 h                                                            |
 | Writes per slot (`card/put` + `event/put`) | 60 per hour                                                            |
+| Stored events per slot                     | 10,000 events and 16 MiB until they expire (see above)                 |
+| Stored events per inbox                    | 128 MiB across all slots (see above)                                   |
 | Pushes per slot                            | 10 per 24 h, at least 60 s apart (extra events are stored, not pushed) |
 | Devices per inbox                          | 10                                                                     |
 | Events                                     | Deleted 30 days after creation                                         |

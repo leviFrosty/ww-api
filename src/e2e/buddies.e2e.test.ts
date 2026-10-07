@@ -19,7 +19,9 @@ import {
   sendSigned,
   sendUnsigned,
   writeTranscript,
+  type Exchange,
 } from '../test/e2e'
+import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 
 /**
  * Two synthetic identities pair through the live relay following the
@@ -269,19 +271,86 @@ describe('inbox ownership across delete-all', () => {
 })
 
 describe('relay limits and abuse', () => {
-  it('rate limits unsigned ops per client IP at 30/min', async () => {
-    const ip = `203.0.113.${Math.floor(Math.random() * 250) + 1}`
+  const hex16 = () => Math.floor(Math.random() * 0x10000).toString(16)
+  /** A random IPv6 /64 prefix nobody else uses (append `::<id>`). */
+  const freshPrefix = () => `2001:db8:${hex16()}:${hex16()}`
+
+  /**
+   * Up to `2 × limit + 1` requests as one fresh caller. The first `limit`
+   * always pass, and a 429 must come by the end even if a minute boundary
+   * falls mid-burst (the limiter counts in fixed one-minute windows).
+   */
+  const burst = async (limit: number, send: (i: number) => Promise<Exchange>) => {
     const statuses: number[] = []
-    for (let i = 0; i < 31; i++) {
-      const res = await http('POST', '/buddies/v1/invite/fetch', {
+    for (let i = 0; i < 2 * limit + 1; i++) {
+      const res = await send(i)
+      statuses.push(res.status)
+      if (res.status === 429) return { statuses, refused: res }
+    }
+    return { statuses, refused: null }
+  }
+
+  it('rate limits unsigned ops per caller, grouping IPv6 by /64', async () => {
+    const limit = BUDDIES_ABUSE_LIMITS.edge.unsigned.perMinute
+    const prefix = freshPrefix()
+    const fetchFrom = (ip: string) =>
+      http('POST', '/buddies/v1/invite/fetch', {
         body: unsignedEnvelope({ inviteId: randomId() }),
         headers: { 'cf-connecting-ip': ip },
       })
-      statuses.push(res.status)
-    }
-    expect(statuses.slice(0, 30).every((s) => s === 404)).toBe(true)
-    expect(statuses[30]).toBe(429)
+    // Every request comes from a different address in the same /64.
+    const { statuses, refused } = await burst(limit, (i) =>
+      fetchFrom(`${prefix}::${(i + 1).toString(16)}`)
+    )
+    expect(statuses.slice(0, limit).every((s) => s === 404)).toBe(true)
+    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    expect(refused?.headers.get('retry-after')).toBe('60')
+    expect((await fetchFrom(`${freshPrefix()}::1`)).status).toBe(404)
   })
+
+  it('rate limits inbox/register per caller', async () => {
+    const limit = BUDDIES_ABUSE_LIMITS.edge.register.perMinute
+    const ip = `${freshPrefix()}::1`
+    const key = await SigningKey.generate()
+    const inboxId = randomId()
+    const { statuses, refused } = await burst(limit, async () =>
+      http('POST', '/buddies/v1/inbox/register', {
+        body: await envelope(
+          'inbox/register',
+          { inboxId, ownerPub: key.publicKey, ts: Date.now(), nonce: randomId() },
+          key
+        ),
+        headers: { 'cf-connecting-ip': ip },
+      })
+    )
+    // Re-registering is idempotent, and each one still counts.
+    expect(statuses.slice(0, limit).every((s) => s === 200)).toBe(true)
+    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    expect(refused?.headers.get('retry-after')).toBe('60')
+  })
+
+  it('keys limits on the caller, so flooding an inbox never locks its owner out', async () => {
+    const owner = await RelayOwner.register()
+    const attacker = await SigningKey.generate()
+    const ip = `${freshPrefix()}::66`
+    const { statuses, refused } = await burst(
+      BUDDIES_ABUSE_LIMITS.edge.read.perMinute,
+      async () =>
+        http('POST', '/buddies/v1/inbox/sync', {
+          body: await envelope(
+            'inbox/sync',
+            { inboxId: owner.inboxId, since: 0, ts: Date.now(), nonce: randomId() },
+            attacker
+          ),
+          headers: { 'cf-connecting-ip': ip },
+        })
+    )
+    expect(statuses.filter((s) => s !== 429).every((s) => s === 401)).toBe(true)
+    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    const sync = await owner.sync()
+    expect(sync.status).toBe(200)
+    expect((await owner.send('inbox/delete')).status).toBe(200)
+  }, 60_000)
 
   it('caps open invites at 3', async () => {
     const owner = await RelayOwner.register()

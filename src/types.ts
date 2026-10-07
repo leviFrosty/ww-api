@@ -216,8 +216,26 @@ export interface Environment {
   /** One SQLite DO per `inviteId`, deleted once the invite ends or expires. */
   BUDDY_INVITE: DurableObjectNamespace<import('./buddies/inviteDO').BuddyInvite>;
 
-  /** Per-IP limiter for the unsigned `invite/fetch` and `invite/claim` ops. */
+  /**
+   * Per-caller (client IP, IPv6 by /64) limiters, one per op tier; sizes in
+   * `BUDDIES_ABUSE_LIMITS.edge` (src/buddies/limits.ts). This one covers the
+   * unsigned `invite/fetch` and `invite/claim`.
+   */
   BUDDIES_RATE_LIMITER: RateLimit;
+  /** Per-caller limiter for `inbox/register`. */
+  BUDDIES_REGISTER_LIMITER: RateLimit;
+  /** Per-caller limiter for `inbox/sync` and the `inbox/live` upgrade. */
+  BUDDIES_READ_LIMITER: RateLimit;
+  /** Per-caller limiter for every other signed op. */
+  BUDDIES_WRITE_LIMITER: RateLimit;
+
+  /**
+   * One SQLite DO per caller (hashed client IP, IPv6 by /64): its signed
+   * `inbox/register` calls per hour over the last day.
+   */
+  BUDDY_REGISTRATION_QUOTA: DurableObjectNamespace<
+    import('./buddies/registrationQuota').BuddyRegistrationQuota
+  >;
 
   /** Kill-switch fallback (`"true"` enables) when KV `buddies:enabled` is absent. */
   BUDDIES_ENABLED?: string;

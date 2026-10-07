@@ -1,4 +1,3 @@
-import { bytesToBase64Url } from '../crypto'
 import { signedMessage } from '../buddies/envelope'
 import {
   BUDDIES_LIVE_HEADERS,
@@ -10,7 +9,11 @@ import {
 
 const encoder = new TextEncoder()
 
-export const b64u = (bytes: Uint8Array): string => bytesToBase64Url(bytes)
+/** Same output as `bytesToBase64Url`, via Node's native encoder (tests send a lot). */
+export const b64u = (bytes: Uint8Array): string =>
+  Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString(
+    'base64url'
+  )
 export const randomBytes = (size: number): Uint8Array =>
   crypto.getRandomValues(new Uint8Array(size))
 export const randomId = (): string => b64u(randomBytes(16))

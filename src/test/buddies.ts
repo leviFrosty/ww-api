@@ -1,6 +1,8 @@
 import { vi } from 'vitest'
 import { BuddyInbox } from '../buddies/inboxDO'
 import { BuddyInvite } from '../buddies/inviteDO'
+import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
+import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
 import type { BuddiesSignedOp } from '../buddies/contracts'
@@ -27,9 +29,11 @@ export * from './buddiesClient'
 
 /**
  * End-to-end harness for the Buddies relay: the real Hono routes, the real
- * Durable Object classes on SQLite, an in-memory KV, a counting rate limiter,
- * a recording APNs `fetch`, and fake Workers WebSockets (stubbed globals).
- * Requires `vi.mock('cloudflare:workers')` in the calling test file.
+ * Durable Object classes on SQLite, an in-memory KV, rate limiters that count
+ * like the local runtime's (fixed windows on the faked clock, production
+ * limits unless overridden), a recording APNs `fetch`, and fake Workers
+ * WebSockets (stubbed globals). Requires `vi.mock('cloudflare:workers')` in
+ * the calling test file.
  */
 
 export const TEAM_ID = 'TEAMID1234'
@@ -60,6 +64,7 @@ export interface HarnessOptions {
   enabled?: string
   kvEnabled?: string
   apnsConfigured?: boolean
+  /** Per-minute limit for unsigned ops; production's by default. */
   unsignedLimit?: number
 }
 
@@ -68,11 +73,15 @@ export interface Harness {
   kv: MemoryKv
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
+  quotas: FakeNamespace<BuddyRegistrationQuota>
   pushes: RecordedPush[]
   apnsPublicKey: CryptoKey
   /** Decides each APNs response; default 200. */
   apnsResponse: (push: RecordedPush) => Response
+  /** Keys the unsigned-op limiter saw, refused ones included. */
   rateLimitKeys: string[]
+  /** The raw Response for a request to the relay routes. */
+  request(path: string, init: RequestInit): Promise<Response>
   post(
     path: string,
     body: unknown,
@@ -87,6 +96,29 @@ export interface Harness {
   live(headers: Record<string, string>, method?: string): Promise<LiveResponse>
   /** Awaits every `waitUntil` task (push delivery). */
   flush(): Promise<void>
+}
+
+/**
+ * A per-key limiter that counts like the local runtime's (Miniflare): fixed
+ * one-minute windows on the (faked) clock, refused calls not counted.
+ */
+const fakeRateLimiter = (limit: number, seen?: string[]) => {
+  let window = -1
+  const counts = new Map<string, number>()
+  return {
+    limit: async ({ key }: { key: string }) => {
+      seen?.push(key)
+      const current = Math.floor(Date.now() / 60_000)
+      if (current !== window) {
+        window = current
+        counts.clear()
+      }
+      const used = counts.get(key) ?? 0
+      if (used >= limit) return { success: false }
+      counts.set(key, used + 1)
+      return { success: true }
+    },
+  }
 }
 
 const pem = (der: Uint8Array): string => {
@@ -121,21 +153,22 @@ export const createHarness = async (
   )
 
   const rateLimitKeys: string[] = []
-  const unsignedLimit = options.unsignedLimit ?? Number.POSITIVE_INFINITY
+  const limiters = Object.fromEntries(
+    Object.entries(BUDDIES_ABUSE_LIMITS.edge).map(
+      ([tier, { binding, perMinute }]) => [
+        binding,
+        tier === 'unsigned'
+          ? fakeRateLimiter(options.unsignedLimit ?? perMinute, rateLimitKeys)
+          : fakeRateLimiter(perMinute),
+      ]
+    )
+  )
   const env = {
     NOTES_KV: kv,
     APPLE_TEAM_ID: TEAM_ID,
     IOS_BUNDLE_ID: BUNDLE_ID,
     BUDDIES_ENABLED: options.enabled ?? 'true',
-    BUDDIES_RATE_LIMITER: {
-      limit: async ({ key }: { key: string }) => {
-        rateLimitKeys.push(key)
-        return {
-          success:
-            rateLimitKeys.filter((k) => k === key).length <= unsignedLimit,
-        }
-      },
-    },
+    ...limiters,
     ...(options.apnsConfigured === false
       ? {}
       : { APNS_KEY_ID, APNS_PRIVATE_KEY: apnsPrivateKey }),
@@ -147,8 +180,13 @@ export const createHarness = async (
   const invites = createNamespace(
     (state) => new BuddyInvite(state as never, env as never)
   )
+  const quotas = createNamespace(
+    (state) => new BuddyRegistrationQuota(state as never, env as never)
+  )
   env.BUDDY_INBOX = inboxes.namespace as Environment['BUDDY_INBOX']
   env.BUDDY_INVITE = invites.namespace as Environment['BUDDY_INVITE']
+  env.BUDDY_REGISTRATION_QUOTA =
+    quotas.namespace as Environment['BUDDY_REGISTRATION_QUOTA']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -164,10 +202,14 @@ export const createHarness = async (
     kv,
     inboxes,
     invites,
+    quotas,
     pushes: [],
     apnsPublicKey: apnsKeys.publicKey,
     apnsResponse: () => new Response(null, { status: 200 }),
     rateLimitKeys,
+    request: async () => {
+      throw new Error('replaced below')
+    },
     post: async () => {
       throw new Error('replaced below')
     },
@@ -201,21 +243,19 @@ export const createHarness = async (
     },
   })
 
+  harness.request = async (path, init) =>
+    routes.request(path, init, env, executionCtx)
+
   harness.post = async (path, body, headers = {}) => {
-    const response = await routes.request(
-      path,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'cf-connecting-ip': '203.0.113.7',
-          ...headers,
-        },
-        body: typeof body === 'string' ? body : JSON.stringify(body),
+    const response = await harness.request(path, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'cf-connecting-ip': '203.0.113.7',
+        ...headers,
       },
-      env,
-      executionCtx
-    )
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    })
     return { status: response.status, body: await response.json() }
   }
 

@@ -29,6 +29,14 @@ export const WIRE_LIMITS = {
   maxInviteLifetimeMs: 7 * 24 * 60 * 60 * 1000 + 5 * 60 * 1000,
 }
 
+/** Per-caller requests per minute by edge tier (BUDDIES_ABUSE_LIMITS.edge). */
+export const WIRE_EDGE_LIMITS = {
+  unsigned: 120,
+  register: 60,
+  read: 600,
+  write: 600,
+}
+
 export const SIGNED_OPS = [
   'inbox/register',
   'inbox/sync',

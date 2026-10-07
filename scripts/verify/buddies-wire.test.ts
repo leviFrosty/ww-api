@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
 import { BUDDIES_LIMITS, BUDDIES_OPS, BUDDIES_UNSIGNED_OPS } from '../../src/buddies/contracts'
+import { BUDDIES_ABUSE_LIMITS } from '../../src/buddies/limits'
 import { signedMessage, verifyBuddiesSignature } from '../../src/buddies/envelope'
 import * as wire from './buddies-wire.mjs'
 
@@ -9,6 +10,13 @@ it('mirrors the relay limits the fuzzer probes', () => {
   for (const [name, value] of Object.entries(wire.WIRE_LIMITS)) {
     expect(BUDDIES_LIMITS[name as keyof typeof BUDDIES_LIMITS], name).toBe(value)
   }
+})
+
+it('mirrors the per-caller edge limits', () => {
+  const edge = Object.fromEntries(
+    Object.entries(BUDDIES_ABUSE_LIMITS.edge).map(([tier, { perMinute }]) => [tier, perMinute])
+  )
+  expect(wire.WIRE_EDGE_LIMITS).toEqual(edge)
 })
 
 it('knows every op', () => {

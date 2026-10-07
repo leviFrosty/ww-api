@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 /**
  * Durable Object test doubles backed by a real in-memory SQLite database, so
@@ -174,6 +174,9 @@ export interface SqliteState {
 
 export const createSqliteState = (name: string): SqliteState => {
   let db = new DatabaseSync(':memory:')
+  // Compiled once per SQL text, like the runtime's statement cache; SQLite
+  // re-prepares a cached statement itself when the schema changes.
+  let statements = new Map<string, StatementSync>()
   let alarmAt: number | null = null
   let depth = 0
 
@@ -193,8 +196,12 @@ export const createSqliteState = (name: string): SqliteState => {
         (typeof binding === 'number' && Number.isFinite(binding))
       if (!ok) throw new Error(`Unsupported SQL binding: ${typeof binding}`)
     }
-    const rows = db
-      .prepare(statement)
+    let prepared = statements.get(statement)
+    if (!prepared) {
+      prepared = db.prepare(statement)
+      statements.set(statement, prepared)
+    }
+    const rows = prepared
       .all(...(bindings as (string | number | null)[]))
       .map((row: Row) => ({ ...row }))
     return cursor(rows)
@@ -227,6 +234,7 @@ export const createSqliteState = (name: string): SqliteState => {
     deleteAll: async () => {
       db.close()
       db = new DatabaseSync(':memory:')
+      statements = new Map()
     },
   }
 
@@ -302,6 +310,8 @@ export interface FakeNamespace<T> {
   fireAlarm(name: string): Promise<void>
   /** Makes the next RPC to `name` throw after the callee finishes (lost reply). */
   failNextReply(name: string): void
+  /** Replaces the object with a fresh instance on the same storage (eviction). */
+  restart(name: string): void
 }
 
 /**
@@ -373,6 +383,11 @@ export const createNamespace = <T extends object>(
     },
     failNextReply: (name) => {
       lostReplies.add(name)
+    },
+    restart: (name) => {
+      const entry = ensure(name)
+      entry.object = construct(entry.storage.state)
+      entry.storage.attach(entry.object as SocketHandlers)
     },
   }
 }

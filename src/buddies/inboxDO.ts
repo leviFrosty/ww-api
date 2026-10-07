@@ -42,6 +42,7 @@ import {
   readLiveCall,
   verifyBuddiesSignature,
 } from './envelope'
+import { BUDDIES_ABUSE_LIMITS as ABUSE, SignerBudget, logLimitHit } from './limits'
 
 type Empty = Record<string, never>
 
@@ -77,6 +78,10 @@ type DeviceRow = {
 
 type KeyRef = 'owner' | 'writer'
 type KeyedCall = InboxFields & { slotId?: string }
+
+/** Who signed, for `SignerBudget`: the owner, or a writer by its slot id. */
+const signerOf = (call: KeyedCall, ref: KeyRef): string =>
+  ref === 'owner' ? 'owner' : (call.slotId ?? '')
 
 const INVITE_DELETE_RETRY_MS = 60_000
 
@@ -141,6 +146,14 @@ const SCHEMA = [
   'CREATE INDEX IF NOT EXISTS event_by_seq ON event (seq)',
   'CREATE INDEX IF NOT EXISTS event_by_created ON event (created_at)',
   'CREATE INDEX IF NOT EXISTS event_by_slot ON event (slot_id)',
+  // Running count and blob bytes of each writer slot's stored events, so the
+  // storage caps never scan the event table. Kept in step on insert, slot
+  // removal, and retention; relay events (slot "") aren't counted.
+  `CREATE TABLE IF NOT EXISTS slot_usage (
+     slot_id TEXT PRIMARY KEY,
+     events  INTEGER NOT NULL,
+     bytes   INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS roster (
      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
      blob      TEXT NOT NULL,
@@ -223,6 +236,7 @@ const ownerKeyHash = async (ownerPub: string): Promise<string> =>
  */
 export class BuddyInbox extends DurableObject<Environment> {
   #schemaReady = false
+  #signers = new SignerBudget(ABUSE.signerWindowMs)
 
   constructor(ctx: DurableObjectState, env: Environment) {
     super(ctx, env)
@@ -443,6 +457,7 @@ export class BuddyInbox extends DurableObject<Environment> {
           this.#count('SELECT COUNT(*) AS n FROM invite_creation') >=
           LIMITS.inviteCreations
         ) {
+          logLimitHit('invite/create', 'inviteCreations')
           return fail('rate_limited')
         }
         this.#sql.exec(
@@ -510,7 +525,8 @@ export class BuddyInbox extends DurableObject<Environment> {
     const auth = await this.#authenticate('card/put', call, 'writer')
     if (!auth.ok) return auth
     const result = this.#commit(call, 'writer', auth.value, (now) => {
-      if (!this.#recordWrite(call.slotId, now)) return fail('rate_limited')
+      if (!this.#recordWrite('card/put', call.slotId, now))
+        return fail('rate_limited')
       const seq = this.#nextSeq()
       this.#sql.exec(
         `INSERT INTO card (slot_id, blob, seq, updated_at) VALUES (?, ?, ?, ?)
@@ -536,7 +552,13 @@ export class BuddyInbox extends DurableObject<Environment> {
     const result = this.#commit(call, 'writer', auth.value, (now) => {
       const existing = this.#eventSeq(call.eventId)
       if (existing != null) return ok({ seq: existing, push: null })
-      if (!this.#recordWrite(call.slotId, now)) return fail('rate_limited')
+      const cap = this.#eventCapHit(call.slotId, call.blob.length)
+      if (cap) {
+        logLimitHit('event/put', cap)
+        return fail('rate_limited')
+      }
+      if (!this.#recordWrite('event/put', call.slotId, now))
+        return fail('rate_limited')
       const seq = this.#nextSeq()
       this.#sql.exec(
         `INSERT INTO event (event_id, slot_id, kind, blob, seq, created_at)
@@ -547,6 +569,13 @@ export class BuddyInbox extends DurableObject<Environment> {
         call.blob,
         seq,
         now
+      )
+      this.#sql.exec(
+        `INSERT INTO slot_usage (slot_id, events, bytes) VALUES (?, 1, ?)
+         ON CONFLICT (slot_id) DO UPDATE SET
+           events = events + 1, bytes = bytes + excluded.bytes`,
+        call.slotId,
+        call.blob.length
       )
       inserted = true
       const push = call.push
@@ -751,6 +780,11 @@ export class BuddyInbox extends DurableObject<Environment> {
     return writerPub ? ok(writerPub) : fail('gone')
   }
 
+  /**
+   * Verifies the signature, then checks the signer's budget of requests that
+   * take effect (`#commit` spends it). Both are about the authenticated
+   * signer, so nobody else can use up an inbox's budget.
+   */
   async #authenticate(
     op: BuddiesSigningOp,
     call: Signed<KeyedCall>,
@@ -764,14 +798,29 @@ export class BuddyInbox extends DurableObject<Environment> {
       call.payloadBytes,
       call.signature
     )
-    return valid ? key : fail('bad_signature')
+    if (!valid) return fail('bad_signature')
+    const [budget, limit] =
+      ref === 'owner'
+        ? [ABUSE.ownerRequests, 'ownerRequests']
+        : [ABUSE.writerRequests, 'writerRequests']
+    if (!this.#signers.allows(signerOf(call, ref), budget, Date.now())) {
+      logLimitHit(op, limit)
+      return fail('rate_limited')
+    }
+    return key
   }
 
   /**
-   * After the signature check: the verifying key must be unchanged, `ts` fresh,
-   * and the nonce unseen, then `work` runs in the same transaction. Owner ops
-   * also count as owner activity for the 180-day retention unless `activity`
-   * is false (the live socket).
+   * After the signature check: the verifying key must be unchanged, `ts`
+   * fresh, and the nonce unseen, then `work` runs in the same transaction.
+   * Owner ops also count as owner activity for the 180-day retention unless
+   * `activity` is false (the live socket).
+   *
+   * Only a request that took effect keeps its nonce (and spends its signer's
+   * budget), so refused ones (caps, rate limits, conflicts) add no rows.
+   * Replay protection is unchanged: the check and the record share this
+   * synchronous transaction, so each signed request still takes effect at
+   * most once, and only within ±5 minutes.
    */
   #commit<T>(
     call: KeyedCall & SignedFields,
@@ -788,13 +837,18 @@ export class BuddyInbox extends DurableObject<Environment> {
       const denied = this.#admit(call, now)
       if (denied) return fail(denied)
       if (activity) this.#touch(now)
-      return work(now)
+      const result = work(now)
+      if (result.ok) {
+        this.#recordNonce(call, now)
+        this.#signers.spend(signerOf(call, ref), now)
+      }
+      return result
     })
   }
 
   #admit(call: SignedFields, now: number): BuddiesErrorCode | null {
     if (this.#isStale(call, now)) return 'stale'
-    return this.#claimNonce(call, now) ? null : 'replay'
+    return this.#nonceSeen(call, now) ? 'replay' : null
   }
 
   #isStale(call: SignedFields, now: number): boolean {
@@ -806,20 +860,31 @@ export class BuddyInbox extends DurableObject<Environment> {
    * limited to ±5 minutes, a request can't outlive its nonce record.
    */
   #claimNonce(call: SignedFields, now: number): boolean {
+    if (this.#nonceSeen(call, now)) return false
+    this.#recordNonce(call, now)
+    return true
+  }
+
+  /** Whether the nonce was seen in the last 10 minutes (expired ones go). */
+  #nonceSeen(call: SignedFields, now: number): boolean {
     this.#sql.exec(
       'DELETE FROM nonce WHERE seen_at < ?',
       now - LIMITS.nonceRetentionMs
     )
-    if (
-      this.#count('SELECT COUNT(*) AS n FROM nonce WHERE nonce = ?', call.nonce)
+    return (
+      this.#count(
+        'SELECT COUNT(*) AS n FROM nonce WHERE nonce = ?',
+        call.nonce
+      ) > 0
     )
-      return false
+  }
+
+  #recordNonce(call: SignedFields, now: number): void {
     this.#sql.exec(
       'INSERT INTO nonce (nonce, seen_at) VALUES (?, ?)',
       call.nonce,
       now
     )
-    return true
   }
 
   #touch(now: number): void {
@@ -837,15 +902,25 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   #ready(): boolean {
     if (this.#schemaReady) return true
-    const exists =
+    const exists = this.#hasTable('meta')
+    // Existing inboxes pick up any tables added since they were created.
+    if (exists) {
+      const backfill = !this.#hasTable('slot_usage')
+      this.#ensureSchema()
+      if (backfill) this.#backfillUsage()
+    }
+    return exists
+  }
+
+  #hasTable(name: string): boolean {
+    return (
       this.#sql
         .exec(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+          name
         )
         .toArray().length > 0
-    // Existing inboxes pick up any tables added since they were created.
-    if (exists) this.#ensureSchema()
-    return exists
+    )
   }
 
   #ensureSchema(): void {
@@ -875,13 +950,7 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /** The wiped owner's key hash; null if this inbox was never wiped. */
   #tombstone(): string | null {
-    const exists =
-      this.#sql
-        .exec(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'owner_tombstone'"
-        )
-        .toArray().length > 0
-    if (!exists) return null
+    if (!this.#hasTable('owner_tombstone')) return null
     return (
       this.#sql
         .exec<{
@@ -937,7 +1006,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /** Sliding one-hour window of writes per slot. */
-  #recordWrite(slotId: string, now: number): boolean {
+  #recordWrite(op: BuddiesSigningOp, slotId: string, now: number): boolean {
     this.#sql.exec(
       'DELETE FROM slot_write WHERE slot_id = ? AND at <= ?',
       slotId,
@@ -947,13 +1016,53 @@ export class BuddyInbox extends DurableObject<Environment> {
       'SELECT COUNT(*) AS n FROM slot_write WHERE slot_id = ?',
       slotId
     )
-    if (writes >= LIMITS.writesPerSlot) return false
+    if (writes >= LIMITS.writesPerSlot) {
+      logLimitHit(op, 'writesPerSlot')
+      return false
+    }
     this.#sql.exec(
       'INSERT INTO slot_write (slot_id, at) VALUES (?, ?)',
       slotId,
       now
     )
     return true
+  }
+
+  /**
+   * Which stored-event cap one more event of `bytes` from `slotId` would pass:
+   * per slot by count and bytes, or per inbox by bytes. Null when it fits.
+   *
+   * A full slot refuses new events (`rate_limited`) rather than dropping old
+   * ones, so nothing a buddy already delivered vanishes before the owner syncs
+   * it. The sender keeps an unsent event and retries on its next publish, and
+   * room comes back as stored events reach their 30-day retention.
+   */
+  #eventCapHit(slotId: string, bytes: number): string | null {
+    const slot = this.#sql
+      .exec<{
+        events: number
+        bytes: number
+      }>('SELECT events, bytes FROM slot_usage WHERE slot_id = ?', slotId)
+      .toArray()[0] ?? { events: 0, bytes: 0 }
+    if (slot.events >= ABUSE.slotEvents) return 'slotEvents'
+    if (slot.bytes + bytes > ABUSE.slotEventBytes) return 'slotEventBytes'
+    const { total } = this.#sql
+      .exec<{
+        total: number
+      }>('SELECT COALESCE(SUM(bytes), 0) AS total FROM slot_usage')
+      .one()
+    if (total + bytes > ABUSE.inboxEventBytes) return 'inboxEventBytes'
+    return null
+  }
+
+  /** Counts the writer events an inbox stored before `slot_usage` existed. */
+  #backfillUsage(): void {
+    this.#sql.exec(
+      `INSERT OR REPLACE INTO slot_usage (slot_id, events, bytes)
+       SELECT slot_id, COUNT(*), COALESCE(SUM(LENGTH(blob)), 0)
+       FROM event WHERE slot_id <> ? GROUP BY slot_id`,
+      RELAY_SLOT_ID
+    )
   }
 
   /**
@@ -1045,6 +1154,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM event WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM slot_usage WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
     return existed
@@ -1111,7 +1221,11 @@ export class BuddyInbox extends DurableObject<Environment> {
       since,
       now - LIMITS.eventRetentionMs
     )) {
-      if (events.length && chars + event.blob.length > LIMITS.syncEventChars) {
+      if (
+        events.length &&
+        (chars + event.blob.length > LIMITS.syncEventChars ||
+          events.length >= ABUSE.syncEvents)
+      ) {
         cursor = events[events.length - 1].seq
         break
       }
@@ -1157,10 +1271,25 @@ export class BuddyInbox extends DurableObject<Environment> {
   // --- Retention ------------------------------------------------------------
 
   #prune(now: number): void {
-    this.#sql.exec(
-      'DELETE FROM event WHERE created_at <= ?',
-      now - LIMITS.eventRetentionMs
-    )
+    const expiry = now - LIMITS.eventRetentionMs
+    const expiring = this.#sql
+      .exec<{ slotId: string; events: number; bytes: number }>(
+        `SELECT slot_id AS slotId, COUNT(*) AS events,
+                COALESCE(SUM(LENGTH(blob)), 0) AS bytes
+         FROM event WHERE created_at <= ? GROUP BY slot_id`,
+        expiry
+      )
+      .toArray()
+    for (const { slotId, events, bytes } of expiring) {
+      this.#sql.exec(
+        `UPDATE slot_usage SET events = MAX(0, events - ?), bytes = MAX(0, bytes - ?)
+         WHERE slot_id = ?`,
+        events,
+        bytes,
+        slotId
+      )
+    }
+    this.#sql.exec('DELETE FROM event WHERE created_at <= ?', expiry)
     this.#sql.exec(
       'DELETE FROM invite WHERE expires_at <= ?',
       now - LIMITS.inviteGraceMs

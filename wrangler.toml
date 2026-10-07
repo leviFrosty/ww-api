@@ -110,6 +110,10 @@ class_name = "BuddyInvite"
 name = "ROUTE_PLANNING_QUOTA"
 class_name = "RoutePlanningQuota"
 
+[[env.dev.durable_objects.bindings]]
+name = "BUDDY_REGISTRATION_QUOTA"
+class_name = "BuddyRegistrationQuota"
+
 [[env.dev.migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -130,6 +134,10 @@ new_sqlite_classes = ["PlayIntegrityChallenges"]
 tag = "v5"
 new_sqlite_classes = ["RoutePlanningQuota"]
 
+[[env.dev.migrations]]
+tag = "v6"
+new_sqlite_classes = ["BuddyRegistrationQuota"]
+
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "2001"   # distinct from prod's 1001
@@ -138,13 +146,43 @@ namespace_id = "2001"   # distinct from prod's 1001
   limit = 60
   period = 60
 
-# Buddies unsigned ops (invite/fetch, invite/claim), keyed by client IP.
+# Buddies per-caller limits (client IP, IPv6 by /64), one per op tier. Sizes
+# and rationale: BUDDIES_ABUSE_LIMITS.edge in src/buddies/limits.ts, which
+# limits.test.ts keeps equal to these (and to prod's below).
+# Unsigned ops (invite/fetch, invite/claim).
 [[env.dev.ratelimits]]
 name = "BUDDIES_RATE_LIMITER"
 namespace_id = "2002"   # distinct from prod's 1002
 
   [env.dev.ratelimits.simple]
-  limit = 30
+  limit = 120
+  period = 60
+
+# inbox/register.
+[[env.dev.ratelimits]]
+name = "BUDDIES_REGISTER_LIMITER"
+namespace_id = "2003"   # distinct from prod's 1003
+
+  [env.dev.ratelimits.simple]
+  limit = 60
+  period = 60
+
+# inbox/sync and the inbox/live upgrade.
+[[env.dev.ratelimits]]
+name = "BUDDIES_READ_LIMITER"
+namespace_id = "2004"   # distinct from prod's 1004
+
+  [env.dev.ratelimits.simple]
+  limit = 600
+  period = 60
+
+# Every other signed op.
+[[env.dev.ratelimits]]
+name = "BUDDIES_WRITE_LIMITER"
+namespace_id = "2005"   # distinct from prod's 1005
+
+  [env.dev.ratelimits.simple]
+  limit = 600
   period = 60
 
 # Cloudflare Workers Observability — not inherited, so repeated for dev.
@@ -269,13 +307,43 @@ namespace_id = "1001"
   limit = 60
   period = 60
 
-# Buddies unsigned ops (invite/fetch, invite/claim), keyed by client IP.
+# Buddies per-caller limits (client IP, IPv6 by /64), one per op tier. Sizes
+# and rationale: BUDDIES_ABUSE_LIMITS.edge in src/buddies/limits.ts, which
+# limits.test.ts keeps equal to these (and to [env.dev]'s above).
+# Unsigned ops (invite/fetch, invite/claim).
 [[ratelimits]]
 name = "BUDDIES_RATE_LIMITER"
 namespace_id = "1002"
 
   [ratelimits.simple]
-  limit = 30
+  limit = 120
+  period = 60
+
+# inbox/register.
+[[ratelimits]]
+name = "BUDDIES_REGISTER_LIMITER"
+namespace_id = "1003"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
+# inbox/sync and the inbox/live upgrade.
+[[ratelimits]]
+name = "BUDDIES_READ_LIMITER"
+namespace_id = "1004"
+
+  [ratelimits.simple]
+  limit = 600
+  period = 60
+
+# Every other signed op.
+[[ratelimits]]
+name = "BUDDIES_WRITE_LIMITER"
+namespace_id = "1005"
+
+  [ratelimits.simple]
+  limit = 600
   period = 60
 
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
@@ -315,6 +383,13 @@ class_name = "BuddyInvite"
 name = "ROUTE_PLANNING_QUOTA"
 class_name = "RoutePlanningQuota"
 
+# Buddies: signed inbox/register calls per caller (hashed client IP, IPv6 by
+# /64) per hour over the last day, nothing else; deletes itself a day after
+# the newest. Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "BUDDY_REGISTRATION_QUOTA"
+class_name = "BuddyRegistrationQuota"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -336,6 +411,10 @@ new_sqlite_classes = ["PlayIntegrityChallenges"]
 [[migrations]]
 tag = "v5"
 new_sqlite_classes = ["RoutePlanningQuota"]
+
+[[migrations]]
+tag = "v6"
+new_sqlite_classes = ["BuddyRegistrationQuota"]
 
 [observability]
 enabled = true
