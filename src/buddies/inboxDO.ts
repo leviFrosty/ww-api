@@ -77,12 +77,14 @@ type DeviceRow = {
   token: string
   apnsEnvironment: string | null
   apnsTopic: string | null
+  appAlerts: number
   templates: string
 }
 
 /** A stored device's push address; null for a row this build can't use. */
 const pushAddressOf = (row: DeviceRow): PushAddress | null => {
-  if (row.service === 'fcm') return { service: 'fcm', token: row.token }
+  if (row.service === 'fcm')
+    return { service: 'fcm', token: row.token, appAlerts: row.appAlerts === 1 }
   if (row.service !== 'apns') return null
   if (row.apnsEnvironment !== 'sandbox' && row.apnsEnvironment !== 'production')
     return null
@@ -178,6 +180,7 @@ const SCHEMA = [
      seq       INTEGER NOT NULL
    )`,
   // `service` is `apns` or `fcm`; the `apns_*` columns are null for FCM.
+  // `app_alerts` (FCM): the app posts named alerts itself.
   `CREATE TABLE IF NOT EXISTS push_device (
      device_id        TEXT PRIMARY KEY,
      service          TEXT NOT NULL,
@@ -186,7 +189,8 @@ const SCHEMA = [
      apns_topic       TEXT,
      templates        TEXT NOT NULL,
      created_at       INTEGER NOT NULL,
-     updated_at       INTEGER NOT NULL
+     updated_at       INTEGER NOT NULL,
+     app_alerts       INTEGER NOT NULL DEFAULT 0
    )`,
   'CREATE INDEX IF NOT EXISTS push_device_by_token ON push_device (service, token)',
   // Open-invite bookkeeping for the caps; rows leave with the invite.
@@ -352,13 +356,14 @@ export class BuddyInbox extends DurableObject<Environment> {
         call.deviceId
       )
       this.#sql.exec(
-        `INSERT INTO push_device (device_id, service, token, apns_environment, apns_topic, templates, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO push_device (device_id, service, token, apns_environment, apns_topic, app_alerts, templates, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (device_id) DO UPDATE SET
            service = excluded.service,
            token = excluded.token,
            apns_environment = excluded.apns_environment,
            apns_topic = excluded.apns_topic,
+           app_alerts = excluded.app_alerts,
            templates = excluded.templates,
            updated_at = excluded.updated_at`,
         call.deviceId,
@@ -366,6 +371,7 @@ export class BuddyInbox extends DurableObject<Environment> {
         push.token,
         push.service === 'apns' ? push.apnsEnvironment : null,
         push.service === 'apns' ? push.apnsTopic : null,
+        push.service === 'fcm' && push.appAlerts ? 1 : 0,
         JSON.stringify(call.templates),
         now,
         now
@@ -618,7 +624,13 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
       inserted = true
       const push = call.push
-        ? this.#reservePush(call.inboxId, call.slotId, call.kind, now)
+        ? this.#reservePush(
+            call.inboxId,
+            call.slotId,
+            call.kind,
+            { seq, eventId: call.eventId, blob: call.blob },
+            now
+          )
         : null
       return ok({ seq, push })
     })
@@ -734,13 +746,17 @@ export class BuddyInbox extends DurableObject<Environment> {
       const existing = this.#sql
         .exec<{
           blob: string
-        }>('SELECT blob FROM event WHERE event_id = ?', args.inviteId)
+          seq: number
+        }>('SELECT blob, seq FROM event WHERE event_id = ?', args.inviteId)
         .toArray()[0]
       if (existing) {
         if (existing.blob !== args.blob) return { status: 'claimed_elsewhere' }
         // Only reachable after the invite DO reopened a claim whose delivery
         // threw, so the Worker never pushed the first attempt.
-        return { status: 'delivered', push: this.#claimPush(meta.inboxId) }
+        return {
+          status: 'delivered',
+          push: this.#claimPush(meta.inboxId, args, existing.seq),
+        }
       }
       const seq = this.#nextSeq()
       this.#sql.exec(
@@ -754,7 +770,10 @@ export class BuddyInbox extends DurableObject<Environment> {
         now
       )
       inserted = true
-      return { status: 'delivered', push: this.#claimPush(meta.inboxId) }
+      return {
+        status: 'delivered',
+        push: this.#claimPush(meta.inboxId, args, seq),
+      }
     })
     if (inserted) {
       this.#broadcastChanged()
@@ -950,6 +969,11 @@ export class BuddyInbox extends DurableObject<Environment> {
       const backfill = !this.#hasTable('slot_usage')
       this.#ensureSchema()
       if (backfill) this.#backfillUsage()
+      if (!this.#hasColumn('push_device', 'app_alerts')) {
+        this.#sql.exec(
+          'ALTER TABLE push_device ADD COLUMN app_alerts INTEGER NOT NULL DEFAULT 0'
+        )
+      }
       if (this.#hasTable('device')) this.#migrateDevices()
     }
     return exists
@@ -966,6 +990,13 @@ export class BuddyInbox extends DurableObject<Environment> {
        FROM device`
     )
     this.#sql.exec('DROP TABLE device')
+  }
+
+  #hasColumn(table: string, column: string): boolean {
+    return this.#sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((row) => row.name === column)
   }
 
   #hasTable(name: string): boolean {
@@ -1130,6 +1161,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     inboxId: string,
     slotId: string,
     kind: string,
+    { seq, ...event }: PushJob['event'] & { seq: number },
     now: number
   ): PushJob | null {
     const targets = this.#pushTargets(kind)
@@ -1161,13 +1193,24 @@ export class BuddyInbox extends DurableObject<Environment> {
       slotId,
       now
     )
-    return { inboxId, kind, targets }
+    return { inboxId, kind, seq, event, targets }
   }
 
-  #claimPush(inboxId: string): PushJob | null {
+  /** The claim's event id is the invite's id. */
+  #claimPush(
+    inboxId: string,
+    claim: { inviteId: string; blob: string },
+    seq: number
+  ): PushJob | null {
     const targets = this.#pushTargets(INVITE_CLAIMED_KIND)
     return targets.length
-      ? { inboxId, kind: INVITE_CLAIMED_KIND, targets }
+      ? {
+          inboxId,
+          kind: INVITE_CLAIMED_KIND,
+          seq,
+          event: { eventId: claim.inviteId, blob: claim.blob },
+          targets,
+        }
       : null
   }
 
@@ -1177,7 +1220,7 @@ export class BuddyInbox extends DurableObject<Environment> {
       .exec<DeviceRow>(
         `SELECT device_id AS deviceId, service, token,
                 apns_environment AS apnsEnvironment, apns_topic AS apnsTopic,
-                templates
+                app_alerts AS appAlerts, templates
          FROM push_device ORDER BY created_at, device_id`
       )
       .toArray()
