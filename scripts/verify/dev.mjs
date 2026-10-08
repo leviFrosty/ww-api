@@ -52,6 +52,10 @@ const OPTIONAL_SECRETS = [
   // Buddies Android pushes: FCM is plain HTTPS, so unlike APNs it works from
   // `wrangler dev`. Pass the key minified to one line (`jq -c`).
   'FCM_SERVICE_ACCOUNT_JSON',
+  // Notes Import analytics. Point POSTHOG_HOST at a local catcher to inspect
+  // events; the real project token would send test runs to production PostHog.
+  'POSTHOG_PROJECT_TOKEN',
+  'POSTHOG_HOST',
 ]
 /** Synthetic, verification-only Apple team id when none is provided. */
 const SYNTHETIC_TEAM_ID = 'VERIFY0000'

@@ -338,6 +338,38 @@ KV read on a miss, and returns `503 no-store` until the first sweep completes
 (~5 hours after the first deploy). The app persists the body for 7 days and
 falls back to a bundled snapshot until then.
 
+## Notes Import analytics (PostHog)
+
+The worker sends anonymous Notes Import usage events to the WitnessWork
+PostHog project (US cloud), so adoption is measured over every import, not
+only installs with app analytics on. Code: `src/analytics.ts` (feature-neutral
+sender) and `src/notesImport/analytics.ts` (events). On when
+`POSTHOG_PROJECT_TOKEN` is set: prod `[vars]` has it, `[env.dev.vars]` leaves
+it commented out.
+
+| Event | When | Properties beyond the shared ones |
+| --- | --- | --- |
+| `api_notes_import_started` | An attested import starts a fresh model run (kickoff or legacy; not reconnects) | `notes_chars`, `new_content`, `imports_remaining` |
+| `api_notes_import_finished` | Once per started run | `outcome` (`success`, `model_error`, `cancelled`, `interrupted`), `duration_ms`, `notes_chars`; on success: `empty`, `empty_charged`, record counts (`contacts`, `visits`, `time_entries`, `categories`, `warnings`, `publisher_detected`), `imports_remaining`, `model`, `provider`, `input_tokens`, `output_tokens`, `reasoning_tokens` |
+| `api_notes_import_limit_reached` | An authenticated request is refused by an allowance or the concurrency cap | `limit` (`imports`, `refinements`, `active_cap`) |
+
+Every event carries `platform` (`ios`, `android`, `dev` for the bypass),
+`transport` (`stream`, `legacy`), `refinement`, `supporter`, `has_account`, and
+`environment`. The internal-TestFlight Beta app talks to prod, so its imports
+are counted as `ios`.
+
+- **Identity**: `distinct_id` is `ww_` plus a truncated SHA-256 of the meter id
+  (account id, else install uuid), so unique users, DAU/WAU/MAU and retention
+  work without the id itself reaching PostHog. It can't be joined to the app's
+  own anonymous PostHog ids. Events set `$process_person_profile: false` and
+  `$geoip_disable: true`.
+- **Privacy**: properties are structural only. Never add notes text, model
+  output, names, ids, or tokens. Delivery uses the pre-Sentry `fetch`, runs in
+  `waitUntil` with a 2-second timeout, and never fails a request; failures log
+  `analytics: capture failed|rejected` with no payload.
+- The app's in-app analytics switch does not reach the worker; these events
+  are sent regardless of it.
+
 ## Route planning
 
 `POST /route-planning/optimize` backs the app's Supporter-only "Plan today's

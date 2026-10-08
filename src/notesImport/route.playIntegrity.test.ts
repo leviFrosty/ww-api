@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+const analytics = vi.hoisted(() => ({ capture: vi.fn(async () => undefined) }))
+vi.mock('../analytics', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../analytics')>()),
+  captureAnalyticsEvent: analytics.capture,
+}))
+
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
     ctx: DurableObjectState
@@ -181,7 +187,10 @@ const setup = async (
 }
 
 describe('Play Integrity on the Notes Import routes', () => {
-  beforeEach(() => resetGoogleAuthState())
+  beforeEach(() => {
+    resetGoogleAuthState()
+    analytics.capture.mockClear()
+  })
   afterEach(() => {
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
@@ -204,6 +213,85 @@ describe('Play Integrity on the Notes Import routes', () => {
     expect(indexNames).toContain(ACCOUNT_ID)
     expect(index.checkCredit).toHaveBeenCalledTimes(1)
     expect(appAttestIdentity.get).not.toHaveBeenCalled()
+  })
+
+  it('reports a started Android import to analytics without its identity', async () => {
+    const { env, signedBody } = await setup()
+    const tracked = { ...env, POSTHOG_PROJECT_TOKEN: 'phc_test' } as Environment
+    const body = await signedBody('notes-import-kickoff', {
+      notesText: NOTES_TEXT,
+      context: NOTES_CONTEXT,
+    })
+
+    const response = await handleNotesImportKickoffRequest(
+      context(tracked, { body })
+    )
+
+    expect(response.status).toBe(200)
+    expect(analytics.capture).toHaveBeenCalledOnce()
+    const [, event] = analytics.capture.mock.calls[0] as unknown as [
+      Environment,
+      { event: string; distinctId: string; properties: object },
+    ]
+    expect(event).toEqual({
+      event: 'api_notes_import_started',
+      distinctId: expect.stringMatching(/^ww_[0-9a-f]{32}$/),
+      properties: {
+        platform: 'android',
+        transport: 'stream',
+        refinement: false,
+        supporter: false,
+        has_account: true,
+        notes_chars: NOTES_TEXT.length,
+        new_content: true,
+        imports_remaining: 4,
+      },
+    })
+    expect(JSON.stringify(event)).not.toContain(ACCOUNT_ID)
+    expect(JSON.stringify(event)).not.toContain(UUID)
+  })
+
+  it('reports an exhausted allowance to analytics', async () => {
+    const { env, index, signedBody } = await setup()
+    index.checkCredit.mockResolvedValueOnce({
+      decision: {
+        allowed: false,
+        reason: 'limit_reached',
+        isNewHash: true,
+        isRefinement: false,
+        remaining: 0,
+      },
+      credits: { ...(await index.kickoffCredits()), remaining: 0 },
+    } as never)
+    const tracked = { ...env, POSTHOG_PROJECT_TOKEN: 'phc_test' } as Environment
+    const body = await signedBody('notes-import-kickoff', {
+      notesText: NOTES_TEXT,
+      context: NOTES_CONTEXT,
+    })
+
+    const response = await handleNotesImportKickoffRequest(
+      context(tracked, { body })
+    )
+
+    expect(response.status).toBe(402)
+    expect(analytics.capture).toHaveBeenCalledOnce()
+    expect(analytics.capture.mock.calls[0]).toMatchObject([
+      tracked,
+      {
+        event: 'api_notes_import_limit_reached',
+        properties: { platform: 'android', limit: 'imports' },
+      },
+    ])
+  })
+
+  it('sends no analytics without a PostHog token', async () => {
+    const { env, signedBody } = await setup()
+    const body = await signedBody('notes-import-kickoff', {
+      notesText: NOTES_TEXT,
+      context: NOTES_CONTEXT,
+    })
+    await handleNotesImportKickoffRequest(context(env, { body }))
+    expect(analytics.capture).not.toHaveBeenCalled()
   })
 
   it('refuses a replayed kickoff token', async () => {
