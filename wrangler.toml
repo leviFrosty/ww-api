@@ -74,7 +74,9 @@ PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
 ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 # Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
 # runs stay out of the production dashboards; uncomment to check delivery
-# (events carry `environment: development`).
+# (events carry `environment: development`). The same token also evaluates
+# server-side flags, so while it's commented out `notes-import-claude` reads
+# as off on dev and Notes Import uses OpenRouter.
 # POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 
 # Separate KV so dev never shares prod runtime policy or App Attest v1 mirrors.
@@ -221,6 +223,12 @@ NOTES_IMPORT_MODEL = "deepseek/deepseek-v4-flash-0731"
 # NOTES_IMPORT_PROVIDERS = "fireworks,digitalocean"   # Western ZDR, priority order (ADR 0008)
 # NOTES_IMPORT_MAX_CHARS = "100000"
 # NOTES_IMPORT_MAX_OUTPUT_TOKENS = "16000"
+# Claude Platform path (PostHog flag `notes-import-claude` + ANTHROPIC_API_KEY
+# secret). Repeat any override under [env.dev.vars].
+# NOTES_IMPORT_ANTHROPIC_MODEL = "claude-haiku-5-5"
+# NOTES_IMPORT_ANTHROPIC_EFFORT = "medium"           # low|medium|high|xhigh|max
+# NOTES_IMPORT_ANTHROPIC_INFERENCE_GEO = "us"        # us (1.1x, ADR 0008) | global
+# NOTES_IMPORT_ANTHROPIC_MAX_OUTPUT_TOKENS = "32000"
 # Runtime-limit env fallbacks. Keep all five explicit here and under
 # [env.dev.vars]; one malformed/missing KV field falls through independently.
 NOTES_IMPORT_FREE_CREDITS = "3"
@@ -245,7 +253,8 @@ ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 # PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT = "MEETS_DEVICE_INTEGRITY"
 # Anonymous Notes Import usage events (src/analytics.ts, AGENTS.md). The
 # WitnessWork PostHog project's write-only ingestion token, the same one the
-# app ships, so not a secret. Remove to turn server analytics off.
+# app ships, so not a secret. It also evaluates server-side feature flags
+# (`notes-import-claude`); removing it turns analytics off and every flag off.
 # POSTHOG_HOST defaults to https://us.i.posthog.com. Not inherited by [env.dev].
 POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 

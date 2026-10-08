@@ -19,6 +19,10 @@ APPLE_TEAM_ID=YOUR_TEAM_ID_HERE
 # enable Zero Data Retention in https://openrouter.ai/settings/privacy.
 OPENROUTER_API_KEY=your_openrouter_key_here
 
+# Claude Platform API key (https://platform.claude.com/settings/keys). Used
+# instead of OpenRouter when the `notes-import-claude` PostHog flag is on.
+ANTHROPIC_API_KEY=sk-ant-your_key_here
+
 # RevenueCat REST v1 SECRET key (sk_...) for server-side Supporter checks.
 # Project → API keys → Secret keys. NEVER ship this in the app.
 REVENUECAT_API_KEY=sk_your_revenuecat_secret_here

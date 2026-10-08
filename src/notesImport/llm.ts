@@ -1,18 +1,17 @@
+import type { JSONSchema7 } from 'ai'
 import {
-  streamText,
-  Output,
-  jsonSchema,
-  type JSONSchema7,
-  type LanguageModelUsage,
-} from 'ai'
-import { createOpenRouter } from '@openrouter/ai-sdk-provider'
-import { buildNotesImportSystemPrompt } from './prompt'
+  streamStructuredObject,
+  type LlmAdapter,
+  type LlmProviderId,
+  type LlmUsage,
+  type PromptBlock,
+} from '../llm'
+import { NOTES_IMPORT_INSTRUCTIONS, buildNotesImportContext } from './prompt'
 import {
   NOTES_IMPORT_SCHEMA,
   type NotesImportContext,
   type NotesImportResult,
 } from './schema'
-import type { NotesImportConfig } from './config'
 
 export interface RefinementInput {
   /** The model's previous full result, as the JSON string the client cached. */
@@ -24,8 +23,8 @@ export interface RefinementInput {
 /**
  * A best-effort signal emitted WHILE the model streams, purely so the client can
  * show that work is happening. Never affects the returned result — the
- * structured object always comes from `result.output`, never assembled from
- * these deltas (see ADR / docs/notes-import-streaming-durable-objects.md).
+ * structured object always comes from the provider's parsed output, never
+ * assembled from these deltas (see docs/notes-import-streaming-durable-objects.md).
  */
 export type ModelProgress =
   | { kind: 'phase'; phase: 'starting' | 'thinking' | 'structuring' }
@@ -33,8 +32,8 @@ export type ModelProgress =
   | { kind: 'progress'; chars: number }
 
 export interface RunModelArgs {
-  apiKey: string
-  config: NotesImportConfig
+  /** Which provider/model to call; see `resolveNotesImportAdapter`. */
+  adapter: LlmAdapter
   /** The notes being parsed (original notes for a refinement). */
   notesText: string
   context: NotesImportContext
@@ -46,24 +45,35 @@ export interface RunModelArgs {
 
 export interface RunModelOutput {
   result: NotesImportResult
-  usage: LanguageModelUsage
-  /** Which underlying provider OpenRouter actually used (for ZDR audit logs). */
+  usage: LlmUsage
+  provider: LlmProviderId
+  model: string
+  /** The upstream host that served the call (OpenRouter's routed ZDR host). */
   resolvedProvider?: string
 }
 
-const buildRefinementPrompt = (
+/**
+ * The user turn. The notes come first and identically in an import and in
+ * every refinement of it, so a refinement reuses the cached prefix through the
+ * notes; only the correction is new input.
+ */
+const buildUserBlocks = (
   notesText: string,
-  refinement: RefinementInput
-): string =>
-  `Here are the user's ORIGINAL notes:
+  refinement: RefinementInput | undefined
+): PromptBlock[] => {
+  const notes: PromptBlock = {
+    text: `<ORIGINAL NOTES>\n${notesText}\n</ORIGINAL NOTES>`,
+    cache: 'session',
+  }
+  if (!refinement) return [notes]
+  return [
+    notes,
+    {
+      text: `You previously produced this structured result for the notes above:
 
-<ORIGINAL NOTES>
-${notesText}
-</ORIGINAL NOTES>
-
-You previously produced this structured result:
-
+<PREVIOUS RESULT>
 ${refinement.previousResultJSON}
+</PREVIOUS RESULT>
 
 The user has a correction. Apply it and return a FRESH, COMPLETE structured
 result for the ORIGINAL notes above — not a diff, the whole object — with the
@@ -72,157 +82,89 @@ implies otherwise.
 
 <USER CORRECTION>
 ${refinement.instruction}
-</USER CORRECTION>
-`
+</USER CORRECTION>`,
+    },
+  ]
+}
 
 /** Emit a `progress` tick at most every N streamed output chars. */
 const PROGRESS_CHAR_STRIDE = 400
 
 /**
- * Runs the notes-import model through OpenRouter, streaming. Routing is pinned to
- * the configured provider allowlist with `zdr: true` and `data_collection:
- * 'deny'`, so the request only reaches a zero-data-retention host (ADR 0008) —
- * falling back across the allowlist but never to a non-ZDR provider, and failing
- * the request rather than leaking to one.
+ * Runs the notes-import model, streaming, through whichever adapter the run
+ * resolved (Claude Platform or OpenRouter). The model is forced to the
+ * NOTES_IMPORT_SCHEMA shape; the parsed object is the result.
  *
- * Uses the AI SDK v6 `streamText` + `Output.object` API (the non-deprecated
- * successor to `generateObject`): the model is still forced to the
- * NOTES_IMPORT_SCHEMA shape and `result.output` resolves to the parsed object
- * (throwing on a non-conforming response). The `fullStream` is drained ONLY to
- * surface progress via `onProgress`; the structured result is never built from
- * those deltas.
+ * Prompt layout, most stable first so prompt caching can reuse prefixes:
+ * the fixed instructions (shared by every user), then this user's context,
+ * then the notes, then (refinements only) the previous result + correction.
  *
- * Reasoning is ON by default (`config.reasoningEffort`, `xhigh` = the model's
- * "Think Max"). The model co-emits reasoning and strict JSON, but some ZDR hosts
- * ship a buggy reasoning parser that misroutes the final JSON into the reasoning
- * channel and returns a blank completion (cf. the vLLM deepseek reasoning-parser
- * bug). When that happens `result.output` rejects, so we recover the
- * schema-shaped object from the buffered reasoning text (`recoverNotesImportJson`)
- * before giving up — the answer was complete, just on the wrong channel.
+ * On OpenRouter, some ZDR hosts misroute the final JSON into the reasoning
+ * channel and return a blank completion; the object is then recovered from
+ * the reasoning text (`recoverNotesImportJson`).
  */
 export const runNotesImportModel = async ({
-  apiKey,
-  config,
+  adapter,
   notesText,
   context,
   refinement,
   abortSignal,
   onProgress,
 }: RunModelArgs): Promise<RunModelOutput> => {
-  const openrouter = createOpenRouter({ apiKey })
-
   onProgress?.({ kind: 'phase', phase: 'starting' })
 
-  const result = streamText({
-    model: openrouter(config.model),
-    output: Output.object({
-      schema: jsonSchema<NotesImportResult>(
-        NOTES_IMPORT_SCHEMA as unknown as JSONSchema7
-      ),
-      name: 'NotesImport',
-      description:
+  let sawText = false
+  let lastTickAt = 0
+  const out = await streamStructuredObject<NotesImportResult>(
+    adapter,
+    {
+      system: [
+        { text: NOTES_IMPORT_INSTRUCTIONS, cache: 'stable' },
+        { text: buildNotesImportContext(context), cache: 'session' },
+      ],
+      user: buildUserBlocks(notesText, refinement),
+      schema: NOTES_IMPORT_SCHEMA as unknown as JSONSchema7,
+      schemaName: 'NotesImport',
+      schemaDescription:
         'Structured WitnessWork records parsed from free-form ministry notes.',
-    }),
-    system: buildNotesImportSystemPrompt(context),
-    prompt: refinement
-      ? buildRefinementPrompt(notesText, refinement)
-      : notesText,
-    temperature: 0,
-    maxOutputTokens: config.maxOutputTokens,
-    maxRetries: 2,
-    abortSignal,
-    providerOptions: {
-      openrouter: {
-        // HARD ZDR INVARIANT (ADR 0008): `zdr: true` + `data_collection: 'deny'`
-        // are global filters OpenRouter applies to every candidate (including
-        // fallbacks), so routing can never reach a data-retaining host. `only`
-        // pins to the vetted Western allowlist (jurisdiction bound); `order`
-        // makes the SAME list a priority sequence, so the preferred host
-        // (Fireworks — verified genuine reasoning) is tried first and a 429/error
-        // falls back to the next Western host (DigitalOcean) WITHOUT escaping the
-        // allowlist. If none can serve, the request errors.
-        provider: {
-          only: config.providers,
-          order: config.providers,
-          data_collection: 'deny',
-          zdr: true,
-          allow_fallbacks: true,
-        },
-        // "Thinking" stream — ON by default (config.reasoningEffort, `xhigh` =
-        // the model's max). If a routed ZDR host's reasoning parser misroutes
-        // the JSON into the reasoning channel (blank completion), the recovery
-        // path below salvages it. See the function-level doc.
-        ...(config.reasoningEffort
-          ? { reasoning: { enabled: true, effort: config.reasoningEffort } }
-          : {}),
+      abortSignal,
+      onEvent: (event) => {
+        if (event.kind === 'reasoning-start') {
+          onProgress?.({ kind: 'phase', phase: 'thinking' })
+        } else if (event.kind === 'reasoning') {
+          onProgress?.({ kind: 'reasoning', text: event.text })
+        } else {
+          if (!sawText) {
+            sawText = true
+            onProgress?.({ kind: 'phase', phase: 'structuring' })
+          }
+          if (event.chars - lastTickAt >= PROGRESS_CHAR_STRIDE) {
+            lastTickAt = event.chars
+            onProgress?.({ kind: 'progress', chars: event.chars })
+          }
+        }
       },
     },
-  })
-
-  // Drain the stream for progress ONLY. Phases fire on first reasoning/text.
-  // `reasoningBuffer` accumulates the raw reasoning text so the recovery path
-  // can salvage the JSON if a buggy provider parser misroutes it there.
-  let chars = 0
-  let lastTickAt = 0
-  let sawText = false
-  let sawReasoning = false
-  let reasoningBuffer = ''
-  for await (const part of result.fullStream) {
-    if (part.type === 'reasoning-start') {
-      if (!sawReasoning) {
-        sawReasoning = true
-        onProgress?.({ kind: 'phase', phase: 'thinking' })
-      }
-    } else if (part.type === 'reasoning-delta') {
-      if (part.text) {
-        reasoningBuffer += part.text
-        onProgress?.({ kind: 'reasoning', text: part.text })
-      }
-    } else if (part.type === 'text-delta') {
-      if (!sawText) {
-        sawText = true
-        onProgress?.({ kind: 'phase', phase: 'structuring' })
-      }
-      chars += part.text.length
-      if (chars - lastTickAt >= PROGRESS_CHAR_STRIDE) {
-        lastTickAt = chars
-        onProgress?.({ kind: 'progress', chars })
-      }
-    }
-  }
-
-  // Usage + routing resolve independently of output parsing — read them first so
-  // we can log reasoning-token spend even when the structured parse needs the
-  // recovery fallback below.
-  const usage = await result.usage
-  const providerMetadata = await result.providerMetadata
-  const resolvedProvider = (
-    providerMetadata?.openrouter as { provider?: string } | undefined
-  )?.provider
-
-  // The authoritative, schema-shaped object. `result.output` rejects on a
-  // non-conforming (or blank) completion — which, with reasoning on, usually
-  // means a buggy provider parser dumped the JSON into the reasoning channel.
-  // Recover it from the reasoning buffer before surfacing the failure.
-  let object: NotesImportResult
-  let recovered = false
-  try {
-    object = await result.output
-  } catch (err) {
-    const salvaged = recoverNotesImportJson(reasoningBuffer)
-    if (!salvaged) throw err
-    object = salvaged
-    recovered = true
-  }
-
-  console.log(
-    `notes-import model resolved provider=${resolvedProvider ?? 'unknown'} ` +
-      `reasoningTokens=${usage.reasoningTokens ?? 0} ` +
-      `outputTokens=${usage.outputTokens ?? 0}` +
-      (recovered ? ' recovered=reasoning-channel' : '')
+    { recover: recoverNotesImportJson }
   )
 
-  return { result: object, usage, resolvedProvider }
+  const { usage } = out
+  console.log(
+    `notes-import model provider=${out.provider} model=${out.model} ` +
+      `host=${out.host ?? 'unknown'} ` +
+      `inputTokens=${usage.inputTokens} cacheReadTokens=${usage.cacheReadTokens} ` +
+      `cacheWriteTokens=${usage.cacheWriteTokens} ` +
+      `outputTokens=${usage.outputTokens} reasoningTokens=${usage.reasoningTokens}` +
+      (out.recovered ? ' recovered=reasoning-channel' : '')
+  )
+
+  return {
+    result: out.output,
+    usage,
+    provider: out.provider,
+    model: out.model,
+    resolvedProvider: out.host,
+  }
 }
 
 /**

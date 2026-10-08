@@ -16,7 +16,7 @@ This directory is the maintained source for verifying ww-api's user-facing behav
 - Treat every command as literal. Keep paths, headers, and JSON unchanged.
 - Signed Buddies ops go through `pnpm test:e2e` (helpers in `src/test/e2e.ts`), not hand-built curl.
 - Restore any KV switch you flip (`node scripts/verify/dev.mjs kv delete <key>`) before the next recipe.
-- Never call `POST /notes-import/kickoff` with the bypass unless `WW_API_E2E_ALLOW_PAID=1` is part of the task. It spends OpenRouter credits.
+- Never call `POST /notes-import/kickoff` with the bypass unless `WW_API_E2E_ALLOW_PAID=1` is part of the task. It spends model credits (Claude Platform or OpenRouter, per the `notes-import-claude` flag).
 
 ## Proof and skip reporting
 

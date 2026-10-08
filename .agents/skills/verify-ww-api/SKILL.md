@@ -117,11 +117,12 @@ Only names are listed here; never print values.
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `OPENROUTER_API_KEY` | real provider health and the paid kickoff | unset; the status probe fails open |
+| `ANTHROPIC_API_KEY` | the paid kickoff on Claude when the `notes-import-claude` PostHog flag is on | unset; runs use OpenRouter |
 | `REVENUECAT_API_KEY` | Supporter lookups during a paid kickoff | unset |
-| `WW_API_E2E_ALLOW_PAID=1` | opt-in to one real Notes Import kickoff (OpenRouter spend) | off |
+| `WW_API_E2E_ALLOW_PAID=1` | opt-in to one real Notes Import kickoff (Claude or OpenRouter spend) | off |
 | `WW_API_URL`, `WW_API_DEV_BYPASS_TOKEN`, `WW_API_ADMIN_TOKEN` | point e2e at another worker | from `.verify/state.json` |
 
-- Optional keys come from the process env or `up --secrets-from <env file>`. Only the five allowlisted names are read: HERE, OpenRouter, RevenueCat, the Apple team id, and `FCM_SERVICE_ACCOUNT_JSON`.
+- Optional keys come from the process env or `up --secrets-from <env file>`. Only the six allowlisted names are read: HERE, OpenRouter, Anthropic, RevenueCat, the Apple team id, and `FCM_SERVICE_ACCOUNT_JSON`.
 - Unlike APNs (HTTP/2 only, so not from `wrangler dev`), FCM works locally: with `FCM_SERVICE_ACCOUNT_JSON` set, the local relay really sends Buddies alerts to Android emulators with Google Play services. Write the key on one line (`printf 'FCM_SERVICE_ACCOUNT_JSON=%s\n' "$(op document get <id> --vault Agents | jq -c .)" > fcm.env`, mode 600, outside the repo) and pass `--secrets-from fcm.env`; JSON values are written single-quoted to the vars file so dotenv keeps them intact.
 - `SENTRY_DSN` and the APNs keys are never passed, so local fuzzing can't reach Sentry or Apple.
 - CI needs no secrets: `wrangler dev --local` runs without Cloudflare credentials.

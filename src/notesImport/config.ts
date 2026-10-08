@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { Environment } from '../types'
+import type { AnthropicEffort, AnthropicInferenceGeo } from '../llm'
 
 /**
  * Environment-only Notes Import controls (model/provider, abuse ceilings,
@@ -75,6 +76,31 @@ export interface NotesImportConfig {
    * recovers that JSON from the reasoning buffer, so reasoning stays on.
    */
   reasoningEffort: ReasoningEffort
+  /**
+   * Claude Platform settings, used when the `notes-import-claude` PostHog flag
+   * is on for the run (see `provider.ts`).
+   */
+  anthropic: AnthropicNotesImportConfig
+}
+
+export interface AnthropicNotesImportConfig {
+  /** Default `claude-haiku-5-5`. */
+  model: string
+  /**
+   * Default `medium` (Haiku 5.5's API default, its recommended start). Effort
+   * steers adaptive thinking, and thinking is billed as output.
+   */
+  effort: AnthropicEffort
+  /**
+   * Default `us`: keeps inference in US infrastructure (the Western
+   * jurisdiction bound of ADR 0008) at 1.1× the token price.
+   */
+  inferenceGeo: AnthropicInferenceGeo
+  /**
+   * Thinking counts toward this cap, so it sits above the OpenRouter one; a
+   * cut-off answer fails to parse. Default 32000.
+   */
+  maxOutputTokens: number
 }
 
 const DEFAULTS = {
@@ -96,6 +122,12 @@ const DEFAULTS = {
   // `xhigh` = the model's max ("Think Max") on OpenRouter. See the
   // NotesImportConfig.reasoningEffort doc above (and why `max` is NOT used).
   reasoningEffort: 'xhigh' as ReasoningEffort,
+  anthropic: {
+    model: 'claude-haiku-5-5',
+    effort: 'medium' as AnthropicEffort,
+    inferenceGeo: 'us' as AnthropicInferenceGeo,
+    maxOutputTokens: 32_000,
+  },
 } as const
 
 export interface NotesImportLimits {
@@ -153,6 +185,24 @@ const reasoningOr = (
   if (v === '' || v === 'off' || v === 'none') return null
   if (v === 'max') return 'xhigh'
   return REASONING_EFFORTS.has(v) ? (v as ReasoningEffort) : fallback
+}
+
+const ANTHROPIC_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+
+const anthropicEffortOr = (
+  raw: string | undefined,
+  fallback: AnthropicEffort
+): AnthropicEffort => {
+  const v = raw?.trim().toLowerCase()
+  return v && ANTHROPIC_EFFORTS.has(v) ? (v as AnthropicEffort) : fallback
+}
+
+const inferenceGeoOr = (
+  raw: string | undefined,
+  fallback: AnthropicInferenceGeo
+): AnthropicInferenceGeo => {
+  const v = raw?.trim().toLowerCase()
+  return v === 'us' || v === 'global' ? v : fallback
 }
 
 const intOr = (raw: string | undefined, fallback: number): number => {
@@ -455,4 +505,20 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
     env.NOTES_IMPORT_REASONING_EFFORT,
     DEFAULTS.reasoningEffort
   ),
+  anthropic: {
+    model:
+      env.NOTES_IMPORT_ANTHROPIC_MODEL?.trim() || DEFAULTS.anthropic.model,
+    effort: anthropicEffortOr(
+      env.NOTES_IMPORT_ANTHROPIC_EFFORT,
+      DEFAULTS.anthropic.effort
+    ),
+    inferenceGeo: inferenceGeoOr(
+      env.NOTES_IMPORT_ANTHROPIC_INFERENCE_GEO,
+      DEFAULTS.anthropic.inferenceGeo
+    ),
+    maxOutputTokens: intOr(
+      env.NOTES_IMPORT_ANTHROPIC_MAX_OUTPUT_TOKENS,
+      DEFAULTS.anthropic.maxOutputTokens
+    ),
+  },
 })

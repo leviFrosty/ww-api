@@ -14,6 +14,7 @@ import {
 import { isSupporter, RevenueCatError } from '../revenuecat'
 import type { CreditDecision, CreditsSnapshot } from '../credits'
 import { runNotesImportModel } from './llm'
+import { resolveNotesImportAdapter } from './provider'
 import { getNotesImportStatus } from './status'
 import { getPublicNotesImportStatus } from './publicStatus'
 import {
@@ -1394,8 +1395,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     let output
     try {
       output = await runNotesImportModel({
-        apiKey: ctx.env.OPENROUTER_API_KEY,
-        config,
+        adapter: await resolveNotesImportAdapter(ctx.env, config, meterId),
         notesText,
         context: body.context,
         refinement: body.refinement,
@@ -1452,7 +1452,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
         result: output.result,
         credits,
         emptyCharged,
-        model: config.model,
+        model: output.model,
         provider: output.resolvedProvider,
         usage: output.usage,
       })

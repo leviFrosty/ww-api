@@ -306,6 +306,8 @@ describe('NotesImportRun analytics', () => {
         visits: [{ date: '2026-07-01', isBibleStudy: false }],
       },
       usage: { inputTokens: 900, outputTokens: 300, reasoningTokens: 120 },
+      provider: 'anthropic',
+      model: 'claude-haiku-5-5',
       resolvedProvider: 'fireworks',
     })
     const recordUsage = vi.fn(async () => ({ credits: CREDITS, emptyCharged: false }))
@@ -325,6 +327,8 @@ describe('NotesImportRun analytics', () => {
       time_entries: 0,
       publisher_detected: false,
       imports_remaining: 4,
+      // The model that served the run, not the configured OpenRouter default.
+      model: 'claude-haiku-5-5',
       provider: 'fireworks',
       input_tokens: 900,
       output_tokens: 300,
