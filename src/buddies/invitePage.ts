@@ -13,6 +13,8 @@ import type { AppContext } from '../types'
 
 const SITE_ORIGIN = 'https://ww-proxy.leviwilkerson.com'
 const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
+const GOOGLE_PLAY_URL =
+  'https://play.google.com/store/apps/details?id=com.leviwilkerson.jwtime'
 const OG_IMAGE_URL = `${SITE_ORIGIN}/assets/og-image.png`
 const ICON_PATH = '/assets/apple-touch-icon.png'
 const OG_TITLE = 'A WitnessWork buddy invite'
@@ -112,6 +114,8 @@ const PAGE_HTML = `<!doctype html>
       font-size: 1rem;
       cursor: pointer;
     }
+    .stores { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; margin-bottom: 1.25rem; }
+    .stores .btn { width: 100%; max-width: 16rem; box-sizing: border-box; }
     .btn.secondary { background: #F0F0F0; color: #003D46; margin-top: 0.75rem; }
     .status { min-height: 1.25rem; margin: 0.75rem 0 0; font-size: 0.85rem; }
   </style>
@@ -120,8 +124,11 @@ const PAGE_HTML = `<!doctype html>
   <main class="card">
     <img class="icon" src="${ICON_PATH}" alt="WitnessWork" width="88" height="88">
     <h1>Open this invite in WitnessWork</h1>
-    <p>Install WitnessWork from the App Store. After installing, tap the invite link again to open it in the app.</p>
-    <a class="btn" href="${APP_STORE_URL}">Get WitnessWork</a>
+    <p>Install WitnessWork from the App Store or Google Play. After installing, tap the invite link again to open it in the app.</p>
+    <div class="stores">
+      <a class="btn" href="${APP_STORE_URL}">Get it on the App Store</a>
+      <a class="btn" href="${GOOGLE_PLAY_URL}">Get it on Google Play</a>
+    </div>
     <div><button id="copy" class="btn secondary" type="button" hidden>Copy invite link</button></div>
     <p id="copy-status" class="status" role="status"></p>
     <p>Already have the app? Copy the invite link and paste it in WitnessWork.</p>

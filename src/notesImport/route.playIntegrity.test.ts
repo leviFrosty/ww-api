@@ -16,7 +16,7 @@ import { createNamespace } from '../test/durableObjects'
 import { createTestServiceAccount } from '../test/googleServiceAccount'
 import type { AppContext, Environment } from '../types'
 import { PlayIntegrityChallenges } from '../playIntegrity/challengeDO'
-import { resetGoogleAuthState } from '../playIntegrity/googleAuth'
+import { resetGoogleAuthState } from '../googleAuth'
 import { computePlayIntegrityRequestBinding } from '../playIntegrity/protocol'
 import { getNotesImportStatus, type StatusKv } from './status'
 import {

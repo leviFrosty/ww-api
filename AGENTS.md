@@ -209,7 +209,10 @@ its existing sampling configuration.
 `POST /buddies/v1/{op}` is the Buddies relay, built to the wire contract in
 [`docs/buddies-protocol.md`](docs/buddies-protocol.md) (the witness-work repo
 holds the canonical copy). Code lives in `src/buddies/`. `GET /b` is the
-no-app fallback page for invite links, and the AASA matches `/b#1…`.
+no-app fallback page for invite links (App Store and Google Play buttons), the
+AASA matches `/b#1…`, and `public/.well-known/assetlinks.json` verifies the
+whole host, `/b` included, for Android App Links. Clients are iOS and Android
+(witness-work ADR 0020).
 
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
@@ -241,20 +244,34 @@ no-app fallback page for invite links, and the AASA matches `/b#1…`.
   - Only requests that take effect record a nonce, so refused ones add no
     rows; replay protection is unchanged.
 - **Secrets** (per environment): `APNS_KEY_ID` and `APNS_PRIVATE_KEY` (the
-  `.p8` PEM). `APPLE_TEAM_ID` is the JWT issuer and `IOS_BUNDLE_ID` the APNs
-  topic. Without the two APNs secrets the relay still works but skips pushes,
-  logging once per isolate.
+  `.p8` PEM). `APPLE_TEAM_ID` is the JWT issuer and `IOS_BUNDLE_ID` the
+  default APNs topic (a device may register `apnsTopic`, any of
+  `IOS_BUNDLE_ID` or `IOS_ADDITIONAL_BUNDLE_IDS`). `FCM_SERVICE_ACCOUNT_JSON`
+  is the key of `buddies-fcm-sender@turing-striker-403102`, whose custom role
+  `fcmSender` holds only `cloudmessaging.messages.create`; its `project_id` is
+  the Firebase project. A copy is in the 1Password Agents vault ("Buddies FCM
+  sender service account key (ww-api)"). Without the APNs secrets or the FCM
+  key the relay still works but skips that service's pushes, logging once per
+  isolate.
 - **Kill switch**: KV `buddies:enabled` in `NOTES_KV`. `"true"` enables, any
   other value disables, and an absent key falls back to `BUDDIES_ENABLED`. The
   read is edge-cached for 60 seconds. `inbox/delete`, `slot/remove`, and
   `slot/leave` work even when disabled.
-- **Push**: `src/apns.ts` is the feature-neutral APNs sender (provider token
-  cached in KV `apns:provider-token`, one outcome per notification, one
+- **Push**: each device registers `pushService` `apns` (iOS; the default) or
+  `fcm` (Android), stored in the inbox's `push_device` table (inboxes from
+  before FCM move their `device` rows there on first use). `src/apns.ts` is
+  the feature-neutral APNs sender (provider token cached in KV
+  `apns:provider-token`, per-device topic, one outcome per notification, one
   retry for network errors, 429, 5xx, and rejected provider tokens).
-  `src/buddies/push.ts` builds the Buddies payload and deletes unregistered
-  devices. Other features should build on `sendApnsNotifications`, not on the
-  Buddies layer. Alerts carry `content-available: 1` so iOS can wake the app
-  to sync. Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
+  `src/fcm.ts` is its FCM HTTP v1 counterpart (OAuth token from
+  `src/googleAuth.ts`, cached per isolate; one retry for network errors, 429,
+  5xx, and a rejected token). `src/buddies/push.ts` builds both payloads,
+  routes each device to its service, and deletes devices either reports as
+  unregistered. Other features should build on `sendApnsNotifications` and
+  `sendFcmNotifications`, not on the Buddies layer. APNs alerts carry
+  `content-available: 1` so iOS can wake the app to sync; FCM messages are
+  data-only and high priority, so expo-notifications shows them and runs the
+  app's background sync task. Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
   skip the 60 s per-slot spacing but still count toward the daily cap.
 - **Live socket**: `GET /buddies/v1/inbox/live` upgrades to a WebSocket. The
   owner-signed envelope (op `inbox/live`) rides in the `x-buddies-p` and
@@ -266,24 +283,31 @@ no-app fallback page for invite links, and the AASA matches `/b#1…`.
   the frame itself arrives at once.
 - **Privacy**: every id travels in the body (for the live socket, in headers;
   never the URL). Never log or report bodies, headers, blobs,
-  ids, or tokens. APNs requests use the `fetch` captured before Sentry wraps
-  the global, so device tokens in APNs URLs stay out of Sentry spans. The dev
-  worker's 100% Workers traces do record subrequest URLs, APNs included.
+  ids, or tokens. APNs and FCM requests use the `fetch` captured before
+  Sentry wraps the global, so device tokens in APNs URLs stay out of Sentry
+  spans (FCM tokens travel only in request bodies). The dev worker's 100%
+  Workers traces do record subrequest URLs, APNs included.
 - **Not yet built** (required before any production rollout): App Attest on
-  `inbox/register` and `invite/*` (`attest` is accepted and ignored), and
-  Notification Service Extension payloads.
+  `inbox/register` and `invite/*` (`attest` is accepted and ignored; Android
+  will use Play Integrity), and Notification Service Extension payloads. The
+  protocol's durable push outbox (retries for 6 h, outcome history, `seq` in
+  alerts, deferred instead of dropped alerts inside the 60 s spacing,
+  `apns-collapse-id`/`apns-expiration`) is specified but not built either;
+  today each push gets one immediate attempt plus one retry.
 
 Dev deploy (first time):
 
 ```bash
 wrangler secret put APNS_KEY_ID --env dev
 wrangler secret put APNS_PRIVATE_KEY --env dev < AuthKey_XXXXXXXXXX.p8
+# Android (FCM): one line of JSON from the 1Password item above.
+jq -c . buddies-fcm-sender.json | wrangler secret put FCM_SERVICE_ACCOUNT_JSON --env dev
 pnpm run deploy:dev   # applies the v3 migration to ww-proxy-dev
 # Optional; dev is already on via BUDDIES_ENABLED:
 wrangler kv key put --binding NOTES_KV buddies:enabled true --env dev
 ```
 
-Production takes the same two secrets without `--env dev`, and the `v3`
+Production takes the same three secrets without `--env dev`, and the `v3`
 migration applies on the next `pnpm run deploy`. Buddies stays off there
 (`BUDDIES_ENABLED = "false"`) until the KV key flips it. The AASA `/b` entry
 only goes live with a prod deploy. iOS caches the AASA, so ship it at least one

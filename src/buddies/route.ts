@@ -36,8 +36,8 @@ import {
   buddiesCallerKey,
   logLimitHit,
 } from './limits'
-import { defaultApnsDependencies, type ApnsDependencies } from '../apns'
-import { deliverPushJob } from './push'
+import { defaultApnsDependencies } from '../apns'
+import { deliverPushJob, type PushDependencies } from './push'
 
 /**
  * `POST /buddies/v1/{op}` — the Buddies relay (docs/buddies-protocol.md) —
@@ -54,7 +54,8 @@ import { deliverPushJob } from './push'
  */
 
 export interface BuddiesRouteDependencies {
-  apns: ApnsDependencies
+  /** APNs, FCM, and Google OAuth requests. */
+  push: PushDependencies
 }
 
 interface OpOutcome {
@@ -271,7 +272,7 @@ const handleBuddiesOp = async (
       return errorResponse(c, result.error, result.retryAfterSeconds)
 
     const { body, push } = result.value
-    if (push) c.executionCtx.waitUntil(deliverPushJob(c.env, push, deps.apns))
+    if (push) c.executionCtx.waitUntil(deliverPushJob(c.env, push, deps.push))
     return c.json({ ok: true, ...body })
   } catch (error) {
     // Report the failure, never the request: bodies hold ids, keys, and blobs.
@@ -310,7 +311,7 @@ const handleLive = async (c: AppContext): Promise<Response> => {
 
 /** Mounted at `/buddies/v1` by the Worker entry point. */
 export const createBuddiesRoutes = (
-  deps: BuddiesRouteDependencies = { apns: defaultApnsDependencies }
+  deps: BuddiesRouteDependencies = { push: defaultApnsDependencies }
 ) => {
   const routes = new Hono<{ Bindings: Environment }>()
   for (const op of BUDDIES_OPS) {

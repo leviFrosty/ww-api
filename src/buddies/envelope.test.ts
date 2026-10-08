@@ -7,6 +7,7 @@ import {
   verifyBuddiesSignature,
 } from './envelope'
 import { SigningKey } from '../test/buddiesClient'
+import { decodeSignature } from './contracts'
 
 const encoder = new TextEncoder()
 const b64u = (value: string | Uint8Array) =>
@@ -192,5 +193,50 @@ describe('readEnvelopeText', () => {
     expect(
       await readEnvelopeText(post(Uint8Array.from([0xff, 0xfe])))
     ).toBeNull()
+  })
+})
+
+/**
+ * The signed envelope from witness-work's known-answer file
+ * (`src/features/buddies/lib/testing/cryptoVectors.json`), which iOS and
+ * Android check in Hermes. The relay's WebCrypto Ed25519 must accept the same
+ * bytes the app's @noble/curves signs.
+ */
+const APP_VECTOR = {
+  ownerPub: '7t2mzSpEmIL4M3gHXGI6QFBwOHGfRDLqBFDBwyHUtC4',
+  p: 'eyJpbmJveElkIjoiUnZtMFBaZFE1Zmd2S0o2Rmh3NlFGZyIsInNpbmNlIjowLCJ0cyI6MTc5MDAwMDAwMDAwMCwibm9uY2UiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIn0',
+  s: 'wl2pW8fUMeHta-zGsMLa5-dE-mNnRU5EUcxLKH2PcVmPWxL0C4twSlC-IpBqQI-vCg9J3cxvbrqR6z78VcKXDg',
+}
+
+describe('app crypto vectors', () => {
+  it("verifies the app's known-answer owner envelope", async () => {
+    const envelope = parseEnvelope(
+      JSON.stringify({ p: APP_VECTOR.p, s: APP_VECTOR.s })
+    )
+    expect(envelope?.payload).toEqual({
+      inboxId: 'Rvm0PZdQ5fgvKJ6Fhw6QFg',
+      since: 0,
+      ts: 1790000000000,
+      nonce: 'AAAAAAAAAAAAAAAAAAAAAA',
+    })
+    const signature = decodeSignature(envelope?.signature)
+    expect(signature).not.toBeNull()
+    await expect(
+      verifyBuddiesSignature(
+        APP_VECTOR.ownerPub,
+        'inbox/sync',
+        envelope!.payloadBytes,
+        signature!
+      )
+    ).resolves.toBe(true)
+    // The same bytes under another op don't verify.
+    await expect(
+      verifyBuddiesSignature(
+        APP_VECTOR.ownerPub,
+        'inbox/delete',
+        envelope!.payloadBytes,
+        signature!
+      )
+    ).resolves.toBe(false)
   })
 })

@@ -2,7 +2,7 @@ import type { Environment } from '../types'
 import { playIntegrityConfig, type PlayIntegrityEnv } from './config'
 import { decodeIntegrityToken } from './decode'
 import { PlayIntegrityError } from './errors'
-import { getPlayIntegrityAccessToken, GoogleAuthError } from './googleAuth'
+import { getPlayIntegrityAccessToken, GoogleAuthError } from '../googleAuth'
 import {
   PLAY_INTEGRITY_PROTOCOL_VERSION,
   PLAY_INTEGRITY_PROVIDER,

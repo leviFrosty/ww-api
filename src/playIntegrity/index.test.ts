@@ -15,7 +15,7 @@ import { createNamespace } from '../test/durableObjects'
 import { createTestServiceAccount } from '../test/googleServiceAccount'
 import type { Environment } from '../types'
 import { PlayIntegrityChallenges } from './challengeDO'
-import { resetGoogleAuthState } from './googleAuth'
+import { resetGoogleAuthState } from '../googleAuth'
 import {
   PlayIntegrityError,
   issuePlayIntegrityChallenge,

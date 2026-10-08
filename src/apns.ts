@@ -57,6 +57,8 @@ export const defaultApnsDependencies: ApnsDependencies = {
 export interface ApnsDevice {
   token: string
   environment: ApnsEnvironment
+  /** The app's bundle id; `IOS_BUNDLE_ID` when absent. */
+  topic?: string
 }
 
 /** One alert to one device. `payload` is the full APNs JSON body (`aps` + custom keys). */
@@ -268,7 +270,7 @@ const send = async (
         method: 'POST',
         headers: {
           authorization: `bearer ${token}`,
-          'apns-topic': config.topic,
+          'apns-topic': device.topic ?? config.topic,
           'apns-push-type': 'alert',
           'apns-collapse-id': collapseId,
           'content-type': 'application/json',

@@ -121,7 +121,8 @@ Only names are listed here; never print values.
 | `WW_API_E2E_ALLOW_PAID=1` | opt-in to one real Notes Import kickoff (OpenRouter spend) | off |
 | `WW_API_URL`, `WW_API_DEV_BYPASS_TOKEN`, `WW_API_ADMIN_TOKEN` | point e2e at another worker | from `.verify/state.json` |
 
-- Optional keys come from the process env or `up --secrets-from <env file>`. Only the four allowlisted names are read: HERE, OpenRouter, RevenueCat, and the Apple team id.
+- Optional keys come from the process env or `up --secrets-from <env file>`. Only the five allowlisted names are read: HERE, OpenRouter, RevenueCat, the Apple team id, and `FCM_SERVICE_ACCOUNT_JSON`.
+- Unlike APNs (HTTP/2 only, so not from `wrangler dev`), FCM works locally: with `FCM_SERVICE_ACCOUNT_JSON` set, the local relay really sends Buddies alerts to Android emulators with Google Play services. Write the key on one line (`printf 'FCM_SERVICE_ACCOUNT_JSON=%s\n' "$(op document get <id> --vault Agents | jq -c .)" > fcm.env`, mode 600, outside the repo) and pass `--secrets-from fcm.env`; JSON values are written single-quoted to the vars file so dotenv keeps them intact.
 - `SENTRY_DSN` and the APNs keys are never passed, so local fuzzing can't reach Sentry or Apple.
 - CI needs no secrets: `wrangler dev --local` runs without Cloudflare credentials.
 

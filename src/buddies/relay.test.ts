@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  BETA_BUNDLE_ID,
   DAY_MS,
+  FCM_SEND_URL,
   Owner,
+  fcmToken,
+  hexToken,
   SigningKey,
   b64u,
   blobOfSize,
@@ -383,6 +387,148 @@ describe('events and pushes', () => {
     })
   })
 
+  it('pushes Android devices through FCM and iPhones through APNs', async () => {
+    const owner = await Owner.create(h)
+    const pixel = fcmToken()
+    expect(
+      (
+        await owner.registerFcmDevice(
+          randomId(),
+          { 'plan.invite': { title: 'Plans', body: 'An invitation' } },
+          pixel
+        )
+      ).body
+    ).toEqual({ ok: true })
+    await owner.registerDevice(randomId(), {
+      'plan.invite': { title: 'Plans', body: 'An invitation' },
+    })
+    const buddy = await owner.addWriter()
+
+    await buddy.putEvent({ kind: 'plan.invite', push: true })
+    await h.flush()
+
+    expect(h.pushes).toHaveLength(2)
+    const fcm = h.pushes.find((push) => push.url === FCM_SEND_URL)
+    expect(fcm?.body).toEqual({
+      message: {
+        token: pixel,
+        data: {
+          title: 'Plans',
+          message: 'An invitation',
+          body: JSON.stringify({ ww: { kind: 'plan.invite' } }),
+          channelId: 'buddies',
+        },
+        android: { priority: 'HIGH', ttl: '86400s' },
+      },
+    })
+    expect(
+      h.pushes.filter((push) => push.url.includes('push.apple.com'))
+    ).toHaveLength(1)
+  })
+
+  it('drops an Android device FCM reports as unregistered', async () => {
+    const owner = await Owner.create(h)
+    const stale = fcmToken()
+    await owner.registerFcmDevice(randomId(), undefined, stale)
+    await owner.registerFcmDevice()
+    h.fcmResponse = (push) =>
+      (push.body as { message: { token: string } }).message.token === stale
+        ? Response.json(
+            { error: { details: [{ errorCode: 'UNREGISTERED' }] } },
+            { status: 404 }
+          )
+        : Response.json({ name: 'projects/p/messages/1' })
+    const buddy = await owner.addWriter()
+
+    await buddy.putEvent({ kind: 'pair.confirmed', push: true })
+    await h.flush()
+
+    const rows = h.inboxes
+      .storage(owner.inboxId)
+      .query('SELECT service, token FROM push_device')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].service).toBe('fcm')
+    expect(rows[0].token).not.toBe(stale)
+  })
+
+  it('sends each iPhone with its registered APNs topic, refusing ones this worker can’t sign for', async () => {
+    const owner = await Owner.create(h)
+    const beta = hexToken(32)
+    expect(
+      (
+        await owner.registerDevice(randomId(), undefined, beta, 'production', {
+          apnsTopic: BETA_BUNDLE_ID,
+        })
+      ).body
+    ).toEqual({ ok: true })
+    const plain = hexToken(32)
+    await owner.registerDevice(randomId(), undefined, plain)
+    expect(
+      await owner.registerDevice(randomId(), undefined, hexToken(32), 'sandbox', {
+        apnsTopic: 'com.example.other',
+      })
+    ).toEqual({ status: 400, body: { error: 'bad_request' } })
+    const buddy = await owner.addWriter()
+
+    await buddy.putEvent({ kind: 'pair.confirmed', push: true })
+    await h.flush()
+
+    const topics = Object.fromEntries(
+      h.pushes.map((push) => [
+        push.url.split('/').pop(),
+        push.headers['apns-topic'],
+      ])
+    )
+    expect(topics).toEqual({
+      [beta]: BETA_BUNDLE_ID,
+      [plain]: 'com.leviwilkerson.jwtimedev',
+    })
+  })
+
+  it('moves devices registered before FCM into the new table, keeping them pushable', async () => {
+    const owner = await Owner.create(h)
+    const storage = h.inboxes.storage(owner.inboxId)
+    const sql = storage.state.storage.sql
+    const legacyToken = hexToken(32)
+    // An inbox as builds before FCM left it.
+    sql.exec('DROP TABLE push_device')
+    sql.exec(
+      `CREATE TABLE device (
+         device_id        TEXT PRIMARY KEY,
+         apns_token       TEXT NOT NULL,
+         apns_environment TEXT NOT NULL,
+         templates        TEXT NOT NULL,
+         created_at       INTEGER NOT NULL,
+         updated_at       INTEGER NOT NULL
+       )`
+    )
+    const legacyId = randomId()
+    sql.exec(
+      'INSERT INTO device VALUES (?, ?, ?, ?, ?, ?)',
+      legacyId,
+      legacyToken,
+      'production',
+      JSON.stringify({ 'pair.confirmed': { title: 'T', body: 'B' } }),
+      START,
+      START
+    )
+    h.inboxes.restart(owner.inboxId)
+
+    const buddy = await owner.addWriter()
+    await buddy.putEvent({ kind: 'pair.confirmed', push: true })
+    await h.flush()
+
+    expect(h.pushes.map((push) => push.url)).toEqual([
+      `https://api.push.apple.com/3/device/${legacyToken}`,
+    ])
+    expect(storage.tables()).not.toContain('device')
+    expect(
+      storage.query(
+        'SELECT device_id AS id, service, apns_environment AS env, apns_topic AS topic FROM push_device'
+      )
+    ).toEqual([{ id: legacyId, service: 'apns', env: 'production', topic: null }])
+  })
+
   it('stores but does not push events with push: false', async () => {
     const owner = await Owner.create(h)
     await owner.registerDevice()
@@ -662,7 +808,7 @@ describe('caps and rate limits', () => {
     }
     const devices = h.inboxes
       .storage(owner.inboxId)
-      .query('SELECT device_id AS id FROM device ORDER BY updated_at')
+      .query('SELECT device_id AS id FROM push_device ORDER BY updated_at')
       .map((row) => row.id)
     expect(devices).toEqual(ids.slice(1))
 
@@ -671,7 +817,7 @@ describe('caps and rate limits', () => {
     await owner.registerDevice(randomId())
     const after = h.inboxes
       .storage(owner.inboxId)
-      .query('SELECT device_id AS id FROM device')
+      .query('SELECT device_id AS id FROM push_device')
       .map((row) => row.id)
     expect(after).toHaveLength(10)
     expect(after).toContain(ids[1])
@@ -684,7 +830,7 @@ describe('caps and rate limits', () => {
     const reinstalled = randomId()
     await owner.registerDevice(reinstalled, undefined, 'ab'.repeat(32))
     const storage = h.inboxes.storage(owner.inboxId)
-    expect(storage.query('SELECT device_id AS id FROM device')).toEqual([
+    expect(storage.query('SELECT device_id AS id FROM push_device')).toEqual([
       { id: reinstalled },
     ])
 
@@ -698,7 +844,7 @@ describe('caps and rate limits', () => {
     ).toEqual({
       ok: true,
     })
-    expect(storage.query('SELECT device_id FROM device')).toEqual([])
+    expect(storage.query('SELECT device_id FROM push_device')).toEqual([])
   })
 
   it('rate-limits unsigned ops by client IP', async () => {

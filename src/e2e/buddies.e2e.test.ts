@@ -71,6 +71,18 @@ describe('pairing happy path', () => {
     })
     expect(device.body).toEqual({ ok: true })
 
+    // Maria's phone is Android: FCM instead of APNs (skipped locally without
+    // the FCM key, like APNs).
+    const android = await maria.send('device/register', {
+      deviceId: randomId(),
+      pushService: 'fcm',
+      fcmToken: `${randomId()}:APA91b${b64u(randomBytes(96))}`,
+      templates: {
+        'pair.confirmed': { title: 'New buddy', body: 'You are now buddies' },
+      },
+    })
+    expect(android.body).toEqual({ ok: true })
+
     // 3. Levi creates an invite.
     const invite = await inviteSecrets()
     const inviteCard = blobOfSize(256)
