@@ -53,6 +53,29 @@ import {
 } from './contracts'
 import type { NotesImportSuccess } from './events'
 import { resolveTerminalSupporter } from './settlement'
+import {
+  analyticsDistinctId,
+  analyticsEnabled,
+  captureAnalyticsEvent,
+  type AnalyticsEvent,
+} from '../analytics'
+import {
+  notesImportFinishedEvent,
+  notesImportLimitReachedEvent,
+  notesImportStartedEvent,
+  type NotesImportAnalyticsContext,
+} from './analytics'
+
+/** Send a usage event after the response, without delaying it. */
+const track = (ctx: AppContext, event: AnalyticsEvent) => {
+  if (!analyticsEnabled(ctx.env)) return
+  const delivery = captureAnalyticsEvent(ctx.env, event)
+  try {
+    ctx.executionCtx.waitUntil(delivery)
+  } catch {
+    // No ExecutionContext (unit tests): the capture still runs unawaited.
+  }
+}
 
 const err = (
   ctx: AppContext,
@@ -641,6 +664,8 @@ interface GateOk {
   isRefinement: boolean
   /** True when the dev-bypass token was used (gates dev-only error detail). */
   devBypass: boolean
+  /** Usage-event context; the caller stamps `startedAt` when a run starts. */
+  analytics: Omit<NotesImportAnalyticsContext, 'startedAt'>
 }
 type GateResult = GateOk | { ok: false; response: Response }
 
@@ -941,11 +966,24 @@ async function authenticateAndGate(
     }
   }
   const supporterConcurrency = supporter || devBypass
+  const isRefinement = !!body.refinement
+  const analytics: GateOk['analytics'] = {
+    distinctId: await analyticsDistinctId(meterId),
+    platform: devBypass
+      ? 'dev'
+      : isPlayIntegrityRequest(record)
+        ? 'android'
+        : 'ios',
+    transport: assertionPurpose == null ? 'legacy' : 'stream',
+    refinement: isRefinement,
+    supporter,
+    hasAccount: accountId != null,
+    notesChars: notesText.length,
+  }
   const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
   const allowances = selectEffectiveAllowances(limits, supporter, devBypass)
   const windowDurationMs = limitsWindowDurationMs(limits)
 
-  const isRefinement = !!body.refinement
   // Pre-flight the credit gate in the per-user index DO (single-threaded →
   // strongly consistent, unlike the old KV read). The commit after a successful
   // run goes through the same DO, so check and charge can't race.
@@ -962,6 +1000,15 @@ async function authenticateAndGate(
     const denial = buildAllowanceDenial(
       checked.decision.reason!,
       checked.credits
+    )
+    track(
+      ctx,
+      notesImportLimitReachedEvent(
+        analytics,
+        checked.decision.reason === 'refinement_limit'
+          ? 'refinements'
+          : 'imports'
+      )
     )
     return {
       ok: false,
@@ -985,6 +1032,7 @@ async function authenticateAndGate(
     decision: checked.decision,
     isRefinement,
     devBypass,
+    analytics,
   }
 }
 
@@ -1048,6 +1096,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     cap
   )
   if (!acquired.ok) {
+    track(ctx, notesImportLimitReachedEvent(gate.analytics, 'active_cap'))
     return err(
       ctx,
       HTTP_STATUS.TOO_MANY_REQUESTS,
@@ -1057,6 +1106,10 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   }
 
   const runId = ctx.env.NOTES_IMPORT_RUN.idFromName(importId)
+  const analytics: NotesImportAnalyticsContext = {
+    ...gate.analytics,
+    startedAt: Date.now(),
+  }
   let outcome
   try {
     outcome = await ctx.env.NOTES_IMPORT_RUN.get(runId).start({
@@ -1069,6 +1122,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       isSupporter: supporter,
       devBypass: gate.devBypass,
       decision,
+      analytics,
     })
   } catch (e) {
     // Couldn't start → release the slot so it isn't leaked.
@@ -1093,6 +1147,10 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   // legitimately consumed) both keep it. release() is idempotent (a DELETE).
   if (outcome === 'terminal') {
     await ctx.env.NOTES_IMPORT_INDEX.get(idxId).release(importId)
+  }
+  // Only a fresh run counts; the run DO reports how it finishes.
+  if (outcome === 'started') {
+    track(ctx, notesImportStartedEvent(analytics, decision))
   }
 
   // Short-lived capability for the stream. App Attest can't sign a long-lived
@@ -1273,6 +1331,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   const slotKey = `legacy:${await deriveImportId(meterId, contentHash, body.refinement)}`
   const acquired = await idx.acquire(slotKey, cap)
   if (!acquired.ok) {
+    track(ctx, notesImportLimitReachedEvent(gate.analytics, 'active_cap'))
     return err(
       ctx,
       HTTP_STATUS.TOO_MANY_REQUESTS,
@@ -1280,6 +1339,12 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       'active_cap'
     )
   }
+
+  const analytics: NotesImportAnalyticsContext = {
+    ...gate.analytics,
+    startedAt: Date.now(),
+  }
+  track(ctx, notesImportStartedEvent(analytics, decision))
 
   try {
     let output
@@ -1294,6 +1359,10 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     } catch (e) {
       Sentry.captureException(e)
       console.error('notes-import model_error', errorDetail(e))
+      track(
+        ctx,
+        notesImportFinishedEvent(analytics, 'model_error', Date.now())
+      )
       return err(
         ctx,
         HTTP_STATUS.BAD_GATEWAY,
@@ -1332,6 +1401,18 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       emptyWindowSeconds: config.emptyWindowSeconds,
       emptyWindowLimit: config.emptyWindowLimit,
     })
+
+    track(
+      ctx,
+      notesImportFinishedEvent(analytics, 'success', Date.now(), {
+        result: output.result,
+        credits,
+        emptyCharged,
+        model: config.model,
+        provider: output.resolvedProvider,
+        usage: output.usage,
+      })
+    )
 
     const response = {
       result: output.result,

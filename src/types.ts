@@ -25,6 +25,15 @@ export interface Environment {
   APPLE_TEAM_ID: string;
   RATE_LIMITER: RateLimit;
 
+  /**
+   * PostHog project token (`phc_…`, write-only ingestion key, not secret) for
+   * anonymous server-side usage events (`src/analytics.ts`). Unset = off.
+   */
+  POSTHOG_PROJECT_TOKEN?: string;
+
+  /** PostHog ingestion host. Default `https://us.i.posthog.com`. */
+  POSTHOG_HOST?: string;
+
   // --- Notes Import ------------------------------------------------------
 
   /**

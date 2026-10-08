@@ -21,6 +21,13 @@ import {
 } from './events'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
 import { resolveTerminalSupporter } from './settlement'
+import { analyticsEnabled, captureAnalyticsEvent } from '../analytics'
+import {
+  notesImportFinishedEvent,
+  type NotesImportAnalyticsContext,
+  type NotesImportOutcome,
+  type NotesImportSuccessDetails,
+} from './analytics'
 
 /**
  * Everything the kickoff handler hands the run DO. All fields are
@@ -46,6 +53,8 @@ export interface StartImportInput {
   /** Authenticated development bypass; overrides usage allowances only. */
   devBypass: boolean
   decision: CreditDecision
+  /** Usage-event context; absent on runs kicked off before analytics shipped. */
+  analytics?: NotesImportAnalyticsContext
 }
 
 export interface RunResultSnapshot {
@@ -232,6 +241,8 @@ export class NotesImportRun extends DurableObject<Environment> {
       try {
         const input = JSON.parse(raw) as StartImportInput
         await this.#releaseSlot(input.uuid, input.importId)
+        // A live run (terminal runs drop their input) ends here unfinished.
+        this.#trackFinished(input, 'cancelled')
       } catch {
         /* malformed input — nothing to release */
       }
@@ -266,6 +277,7 @@ export class NotesImportRun extends DurableObject<Environment> {
         try {
           const input = JSON.parse(raw) as StartImportInput
           await this.#releaseSlot(input.uuid, input.importId)
+          this.#trackFinished(input, 'interrupted')
         } catch {
           /* malformed input — nothing to release */
         }
@@ -365,6 +377,14 @@ export class NotesImportRun extends DurableObject<Environment> {
         console.log(`notes-import[${objectId}] run cancelled before settlement`)
         return
       }
+      this.#trackFinished(input, 'success', {
+        result: out.result,
+        credits: payload.credits,
+        emptyCharged: payload.emptyCharged,
+        model: config.model,
+        provider: out.resolvedProvider,
+        usage: out.usage,
+      })
       console.log(
         `notes-import[${objectId}] run done in ${
           Date.now() - startedAt
@@ -384,6 +404,7 @@ export class NotesImportRun extends DurableObject<Environment> {
           'model_error',
           'The import model could not process these notes'
         )
+        this.#trackFinished(input, 'model_error')
       }
     } finally {
       this.#aborter = null
@@ -444,8 +465,26 @@ export class NotesImportRun extends DurableObject<Environment> {
     // than holding raw notesText until the retention alarm fires.
     this.#metaDel('input')
     this.#emit({ type: 'cancelled' })
-    if (input) await this.#releaseSlot(input.uuid, input.importId)
+    if (input) {
+      await this.#releaseSlot(input.uuid, input.importId)
+      this.#trackFinished(input, 'cancelled')
+    }
     await this.#scheduleCleanup()
+  }
+
+  /** Report how a started run ended. Best-effort; never delays the run. */
+  #trackFinished(
+    input: StartImportInput,
+    outcome: NotesImportOutcome,
+    success?: NotesImportSuccessDetails
+  ): void {
+    if (!input.analytics || !analyticsEnabled(this.env)) return
+    this.ctx.waitUntil(
+      captureAnalyticsEvent(
+        this.env,
+        notesImportFinishedEvent(input.analytics, outcome, Date.now(), success)
+      )
+    )
   }
 
   /**

@@ -6,6 +6,12 @@ import type { StartImportInput } from './runDO'
 const mocks = vi.hoisted(() => ({
   runModel: vi.fn(),
   resolveTerminalSupporter: vi.fn(),
+  capture: vi.fn(async () => undefined),
+}))
+
+vi.mock('../analytics', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../analytics')>()),
+  captureAnalyticsEvent: mocks.capture,
 }))
 
 vi.mock('cloudflare:workers', () => ({
@@ -128,9 +134,13 @@ const fakeContext = (state: FakeRunState): DurableObjectState =>
         state.events = []
       }),
     },
+    waitUntil: vi.fn(),
   }) as unknown as DurableObjectState
 
-const makeRun = async (recordUsage: ReturnType<typeof vi.fn>) => {
+const makeRun = async (
+  recordUsage: ReturnType<typeof vi.fn>,
+  extraEnv: Partial<Environment> = {}
+) => {
   const state: FakeRunState = { meta: new Map(), events: [], alarms: [] }
   const index = {
     recordUsage,
@@ -145,6 +155,7 @@ const makeRun = async (recordUsage: ReturnType<typeof vi.fn>) => {
       idFromName: vi.fn(() => ({ toString: () => 'index-id' })),
       get: vi.fn(() => index),
     },
+    ...extraEnv,
   } as unknown as Environment
   const { NotesImportRun } = await import('./runDO')
   return { run: new NotesImportRun(fakeContext(state), env), state, index }
@@ -258,5 +269,117 @@ describe('NotesImportRun cancellation and destruction settlement', () => {
     expect(run.getResult()).toEqual({ status: null })
     expect(state.meta.size).toBe(0)
     expect(state.events).toEqual([])
+  })
+})
+
+describe('NotesImportRun analytics', () => {
+  const TRACKED = { POSTHOG_PROJECT_TOKEN: 'phc_test' }
+  const ANALYTICS = {
+    distinctId: 'ww_test',
+    platform: 'ios' as const,
+    transport: 'stream' as const,
+    refinement: false,
+    supporter: false,
+    hasAccount: true,
+    notesChars: 5,
+    startedAt: Date.now(),
+  }
+  const TRACKED_INPUT: StartImportInput = { ...INPUT, analytics: ANALYTICS }
+  const finishedEvents = () =>
+    (mocks.capture.mock.calls as unknown as Array<[unknown, { event: string; properties: Record<string, unknown> }]>)
+      .map(([, event]) => event)
+      .filter((event) => event.event === 'api_notes_import_finished')
+
+  it('reports a successful run with structural counts and token usage', async () => {
+    mocks.resolveTerminalSupporter.mockResolvedValue(false)
+    mocks.runModel.mockResolvedValue({
+      result: {
+        ...EMPTY_RESULT,
+        contacts: [{ tempId: 'c1', name: 'Ana' }],
+        visits: [{ date: '2026-07-01', isBibleStudy: false }],
+      },
+      usage: { inputTokens: 900, outputTokens: 300, reasoningTokens: 120 },
+      resolvedProvider: 'fireworks',
+    })
+    const recordUsage = vi.fn(async () => ({ credits: CREDITS, emptyCharged: false }))
+    const { run } = await makeRun(recordUsage, TRACKED)
+    await run.start(TRACKED_INPUT)
+    await run.alarm()
+
+    const events = finishedEvents()
+    expect(events).toHaveLength(1)
+    expect(events[0].properties).toMatchObject({
+      outcome: 'success',
+      platform: 'ios',
+      empty: false,
+      empty_charged: false,
+      contacts: 1,
+      visits: 1,
+      time_entries: 0,
+      publisher_detected: false,
+      imports_remaining: 4,
+      provider: 'fireworks',
+      input_tokens: 900,
+      output_tokens: 300,
+      reasoning_tokens: 120,
+    })
+    expect(events[0].properties.duration_ms).toEqual(expect.any(Number))
+    // Never the notes, the model output's text, or ids.
+    expect(JSON.stringify(events[0])).not.toContain('Ana')
+    expect(JSON.stringify(events[0])).not.toContain('meter-id')
+  })
+
+  it('reports a model error', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    mocks.runModel.mockRejectedValue(new Error('provider down'))
+    const { run } = await makeRun(vi.fn(), TRACKED)
+    await run.start(TRACKED_INPUT)
+    await run.alarm()
+    error.mockRestore()
+
+    expect(finishedEvents().map((e) => e.properties.outcome)).toEqual([
+      'model_error',
+    ])
+  })
+
+  it('reports a cancelled run once', async () => {
+    const refresh = deferred<boolean>()
+    mocks.resolveTerminalSupporter.mockReturnValue(refresh.promise)
+    const { run } = await makeRun(vi.fn(), TRACKED)
+    await run.start(TRACKED_INPUT)
+
+    const alarm = run.alarm()
+    await vi.waitFor(() =>
+      expect(mocks.resolveTerminalSupporter).toHaveBeenCalledOnce()
+    )
+    await run.cancel()
+    refresh.resolve(false)
+    await alarm
+
+    expect(finishedEvents().map((e) => e.properties.outcome)).toEqual([
+      'cancelled',
+    ])
+  })
+
+  it('reports a run interrupted by eviction', async () => {
+    const { run, state } = await makeRun(vi.fn(), TRACKED)
+    await run.start(TRACKED_INPUT)
+    state.meta.set('status', 'thinking')
+    await run.alarm()
+
+    expect(finishedEvents().map((e) => e.properties.outcome)).toEqual([
+      'interrupted',
+    ])
+    expect(mocks.runModel).not.toHaveBeenCalled()
+  })
+
+  it('stays silent for runs started before analytics shipped', async () => {
+    mocks.resolveTerminalSupporter.mockResolvedValue(false)
+    const recordUsage = vi.fn(async () => ({ credits: CREDITS, emptyCharged: false }))
+    const { run } = await makeRun(recordUsage, TRACKED)
+    await run.start(INPUT)
+    await run.alarm()
+
+    expect(mocks.capture).not.toHaveBeenCalled()
   })
 })

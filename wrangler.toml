@@ -72,6 +72,10 @@ BUDDIES_ENABLED = "true"
 ANDROID_PACKAGE_NAME = "com.leviwilkerson.jwtime"
 PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
 ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
+# Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
+# runs stay out of the production dashboards; uncomment to check delivery
+# (events carry `environment: development`).
+# POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 
 # Separate KV so dev never shares prod runtime policy or App Attest v1 mirrors.
 # Create with: wrangler kv namespace create NOTES_KV --env dev
@@ -239,6 +243,11 @@ PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
 # (MEETS_DEVICE_INTEGRITY default; BASIC/STRONG need Play Console opt-in).
 ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 # PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT = "MEETS_DEVICE_INTEGRITY"
+# Anonymous Notes Import usage events (src/analytics.ts, AGENTS.md). The
+# WitnessWork PostHog project's write-only ingestion token, the same one the
+# app ships, so not a secret. Remove to turn server analytics off.
+# POSTHOG_HOST defaults to https://us.i.posthog.com. Not inherited by [env.dev].
+POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state
