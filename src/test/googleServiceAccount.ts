@@ -1,5 +1,7 @@
 /** A throwaway RSA service account for exercising the JWT-bearer exchange. */
-export const createTestServiceAccount = async (): Promise<{
+export const createTestServiceAccount = async (
+  projectId = 'ww-test-project'
+): Promise<{
   json: string
   publicKey: CryptoKey
 }> => {
@@ -22,6 +24,7 @@ export const createTestServiceAccount = async (): Promise<{
   return {
     json: JSON.stringify({
       type: 'service_account',
+      project_id: projectId,
       client_email: 'play-integrity@example.iam.gserviceaccount.com',
       private_key: pem,
       token_uri: 'https://attacker.example/token',

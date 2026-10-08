@@ -1,5 +1,6 @@
 import { base64ToBytes, bytesToBase64Url } from '../crypto'
 import { APNS_DEVICE_TOKEN_PATTERN, type ApnsEnvironment } from '../apns'
+import { FCM_TOKEN_PATTERN } from '../fcm'
 
 /**
  * Buddies relay wire contract (protocol v1). The source of truth is
@@ -185,10 +186,21 @@ export interface PushTemplate {
   body: string
 }
 
-export interface PushTarget {
+/** How a device gets pushes: APNs (iOS, the default) or FCM (Android). */
+export type PushService = 'apns' | 'fcm'
+
+/** A device's push address. `apnsTopic` null means the worker's `IOS_BUNDLE_ID`. */
+export type PushAddress =
+  | {
+      service: 'apns'
+      token: string
+      apnsEnvironment: ApnsEnvironment
+      apnsTopic: string | null
+    }
+  | { service: 'fcm'; token: string }
+
+export type PushTarget = PushAddress & {
   deviceId: string
-  apnsToken: string
-  apnsEnvironment: ApnsEnvironment
   title: string
   body: string
 }
@@ -294,8 +306,7 @@ export interface SyncPayload extends InboxFields {
 
 export interface DeviceRegisterPayload extends InboxFields {
   deviceId: string
-  apnsToken: string
-  apnsEnvironment: ApnsEnvironment
+  push: PushAddress
   templates: Record<string, PushTemplate>
 }
 
@@ -368,6 +379,51 @@ export interface BuddiesPayloads {
 
 type Fields = Record<string, unknown>
 
+/** A bundle id as Apple allows them; the inbox checks it's one this worker serves. */
+const BUNDLE_ID_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/
+const MAX_BUNDLE_ID_CHARS = 155
+
+/**
+ * `pushService` picks the fields: APNs (also when absent, as builds before
+ * Android sent it) takes `apnsToken`, `apnsEnvironment`, and `apnsTopic?`;
+ * FCM takes `fcmToken`. The other service's fields are ignored.
+ */
+const pushAddress = (p: Fields): PushAddress | null => {
+  const service = p.pushService ?? 'apns'
+  if (service === 'fcm') {
+    return typeof p.fcmToken === 'string' && FCM_TOKEN_PATTERN.test(p.fcmToken)
+      ? { service, token: p.fcmToken }
+      : null
+  }
+  if (service !== 'apns') return null
+  if (
+    typeof p.apnsToken !== 'string' ||
+    !APNS_DEVICE_TOKEN_PATTERN.test(p.apnsToken)
+  ) {
+    return null
+  }
+  if (p.apnsEnvironment !== 'sandbox' && p.apnsEnvironment !== 'production') {
+    return null
+  }
+  let apnsTopic: string | null = null
+  if (p.apnsTopic !== undefined) {
+    if (
+      typeof p.apnsTopic !== 'string' ||
+      p.apnsTopic.length > MAX_BUNDLE_ID_CHARS ||
+      !BUNDLE_ID_PATTERN.test(p.apnsTopic)
+    ) {
+      return null
+    }
+    apnsTopic = p.apnsTopic
+  }
+  return {
+    service,
+    token: p.apnsToken.toLowerCase(),
+    apnsEnvironment: p.apnsEnvironment,
+    apnsTopic,
+  }
+}
+
 const inboxFields = (p: Fields): InboxFields | null =>
   isSafeInteger(p.ts) && isId(p.nonce) && isId(p.inboxId)
     ? { ts: p.ts, nonce: p.nonce, inboxId: p.inboxId }
@@ -415,21 +471,12 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
   'device/register': (p) => {
     const base = inboxFields(p)
     const parsedTemplates = templates(p.templates)
-    if (!base || !isId(p.deviceId) || !parsedTemplates) return null
-    if (
-      typeof p.apnsToken !== 'string' ||
-      !APNS_DEVICE_TOKEN_PATTERN.test(p.apnsToken)
-    ) {
-      return null
-    }
-    if (p.apnsEnvironment !== 'sandbox' && p.apnsEnvironment !== 'production') {
-      return null
-    }
+    const push = pushAddress(p)
+    if (!base || !isId(p.deviceId) || !parsedTemplates || !push) return null
     return {
       ...base,
       deviceId: p.deviceId,
-      apnsToken: p.apnsToken.toLowerCase(),
-      apnsEnvironment: p.apnsEnvironment,
+      push,
       templates: parsedTemplates,
     }
   },

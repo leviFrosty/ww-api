@@ -26,6 +26,9 @@ describe('GET /b', () => {
     expect(html).toContain(
       'href="https://apps.apple.com/us/app/jw-time/id6469723047"'
     )
+    expect(html).toContain(
+      'href="https://play.google.com/store/apps/details?id=com.leviwilkerson.jwtime"'
+    )
     expect(html).toContain('After installing, tap the invite link again')
     expect(html).toContain('Copy invite link')
     expect(html).toContain('navigator.clipboard.writeText(location.href)')

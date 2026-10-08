@@ -262,7 +262,7 @@ const validPayload = async (op, ctx) => {
     case 'inbox/delete':
       return base
     case 'device/register':
-      return { ...base, deviceId: rid(), apnsToken: randomBytes(32).toString('hex'), apnsEnvironment: 'sandbox', templates: TEMPLATES }
+      return { ...base, deviceId: rid(), pushService: 'apns', apnsToken: randomBytes(32).toString('hex'), apnsEnvironment: 'sandbox', apnsTopic: 'com.leviwilkerson.jwtimedev', templates: TEMPLATES }
     case 'device/unregister':
       return { ...base, deviceId: rid() }
     case 'slot/add':
@@ -292,6 +292,8 @@ const validPayload = async (op, ctx) => {
 }
 
 const WRITER_OPS = new Set(['card/put', 'event/put', 'slot/leave'])
+/** Valid payload fields the contract lets a client leave out. */
+const OPTIONAL_FIELDS = new Set(['pushService', 'apnsTopic'])
 const keyFor = (op, ctx) => (WRITER_OPS.has(op) ? ctx.writer.key : ctx.owner.key)
 /** Ops whose valid form changes canary data; mutations must not land there. */
 const CANARY_TARGET_OPS = SIGNED_OPS.filter((op) => op !== 'inbox/register')
@@ -317,6 +319,10 @@ const INVALID = {
   expiresAt: [() => Date.now() - 1, () => Date.now() + L.maxInviteLifetimeMs + 120_000, '123', 1.5, null, -5],
   apnsToken: ['', 'xyz', 'zz'.repeat(32), 'ab'.repeat(15), 'ab'.repeat(129), null, 42],
   apnsEnvironment: ['dev', '', null, 'SANDBOX', 1],
+  // 'fcm' is invalid here too: the payload carries no fcmToken.
+  pushService: ['fcm', 'gcm', 'APNS', '', null, 1],
+  // Unknown topics pass the shape check and are refused by the inbox.
+  apnsTopic: ['', 'nodots', 'com.example.other', 'a/b.c', null, 1, 'a.'.repeat(80)],
   templates: [
     null,
     [],
@@ -441,7 +447,7 @@ const GENERATORS = {
     const payload = await validPayload(op, canary)
     const signedOp = SIGNED_OPS.includes(op)
     const full = signedOp ? { ts: Date.now(), nonce: rid(), ...payload } : payload
-    const field = rng.pick(Object.keys(full))
+    const field = rng.pick(Object.keys(full).filter((name) => !OPTIONAL_FIELDS.has(name)))
     delete full[field]
     await send({
       op,

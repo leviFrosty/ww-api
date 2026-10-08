@@ -433,5 +433,7 @@ logs.persist = true
 # Buddies pushes (APNs token auth); without both, the relay skips pushes:
 # wrangler secret put APNS_KEY_ID [--env dev]          # 10-char key id of the .p8
 # wrangler secret put APNS_PRIVATE_KEY [--env dev]     # .p8 PEM contents: < AuthKey_XXXX.p8
+# Buddies Android pushes (FCM HTTP v1); without it, the relay skips them:
+# jq -c . buddies-fcm-sender.json | wrangler secret put FCM_SERVICE_ACCOUNT_JSON [--env dev]
 # Android Notes Import (ADR 0017): the Play Integrity service-account JSON key:
 # wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON [--env dev] < play-integrity-key.json

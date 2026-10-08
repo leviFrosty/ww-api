@@ -163,7 +163,12 @@ describe('event kinds and templates', () => {
       },
     })
     expect(parsed).toMatchObject({
-      apnsToken: 'ab'.repeat(32),
+      push: {
+        service: 'apns',
+        token: 'ab'.repeat(32),
+        apnsEnvironment: 'sandbox',
+        apnsTopic: null,
+      },
       templates: { 'invite.claimed': { title: emoji, body: 'b'.repeat(200) } },
     })
     expect(parsed?.templates['invite.claimed']).toEqual({
@@ -209,6 +214,60 @@ describe('event kinds and templates', () => {
         templates: {},
         apnsEnvironment: 'development',
       })
+    ).toBeNull()
+  })
+
+  it('reads APNs topics, and FCM tokens for pushService "fcm"', () => {
+    const fcmToken = `${id('F')}:APA91b${'x'.repeat(120)}`
+    expect(
+      parse('device/register', {
+        ...device,
+        templates: {},
+        apnsTopic: 'com.leviwilkerson.jwtimebeta',
+      })?.push
+    ).toEqual({
+      service: 'apns',
+      token: 'ab'.repeat(32),
+      apnsEnvironment: 'sandbox',
+      apnsTopic: 'com.leviwilkerson.jwtimebeta',
+    })
+    expect(
+      parse('device/register', { ...device, templates: {}, pushService: 'apns' })
+        ?.push.service
+    ).toBe('apns')
+    for (const apnsTopic of ['', 'nodots', 'com.example/app', 7]) {
+      expect(
+        parse('device/register', { ...device, templates: {}, apnsTopic })
+      ).toBeNull()
+    }
+
+    const android = {
+      ...signed,
+      deviceId: id('D'),
+      pushService: 'fcm',
+      fcmToken,
+      templates: {},
+    }
+    expect(parse('device/register', android)?.push).toEqual({
+      service: 'fcm',
+      token: fcmToken,
+    })
+    // The other service's fields are ignored.
+    expect(
+      parse('device/register', { ...android, apnsToken: 'zz', apnsTopic: 1 })
+        ?.push
+    ).toEqual({ service: 'fcm', token: fcmToken })
+    for (const bad of [undefined, '', 'short', `${fcmToken} `, 'a/b'.repeat(20)]) {
+      expect(
+        parse('device/register', { ...android, fcmToken: bad })
+      ).toBeNull()
+    }
+    expect(
+      parse('device/register', { ...android, pushService: 'gcm' })
+    ).toBeNull()
+    // An FCM token alone is still an APNs registration, missing its token.
+    expect(
+      parse('device/register', { ...android, pushService: undefined })
     ).toBeNull()
   })
 })

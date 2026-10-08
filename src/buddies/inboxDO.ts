@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import type { ApnsEnvironment } from '../apns'
+import { acceptedBundleIds } from '../appAttest/appId'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ERROR_STATUS,
@@ -23,6 +23,7 @@ import {
   type InboxFields,
   type InviteCreatePayload,
   type InviteDeletePayload,
+  type PushAddress,
   type PushJob,
   type PushTarget,
   type RegisterPayload,
@@ -54,7 +55,8 @@ export type ClaimDelivery =
 
 export interface StaleDevice {
   deviceId: string
-  apnsToken: string
+  /** The APNs or FCM token that was rejected. */
+  token: string
 }
 
 type PendingInviteDelete = {
@@ -71,9 +73,25 @@ type MetaRow = {
 }
 type DeviceRow = {
   deviceId: string
-  apnsToken: string
-  apnsEnvironment: string
+  service: string
+  token: string
+  apnsEnvironment: string | null
+  apnsTopic: string | null
   templates: string
+}
+
+/** A stored device's push address; null for a row this build can't use. */
+const pushAddressOf = (row: DeviceRow): PushAddress | null => {
+  if (row.service === 'fcm') return { service: 'fcm', token: row.token }
+  if (row.service !== 'apns') return null
+  if (row.apnsEnvironment !== 'sandbox' && row.apnsEnvironment !== 'production')
+    return null
+  return {
+    service: 'apns',
+    token: row.token,
+    apnsEnvironment: row.apnsEnvironment,
+    apnsTopic: row.apnsTopic,
+  }
 }
 
 type KeyRef = 'owner' | 'writer'
@@ -159,14 +177,18 @@ const SCHEMA = [
      blob      TEXT NOT NULL,
      seq       INTEGER NOT NULL
    )`,
-  `CREATE TABLE IF NOT EXISTS device (
+  // `service` is `apns` or `fcm`; the `apns_*` columns are null for FCM.
+  `CREATE TABLE IF NOT EXISTS push_device (
      device_id        TEXT PRIMARY KEY,
-     apns_token       TEXT NOT NULL,
-     apns_environment TEXT NOT NULL,
+     service          TEXT NOT NULL,
+     token            TEXT NOT NULL,
+     apns_environment TEXT,
+     apns_topic       TEXT,
      templates        TEXT NOT NULL,
      created_at       INTEGER NOT NULL,
      updated_at       INTEGER NOT NULL
    )`,
+  'CREATE INDEX IF NOT EXISTS push_device_by_token ON push_device (service, token)',
   // Open-invite bookkeeping for the caps; rows leave with the invite.
   `CREATE TABLE IF NOT EXISTS invite (
      invite_id  TEXT PRIMARY KEY,
@@ -310,37 +332,51 @@ export class BuddyInbox extends DurableObject<Environment> {
   async registerDevice(
     call: Signed<DeviceRegisterPayload>
   ): Promise<BuddiesResult<Empty>> {
+    const { push } = call
+    // Only topics this worker can sign for; absent means `IOS_BUNDLE_ID`.
+    if (
+      push.service === 'apns' &&
+      push.apnsTopic != null &&
+      !acceptedBundleIds(this.env).includes(push.apnsTopic)
+    ) {
+      return fail('bad_request')
+    }
     const auth = await this.#authenticate('device/register', call, 'owner')
     if (!auth.ok) return auth
     return this.#commit(call, 'owner', auth.value, (now) => {
       // One row per token, so a reinstall with a new deviceId doesn't double-push.
       this.#sql.exec(
-        'DELETE FROM device WHERE apns_token = ? AND device_id <> ?',
-        call.apnsToken,
+        'DELETE FROM push_device WHERE service = ? AND token = ? AND device_id <> ?',
+        push.service,
+        push.token,
         call.deviceId
       )
       this.#sql.exec(
-        `INSERT INTO device (device_id, apns_token, apns_environment, templates, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO push_device (device_id, service, token, apns_environment, apns_topic, templates, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (device_id) DO UPDATE SET
-           apns_token = excluded.apns_token,
+           service = excluded.service,
+           token = excluded.token,
            apns_environment = excluded.apns_environment,
+           apns_topic = excluded.apns_topic,
            templates = excluded.templates,
            updated_at = excluded.updated_at`,
         call.deviceId,
-        call.apnsToken,
-        call.apnsEnvironment,
+        push.service,
+        push.token,
+        push.service === 'apns' ? push.apnsEnvironment : null,
+        push.service === 'apns' ? push.apnsTopic : null,
         JSON.stringify(call.templates),
         now,
         now
       )
       const excess =
-        this.#count('SELECT COUNT(*) AS n FROM device') - LIMITS.devices
+        this.#count('SELECT COUNT(*) AS n FROM push_device') - LIMITS.devices
       if (excess > 0) {
         // Evict the least recently registered devices.
         this.#sql.exec(
-          `DELETE FROM device WHERE device_id IN (
-             SELECT device_id FROM device WHERE device_id <> ?
+          `DELETE FROM push_device WHERE device_id IN (
+             SELECT device_id FROM push_device WHERE device_id <> ?
              ORDER BY updated_at, created_at LIMIT ?
            )`,
           call.deviceId,
@@ -357,7 +393,10 @@ export class BuddyInbox extends DurableObject<Environment> {
     const auth = await this.#authenticate('device/unregister', call, 'owner')
     if (!auth.ok) return auth
     return this.#commit(call, 'owner', auth.value, () => {
-      this.#sql.exec('DELETE FROM device WHERE device_id = ?', call.deviceId)
+      this.#sql.exec(
+        'DELETE FROM push_device WHERE device_id = ?',
+        call.deviceId
+      )
       return ok({})
     })
   }
@@ -730,15 +769,18 @@ export class BuddyInbox extends DurableObject<Environment> {
     this.#sql.exec('DELETE FROM invite WHERE invite_id = ?', inviteId)
   }
 
-  /** Deletes devices APNs rejected, unless they re-registered a new token since. */
+  /**
+   * Deletes devices APNs or FCM rejected, unless they re-registered a new token
+   * since.
+   */
   removeDevices(devices: StaleDevice[]): void {
     if (!this.#ready()) return
     this.ctx.storage.transactionSync(() => {
       for (const device of devices) {
         this.#sql.exec(
-          'DELETE FROM device WHERE device_id = ? AND apns_token = ?',
+          'DELETE FROM push_device WHERE device_id = ? AND token = ?',
           device.deviceId,
-          device.apnsToken
+          device.token
         )
       }
     })
@@ -908,8 +950,22 @@ export class BuddyInbox extends DurableObject<Environment> {
       const backfill = !this.#hasTable('slot_usage')
       this.#ensureSchema()
       if (backfill) this.#backfillUsage()
+      if (this.#hasTable('device')) this.#migrateDevices()
     }
     return exists
+  }
+
+  /**
+   * Inboxes from before FCM kept APNs devices in `device`; they move to
+   * `push_device` once, in the same synchronous turn, so atomically.
+   */
+  #migrateDevices(): void {
+    this.#sql.exec(
+      `INSERT OR IGNORE INTO push_device (device_id, service, token, apns_environment, apns_topic, templates, created_at, updated_at)
+       SELECT device_id, 'apns', apns_token, apns_environment, NULL, templates, created_at, updated_at
+       FROM device`
+    )
+    this.#sql.exec('DROP TABLE device')
   }
 
   #hasTable(name: string): boolean {
@@ -1119,9 +1175,10 @@ export class BuddyInbox extends DurableObject<Environment> {
   #pushTargets(kind: string): PushTarget[] {
     const rows = this.#sql
       .exec<DeviceRow>(
-        `SELECT device_id AS deviceId, apns_token AS apnsToken,
-                apns_environment AS apnsEnvironment, templates
-         FROM device ORDER BY created_at, device_id`
+        `SELECT device_id AS deviceId, service, token,
+                apns_environment AS apnsEnvironment, apns_topic AS apnsTopic,
+                templates
+         FROM push_device ORDER BY created_at, device_id`
       )
       .toArray()
     const targets: PushTarget[] = []
@@ -1137,13 +1194,9 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!isPlainObject(template)) continue
       const { title, body } = template
       if (typeof title !== 'string' || typeof body !== 'string') continue
-      targets.push({
-        deviceId: row.deviceId,
-        apnsToken: row.apnsToken,
-        apnsEnvironment: row.apnsEnvironment as ApnsEnvironment,
-        title,
-        body,
-      })
+      const address = pushAddressOf(row)
+      if (!address) continue
+      targets.push({ ...address, deviceId: row.deviceId, title, body })
     }
     return targets
   }

@@ -5,9 +5,12 @@ import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
+import { resetFcmState } from '../fcm'
+import { resetGoogleAuthState } from '../googleAuth'
 import type { BuddiesSignedOp } from '../buddies/contracts'
 import type { Environment } from '../types'
 import { makeMemoryKv, type MemoryKv } from './memoryKv'
+import { createTestServiceAccount } from './googleServiceAccount'
 import {
   WORKERS_WEBSOCKET_GLOBALS,
   createNamespace,
@@ -31,7 +34,8 @@ export * from './buddiesClient'
  * End-to-end harness for the Buddies relay: the real Hono routes, the real
  * Durable Object classes on SQLite, an in-memory KV, rate limiters that count
  * like the local runtime's (fixed windows on the faked clock, production
- * limits unless overridden), a recording APNs `fetch`, and fake Workers
+ * limits unless overridden), a recording APNs and FCM `fetch` (Google's
+ * OAuth token exchange answered with a fixed token), and fake Workers
  * WebSockets (stubbed globals). Requires `vi.mock('cloudflare:workers')` in
  * the calling test file.
  */
@@ -39,6 +43,23 @@ export * from './buddiesClient'
 export const TEAM_ID = 'TEAMID1234'
 export const APNS_KEY_ID = 'KEYID56789'
 export const BUNDLE_ID = 'com.leviwilkerson.jwtimedev'
+/** Also accepted as an APNs topic (`IOS_ADDITIONAL_BUNDLE_IDS`). */
+export const BETA_BUNDLE_ID = 'com.leviwilkerson.jwtimebeta'
+export const FCM_PROJECT_ID = 'ww-test-project'
+export const FCM_ACCESS_TOKEN = 'ya29.fcm-test'
+export const FCM_SEND_URL = `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+
+let fcmAccount: Promise<string> | null = null
+/** One RSA key for every harness: generating one per test is slow. */
+const fcmServiceAccount = (): Promise<string> =>
+  (fcmAccount ??= createTestServiceAccount(FCM_PROJECT_ID).then(
+    (account) => account.json
+  ))
+
+/** A fake FCM registration token: long base64url with a `:`, like real ones. */
+export const fcmToken = (): string =>
+  `${randomId()}:APA91b${b64u(randomBytes(96))}`
 
 export interface RecordedPush {
   url: string
@@ -64,6 +85,7 @@ export interface HarnessOptions {
   enabled?: string
   kvEnabled?: string
   apnsConfigured?: boolean
+  fcmConfigured?: boolean
   /** Per-minute limit for unsigned ops; production's by default. */
   unsignedLimit?: number
 }
@@ -74,10 +96,13 @@ export interface Harness {
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
+  /** APNs and FCM sends (Google's token exchange isn't recorded). */
   pushes: RecordedPush[]
   apnsPublicKey: CryptoKey
   /** Decides each APNs response; default 200. */
   apnsResponse: (push: RecordedPush) => Response
+  /** Decides each FCM response; default 200. */
+  fcmResponse: (push: RecordedPush) => Response
   /** Keys the unsigned-op limiter saw, refused ones included. */
   rateLimitKeys: string[]
   /** The raw Response for a request to the relay routes. */
@@ -132,6 +157,8 @@ export const createHarness = async (
   options: HarnessOptions = {}
 ): Promise<Harness> => {
   resetApnsState()
+  resetFcmState()
+  resetGoogleAuthState()
   for (const [name, value] of Object.entries(WORKERS_WEBSOCKET_GLOBALS))
     vi.stubGlobal(name, value)
   const kv = makeMemoryKv()
@@ -167,11 +194,17 @@ export const createHarness = async (
     NOTES_KV: kv,
     APPLE_TEAM_ID: TEAM_ID,
     IOS_BUNDLE_ID: BUNDLE_ID,
+    IOS_ADDITIONAL_BUNDLE_IDS: BETA_BUNDLE_ID,
     BUDDIES_ENABLED: options.enabled ?? 'true',
     ...limiters,
     ...(options.apnsConfigured === false
       ? {}
       : { APNS_KEY_ID, APNS_PRIVATE_KEY: apnsPrivateKey }),
+    ...(options.fcmConfigured === false
+      ? {}
+      : {
+          FCM_SERVICE_ACCOUNT_JSON: await fcmServiceAccount(),
+        }),
   } as unknown as Environment & Record<string, unknown>
 
   const inboxes = createNamespace(
@@ -206,6 +239,7 @@ export const createHarness = async (
     pushes: [],
     apnsPublicKey: apnsKeys.publicKey,
     apnsResponse: () => new Response(null, { status: 200 }),
+    fcmResponse: () => Response.json({ name: 'projects/p/messages/1' }),
     rateLimitKeys,
     request: async () => {
       throw new Error('replaced below')
@@ -224,20 +258,27 @@ export const createHarness = async (
     },
   }
 
-  const apnsFetch = vi.fn(
+  const pushFetch = vi.fn(
     async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === GOOGLE_TOKEN_URL)
+        return Response.json({
+          access_token: FCM_ACCESS_TOKEN,
+          expires_in: 3599,
+        })
       const push: RecordedPush = {
         url: String(input),
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
         body: JSON.parse(String(init?.body)),
       }
       harness.pushes.push(push)
-      return harness.apnsResponse(push)
+      return push.url === FCM_SEND_URL
+        ? harness.fcmResponse(push)
+        : harness.apnsResponse(push)
     }
   )
   const routes = createBuddiesRoutes({
-    apns: {
-      fetch: apnsFetch as unknown as typeof fetch,
+    push: {
+      fetch: pushFetch as unknown as typeof fetch,
       now: () => Date.now(),
       sleep: async () => undefined,
     },
@@ -346,12 +387,37 @@ export class Owner {
       'plan.joined': { title: 'Plans', body: 'A buddy is coming' },
     },
     apnsToken = hexToken(32),
-    apnsEnvironment: 'sandbox' | 'production' = 'sandbox'
+    apnsEnvironment: 'sandbox' | 'production' = 'sandbox',
+    extra: Record<string, unknown> = {}
   ): Promise<ApiResponse> {
     return this.send('device/register', {
       deviceId,
       apnsToken,
       apnsEnvironment,
+      templates,
+      ...extra,
+    })
+  }
+
+  /** An Android device: FCM instead of APNs. */
+  registerFcmDevice(
+    deviceId = randomId(),
+    templates: Record<string, { title: string; body: string }> = {
+      'invite.claimed': {
+        title: 'Buddy request',
+        body: 'Someone accepted your invite',
+      },
+      'pair.confirmed': {
+        title: 'You are buddies',
+        body: 'Your buddy confirmed',
+      },
+    },
+    token = fcmToken()
+  ): Promise<ApiResponse> {
+    return this.send('device/register', {
+      deviceId,
+      pushService: 'fcm',
+      fcmToken: token,
       templates,
     })
   }

@@ -49,6 +49,9 @@ const OPTIONAL_SECRETS = [
   'OPENROUTER_API_KEY',
   'REVENUECAT_API_KEY',
   'APPLE_TEAM_ID',
+  // Buddies Android pushes: FCM is plain HTTPS, so unlike APNs it works from
+  // `wrangler dev`. Pass the key minified to one line (`jq -c`).
+  'FCM_SERVICE_ACCOUNT_JSON',
 ]
 /** Synthetic, verification-only Apple team id when none is provided. */
 const SYNTHETIC_TEAM_ID = 'VERIFY0000'
@@ -187,7 +190,16 @@ const readAllowlistedEnvFile = (path) => {
   return values
 }
 
-const quoteEnv = (value) => JSON.stringify(String(value))
+/**
+ * Double-quoted, except JSON values (a service-account key), which go in
+ * single quotes: dotenv reads those literally, keeping the JSON's own escapes.
+ */
+const quoteEnv = (value) => {
+  const text = String(value)
+  return text.includes('"') && !text.includes("'")
+    ? `'${text}'`
+    : JSON.stringify(text)
+}
 
 const writeVarsFile = (flags, previousTokens) => {
   const fromFile = flags['secrets-from']

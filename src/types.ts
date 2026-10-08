@@ -246,6 +246,13 @@ export interface Environment {
   /** APNs `.p8` auth key, PKCS#8 PEM (secret). Pushes are skipped when unset. */
   APNS_PRIVATE_KEY?: string;
 
+  /**
+   * Service-account JSON key allowed to send Firebase Cloud Messaging messages
+   * (secret). Its `project_id` is the Firebase project. Android pushes are
+   * skipped when unset.
+   */
+  FCM_SERVICE_ACCOUNT_JSON?: string;
+
   // --- Route planning ------------------------------------------------------
 
   /**

@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { base64ToBytes } from '../crypto'
-import { createTestServiceAccount } from '../test/googleServiceAccount'
+import { base64ToBytes } from './crypto'
+import { createTestServiceAccount } from './test/googleServiceAccount'
 import {
+  FIREBASE_MESSAGING_SCOPE,
   GoogleAuthError,
   PLAY_INTEGRITY_SCOPE,
+  forgetGoogleAccessToken,
+  getGoogleAccessToken,
   getPlayIntegrityAccessToken,
   resetGoogleAuthState,
 } from './googleAuth'
@@ -109,5 +112,48 @@ describe('getPlayIntegrityAccessToken', () => {
         now: () => NOW,
       })
     ).rejects.toThrow('returned no token')
+  })
+})
+
+describe('getGoogleAccessToken', () => {
+  beforeEach(() => resetGoogleAuthState())
+
+  it('caches a token per scope, so one key can serve two APIs', async () => {
+    const account = await createTestServiceAccount()
+    const fetch = tokenFetch()
+    const deps = { fetch, now: () => NOW }
+
+    await getGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, deps)
+    await getGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, deps)
+    await getGoogleAccessToken(account.json, PLAY_INTEGRITY_SCOPE, deps)
+
+    expect(fetch).toHaveBeenCalledTimes(2)
+    const scopes = fetch.mock.calls.map(
+      ([, init]) =>
+        decodeSegment(
+          new URLSearchParams(String(init?.body)).get('assertion')!.split('.')[1]
+        ).scope
+    )
+    expect(scopes).toEqual([FIREBASE_MESSAGING_SCOPE, PLAY_INTEGRITY_SCOPE])
+  })
+
+  it('mints a new token once a rejected one is forgotten', async () => {
+    const account = await createTestServiceAccount()
+    const fetch = tokenFetch({ access_token: 'ya29.first', expires_in: 3600 })
+    const deps = { fetch, now: () => NOW }
+
+    const first = await getGoogleAccessToken(
+      account.json,
+      FIREBASE_MESSAGING_SCOPE,
+      deps
+    )
+    // A stale token from elsewhere doesn't evict the cached one.
+    forgetGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, 'ya29.other')
+    await getGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, deps)
+    expect(fetch).toHaveBeenCalledTimes(1)
+
+    forgetGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, first)
+    await getGoogleAccessToken(account.json, FIREBASE_MESSAGING_SCOPE, deps)
+    expect(fetch).toHaveBeenCalledTimes(2)
   })
 })
