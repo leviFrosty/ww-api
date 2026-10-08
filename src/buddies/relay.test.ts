@@ -371,8 +371,15 @@ describe('events and pushes', () => {
       'invite.claimed': { title: 'x', body: 'y' },
     })
     const buddy = await owner.addWriter()
+    const eventId = randomId()
+    const blob = blobOfSize(48)
 
-    await buddy.putEvent({ kind: 'plan.joined', push: true })
+    const put = await buddy.putEvent({
+      kind: 'plan.joined',
+      eventId,
+      blob,
+      push: true,
+    })
     await h.flush()
 
     expect(h.pushes).toHaveLength(1)
@@ -382,9 +389,44 @@ describe('events and pushes', () => {
         sound: 'default',
         'thread-id': 'buddies',
         'content-available': 1,
+        'mutable-content': 1,
       },
-      ww: { kind: 'plan.joined' },
+      ww: { kind: 'plan.joined', seq: put.body.seq, eventId, blob },
     })
+  })
+
+  it('leaves out an event too big for the push, so the app fetches it by seq', async () => {
+    const owner = await Owner.create(h)
+    await owner.registerDevice(randomId(), {
+      'plan.invite': { title: 'Plans', body: 'An invitation' },
+    })
+    await owner.registerFcmDevice(randomId(), {
+      'plan.invite': { title: 'Plans', body: 'An invitation' },
+    })
+    const buddy = await owner.addWriter()
+    const large = await buddy.putEvent({
+      kind: 'plan.invite',
+      blob: blobOfSize(4000),
+      push: true,
+    })
+    await h.flush()
+
+    const markers = h.pushes.map((push) => {
+      const body = push.body as {
+        ww?: unknown
+        message?: { data: { body: string } }
+      }
+      return body.ww ?? JSON.parse(body.message!.data.body).ww
+    })
+    expect(markers).toEqual([
+      { kind: 'plan.invite', seq: large.body.seq },
+      { kind: 'plan.invite', seq: large.body.seq },
+    ])
+    for (const push of h.pushes) {
+      expect(
+        new TextEncoder().encode(JSON.stringify(push.body)).length
+      ).toBeLessThanOrEqual(4096)
+    }
   })
 
   it('pushes Android devices through FCM and iPhones through APNs', async () => {
@@ -395,7 +437,8 @@ describe('events and pushes', () => {
         await owner.registerFcmDevice(
           randomId(),
           { 'plan.invite': { title: 'Plans', body: 'An invitation' } },
-          pixel
+          pixel,
+          true
         )
       ).body
     ).toEqual({ ok: true })
@@ -403,8 +446,15 @@ describe('events and pushes', () => {
       'plan.invite': { title: 'Plans', body: 'An invitation' },
     })
     const buddy = await owner.addWriter()
+    const eventId = randomId()
+    const blob = blobOfSize(48)
 
-    await buddy.putEvent({ kind: 'plan.invite', push: true })
+    const put = await buddy.putEvent({
+      kind: 'plan.invite',
+      eventId,
+      blob,
+      push: true,
+    })
     await h.flush()
 
     expect(h.pushes).toHaveLength(2)
@@ -412,11 +462,13 @@ describe('events and pushes', () => {
     expect(fcm?.body).toEqual({
       message: {
         token: pixel,
+        // No title or message: the app posts the alert itself.
         data: {
-          title: 'Plans',
-          message: 'An invitation',
-          body: JSON.stringify({ ww: { kind: 'plan.invite' } }),
-          channelId: 'buddies',
+          fallbackTitle: 'Plans',
+          fallbackBody: 'An invitation',
+          body: JSON.stringify({
+            ww: { kind: 'plan.invite', seq: put.body.seq, eventId, blob },
+          }),
         },
         android: { priority: 'HIGH', ttl: '86400s' },
       },
@@ -424,6 +476,95 @@ describe('events and pushes', () => {
     expect(
       h.pushes.filter((push) => push.url.includes('push.apple.com'))
     ).toHaveLength(1)
+  })
+
+  it('sends the alert expo-notifications shows to Android builds before named alerts', async () => {
+    const owner = await Owner.create(h)
+    const legacy = fcmToken()
+    const named = fcmToken()
+    const templates = {
+      'plan.invite': { title: 'Plans', body: 'An invitation' },
+    }
+    await owner.registerFcmDevice(randomId(), templates, legacy)
+    await owner.registerFcmDevice(randomId(), templates, named, true)
+    const buddy = await owner.addWriter()
+
+    await buddy.putEvent({ kind: 'plan.invite', push: true })
+    await h.flush()
+
+    const data = (token: string) => {
+      const push = h.pushes.find(
+        (p) =>
+          (p.body as { message: { token: string } }).message.token === token
+      )
+      return (push!.body as { message: { data: Record<string, string> } })
+        .message.data
+    }
+    expect(Object.keys(data(legacy)).sort()).toEqual(
+      ['body', 'channelId', 'message', 'title'].sort()
+    )
+    expect(data(legacy)).toMatchObject({
+      title: 'Plans',
+      message: 'An invitation',
+    })
+    expect(Object.keys(data(named)).sort()).toEqual(
+      ['body', 'fallbackBody', 'fallbackTitle'].sort()
+    )
+    expect(
+      (
+        await owner.send('device/register', {
+          deviceId: randomId(),
+          pushService: 'fcm',
+          fcmToken: fcmToken(),
+          appAlerts: 'yes',
+          templates,
+        })
+      ).status
+    ).toBe(400)
+  })
+
+  it('adds the app alerts column to inboxes from before named alerts', async () => {
+    const owner = await Owner.create(h)
+    const storage = h.inboxes.storage(owner.inboxId)
+    const sql = storage.state.storage.sql
+    const token = fcmToken()
+    // An inbox as builds before named alerts left it.
+    sql.exec('DROP TABLE push_device')
+    sql.exec(
+      `CREATE TABLE push_device (
+         device_id        TEXT PRIMARY KEY,
+         service          TEXT NOT NULL,
+         token            TEXT NOT NULL,
+         apns_environment TEXT,
+         apns_topic       TEXT,
+         templates        TEXT NOT NULL,
+         created_at       INTEGER NOT NULL,
+         updated_at       INTEGER NOT NULL
+       )`
+    )
+    sql.exec(
+      'INSERT INTO push_device VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)',
+      randomId(),
+      'fcm',
+      token,
+      JSON.stringify({ 'pair.confirmed': { title: 'T', body: 'B' } }),
+      START,
+      START
+    )
+    h.inboxes.restart(owner.inboxId)
+
+    const buddy = await owner.addWriter()
+    await buddy.putEvent({ kind: 'pair.confirmed', push: true })
+    await h.flush()
+
+    expect(h.pushes).toHaveLength(1)
+    expect(
+      (h.pushes[0].body as { message: { data: Record<string, string> } })
+        .message.data
+    ).toMatchObject({ title: 'T', message: 'B' })
+    expect(
+      storage.query('SELECT app_alerts AS appAlerts FROM push_device')
+    ).toEqual([{ appAlerts: 0 }])
   })
 
   it('drops an Android device FCM reports as unregistered', async () => {
@@ -464,9 +605,15 @@ describe('events and pushes', () => {
     const plain = hexToken(32)
     await owner.registerDevice(randomId(), undefined, plain)
     expect(
-      await owner.registerDevice(randomId(), undefined, hexToken(32), 'sandbox', {
-        apnsTopic: 'com.example.other',
-      })
+      await owner.registerDevice(
+        randomId(),
+        undefined,
+        hexToken(32),
+        'sandbox',
+        {
+          apnsTopic: 'com.example.other',
+        }
+      )
     ).toEqual({ status: 400, body: { error: 'bad_request' } })
     const buddy = await owner.addWriter()
 

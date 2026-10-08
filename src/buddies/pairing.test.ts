@@ -354,8 +354,14 @@ it('pairs two people end to end: register → invite → claim → confirm → c
         sound: 'default',
         'thread-id': 'buddies',
         'content-available': 1,
+        'mutable-content': 1,
       },
-      ww: { kind: 'invite.claimed' },
+      ww: {
+        kind: 'invite.claimed',
+        seq: expect.any(Number),
+        eventId: leviInvite.inviteId,
+        blob: expect.any(String),
+      },
     },
   ])
 
@@ -366,6 +372,15 @@ it('pairs two people end to end: register → invite → claim → confirm → c
     eventId: leviInvite.inviteId,
     slotId: '',
     kind: 'invite.claimed',
+  })
+  // The alert carried that same sealed claim, so the app can name Maria
+  // without fetching it.
+  const claimPush = pushesTo(levi)[0].body as {
+    ww: { seq: number; blob: string }
+  }
+  expect(claimPush.ww).toMatchObject({
+    seq: claimEvent.seq,
+    blob: claimEvent.blob,
   })
   const claim = open(
     leviInvite.inviteKey,
@@ -432,10 +447,17 @@ it('pairs two people end to end: register → invite → claim → confirm → c
 
   // 5. Maria gets pair.confirmed, reads Levi's card, and publishes hers.
   await h.flush()
+  const mariaSync = await maria.ownerOp('inbox/sync', { since: 0 })
   expect(
     pushesTo(maria).map((push) => (push.body as { ww: unknown }).ww)
-  ).toEqual([{ kind: 'pair.confirmed' }])
-  const mariaSync = await maria.ownerOp('inbox/sync', { since: 0 })
+  ).toEqual([
+    {
+      kind: 'pair.confirmed',
+      seq: mariaSync.events[0].seq,
+      eventId: confirmId,
+      blob: mariaSync.events[0].blob,
+    },
+  ])
   expect(mariaSync.slots).toEqual([
     { slotId: leviToMaria.slotId, createdAt: expect.any(Number) },
   ])

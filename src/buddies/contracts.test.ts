@@ -251,12 +251,20 @@ describe('event kinds and templates', () => {
     expect(parse('device/register', android)?.push).toEqual({
       service: 'fcm',
       token: fcmToken,
+      appAlerts: false,
     })
     // The other service's fields are ignored.
     expect(
       parse('device/register', { ...android, apnsToken: 'zz', apnsTopic: 1 })
         ?.push
-    ).toEqual({ service: 'fcm', token: fcmToken })
+    ).toEqual({ service: 'fcm', token: fcmToken, appAlerts: false })
+    // Builds with named alerts post the alert themselves.
+    expect(
+      parse('device/register', { ...android, appAlerts: true })?.push
+    ).toEqual({ service: 'fcm', token: fcmToken, appAlerts: true })
+    expect(
+      parse('device/register', { ...android, appAlerts: 'true' })
+    ).toBeNull()
     for (const bad of [undefined, '', 'short', `${fcmToken} `, 'a/b'.repeat(20)]) {
       expect(
         parse('device/register', { ...android, fcmToken: bad })

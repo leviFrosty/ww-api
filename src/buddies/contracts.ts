@@ -177,6 +177,16 @@ export const isImmediatePushKind = (kind: string): boolean =>
   BUDDIES_IMMEDIATE_PUSH_KINDS.has(kind) ||
   kind.startsWith(BUDDIES_IMMEDIATE_PUSH_PREFIX)
 
+/**
+ * Buddies' social news (a new badge, a reaction to one of the User's) is
+ * quiet: delivered without sound or lighting the screen. Budget and spacing
+ * are as for any other kind.
+ */
+export const BUDDIES_PASSIVE_PUSH_KINDS: ReadonlySet<string> = new Set([
+  'badge.new',
+  'badge.reaction',
+])
+
 export const BUDDIES_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
 const B64U_PATTERN = /^[A-Za-z0-9_-]*$/
 const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{86}$/
@@ -197,7 +207,15 @@ export type PushAddress =
       apnsEnvironment: ApnsEnvironment
       apnsTopic: string | null
     }
-  | { service: 'fcm'; token: string }
+  | {
+      service: 'fcm'
+      token: string
+      /**
+       * The app posts the alert itself (named alerts): the relay sends the
+       * template as fallback text that expo-notifications doesn't show.
+       */
+      appAlerts: boolean
+    }
 
 export type PushTarget = PushAddress & {
   deviceId: string
@@ -209,6 +227,13 @@ export type PushTarget = PushAddress & {
 export interface PushJob {
   inboxId: string
   kind: string
+  /** The inbox `seq` of the event the alert is about. */
+  seq: number
+  /**
+   * The event itself, still sealed: the app opens it to name the sender. Goes
+   * in the push only when it fits.
+   */
+  event: { eventId: string; blob: string }
   targets: PushTarget[]
 }
 
@@ -386,13 +411,16 @@ const MAX_BUNDLE_ID_CHARS = 155
 /**
  * `pushService` picks the fields: APNs (also when absent, as builds before
  * Android sent it) takes `apnsToken`, `apnsEnvironment`, and `apnsTopic?`;
- * FCM takes `fcmToken`. The other service's fields are ignored.
+ * FCM takes `fcmToken` and `appAlerts?`. The other service's fields are
+ * ignored.
  */
 const pushAddress = (p: Fields): PushAddress | null => {
   const service = p.pushService ?? 'apns'
   if (service === 'fcm') {
+    if (p.appAlerts !== undefined && typeof p.appAlerts !== 'boolean')
+      return null
     return typeof p.fcmToken === 'string' && FCM_TOKEN_PATTERN.test(p.fcmToken)
-      ? { service, token: p.fcmToken }
+      ? { service, token: p.fcmToken, appAlerts: p.appAlerts === true }
       : null
   }
   if (service !== 'apns') return null

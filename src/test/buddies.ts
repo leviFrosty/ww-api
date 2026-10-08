@@ -412,13 +412,15 @@ export class Owner {
         body: 'Your buddy confirmed',
       },
     },
-    token = fcmToken()
+    token = fcmToken(),
+    appAlerts?: boolean
   ): Promise<ApiResponse> {
     return this.send('device/register', {
       deviceId,
       pushService: 'fcm',
       fcmToken: token,
       templates,
+      ...(appAlerts === undefined ? {} : { appAlerts }),
     })
   }
 

@@ -268,10 +268,20 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   5xx, and a rejected token). `src/buddies/push.ts` builds both payloads,
   routes each device to its service, and deletes devices either reports as
   unregistered. Other features should build on `sendApnsNotifications` and
-  `sendFcmNotifications`, not on the Buddies layer. APNs alerts carry
-  `content-available: 1` so iOS can wake the app to sync; FCM messages are
-  data-only and high priority, so expo-notifications shows them and runs the
-  app's background sync task. Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
+  `sendFcmNotifications`, not on the Buddies layer. Every alert's `ww`
+  marker carries the event's `seq` and, when it fits (APNs 4 KB, FCM 4,000
+  bytes of data), the still-sealed event (`eventId`, `blob`), so the app can
+  name the sender without the relay seeing a name. APNs alerts carry the
+  device's generic template with `mutable-content: 1` (the app's Notification
+  Service Extension rewrites it) and `content-available: 1` so iOS can wake
+  the app to sync; badge news (`BUDDIES_PASSIVE_PUSH_KINDS`) is passive, with
+  no sound. FCM messages are data-only and high priority. A device registered with
+  `appAlerts: true` (builds with named alerts) gets the template as
+  `fallbackTitle`/`fallbackBody` and no `title`/`message`, so
+  expo-notifications shows nothing itself and the app's background task posts
+  the alert; any other device gets `title`/`message`, which expo-notifications
+  shows, so the relay can ship ahead of the app (`push_device.app_alerts`,
+  added in place to older inboxes). Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
   skip the 60 s per-slot spacing but still count toward the daily cap.
 - **Live socket**: `GET /buddies/v1/inbox/live` upgrades to a WebSocket. The
   owner-signed envelope (op `inbox/live`) rides in the `x-buddies-p` and
@@ -289,10 +299,9 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   Workers traces do record subrequest URLs, APNs included.
 - **Not yet built** (required before any production rollout): App Attest on
   `inbox/register` and `invite/*` (`attest` is accepted and ignored; Android
-  will use Play Integrity), and Notification Service Extension payloads. The
-  protocol's durable push outbox (retries for 6 h, outcome history, `seq` in
-  alerts, deferred instead of dropped alerts inside the 60 s spacing,
-  `apns-collapse-id`/`apns-expiration`) is specified but not built either;
+  will use Play Integrity). The protocol's durable push outbox (retries for
+  6 h, outcome history, deferred instead of dropped alerts inside the 60 s
+  spacing, `apns-expiration`) is specified but not built either;
   today each push gets one immediate attempt plus one retry.
 
 Dev deploy (first time):
