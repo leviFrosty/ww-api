@@ -36,6 +36,7 @@ Preconditions:
 ## Gotchas
 
 - The bypass works only with `APP_ATTEST_ENVIRONMENT=development` (`--env dev`). Plain `pnpm dev` uses prod vars, and Notes Import routes then return 500 when a bypass token is present.
-- `/notes-import*` is rate limited at 60/min per `cf-connecting-ip`. Reusing one IP across a long run produces 429s that look like bugs.
+- `/notes-import*` is rate limited at 60/min per `cf-connecting-ip` (its own bucket, apart from place search). Reusing one IP across a long run produces 429s (`rate_limited`, `Retry-After: 60`) that look like bugs.
+- While a run is live, the SSE stream sends a `:` comment line every 15 s; finished, cancelled, and unknown runs close right after the replay.
 - `/notes-import/:id/events` is SSE. Use `/result` for assertions.
 - The bypass skips attestation only. Real App Attest and Play Integrity flows need a physical device against the deployed dev worker (see AGENTS.md); don't claim them from this loop.

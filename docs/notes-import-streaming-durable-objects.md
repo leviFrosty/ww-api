@@ -117,6 +117,10 @@ becomes a multi-step pipeline.
 boundary as the legacy path) → gate + cap → start run DO → `{ importId,
 subscribeToken }`. Client subscribes at `GET /notes-import/:importId/events`
 (SSE, `?token=` capability) and falls back to `GET /notes-import/:importId/result`.
+While the run is live the stream sends an SSE comment (`:\n\n`) every 15 s
+(`SSE_HEARTBEAT_MS`), so a client can treat ~20 s of silence as a dead
+connection; parsers skip comments. A finished, cancelled, or unknown run
+closes right after its replay.
 
 **Model:** `streamText` + `Output.object` (AI SDK v6; replaced deprecated
 `generateObject`). `result.output` is the authoritative validated object;

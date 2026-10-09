@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import type { Environment } from '../types'
+import { relayError } from '../test/buddiesClient'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -46,14 +47,14 @@ describe('Worker entry', () => {
       body: '{}',
     })
     expect(disabled.status).toBe(503)
-    expect(await disabled.json()).toEqual({ error: 'disabled' })
+    expect(await disabled.json()).toEqual(relayError('disabled'))
 
     // Always-allowed ops get past the kill switch to envelope validation.
     const malformed = await call('/buddies/v1/slot/leave', {
       method: 'POST',
       body: 'x',
     })
-    expect(await malformed.json()).toEqual({ error: 'bad_request' })
+    expect(await malformed.json()).toEqual(relayError('bad_request'))
 
     expect(
       (await call('/buddies/v1/nope', { method: 'POST', body: '{}' })).status
@@ -64,7 +65,7 @@ describe('Worker entry', () => {
       headers: { upgrade: 'websocket' },
     })
     expect(live.status).toBe(503)
-    expect(await live.json()).toEqual({ error: 'disabled' })
+    expect(await live.json()).toEqual(relayError('disabled'))
     expect(
       (await call('/buddies/v1/inbox/live', { method: 'POST', body: '{}' }))
         .status

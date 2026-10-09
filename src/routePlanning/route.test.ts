@@ -154,6 +154,8 @@ describe('POST /route-planning/optimize', () => {
     const response = await s.post(body())
     expect(response.status).toBe(503)
     expect(response.json.code).toBe('supporter_check_failed')
+    expect(response.json.retryAfter).toBe(30)
+    expect(response.headers.get('Retry-After')).toBe('30')
     expect(s.here).not.toHaveBeenCalled()
   })
 
@@ -195,7 +197,14 @@ describe('POST /route-planning/optimize', () => {
     await s.kv.put('route-planning:enabled', 'false')
     const response = await s.post(body())
     expect(response.status).toBe(503)
-    expect(response.json.code).toBe('unavailable')
+    expect(response.json).toEqual({
+      ok: false,
+      error: 'Route planning is unavailable',
+      code: 'unavailable',
+      retryAfter: 60,
+      retryAfterSeconds: 60,
+    })
+    expect(response.headers.get('Retry-After')).toBe('60')
     expect(s.supporter).not.toHaveBeenCalled()
 
     await s.kv.put('route-planning:enabled', 'true')
@@ -206,8 +215,11 @@ describe('POST /route-planning/optimize', () => {
     for (let i = 0; i < 3; i++) expect((await s.post(body())).status).toBe(200)
     const burst = await s.post(body())
     expect(burst.status).toBe(429)
-    expect(burst.json).toMatchObject({
+    expect(burst.json).toEqual({
+      ok: false,
+      error: 'Too many route requests',
       code: 'rate_limited',
+      retryAfter: 60,
       retryAfterSeconds: 60,
     })
     expect(burst.headers.get('Retry-After')).toBe('60')

@@ -294,36 +294,60 @@ logged or stored.
 
 `order` lists indices into `stops` in visiting order.
 
-**Errors** carry `{ "error", "code" }`: `bad_request` (400), `payload_too_large`
-(413), `supporter_required` (403), `supporter_check_failed` (503 — RevenueCat
+**Errors** carry `{ "ok": false, "error", "code" }` (`error` is a message;
+branch on `code`): `bad_request` (400), `payload_too_large` (413),
+`supporter_required` (403), `supporter_check_failed` (503 — RevenueCat
 unreachable; fails closed), `unavailable` (503 — kill switch), `daily_limit` /
-`rate_limited` (429, with `retryAfterSeconds` and `Retry-After`), `no_route`
-(422), `upstream_error` (502).
+`rate_limited` (429), `no_route` (422), `upstream_error` (502). Every 429 and
+503 sends `Retry-After` and repeats it as `retryAfter` (and, for older builds,
+`retryAfterSeconds`).
 
 ### `/health`
 
-Health check endpoint.
+Health check endpoint, and the clock clients calibrate against: it sends
+`Cache-Control: no-store` and a `Date` header, and does no I/O.
 
 **Response:**
 
 ```json
 {
   "status": "ok",
-  "timestamp": "2024-11-27T12:34:56.789Z"
+  "timestamp": "2024-11-27T12:34:56.789Z",
+  "serverTime": 1732710896789,
+  "versionId": "…",
+  "deployedAt": "…"
 }
 ```
 
 ## Error Responses
 
-All errors return JSON with an `error` field:
+Every JSON route answers errors with one envelope (`src/errors.ts`):
 
 ```json
-{
-  "error": "Error message"
-}
+{ "ok": false, "error": "rate_limited", "code": "rate_limited", "retryAfter": 60 }
 ```
 
-All errors are automatically reported to Sentry with full context.
+- `code` is always the stable, machine-readable code; read it first.
+- `error` is the same code everywhere except Notes Import and route planning,
+  where it stays a human-readable message for shipped builds.
+- Every 429 and 503 sends `Retry-After` (seconds) and repeats it as
+  `retryAfter`, except quotas no wait can free (Notes Import's
+  `limit_reached` and `refinement_limit`, Buddies' `limit`).
+- Routes add their own fields beside these (`reason`, `action`, `credits`,
+  `serverTime`, HERE's own error fields on the place-search proxy).
+- `/geocode` and `/autocomplete` pass HERE's status through; a HERE error body
+  keeps its fields and gains the envelope (`bad_request`, `not_found`,
+  `rate_limited`, `upstream_error`). HERE unreachable or answering non-JSON is
+  502 `upstream_error`.
+- The HTML pages (`/c`, `/c/:payload`, `/b`) are for browsers and always
+  answer 200.
+
+Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
+bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
+`route-planning`, `admin` (`src/rateLimit.ts`). Refusals are 429
+`rate_limited` with `Retry-After: 60`.
+
+Unexpected errors are 500 `server_error` and are reported to Sentry.
 
 ## Architecture
 

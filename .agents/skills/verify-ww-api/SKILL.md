@@ -53,7 +53,7 @@ node scripts/verify/dev.mjs kv get app-store-ratings:summary
 node scripts/verify/dev.mjs kv delete buddies:enabled
 ```
 
-- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min on `/notes-import*`, `/geocode`, `/autocomplete`, `/admin/*`, and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
+- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/route-planning/*`, and `/admin/*` each count separately), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
 - Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl.
 - KV edits take effect on the next request (no 60 s edge cache locally).
 
@@ -79,7 +79,7 @@ The oracle checks every request:
 
 - no 5xx;
 - no response slower than 5 s (`--timeout-ms`);
-- Buddies errors are `{error}` JSON;
+- Buddies errors are `{error}` JSON (the full body is `{ok: false, error, code}`);
 - each mutation gets its documented status (for example, a bad signature is 401 `bad_signature`).
 
 After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapshot, and `/health` must still be ok. When a case fails, the fuzzer prints the seed, a `--case` repro command, and the exact failing request, then exits 1.

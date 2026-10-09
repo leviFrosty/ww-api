@@ -14,6 +14,7 @@ import {
   inviteSecrets,
   randomId,
   unsignedEnvelope,
+  relayError,
   type Harness,
 } from '../test/buddies'
 
@@ -83,7 +84,7 @@ describe('signed envelopes', () => {
       inboxId: owner.inboxId,
       ownerPub: intruder.publicKey,
     })
-    expect(response).toEqual({ status: 409, body: { error: 'conflict' } })
+    expect(response).toEqual({ status: 409, body: relayError('conflict') })
   })
 
   it('requires register to be signed by the key it registers', async () => {
@@ -93,7 +94,7 @@ describe('signed envelopes', () => {
       inboxId: randomId(),
       ownerPub: claimed.publicKey,
     })
-    expect(response).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(response).toEqual({ status: 401, body: relayError('bad_signature') })
   })
 
   it('rejects owner ops signed with the wrong key', async () => {
@@ -103,7 +104,7 @@ describe('signed envelopes', () => {
       inboxId: owner.inboxId,
       since: 0,
     })
-    expect(response).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(response).toEqual({ status: 401, body: relayError('bad_signature') })
   })
 
   it('rejects tampered payload bytes and a missing signature', async () => {
@@ -122,12 +123,12 @@ describe('signed envelopes', () => {
     expect(await h.post('/inbox/sync', { p: tampered.p, s: signed.s })).toEqual(
       {
         status: 401,
-        body: { error: 'bad_signature' },
+        body: relayError('bad_signature'),
       }
     )
     expect(await h.post('/inbox/sync', { p: signed.p })).toEqual({
       status: 401,
-      body: { error: 'bad_signature' },
+      body: relayError('bad_signature'),
     })
     expect((await h.post('/inbox/sync', signed)).status).toBe(200)
   })
@@ -141,7 +142,7 @@ describe('signed envelopes', () => {
     )
     expect(await h.post('/inbox/delete', signedForSync)).toEqual({
       status: 401,
-      body: { error: 'bad_signature' },
+      body: relayError('bad_signature'),
     })
     expect((await owner.sync()).status).toBe(200)
   })
@@ -163,7 +164,7 @@ describe('signed envelopes', () => {
         since: 0,
         ts: Date.now() + skew,
       })
-      expect(response).toEqual({ status: 401, body: { error: 'stale' } })
+      expect(response).toEqual({ status: 401, body: relayError('stale') })
     }
     for (const skew of [-300_000, 300_000]) {
       expect(
@@ -171,6 +172,33 @@ describe('signed envelopes', () => {
           .status
       ).toBe(200)
     }
+  })
+
+  it('tells a stale client the server time, in the body and a Date header', async () => {
+    const owner = await Owner.create(h)
+    advance(1_234)
+    const request = await envelope(
+      'inbox/sync',
+      {
+        inboxId: owner.inboxId,
+        since: 0,
+        ts: Date.now() - 10 * MINUTE_MS,
+        nonce: randomId(),
+      },
+      owner.key
+    )
+    const response = await h.request('/inbox/sync', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    })
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual(
+      relayError('stale', { serverTime: START + 1_234 })
+    )
+    expect(response.headers.get('Date')).toBe(
+      new Date(START + 1_234).toUTCString()
+    )
   })
 
   it('rejects a replayed nonce for the same inbox', async () => {
@@ -184,7 +212,7 @@ describe('signed envelopes', () => {
     advance(4 * MINUTE_MS)
     expect(await h.post('/inbox/sync', request)).toEqual({
       status: 409,
-      body: { error: 'replay' },
+      body: relayError('replay'),
     })
     // A reused nonce with a new signature is still a replay.
     const nonce = randomId()
@@ -193,27 +221,25 @@ describe('signed envelopes', () => {
     )
     expect(
       (await owner.send('roster/put', { blob: blobOfSize(10), nonce })).body
-    ).toEqual({
-      error: 'replay',
-    })
+    ).toEqual(relayError('replay'))
   })
 
   it('returns not_found for an unknown inbox and bad_request for malformed input', async () => {
     const stranger = await SigningKey.generate()
     expect(
       await h.send('inbox/sync', stranger, { inboxId: randomId(), since: 0 })
-    ).toEqual({ status: 404, body: { error: 'not_found' } })
+    ).toEqual({ status: 404, body: relayError('not_found') })
 
     const owner = await Owner.create(h)
-    expect((await owner.send('inbox/sync', { since: -1 })).body).toEqual({
-      error: 'bad_request',
-    })
-    expect((await h.post('/inbox/sync', 'not json')).body).toEqual({
-      error: 'bad_request',
-    })
-    expect((await h.post('/inbox/sync', { p: '***' })).body).toEqual({
-      error: 'bad_request',
-    })
+    expect(
+      (await owner.send('inbox/sync', { since: -1 })).body
+    ).toEqual(relayError('bad_request'))
+    expect(
+      (await h.post('/inbox/sync', 'not json')).body
+    ).toEqual(relayError('bad_request'))
+    expect(
+      (await h.post('/inbox/sync', { p: '***' })).body
+    ).toEqual(relayError('bad_request'))
     expect(
       (await owner.send('inbox/sync', { since: 0, inboxId: 'short' })).status
     ).toBe(400)
@@ -614,7 +640,7 @@ describe('events and pushes', () => {
           apnsTopic: 'com.example.other',
         }
       )
-    ).toEqual({ status: 400, body: { error: 'bad_request' } })
+    ).toEqual({ status: 400, body: relayError('bad_request') })
     const buddy = await owner.addWriter()
 
     await buddy.putEvent({ kind: 'pair.confirmed', push: true })
@@ -701,11 +727,11 @@ describe('ending a connection', () => {
 
     expect(await buddy.putCard()).toEqual({
       status: 410,
-      body: { error: 'gone' },
+      body: relayError('gone'),
     })
     expect(await buddy.putEvent()).toEqual({
       status: 410,
-      body: { error: 'gone' },
+      body: relayError('gone'),
     })
     const sync = (await owner.sync()).body
     expect(sync.slots.map((s: { slotId: string }) => s.slotId)).toEqual([
@@ -729,7 +755,7 @@ describe('ending a connection', () => {
     ).toEqual({ ok: true })
     expect(await buddy.putCard()).toEqual({
       status: 410,
-      body: { error: 'gone' },
+      body: relayError('gone'),
     })
     expect((await owner.sync()).body).toMatchObject({ slots: [], cards: [] })
   })
@@ -749,7 +775,7 @@ describe('ending a connection', () => {
       inboxId: owner.inboxId,
       slotId: buddy.slotId,
     })
-    expect(response).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(response).toEqual({ status: 401, body: relayError('bad_signature') })
     expect((await owner.sync()).body.slots).toHaveLength(1)
   })
 
@@ -772,7 +798,7 @@ describe('ending a connection', () => {
           writerPub: other.publicKey,
         })
       ).body
-    ).toEqual({ error: 'conflict' })
+    ).toEqual(relayError('conflict'))
   })
 })
 
@@ -785,7 +811,7 @@ describe('caps and rate limits', () => {
 
     expect((await createInvite(owner)).response).toEqual({
       status: 429,
-      body: { error: 'limit' },
+      body: relayError('limit'),
     })
     const writer = await SigningKey.generate()
     expect(
@@ -795,7 +821,7 @@ describe('caps and rate limits', () => {
           writerPub: writer.publicKey,
         })
       ).body
-    ).toEqual({ error: 'limit' })
+    ).toEqual(relayError('limit'))
   })
 
   it('limits open invites to 3', async () => {
@@ -803,9 +829,9 @@ describe('caps and rate limits', () => {
     for (let i = 0; i < 3; i++) {
       expect((await createInvite(owner)).response.status).toBe(200)
     }
-    expect((await createInvite(owner)).response.body).toEqual({
-      error: 'limit',
-    })
+    expect(
+      (await createInvite(owner)).response.body
+    ).toEqual(relayError('limit'))
   })
 
   it('limits invite creation to 20 per 24 hours, counting deleted invites', async () => {
@@ -816,9 +842,10 @@ describe('caps and rate limits', () => {
       await owner.send('invite/delete', { inviteId: invite.inviteId })
       advance(HOUR_MS)
     }
+    // The oldest of the 20 leaves the rolling day in 4 hours.
     expect((await createInvite(owner)).response).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited', { retryAfter: 4 * 60 * 60 }),
     })
     advance(5 * HOUR_MS)
     expect((await createInvite(owner)).response.status).toBe(200)
@@ -834,15 +861,16 @@ describe('caps and rate limits', () => {
     }
     expect(await buddy.putCard()).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited', { retryAfter: 60 * 60 }),
     })
+    advance(15 * MINUTE_MS)
     expect(await buddy.putEvent()).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited', { retryAfter: 45 * 60 }),
     })
     expect((await other.putCard()).status).toBe(200)
 
-    advance(HOUR_MS)
+    advance(45 * MINUTE_MS)
     expect((await buddy.putCard()).status).toBe(200)
   })
 
@@ -1001,7 +1029,7 @@ describe('caps and rate limits', () => {
     expect((await fetchInvite(inviteId)).status).toBe(404)
     expect(await fetchInvite(inviteId)).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited'),
     })
     expect(
       (
@@ -1045,7 +1073,7 @@ describe('invites', () => {
     expect((await fetchInvite(invite.inviteId)).body.status).toBe('claimed')
     expect(await claim(invite.inviteId, invite.claimSecret)).toEqual({
       status: 409,
-      body: { error: 'conflict' },
+      body: relayError('conflict'),
     })
 
     const { events, seq } = (await owner.sync()).body
@@ -1068,7 +1096,7 @@ describe('invites', () => {
     })
     expect(await fetchInvite(invite.inviteId)).toEqual({
       status: 404,
-      body: { error: 'not_found' },
+      body: relayError('not_found'),
     })
     expect(h.invites.storage(invite.inviteId).tables()).toEqual([])
     expect(
@@ -1085,13 +1113,13 @@ describe('invites', () => {
     for (let attempt = 1; attempt <= 5; attempt++) {
       expect(await claim(invite.inviteId, wrong)).toEqual({
         status: 401,
-        body: { error: 'bad_signature' },
+        body: relayError('bad_signature'),
       })
     }
     expect((await fetchInvite(invite.inviteId)).status).toBe(404)
-    expect((await claim(invite.inviteId, invite.claimSecret)).body).toEqual({
-      error: 'not_found',
-    })
+    expect(
+      (await claim(invite.inviteId, invite.claimSecret)).body
+    ).toEqual(relayError('not_found'))
     // The burned invite no longer holds one of the creator's spots.
     expect(
       h.inboxes.storage(owner.inboxId).query('SELECT invite_id FROM invite')
@@ -1115,12 +1143,12 @@ describe('invites', () => {
     expect(storage.alarm()).toBe(START + HOUR_MS + 10 * MINUTE_MS)
 
     advance(HOUR_MS)
-    expect((await fetchInvite(invite.inviteId)).body).toEqual({
-      error: 'not_found',
-    })
-    expect((await claim(invite.inviteId, invite.claimSecret)).body).toEqual({
-      error: 'not_found',
-    })
+    expect(
+      (await fetchInvite(invite.inviteId)).body
+    ).toEqual(relayError('not_found'))
+    expect(
+      (await claim(invite.inviteId, invite.claimSecret)).body
+    ).toEqual(relayError('not_found'))
 
     advance(10 * MINUTE_MS)
     await h.invites.fireAlarm(invite.inviteId)
@@ -1137,12 +1165,12 @@ describe('invites', () => {
     const owner = await Owner.create(h)
     const ceiling = Date.now() + 7 * DAY_MS + 5 * MINUTE_MS
     expect((await createInvite(owner, ceiling)).response.status).toBe(200)
-    expect((await createInvite(owner, ceiling + 1)).response.body).toEqual({
-      error: 'bad_request',
-    })
-    expect((await createInvite(owner, Date.now())).response.body).toEqual({
-      error: 'bad_request',
-    })
+    expect(
+      (await createInvite(owner, ceiling + 1)).response.body
+    ).toEqual(relayError('bad_request'))
+    expect(
+      (await createInvite(owner, Date.now())).response.body
+    ).toEqual(relayError('bad_request'))
   })
 
   it('conflicts on an existing inviteId, and only the creator may delete', async () => {
@@ -1156,7 +1184,7 @@ describe('invites', () => {
       blob: blobOfSize(10),
       expiresAt: Date.now() + DAY_MS,
     })
-    expect(duplicate).toEqual({ status: 409, body: { error: 'conflict' } })
+    expect(duplicate).toEqual({ status: 409, body: relayError('conflict') })
     // The failed create doesn't hold one of the other inbox's spots.
     expect(
       h.inboxes.storage(other.inboxId).query('SELECT * FROM invite')
@@ -1175,9 +1203,9 @@ describe('invites', () => {
     const invite = await createInvite(owner)
     // Simulate a lost invite DO delete: the inbox forgot it, the DO didn't.
     await h.inboxes.object(owner.inboxId).forgetInvite(invite.inviteId)
-    expect((await claim(invite.inviteId, invite.claimSecret)).body).toEqual({
-      error: 'not_found',
-    })
+    expect(
+      (await claim(invite.inviteId, invite.claimSecret)).body
+    ).toEqual(relayError('not_found'))
     expect(h.invites.storage(invite.inviteId).tables()).toEqual([])
   })
 
@@ -1191,7 +1219,7 @@ describe('invites', () => {
     h.inboxes.failNextReply(owner.inboxId)
     expect(await claim(invite.inviteId, invite.claimSecret, blob)).toEqual({
       status: 500,
-      body: { error: 'internal' },
+      body: relayError('internal'),
     })
     expect((await fetchInvite(invite.inviteId)).body.status).toBe('open')
 
@@ -1204,9 +1232,86 @@ describe('invites', () => {
     const { events } = (await owner.sync()).body
     expect(events).toHaveLength(1)
     // A different claimer can't slip in behind the first claim.
-    expect((await claim(invite.inviteId, invite.claimSecret)).body).toEqual({
-      error: 'conflict',
+    expect(
+      (await claim(invite.inviteId, invite.claimSecret)).body
+    ).toEqual(relayError('conflict'))
+  })
+
+  it('answers a retried claim from its winner with ok, without a second event or push', async () => {
+    const owner = await Owner.create(h)
+    await owner.registerDevice()
+    const invite = await createInvite(owner)
+    const blob = blobOfSize(150)
+    expect((await claim(invite.inviteId, invite.claimSecret, blob)).body).toEqual(
+      { ok: true }
+    )
+    await h.flush()
+
+    // The response was lost; the client resends the same request.
+    for (let retry = 0; retry < 2; retry++) {
+      expect(await claim(invite.inviteId, invite.claimSecret, blob)).toEqual({
+        status: 200,
+        body: { ok: true },
+      })
+    }
+    await h.flush()
+    expect(h.pushes).toHaveLength(1)
+    const { events } = (await owner.sync()).body
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ kind: 'invite.claimed', blob })
+    // The DO keeps a digest of the winning blob, never a second copy.
+    expect(
+      h.invites
+        .storage(invite.inviteId)
+        .query('SELECT claim_blob_hash AS hash FROM invite')[0].hash
+    ).not.toBe(blob)
+  })
+
+  it('still refuses everyone but the winner of a claimed invite', async () => {
+    const owner = await Owner.create(h)
+    const invite = await createInvite(owner)
+    const blob = blobOfSize(150)
+    expect((await claim(invite.inviteId, invite.claimSecret, blob)).status).toBe(
+      200
+    )
+
+    // The right secret with a freshly sealed blob is another claim.
+    expect(await claim(invite.inviteId, invite.claimSecret)).toEqual({
+      status: 409,
+      body: relayError('conflict'),
     })
+    // The winner's blob without the secret gets nowhere, and burns nothing.
+    const wrong = (await inviteSecrets()).claimSecret
+    for (let attempt = 0; attempt < 6; attempt++) {
+      expect(await claim(invite.inviteId, wrong, blob)).toEqual({
+        status: 409,
+        body: relayError('conflict'),
+      })
+    }
+    expect((await fetchInvite(invite.inviteId)).body.status).toBe('claimed')
+    expect(
+      (await claim(invite.inviteId, invite.claimSecret, blob)).body
+    ).toEqual({ ok: true })
+  })
+
+  it('keeps conflict for retries on invites claimed before claims were repeatable', async () => {
+    const owner = await Owner.create(h)
+    const invite = await createInvite(owner)
+    const blob = blobOfSize(150)
+    await claim(invite.inviteId, invite.claimSecret, blob)
+    // An invite DO from before this change: no column, so no digest.
+    const storage = h.invites.storage(invite.inviteId)
+    storage.query('ALTER TABLE invite DROP COLUMN claim_blob_hash')
+    h.invites.restart(invite.inviteId)
+
+    expect((await claim(invite.inviteId, invite.claimSecret, blob)).body).toEqual(
+      relayError('conflict')
+    )
+    // It picked the column up in place and still serves the invite.
+    expect(
+      storage.query('PRAGMA table_info(invite)').map((column) => column.name)
+    ).toContain('claim_blob_hash')
+    expect((await fetchInvite(invite.inviteId)).body.status).toBe('claimed')
   })
 })
 
@@ -1233,10 +1338,10 @@ describe('inbox/delete', () => {
       expect((await fetchInvite(invite.inviteId)).status).toBe(404)
       expect(h.invites.storage(invite.inviteId).tables()).toEqual([])
     }
-    expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+    expect((await owner.sync()).body).toEqual(relayError('not_found'))
     expect(await buddy.putCard()).toEqual({
       status: 404,
-      body: { error: 'not_found' },
+      body: relayError('not_found'),
     })
 
     // The same identity can start over from an empty inbox.
@@ -1319,16 +1424,16 @@ describe('inbox ownership across wipes', () => {
         const intruder = await SigningKey.generate()
         expect(await registerAs(intruder, owner.inboxId)).toEqual({
           status: 409,
-          body: { error: 'conflict' },
+          body: relayError('conflict'),
         })
         // A refused registration stores nothing.
         expect(storage.tables()).toEqual(['owner_tombstone'])
 
         // Everything else still sees no inbox, exactly as before the binding.
-        expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+        expect((await owner.sync()).body).toEqual(relayError('not_found'))
         expect(await buddy.putCard()).toEqual({
           status: 404,
-          body: { error: 'not_found' },
+          body: relayError('not_found'),
         })
         expect((await buddy.send('slot/leave')).body).toEqual({ ok: true })
 
@@ -1340,11 +1445,11 @@ describe('inbox ownership across wipes', () => {
         // Until the owner restores the slot, the buddy's writes are gone.
         expect(await buddy.putCard()).toEqual({
           status: 410,
-          body: { error: 'gone' },
+          body: relayError('gone'),
         })
         expect(await registerAs(intruder, owner.inboxId)).toEqual({
           status: 409,
-          body: { error: 'conflict' },
+          body: relayError('conflict'),
         })
 
         await owner.send('slot/add', {
@@ -1418,7 +1523,7 @@ describe('kill switch', () => {
     const invite = await createInvite(owner)
 
     await h.kv.put('buddies:enabled', 'false')
-    const disabled = { status: 503, body: { error: 'disabled' } }
+    const disabled = { status: 503, body: relayError('disabled') }
     expect(await owner.sync()).toEqual(disabled)
     expect(await owner.registerDevice()).toEqual(disabled)
     expect(await buddy.putCard()).toEqual(disabled)
@@ -1499,7 +1604,7 @@ describe('retention', () => {
     advance(100 * DAY_MS)
     await h.inboxes.fireAlarm(owner.inboxId)
     expect(storage.tables()).toEqual(['owner_tombstone'])
-    expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+    expect((await owner.sync()).body).toEqual(relayError('not_found'))
   })
 
   it('stores nothing for requests to an inbox that was never registered', async () => {

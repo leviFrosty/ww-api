@@ -1,12 +1,8 @@
 import { Hono } from "hono";
-import type { MiddlewareHandler } from "hono";
-import type {
-  Environment,
-  AppContext,
-  HealthCheckResponse,
-  ErrorResponse,
-} from "./types";
+import type { Environment, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
+import { apiError, dateHeader } from "./errors";
+import { rateLimit } from "./rateLimit";
 import { proxyRequestToHereApi } from "./proxy";
 import {
   handleAasaRequest,
@@ -46,17 +42,6 @@ export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
 
 const app = new Hono<{ Bindings: Environment }>();
 
-const rateLimitMiddleware: MiddlewareHandler<{ Bindings: Environment }> =
-  async (context, next) => {
-    const clientIp = context.req.header("CF-Connecting-IP") ?? "unknown";
-    const { success } = await context.env.RATE_LIMITER.limit({ key: clientIp });
-    if (!success) {
-      const response: ErrorResponse = { error: "Rate limit exceeded" };
-      return context.json(response, HTTP_STATUS.TOO_MANY_REQUESTS);
-    }
-    await next();
-  };
-
 async function handleGeocodeRequest(context: AppContext) {
   return proxyRequestToHereApi(context, HERE_API.GEOCODE_URL);
 }
@@ -65,36 +50,45 @@ async function handleAutocompleteRequest(context: AppContext) {
   return proxyRequestToHereApi(context, HERE_API.AUTOCOMPLETE_URL);
 }
 
+/**
+ * Liveness plus the server clock. Clients calibrate against `Date` (and
+ * `serverTime`, epoch ms) before signing time-bound requests (Buddies `ts`),
+ * so it is never cached anywhere: a cached copy would carry an old clock. No
+ * I/O, no rate limit.
+ */
 function handleHealthCheckRequest(context: AppContext) {
+  const now = Date.now();
   const response: HealthCheckResponse = {
     status: "ok",
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(now).toISOString(),
+    serverTime: now,
     versionId: context.env.CF_VERSION_METADATA.id,
     versionTag: context.env.CF_VERSION_METADATA.tag || undefined,
     deployedAt: context.env.CF_VERSION_METADATA.timestamp,
   };
-  return context.json(response);
+  return context.json(response, 200, {
+    "Cache-Control": "no-store",
+    ...dateHeader(now),
+  });
 }
 
-function handleNotFound(context: AppContext) {
-  const response: ErrorResponse = { error: "Not found" };
-  return context.json(response, HTTP_STATUS.NOT_FOUND);
+function handleNotFound() {
+  return apiError(HTTP_STATUS.NOT_FOUND, "not_found");
 }
 
-function handleApplicationError(error: Error, context: AppContext) {
+function handleApplicationError(error: Error) {
   Sentry.captureException(error);
   console.error("Application error:", error);
-
-  const response: ErrorResponse = { error: "Internal server error" };
-  return context.json(response, HTTP_STATUS.INTERNAL_SERVER_ERROR);
+  return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 
-app.use("/geocode", rateLimitMiddleware);
-app.use("/autocomplete", rateLimitMiddleware);
-app.use("/notes-import", rateLimitMiddleware);
-app.use("/notes-import/*", rateLimitMiddleware);
-app.use("/admin/*", rateLimitMiddleware);
-app.use("/route-planning/*", rateLimitMiddleware);
+// Each family counts in its own per-IP bucket (src/rateLimit.ts).
+app.use("/geocode", rateLimit("places"));
+app.use("/autocomplete", rateLimit("places"));
+app.use("/notes-import", rateLimit("notes-import"));
+app.use("/notes-import/*", rateLimit("notes-import"));
+app.use("/admin/*", rateLimit("admin"));
+app.use("/route-planning/*", rateLimit("route-planning"));
 
 app.get("/geocode", handleGeocodeRequest);
 app.get("/autocomplete", handleAutocompleteRequest);

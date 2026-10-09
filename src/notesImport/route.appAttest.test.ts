@@ -250,6 +250,7 @@ describe('App Attest route compatibility', () => {
 
     expect(response.status).toBe(401)
     await expect(response.json()).resolves.toEqual({
+      ok: false,
       error: 'recovery token did not match',
       code: 'attestation_failed',
       reason: 'recovery_token_mismatch',
@@ -567,6 +568,43 @@ describe('App Attest route compatibility', () => {
     })
   })
 
+  it('tells a capped kickoff when to look for a free slot', async () => {
+    const { environment, index, start } = await makeKickoffEnvironment()
+    index.acquire.mockResolvedValueOnce({ ok: false, active: 2 } as never)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 404 }))
+    )
+    const response = await handleNotesImportKickoffRequest(
+      context(environment, {
+        body: {
+          protocolVersion: 2,
+          operation: 'assert',
+          operationId: 'assert-operation-1',
+          purpose: 'notes-import-kickoff',
+          uuid: UUID,
+          accountId: 'account-id',
+          notesText: GOLDEN_NOTES_TEXT,
+          context: GOLDEN_CONTEXT,
+          contentHash: GOLDEN_CONTENT_HASH,
+          requestHash: GOLDEN_REQUEST_HASH,
+          keyId: `${'A'.repeat(43)}=`,
+          challenge: 'C'.repeat(43),
+          assertion: 'assertion',
+        },
+      })
+    )
+
+    expect(response.status).toBe(429)
+    await expect(response.json()).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining('imports running'),
+      code: 'active_cap',
+      retryAfter: 15,
+    })
+    expect(start).not.toHaveBeenCalled()
+  })
+
   it('rejects every kickoff payload mutation not covered by its claimed requestHash', async () => {
     const { environment, index } = await makeKickoffEnvironment('bypass-token')
     const baseBody = {
@@ -665,9 +703,12 @@ describe('App Attest route compatibility', () => {
       context(environment, { body: {} })
     )
     expect(kickoff.status).toBe(503)
-    await expect(kickoff.json()).resolves.toMatchObject({
+    await expect(kickoff.json()).resolves.toEqual({
+      ok: false,
+      error: 'Notes Import is temporarily unavailable',
       code: 'unavailable',
       detail: 'disabled',
+      retryAfter: 60,
     })
 
     const challenge = await handleChallengeRequest(

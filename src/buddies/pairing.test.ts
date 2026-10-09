@@ -11,6 +11,7 @@ import {
   randomBytes,
   randomId,
   unsignedEnvelope,
+  relayError,
   type Harness,
 } from '../test/buddies'
 
@@ -524,7 +525,7 @@ it('pairs two people end to end: register → invite → claim → confirm → c
     await maria.write('card/put', levi.inboxId, mariaMariaToLevi, {
       blob: b64u(randomBytes(40)),
     })
-  ).toEqual({ status: 410, body: { error: 'gone' } })
+  ).toEqual({ status: 410, body: relayError('gone') })
   // Ending sends no push.
   await h.flush()
   expect(h.pushes).toHaveLength(2)

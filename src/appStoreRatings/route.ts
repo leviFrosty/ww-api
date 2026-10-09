@@ -1,11 +1,14 @@
-import type { AppContext, ErrorResponse } from '../types'
+import type { AppContext } from '../types'
 import { HTTP_STATUS } from '../config'
+import { apiError } from '../errors'
 import { SUMMARY_KEY } from './ratings'
 
 /** The summary changes at most daily (see SWEEP_INTERVAL_MS). */
 const EDGE_TTL_SECONDS = 6 * 60 * 60
 const CLIENT_TTL_SECONDS = 24 * 60 * 60
 const KV_EDGE_TTL_SECONDS = 60 * 60
+/** The sweep cron runs hourly. */
+const RETRY_AFTER_SECONDS = 60 * 60
 
 /**
  * GET /app-store/ratings — paywall social proof. Served from the colo's Cache
@@ -24,10 +27,11 @@ export async function handleAppStoreRatingsRequest(ctx: AppContext) {
     cacheTtl: KV_EDGE_TTL_SECONDS,
   })
   if (!summary) {
-    // No completed sweep yet (fresh deploy). Clients keep their fallback.
-    const response: ErrorResponse = { error: 'Ratings unavailable' }
-    return ctx.json(response, HTTP_STATUS.SERVICE_UNAVAILABLE, {
-      'Cache-Control': 'no-store',
+    // No completed sweep yet (fresh deploy). Clients keep their fallback; the
+    // hourly cron is the soonest anything changes.
+    return apiError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'unavailable', {
+      retryAfter: RETRY_AFTER_SECONDS,
+      headers: { 'Cache-Control': 'no-store' },
     })
   }
 

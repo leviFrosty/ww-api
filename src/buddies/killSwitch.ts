@@ -2,6 +2,8 @@ import type { Environment } from '../types'
 
 export const BUDDIES_ENABLED_KEY = 'buddies:enabled'
 const CACHE_TTL_SECONDS = 60
+/** A flip takes up to one cache lifetime to reach every colo. */
+export const KILL_SWITCH_RETRY_AFTER_SECONDS = CACHE_TTL_SECONDS
 
 export type KillSwitchEnv = Pick<Environment, 'BUDDIES_ENABLED'> & {
   NOTES_KV: Pick<KVNamespace, 'get'>

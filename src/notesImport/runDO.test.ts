@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CreditsSnapshot } from '../credits'
 import type { Environment } from '../types'
 import type { StartImportInput } from './runDO'
@@ -113,6 +113,13 @@ const fakeContext = (state: FakeRunState): DurableObjectState =>
           if (query === 'DELETE FROM meta WHERE k = ?') {
             state.meta.delete(String(args[0]))
             return cursor([])
+          }
+          if (query.startsWith('SELECT seq, data FROM events WHERE seq > ?')) {
+            return cursor(
+              state.events
+                .filter((event) => event.seq > Number(args[0]))
+                .map(({ seq, data }) => ({ seq, data }))
+            )
           }
           if (query.startsWith('INSERT INTO events')) {
             const seq = state.events.length + 1
@@ -383,3 +390,67 @@ describe('NotesImportRun analytics', () => {
     expect(mocks.capture).not.toHaveBeenCalled()
   })
 })
+
+describe('NotesImportRun SSE heartbeat', () => {
+  const decoder = new TextDecoder()
+  const subscribe = async (run: { fetch(request: Request): Promise<Response> }) => {
+    const response = await run.fetch(new Request('https://do/events'))
+    return response.body!.getReader()
+  }
+  const text = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>
+  ): Promise<string | null> => {
+    const { value, done } = await reader.read()
+    return done ? null : decoder.decode(value)
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('sends an SSE comment every 15 s while the run is live, then stops', async () => {
+    vi.useFakeTimers()
+    const { run } = await makeRun(vi.fn())
+    const { SSE_HEARTBEAT_MS } = await import('./runDO')
+    expect(SSE_HEARTBEAT_MS).toBe(15_000)
+    await run.start(INPUT)
+    const reader = await subscribe(run)
+
+    vi.advanceTimersByTime(SSE_HEARTBEAT_MS - 1)
+    vi.advanceTimersByTime(1)
+    expect(await text(reader)).toBe(':\n\n')
+    vi.advanceTimersByTime(SSE_HEARTBEAT_MS)
+    expect(await text(reader)).toBe(':\n\n')
+
+    // A terminal event closes the stream and the timer with it.
+    await run.cancel()
+    expect(await text(reader)).toContain('event: cancelled')
+    expect(await text(reader)).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('stops the heartbeat when the last subscriber hangs up', async () => {
+    vi.useFakeTimers()
+    const { run } = await makeRun(vi.fn())
+    await run.start(INPUT)
+    const reader = await subscribe(run)
+    expect(vi.getTimerCount()).toBe(1)
+    await reader.cancel()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('closes after the replay when nothing is live to tail', async () => {
+    vi.useFakeTimers()
+    const { run } = await makeRun(vi.fn())
+    // No run at all.
+    expect(await text(await subscribe(run))).toBeNull()
+    // A cancelled run replays its terminal event, then closes.
+    await run.start(INPUT)
+    await run.cancel()
+    const reader = await subscribe(run)
+    const replay = (await text(reader)) ?? ''
+    expect(replay + ((await text(reader)) ?? '')).toContain('event: cancelled')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
+

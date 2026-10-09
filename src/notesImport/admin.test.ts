@@ -49,7 +49,10 @@ describe('admin Notes Import usage reset', () => {
       const { deps, indexFor } = makeDeps(configured)
       await expect(
         handleAdminResetRequest(request(supplied), deps).then(responseBody)
-      ).resolves.toEqual({ status: 404, body: { error: 'Not found' } })
+      ).resolves.toEqual({
+        status: 404,
+        body: { ok: false, error: 'not_found', code: 'not_found' },
+      })
       expect(indexFor).not.toHaveBeenCalled()
     }
   })
@@ -61,7 +64,10 @@ describe('admin Notes Import usage reset', () => {
         request('correct-token', { meterId: 'bad|identity' }),
         deps
       ).then(responseBody)
-    ).resolves.toEqual({ status: 400, body: { error: 'Invalid meterId' } })
+    ).resolves.toEqual({
+      status: 400,
+      body: { ok: false, error: 'Invalid meterId', code: 'bad_request' },
+    })
     expect(indexFor).not.toHaveBeenCalled()
   })
 

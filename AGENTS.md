@@ -230,7 +230,10 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
     `inbox/live`, `BUDDIES_WRITE_LIMITER` 600/min for every other op
     (namespaces 1002-1005 prod, 2002-2005 dev; `limits.test.ts` keeps
     `wrangler.toml` equal to the constants). Refusals are 429 `rate_limited`
-    with `Retry-After: 60`. The Worker also refuses stale `ts` and badly
+    with `Retry-After: 60`. Every relay error is `{ok: false, error, code}`
+    (`src/buddies/errorResponse.ts`); `rate_limited` and `disabled` always
+    carry `Retry-After`/`retryAfter`, computed from the limit's window inside
+    the Durable Objects, and `stale` carries `serverTime` and `Date`. The Worker also refuses stale `ts` and badly
     signed `inbox/register` before any DO. A limiter outage lets requests
     through.
   - `inbox/register`: 2,000 validly signed calls per caller per rolling day

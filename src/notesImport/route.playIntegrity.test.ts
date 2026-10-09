@@ -398,9 +398,11 @@ describe('Play Integrity on the Notes Import routes', () => {
     )
     expect(response.status).toBe(503)
     await expect(response.json()).resolves.toMatchObject({
+      ok: false,
       code: 'server_error',
       reason: 'integrity_unavailable',
       action: 'retry',
+      retryAfter: 30,
     })
   })
 

@@ -94,19 +94,25 @@ export const BUDDIES_ERROR_STATUS = {
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
 
+/** A refusal; time-bound limits say how long to wait (`Retry-After`). */
+export type BuddiesFailure = {
+  ok: false
+  error: BuddiesErrorCode
+  retryAfterSeconds?: number
+}
+
 /** Result shape shared by every Durable Object method (RPC-serializable). */
-export type BuddiesResult<T> =
-  | { ok: true; value: T }
-  | { ok: false; error: BuddiesErrorCode }
+export type BuddiesResult<T> = { ok: true; value: T } | BuddiesFailure
 
 export const ok = <T>(value: T): { ok: true; value: T } => ({ ok: true, value })
 
 export const fail = (
-  error: BuddiesErrorCode
-): { ok: false; error: BuddiesErrorCode } => ({
-  ok: false,
-  error,
-})
+  error: BuddiesErrorCode,
+  retryAfterSeconds?: number
+): BuddiesFailure =>
+  retryAfterSeconds == null
+    ? { ok: false, error }
+    : { ok: false, error, retryAfterSeconds }
 
 const SECOND_MS = 1_000
 const MINUTE_MS = 60 * SECOND_MS

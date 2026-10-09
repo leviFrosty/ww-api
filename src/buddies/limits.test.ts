@@ -10,6 +10,7 @@ import {
   liveHeaders,
   randomId,
   unsignedEnvelope,
+  relayError,
   type ApiResponse,
   type Harness,
   type Writer,
@@ -24,6 +25,7 @@ import {
   type BuddiesEdgeTier,
 } from './limits'
 import type { Environment } from '../types'
+import { RATE_LIMIT_PERIOD_SECONDS } from '../rateLimit'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -230,6 +232,15 @@ describe('wrangler.toml', () => {
     }
   )
 
+  it.each(['', 'env.dev.'])(
+    'sends the shared limiter’s window as Retry-After (%s)',
+    (prefix) => {
+      expect(rateLimits(prefix).RATE_LIMITER).toMatchObject({
+        period: RATE_LIMIT_PERIOD_SECONDS,
+      })
+    }
+  )
+
   it('gives every rate limiter its own namespace', () => {
     const ids = ['', 'env.dev.'].flatMap((prefix) =>
       Object.values(rateLimits(prefix)).map((limit) => limit.id)
@@ -273,9 +284,9 @@ describe('per-caller edge limits', () => {
     async (tier) => {
       const limit = ABUSE.edge[tier].perMinute
       for (let i = 0; i < limit; i++) {
-        expect((await garbage(paths[tier], '198.51.100.1')).body).toEqual({
-          error: 'bad_request',
-        })
+        expect(
+          (await garbage(paths[tier], '198.51.100.1')).body
+        ).toEqual(relayError('bad_request'))
       }
       const refused = await h.request(paths[tier], {
         method: 'POST',
@@ -283,7 +294,7 @@ describe('per-caller edge limits', () => {
         body: JSON.stringify({ p: '!!' }),
       })
       expect(refused.status).toBe(429)
-      expect(await refused.json()).toEqual({ error: 'rate_limited' })
+      expect(await refused.json()).toEqual(relayError('rate_limited'))
       expect(refused.headers.get('retry-after')).toBe('60')
 
       // Other callers and other tiers are unaffected.
@@ -331,7 +342,7 @@ describe('per-caller edge limits', () => {
       inboxId: victim.inboxId,
       since: 0,
     })
-    expect(refused).toEqual({ status: 429, body: { error: 'rate_limited' } })
+    expect(refused).toEqual({ status: 429, body: relayError('rate_limited') })
     // Refused at the edge: the victim's Durable Object never woke.
     expect(inboxCalls).toHaveBeenCalledTimes(limit)
 
@@ -358,7 +369,7 @@ describe('per-caller edge limits', () => {
       since: 0,
       ts: Date.now() - BUDDIES_LIMITS.timestampSkewMs - 1,
     })
-    expect(stale).toEqual({ status: 401, body: { error: 'stale' } })
+    expect(stale).toEqual({ status: 401, body: relayError('stale') })
     const staleLive = await h.live(
       await liveHeaders(
         { inboxId: owner.inboxId, ts: Date.now() + 6 * MINUTE_MS, nonce: randomId() },
@@ -371,7 +382,7 @@ describe('per-caller edge limits', () => {
       inboxId: owner.inboxId,
       ownerPub: owner.key.publicKey,
     })
-    expect(forged).toEqual({ status: 401, body: { error: 'bad_signature' } })
+    expect(forged).toEqual({ status: 401, body: relayError('bad_signature') })
 
     expect(inboxCalls).not.toHaveBeenCalled()
     expect(quotaCalls).not.toHaveBeenCalled()
@@ -426,7 +437,7 @@ describe('registration quota', () => {
       ),
     })
     expect(refused.status).toBe(429)
-    expect(await refused.json()).toEqual({ error: 'rate_limited' })
+    expect(await refused.json()).toEqual(relayError('rate_limited'))
     // Free again once the first hour of registrations leaves the window.
     const retryAfter = Number(refused.headers.get('retry-after'))
     expect(retryAfter * SECOND_MS).toBe(START + DAY_MS - Date.now())
@@ -578,9 +589,12 @@ describe('stored-event caps', () => {
     const stored = storedEvents(owner.inboxId)
     const nonces = nonceRows(owner.inboxId)
 
+    // Room comes back when the oldest stored event reaches retention.
     expect(await buddy.putEvent()).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited', {
+        retryAfter: BUDDIES_LIMITS.eventRetentionMs / 1000,
+      }),
     })
     expect(storedEvents(owner.inboxId)).toBe(stored)
     expect(nonceRows(owner.inboxId)).toBe(nonces)
@@ -603,7 +617,7 @@ describe('stored-event caps', () => {
     expect((await buddy.putEvent({ blob: blobOfSize(4_000) })).status).toBe(200)
     expect(await buddy.putEvent({ blob: blobOfSize(4_000) })).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited'),
     })
     expect((await buddy.putEvent({ blob: blobOfSize(300) })).status).toBe(200)
     expect(limitHits()).toEqual([['event/put', 'slotEventBytes']])
@@ -627,7 +641,7 @@ describe('stored-event caps', () => {
     }
     expect(await writers[4].putEvent({ blob: blobOfSize(3_000) })).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited'),
     })
     expect(limitHits()).toEqual([['event/put', 'inboxEventBytes']])
   })
@@ -675,12 +689,12 @@ describe('nonces', () => {
         slotId: buddy.slotId,
         writerPub: owner.key.publicKey,
       })
-    expect((await slotAdd()).body).toEqual({ error: 'conflict' })
+    expect((await slotAdd()).body).toEqual(relayError('conflict'))
     const full = await owner.send('slot/add', {
       slotId: randomId(),
       writerPub: owner.key.publicKey,
     })
-    expect(full.body).toEqual({ error: 'limit' })
+    expect(full.body).toEqual(relayError('limit'))
     const accepted = 4 // the four slot/adds
     expect(nonceRows(owner.inboxId)).toBe(nonces + accepted)
     expect(limitHits()).toEqual([
@@ -715,7 +729,7 @@ describe('nonces', () => {
     expect((await h.post('/card/put', signed)).status).toBe(200)
     expect(await h.post('/card/put', signed)).toEqual({
       status: 409,
-      body: { error: 'replay' },
+      body: relayError('replay'),
     })
     const parallel = await envelope(
       'inbox/sync',
@@ -729,9 +743,9 @@ describe('nonces', () => {
     ).map((response) => response.status)
     expect(statuses.sort()).toEqual([200, 409, 409, 409, 409, 409])
     advance(6 * MINUTE_MS)
-    expect((await h.post('/inbox/sync', parallel)).body).toEqual({
-      error: 'stale',
-    })
+    expect(
+      (await h.post('/inbox/sync', parallel)).body
+    ).toEqual(relayError('stale'))
   })
 })
 
@@ -747,9 +761,10 @@ describe('signer budgets', () => {
       expect((await buddy.putEvent({ eventId })).status, `request ${i}`).toBe(200)
     }
     const nonces = nonceRows(owner.inboxId)
+    // 2.5 minutes into the writer's 10-minute window.
     expect(await buddy.putEvent({ eventId })).toEqual({
       status: 429,
-      body: { error: 'rate_limited' },
+      body: relayError('rate_limited', { retryAfter: 7.5 * 60 }),
     })
     expect(nonceRows(owner.inboxId)).toBe(nonces)
     expect((await other.putEvent()).status).toBe(200)
@@ -793,7 +808,7 @@ describe('signer budgets', () => {
       }
       // Registering doesn't count; it has its own limits.
       expect(nonceRows(owner.inboxId)).toBe(ABUSE.ownerRequests + 1)
-      expect((await owner.sync()).body).toEqual({ error: 'rate_limited' })
+      expect((await owner.sync()).body).toEqual(relayError('rate_limited'))
       expect(limitHits()).toEqual([['inbox/sync', 'ownerRequests']])
       advance(ABUSE.signerWindowMs)
       expect((await owner.sync()).status).toBe(200)
@@ -808,6 +823,7 @@ describe('signer budgets', () => {
     expect(budget.allows('a', 2, START + 2 * MINUTE_MS)).toBe(false)
     expect(budget.allows('b', 2, START + 2 * MINUTE_MS)).toBe(true)
     expect(budget.allows('a', 2, START + 10 * MINUTE_MS)).toBe(true)
+    expect(budget.waitMs('a', START + 2 * MINUTE_MS)).toBe(8 * MINUTE_MS)
   })
 })
 
