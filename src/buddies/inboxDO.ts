@@ -1,13 +1,15 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import { acceptedBundleIds } from '../appAttest/appId'
-import { bytesToBase64Url, sha256Bytes } from '../crypto'
+import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import {
   BUDDIES_LIMITS as LIMITS,
   BUDDIES_LIVE_CLOSE,
   BUDDIES_LIVE_OP,
   INVITE_CLAIMED_KIND,
   RELAY_SLOT_ID,
+  buddyBlobKey,
+  decodeB64u,
   fail,
   isImmediatePushKind,
   isPlainObject,
@@ -16,6 +18,8 @@ import {
   type BuddiesFailure,
   type BuddiesResult,
   type BuddiesSigningOp,
+  type BlobDeletePayload,
+  type BlobPutPayload,
   type CardPutPayload,
   type DeviceRegisterPayload,
   type DeviceUnregisterPayload,
@@ -106,6 +110,34 @@ const signerOf = (call: KeyedCall, ref: KeyRef): string =>
   ref === 'owner' ? 'owner' : (call.slotId ?? '')
 
 const INVITE_DELETE_RETRY_MS = 60_000
+/**
+ * R2 deletions that failed are retried from the alarm this soon, then twice
+ * as long after each failure in a row, up to `BLOB_DELETE_RETRY_MAX_MS`.
+ */
+const BLOB_DELETE_RETRY_MS = 60_000
+const BLOB_DELETE_RETRY_MAX_MS = 6 * 60 * 60_000
+/**
+ * A failed upload keeps its (unreadable) row this long, in case its object
+ * landed anyway: the row's expiry then deletes the object.
+ */
+const FAILED_UPLOAD_GRACE_MS = 10 * 60_000
+/** How often an inbox that stores photos sweeps its R2 prefix. */
+const BLOB_SWEEP_INTERVAL_MS = 7 * 24 * 60 * 60_000
+/** The sweep leaves newer objects alone: their upload may be in flight. */
+const BLOB_SWEEP_MIN_AGE_MS = 60 * 60_000
+/** Keys per R2 `delete()` call (R2 takes up to 1,000). */
+const BLOB_DELETE_BATCH = 100
+
+type BlobRow = {
+  bytes: number
+  tokenHash: string
+  expiresAt: number
+  /** Null until the object is in R2. */
+  writtenAt: number | null
+}
+
+const hex = (bytes: Uint8Array): string =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 
 /** `WebSocket.READY_STATE_OPEN`. */
 const SOCKET_OPEN = 1
@@ -229,6 +261,41 @@ const SCHEMA = [
      creator_inbox_id TEXT NOT NULL,
      expires_at       INTEGER NOT NULL
    )`,
+  // Photo blobs the owner uploaded; the sealed bytes are in R2 at
+  // `v1/<inboxId>/<blobId>`. `written_at` stays null until the object is
+  // stored, and `blob/get` serves only written, unexpired rows. Inboxes from
+  // before photos get these tables in place (`#ready`).
+  `CREATE TABLE IF NOT EXISTS blob (
+     blob_id    TEXT PRIMARY KEY,
+     bytes      INTEGER NOT NULL,
+     token_hash TEXT NOT NULL,
+     expires_at INTEGER NOT NULL,
+     created_at INTEGER NOT NULL,
+     written_at INTEGER
+   )`,
+  'CREATE INDEX IF NOT EXISTS blob_by_expiry ON blob (expires_at)',
+  // Rolling 24 h log of object writes. Random ids, so it never holds blob ids.
+  `CREATE TABLE IF NOT EXISTS blob_upload (
+     id TEXT PRIMARY KEY,
+     at INTEGER NOT NULL
+   )`,
+  // R2 objects still to delete (blob/delete, expiry, a wipe that failed
+  // part-way), retried from the alarm.
+  `CREATE TABLE IF NOT EXISTS pending_blob_delete (
+     object_key TEXT PRIMARY KEY
+   )`,
+  // R2 deletions failing in a row, and when the alarm tries again.
+  `CREATE TABLE IF NOT EXISTS blob_delete_backoff (
+     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+     failures  INTEGER NOT NULL,
+     retry_at  INTEGER NOT NULL
+   )`,
+  // When this inbox next sweeps its R2 prefix for objects no row knows.
+  // Kept while it stores photos.
+  `CREATE TABLE IF NOT EXISTS blob_sweep (
+     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+     due_at    INTEGER NOT NULL
+   )`,
 ] as const
 
 /**
@@ -252,9 +319,10 @@ const ownerKeyHash = async (ownerPub: string): Promise<string> =>
 /**
  * One SQLite Durable Object per `inboxId`: the owner key, slots (buddies'
  * writer keys), Buddy Cards, events, devices, the encrypted roster, the nonce
- * cache, the per-inbox `seq`, and open-invite bookkeeping. It holds ciphertext,
- * random ids, public keys, and push tokens only. A wiped inbox keeps a hash of
- * its owner key, which binds the `inboxId` to that key for good.
+ * cache, the per-inbox `seq`, open-invite bookkeeping, and the owner's photo
+ * blobs (their bytes live in R2). It holds ciphertext, random ids, hashes,
+ * public keys, and push tokens only. A wiped inbox keeps a hash of its owner
+ * key, which binds the `inboxId` to that key for good.
  *
  * Signed ops verify (and hash, for the tombstone) first, the only awaits, then
  * run their checks and writes in one synchronous transaction, so caps, `seq`,
@@ -675,6 +743,160 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
+  // --- Photo blobs ----------------------------------------------------------
+
+  /**
+   * `blob/put`, after the Worker checked that `body` is `call.bytes` long and
+   * hashes to `call.blobId`. Idempotent per `blobId`: a repeat keeps the
+   * first read-token hash and moves the expiry to the later of the two. The
+   * object is (re)written only when it isn't stored yet or the expiry moves,
+   * so a live object is never older than `maxBlobLifetimeMs` and the R2
+   * lifecycle backstop never removes one. Only an inbox with a buddy (a
+   * slot) can write one. New blobs count against the per-inbox caps until
+   * they expire, and every object write counts toward the rolling day's
+   * uploads.
+   */
+  async putBlob(
+    call: Signed<BlobPutPayload>,
+    body: Uint8Array
+  ): Promise<BuddiesResult<{ expiresAt: number }>> {
+    const bucket = this.env.BUDDY_BLOBS
+    if (!bucket) return fail('photos_disabled')
+    const auth = await this.#authenticate('blob/put', call, 'owner')
+    if (!auth.ok) return auth
+
+    const uploadId = crypto.randomUUID()
+    let write = null as 'new' | 'existing' | null
+    const reserved = this.#commit(
+      call,
+      'owner',
+      auth.value,
+      (now): BuddiesResult<{ expiresAt: number }> => {
+        const row = this.#blobRow(call.blobId)
+        // Stored, and the expiry doesn't move: nothing to write.
+        if (row?.writtenAt != null && call.expiresAt <= row.expiresAt)
+          return ok({ expiresAt: row.expiresAt })
+        // A photo is for buddies to read: without one, nobody could.
+        if (!this.#count('SELECT COUNT(*) AS n FROM slot'))
+          return fail('no_buddies')
+        if (!row) {
+          const cap = this.#blobCapHit(call.bytes, now)
+          if (cap) {
+            logLimitHit('blob/put', cap.limit)
+            return fail('rate_limited', retryAfterSeconds(cap.waitMs))
+          }
+        }
+        const refused = this.#recordUpload(uploadId, now)
+        if (refused) return refused
+        if (row) {
+          write = 'existing'
+        } else {
+          // The expiry is stored with the write, so a reservation keeps the new one.
+          this.#sql.exec(
+            `INSERT INTO blob (blob_id, bytes, token_hash, expires_at, created_at, written_at)
+             VALUES (?, ?, ?, ?, ?, NULL)`,
+            call.blobId,
+            call.bytes,
+            call.readTokenHash,
+            call.expiresAt,
+            now
+          )
+          this.#sql.exec(
+            'INSERT OR IGNORE INTO blob_sweep (singleton, due_at) VALUES (1, ?)',
+            now + BLOB_SWEEP_INTERVAL_MS
+          )
+          write = 'new'
+        }
+        return ok({ expiresAt: Math.max(row?.expiresAt ?? 0, call.expiresAt) })
+      }
+    )
+    if (!reserved.ok || write == null) return reserved
+
+    const key = buddyBlobKey(call.inboxId, call.blobId)
+    const digest = decodeB64u(call.blobId)
+    try {
+      await bucket.put(key, body, digest ? { sha256: hex(digest) } : {})
+    } catch (error) {
+      const failedAt = Date.now()
+      this.#releaseUpload(call.blobId, uploadId, write === 'new', failedAt)
+      await this.#ensureAlarm(failedAt).catch(() => undefined)
+      throw error
+    }
+
+    const now = Date.now()
+    const stored = this.ctx.storage.transactionSync((): number | null => {
+      if (!this.#meta()) return null
+      const row = this.#blobRow(call.blobId)
+      if (!row) return null
+      const expiresAt = Math.max(row.expiresAt, call.expiresAt)
+      this.#sql.exec(
+        'UPDATE blob SET written_at = ?, expires_at = ? WHERE blob_id = ?',
+        now,
+        expiresAt,
+        call.blobId
+      )
+      return expiresAt
+    })
+    if (stored == null) {
+      // Deleted, or the inbox wiped, while the object was being written.
+      await this.#deleteObjects([key], now)
+      return fail('not_found')
+    }
+    await this.#ensureAlarm(now)
+    return ok({ expiresAt: stored })
+  }
+
+  /**
+   * `blob/get`: whether `tokenHash` reads `blobId` from this inbox right now.
+   * Unknown inboxes and blobs, unwritten or expired blobs, and wrong tokens
+   * are all the same `not_found`. The Worker hashes the token and streams the
+   * object; nothing here counts as owner activity.
+   */
+  authorizeBlobRead(args: {
+    inboxId: string
+    blobId: string
+    tokenHash: string
+  }): BuddiesResult<Empty> {
+    const meta = this.#meta()
+    const row =
+      meta?.inboxId === args.inboxId ? this.#blobRow(args.blobId) : null
+    // Always compare, so a missing blob takes as long as a wrong token.
+    const tokenOk = timingSafeEqual(row?.tokenHash ?? '', args.tokenHash)
+    const readable =
+      row != null &&
+      tokenOk &&
+      row.writtenAt != null &&
+      row.expiresAt > Date.now()
+    return readable ? ok({}) : fail('not_found')
+  }
+
+  /**
+   * `blob/delete`: forgets the blobs at once (so reads stop), then deletes
+   * their objects. Idempotent; unknown ids still get their object deleted,
+   * in case one outlived its row. R2 failures are retried from the alarm.
+   */
+  async deleteBlobs(
+    call: Signed<BlobDeletePayload>
+  ): Promise<BuddiesResult<Empty>> {
+    const auth = await this.#authenticate('blob/delete', call, 'owner')
+    if (!auth.ok) return auth
+    const result = this.#commit(call, 'owner', auth.value, () => {
+      for (const blobId of call.blobIds) {
+        this.#sql.exec('DELETE FROM blob WHERE blob_id = ?', blobId)
+        this.#sql.exec(
+          'INSERT OR IGNORE INTO pending_blob_delete (object_key) VALUES (?)',
+          buddyBlobKey(call.inboxId, blobId)
+        )
+      }
+      return ok({})
+    })
+    if (!result.ok) return result
+    const now = Date.now()
+    await this.#flushBlobDeletes()
+    await this.#ensureAlarm(now)
+    return result
+  }
+
   // --- Live socket ---------------------------------------------------------
 
   /**
@@ -817,7 +1039,10 @@ export class BuddyInbox extends DurableObject<Environment> {
     })
   }
 
-  /** Retention: events at 30 days, invite bookkeeping, and the 180-day wipe. */
+  /**
+   * Retention: events at 30 days, blobs at their `expiresAt`, the weekly
+   * blob sweep, invite bookkeeping, and the 180-day wipe.
+   */
   async alarm(): Promise<void> {
     const now = Date.now()
     if (!this.#ready()) return
@@ -832,10 +1057,13 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!this.#ready()) return
     }
     this.ctx.storage.transactionSync(() => this.#prune(now))
+    await this.#flushBlobDeletes()
+    await this.#sweepBlobs(now)
     await this.#retryInviteDeletes(now)
     if (
       !this.#meta() &&
-      !this.#count('SELECT COUNT(*) AS n FROM pending_invite_delete')
+      !this.#count('SELECT COUNT(*) AS n FROM pending_invite_delete') &&
+      !this.#count('SELECT COUNT(*) AS n FROM pending_blob_delete')
     ) {
       await this.#deleteAllButTombstone(this.#tombstone())
       return
@@ -1107,6 +1335,95 @@ export class BuddyInbox extends DurableObject<Environment> {
         }>('SELECT seq FROM event WHERE event_id = ?', eventId)
         .toArray()[0]?.seq ?? null
     )
+  }
+
+  #blobRow(blobId: string): BlobRow | null {
+    return (
+      this.#sql
+        .exec<BlobRow>(
+          `SELECT bytes, token_hash AS tokenHash, expires_at AS expiresAt, written_at AS writtenAt
+           FROM blob WHERE blob_id = ?`,
+          blobId
+        )
+        .toArray()[0] ?? null
+    )
+  }
+
+  /**
+   * Which per-inbox blob cap one more blob of `bytes` would pass, counting
+   * live (unexpired) blobs, and how long until the soonest of them expires
+   * and frees room. Null when it fits.
+   */
+  #blobCapHit(
+    bytes: number,
+    now: number
+  ): { limit: 'inboxBlobs' | 'inboxBlobBytes'; waitMs: number } | null {
+    const { live, total, soonest } = this.#sql
+      .exec<{ live: number; total: number; soonest: number | null }>(
+        `SELECT COUNT(*) AS live, COALESCE(SUM(bytes), 0) AS total, MIN(expires_at) AS soonest
+         FROM blob WHERE expires_at > ?`,
+        now
+      )
+      .one()
+    const limit =
+      live >= ABUSE.inboxBlobs
+        ? 'inboxBlobs'
+        : total + bytes > ABUSE.inboxBlobBytes
+          ? 'inboxBlobBytes'
+          : null
+    return limit ? { limit, waitMs: (soonest ?? now) - now } : null
+  }
+
+  /**
+   * Rolling day of object writes per inbox. A refusal says when the oldest
+   * write in the window ages out.
+   */
+  #recordUpload(id: string, now: number): BuddiesFailure | null {
+    this.#sql.exec(
+      'DELETE FROM blob_upload WHERE at <= ?',
+      now - ABUSE.blobUploadWindowMs
+    )
+    const { uploads, oldest } = this.#sql
+      .exec<{
+        uploads: number
+        oldest: number | null
+      }>('SELECT COUNT(*) AS uploads, MIN(at) AS oldest FROM blob_upload')
+      .one()
+    if (uploads >= ABUSE.blobUploads) {
+      logLimitHit('blob/put', 'blobUploads')
+      return fail(
+        'rate_limited',
+        retryAfterSeconds((oldest ?? now) + ABUSE.blobUploadWindowMs - now)
+      )
+    }
+    this.#sql.exec('INSERT INTO blob_upload (id, at) VALUES (?, ?)', id, now)
+    return null
+  }
+
+  /**
+   * Undoes a reservation whose object write failed. A new blob's row stays,
+   * unreadable while unwritten, until `FAILED_UPLOAD_GRACE_MS`: the object
+   * may have landed anyway, and the row's expiry deletes it. A retry in the
+   * meantime finishes the upload.
+   */
+  #releaseUpload(
+    blobId: string,
+    uploadId: string,
+    created: boolean,
+    now: number
+  ): void {
+    if (!this.#ready()) return
+    this.ctx.storage.transactionSync(() => {
+      this.#sql.exec('DELETE FROM blob_upload WHERE id = ?', uploadId)
+      if (created) {
+        this.#sql.exec(
+          `UPDATE blob SET expires_at = MIN(expires_at, ?)
+           WHERE blob_id = ? AND written_at IS NULL`,
+          now + FAILED_UPLOAD_GRACE_MS,
+          blobId
+        )
+      }
+    })
   }
 
   /**
@@ -1464,6 +1781,25 @@ export class BuddyInbox extends DurableObject<Environment> {
       'DELETE FROM nonce WHERE seen_at < ?',
       now - LIMITS.nonceRetentionMs
     )
+    // Expired blobs stop being readable at once; their objects go next.
+    const inboxId = this.#meta()?.inboxId
+    if (inboxId) {
+      for (const { blobId } of this.#sql
+        .exec<{
+          blobId: string
+        }>('SELECT blob_id AS blobId FROM blob WHERE expires_at <= ?', now)
+        .toArray()) {
+        this.#sql.exec(
+          'INSERT OR IGNORE INTO pending_blob_delete (object_key) VALUES (?)',
+          buddyBlobKey(inboxId, blobId)
+        )
+      }
+    }
+    this.#sql.exec('DELETE FROM blob WHERE expires_at <= ?', now)
+    this.#sql.exec(
+      'DELETE FROM blob_upload WHERE at <= ?',
+      now - ABUSE.blobUploadWindowMs
+    )
   }
 
   #nextDeadline(now: number): number | null {
@@ -1487,6 +1823,19 @@ export class BuddyInbox extends DurableObject<Environment> {
     if (this.#count('SELECT COUNT(*) AS n FROM pending_invite_delete')) {
       deadlines.push(now + INVITE_DELETE_RETRY_MS)
     }
+    const { nextBlob } = this.#sql
+      .exec<{
+        nextBlob: number | null
+      }>('SELECT MIN(expires_at) AS nextBlob FROM blob')
+      .one()
+    if (nextBlob != null) deadlines.push(nextBlob)
+    if (this.#count('SELECT COUNT(*) AS n FROM pending_blob_delete')) {
+      deadlines.push(
+        this.#blobDeleteBackoff()?.retryAt ?? now + BLOB_DELETE_RETRY_MS
+      )
+    }
+    const sweep = this.#blobSweepDue()
+    if (sweep != null) deadlines.push(sweep)
     return deadlines.length ? Math.min(...deadlines) : null
   }
 
@@ -1500,13 +1849,14 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
-   * Deletes everything (slots, cards, events, devices, roster) and every invite
-   * this inbox created, keeping only `tombstone` (the owner's key hash). Local
-   * state goes first so concurrent ops see a missing inbox; invite deletions
-   * that fail are retried from the alarm.
+   * Deletes everything (slots, cards, events, devices, roster, photo blobs)
+   * and every invite this inbox created, keeping only `tombstone` (the
+   * owner's key hash). Local state goes first so concurrent ops see a missing
+   * inbox; invite and R2 deletions that fail are retried from the alarm.
    */
   async #wipe(now: number, tombstone: string): Promise<void> {
     const invites: PendingInviteDelete[] = []
+    const objects: string[] = []
     if (this.#ready()) {
       const meta = this.#meta()
       if (meta) {
@@ -1520,15 +1870,218 @@ export class BuddyInbox extends DurableObject<Environment> {
           .toArray()) {
           invites.push({ ...row, creatorInboxId: meta.inboxId })
         }
+        for (const { blobId } of this.#sql
+          .exec<{ blobId: string }>('SELECT blob_id AS blobId FROM blob')
+          .toArray()) {
+          objects.push(buddyBlobKey(meta.inboxId, blobId))
+        }
       }
       invites.push(...this.#pendingInviteDeletes())
+      objects.push(...this.#pendingBlobDeletes())
     }
+    const inboxId = this.#ready() ? this.#meta()?.inboxId : undefined
     await this.#deleteAllButTombstone(tombstone)
     // Before compatibility date 2026-02-24, deleteAll() keeps the alarm.
     await this.ctx.storage.deleteAlarm()
     this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.gone)
     const unique = new Map(invites.map((invite) => [invite.inviteId, invite]))
     await this.#deleteInvites([...unique.values()], now)
+    // Everything under the inbox's prefix goes too, rows or not.
+    const bucket = this.env.BUDDY_BLOBS
+    if (inboxId && bucket) {
+      try {
+        objects.push(...(await this.#listObjects(bucket, inboxId)))
+      } catch {
+        console.warn('buddies: listing blobs for a wipe failed')
+      }
+    }
+    await this.#deleteObjects([...new Set(objects)], now)
+  }
+
+  /** Keys under `inboxId`'s R2 prefix, uploaded before `before` if given. */
+  async #listObjects(
+    bucket: R2Bucket,
+    inboxId: string,
+    before = Number.POSITIVE_INFINITY
+  ): Promise<string[]> {
+    const prefix = buddyBlobKey(inboxId, '')
+    const keys: string[] = []
+    let cursor: string | undefined
+    do {
+      const page = await bucket.list({ prefix, cursor, limit: 1_000 })
+      for (const object of page.objects) {
+        if (object.uploaded.getTime() < before) keys.push(object.key)
+      }
+      cursor = page.truncated ? page.cursor : undefined
+    } while (cursor)
+    return keys
+  }
+
+  #blobSweepDue(): number | null {
+    return (
+      this.#sql
+        .exec<{ dueAt: number }>('SELECT due_at AS dueAt FROM blob_sweep')
+        .toArray()[0]?.dueAt ?? null
+    )
+  }
+
+  /**
+   * Deletes objects under this inbox's prefix that no row knows: a put whose
+   * object landed after it reported failure, or a cleanup that lost track.
+   * Objects newer than `BLOB_SWEEP_MIN_AGE_MS` are left alone, in case their
+   * upload is in flight. Weekly while the inbox stores photos, and once more
+   * after it stops; the R2 lifecycle rule is the last resort.
+   */
+  async #sweepBlobs(now: number): Promise<void> {
+    const bucket = this.env.BUDDY_BLOBS
+    const due = this.#blobSweepDue()
+    const inboxId = this.#meta()?.inboxId
+    if (due == null || due > now || !inboxId || !bucket) return
+    let found: string[] | null = null
+    try {
+      found = await this.#listObjects(
+        bucket,
+        inboxId,
+        now - BLOB_SWEEP_MIN_AGE_MS
+      )
+    } catch {
+      console.warn('buddies: blob sweep failed; retrying next week')
+    }
+    // A wipe meanwhile took the rows and the sweep with it.
+    if (!this.#ready() || !this.#meta()) return
+    const prefix = buddyBlobKey(inboxId, '')
+    let orphans = 0
+    this.ctx.storage.transactionSync(() => {
+      for (const key of found ?? []) {
+        if (this.#blobRow(key.slice(prefix.length))) continue
+        this.#sql.exec(
+          'INSERT OR IGNORE INTO pending_blob_delete (object_key) VALUES (?)',
+          key
+        )
+        orphans++
+      }
+      const stores = this.#count('SELECT COUNT(*) AS n FROM blob')
+      if (found == null || orphans || stores) {
+        this.#sql.exec(
+          'UPDATE blob_sweep SET due_at = ?',
+          now + BLOB_SWEEP_INTERVAL_MS
+        )
+      } else {
+        this.#sql.exec('DELETE FROM blob_sweep')
+      }
+    })
+    if (orphans) {
+      console.warn('buddies: blob sweep found objects without a row', {
+        orphans,
+      })
+      await this.#flushBlobDeletes()
+    }
+  }
+
+  #blobDeleteBackoff(): { failures: number; retryAt: number } | null {
+    return (
+      this.#sql
+        .exec<{
+          failures: number
+          retryAt: number
+        }>('SELECT failures, retry_at AS retryAt FROM blob_delete_backoff')
+        .toArray()[0] ?? null
+    )
+  }
+
+  /** Waits twice as long after each R2 deletion failure in a row. */
+  #noteBlobDeleteFailure(now: number): void {
+    const failures = (this.#blobDeleteBackoff()?.failures ?? 0) + 1
+    const wait = Math.min(
+      BLOB_DELETE_RETRY_MS * 2 ** (failures - 1),
+      BLOB_DELETE_RETRY_MAX_MS
+    )
+    this.#sql.exec(
+      `INSERT OR REPLACE INTO blob_delete_backoff (singleton, failures, retry_at)
+       VALUES (1, ?, ?)`,
+      failures,
+      now + wait
+    )
+  }
+
+  #pendingBlobDeletes(): string[] {
+    return this.#sql
+      .exec<{
+        key: string
+      }>(
+        'SELECT object_key AS key FROM pending_blob_delete ORDER BY object_key'
+      )
+      .toArray()
+      .map((row) => row.key)
+  }
+
+  /**
+   * Deletes R2 objects in batches; returns the keys whose batch failed.
+   * Without a bucket nothing could have been stored, so there is nothing to
+   * delete.
+   */
+  async #deleteFromBucket(keys: string[]): Promise<string[]> {
+    const bucket = this.env.BUDDY_BLOBS
+    if (!bucket) return []
+    const failed: string[] = []
+    for (let i = 0; i < keys.length; i += BLOB_DELETE_BATCH) {
+      const batch = keys.slice(i, i + BLOB_DELETE_BATCH)
+      try {
+        await bucket.delete(batch)
+      } catch {
+        failed.push(...batch)
+      }
+    }
+    return failed
+  }
+
+  /** Deletes the queued objects, keeping the ones R2 refused for the alarm. */
+  async #flushBlobDeletes(): Promise<void> {
+    if (!this.#ready()) return
+    const keys = this.#pendingBlobDeletes()
+    if (!keys.length) return
+    const failed = new Set(await this.#deleteFromBucket(keys))
+    if (failed.size)
+      console.warn('buddies: blob cleanup failed; retrying from the alarm', {
+        failed: failed.size,
+      })
+    // A wipe meanwhile took the queue with it.
+    if (!this.#ready()) return
+    this.ctx.storage.transactionSync(() => {
+      for (const key of keys) {
+        if (failed.has(key)) continue
+        this.#sql.exec(
+          'DELETE FROM pending_blob_delete WHERE object_key = ?',
+          key
+        )
+      }
+      if (failed.size) this.#noteBlobDeleteFailure(Date.now())
+      else this.#sql.exec('DELETE FROM blob_delete_backoff')
+    })
+  }
+
+  /**
+   * Deletes objects outside the queue (a wipe, or a put that lost its row),
+   * queueing the ones R2 refused, like `#deleteInvites`.
+   */
+  async #deleteObjects(keys: string[], now: number): Promise<void> {
+    if (!keys.length) return
+    const failed = await this.#deleteFromBucket(keys)
+    if (!failed.length) return
+    this.ctx.storage.transactionSync(() => {
+      this.#ensureSchema()
+      for (const key of failed) {
+        this.#sql.exec(
+          'INSERT OR IGNORE INTO pending_blob_delete (object_key) VALUES (?)',
+          key
+        )
+      }
+      this.#noteBlobDeleteFailure(now)
+    })
+    console.warn('buddies: blob cleanup failed; retrying from the alarm', {
+      failed: failed.length,
+    })
+    await this.#ensureAlarm(now)
   }
 
   /**

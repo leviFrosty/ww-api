@@ -65,6 +65,8 @@ NOTES_IMPORT_MAX_REFINEMENTS_SUPPORTER = "-1"
 NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. On in dev.
 BUDDIES_ENABLED = "true"
+# Buddies photo blobs fallback when KV `buddies:photos` is absent. On in dev.
+BUDDIES_PHOTOS = "on"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -117,6 +119,13 @@ class_name = "RoutePlanningQuota"
 [[env.dev.durable_objects.bindings]]
 name = "BUDDY_REGISTRATION_QUOTA"
 class_name = "BuddyRegistrationQuota"
+
+# Buddies note photos (encrypted blobs), separate from prod's bucket. Not
+# inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
+# lifecycle rule (scripts/r2-lifecycle.mjs).
+[[env.dev.r2_buckets]]
+binding = "BUDDY_BLOBS"
+bucket_name = "ww-buddy-blobs-dev"
 
 [[env.dev.migrations]]
 tag = "v1"
@@ -189,6 +198,24 @@ namespace_id = "2005"   # distinct from prod's 1005
   limit = 600
   period = 60
 
+# blob/put (photo uploads).
+[[env.dev.ratelimits]]
+name = "BUDDIES_BLOB_PUT_LIMITER"
+namespace_id = "2006"   # distinct from prod's 1006
+
+  [env.dev.ratelimits.simple]
+  limit = 60
+  period = 60
+
+# blob/get (photo downloads).
+[[env.dev.ratelimits]]
+name = "BUDDIES_BLOB_GET_LIMITER"
+namespace_id = "2007"   # distinct from prod's 1007
+
+  [env.dev.ratelimits.simple]
+  limit = 600
+  period = 60
+
 # Cloudflare Workers Observability — not inherited, so repeated for dev.
 # Full sampling on dev to capture everything while iterating.
 [env.dev.observability]
@@ -231,6 +258,8 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 # Buddies kill-switch fallback when KV `buddies:enabled` is absent. Off in prod
 # until App Attest lands on inbox/register and invite/* (see AGENTS.md).
 BUDDIES_ENABLED = "false"
+# Buddies photo blobs stay off in prod unless KV `buddies:photos` is "on"
+# (no BUDDIES_PHOTOS fallback here). Not inherited by [env.dev].
 # Android Notes Import via Play Integrity (witness-work ADR 0017; setup steps in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -288,6 +317,15 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 #   wrangler kv key put --binding NOTES_KV buddies:enabled true    # on
 #   wrangler kv key put --binding NOTES_KV buddies:enabled false   # off
 #   wrangler kv key delete --binding NOTES_KV buddies:enabled      # use the var
+# (add `--env dev` for the dev worker).
+#
+# Buddies photo blobs (cacheTtl 60; blob/put, blob/get, blob/delete, and
+# `capabilities.photos` on inbox/sync): on iff the value is "on"; an absent key
+# falls back to BUDDIES_PHOTOS (dev "on", prod unset = off). Needs Buddies on
+# and the BUDDY_BLOBS bucket.
+#   wrangler kv key put --binding NOTES_KV buddies:photos on      # on
+#   wrangler kv key put --binding NOTES_KV buddies:photos off     # off
+#   wrangler kv key delete --binding NOTES_KV buddies:photos      # use the var
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -354,6 +392,34 @@ namespace_id = "1005"
   [ratelimits.simple]
   limit = 600
   period = 60
+
+# blob/put (photo uploads).
+[[ratelimits]]
+name = "BUDDIES_BLOB_PUT_LIMITER"
+namespace_id = "1006"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
+# blob/get (photo downloads).
+[[ratelimits]]
+name = "BUDDIES_BLOB_GET_LIMITER"
+namespace_id = "1007"
+
+  [ratelimits.simple]
+  limit = 600
+  period = 60
+
+# Buddies note photos: sealed blobs at v1/<inboxId>/<blobId>, written and
+# deleted by the sender's BuddyInbox DO (bookkeeping, expiry, sweeps, wipes).
+# Every deploy runs scripts/r2-lifecycle.mjs first: it creates the bucket if
+# it's missing and sets the lifecycle backstop (v1/ objects deleted 91 days
+# after their last write; blobs live at most 90). Repeated (with its own
+# bucket) under [env.dev] above.
+[[r2_buckets]]
+binding = "BUDDY_BLOBS"
+bucket_name = "ww-buddy-blobs"
 
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
 # SQLite-backed (event log / active-import set). See

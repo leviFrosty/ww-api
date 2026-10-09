@@ -138,12 +138,14 @@ describe('caller keys', () => {
 })
 
 describe('edge tiers', () => {
-  it('puts every op and the live socket in a tier', () => {
+  it('puts every op, the live socket, and the blob routes in a tier', () => {
     const tiers = Object.fromEntries(
-      [...BUDDIES_OPS, 'inbox/live' as const].map((op) => [
-        op,
-        buddiesEdgeTier(op),
-      ])
+      [
+        ...BUDDIES_OPS,
+        'inbox/live' as const,
+        'blob/put' as const,
+        'blob/get' as const,
+      ].map((op) => [op, buddiesEdgeTier(op)])
     )
     expect(tiers).toEqual({
       'inbox/register': 'register',
@@ -157,6 +159,9 @@ describe('edge tiers', () => {
       'roster/put': 'write',
       'invite/create': 'write',
       'invite/delete': 'write',
+      'blob/delete': 'write',
+      'blob/put': 'blobPut',
+      'blob/get': 'blobGet',
       'card/put': 'write',
       'event/put': 'write',
       'slot/leave': 'write',
@@ -277,6 +282,8 @@ describe('per-caller edge limits', () => {
     register: '/inbox/register',
     read: '/inbox/sync',
     write: '/card/put',
+    blobPut: '/blob/put',
+    blobGet: '/blob/get',
   }
 
   it.each(Object.keys(paths) as BuddiesEdgeTier[])(

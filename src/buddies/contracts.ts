@@ -22,6 +22,7 @@ export const BUDDIES_OWNER_OPS = [
   'roster/put',
   'invite/create',
   'invite/delete',
+  'blob/delete',
 ] as const
 
 export const BUDDIES_WRITER_OPS = [
@@ -38,11 +39,33 @@ export const BUDDIES_UNSIGNED_OPS = ['invite/fetch', 'invite/claim'] as const
  * it is not in `BUDDIES_OPS` and has no POST route.
  */
 export const BUDDIES_LIVE_OP = 'inbox/live'
-/** Request headers that carry the live upgrade's `p` and `s`. */
-export const BUDDIES_LIVE_HEADERS = {
+/**
+ * Request headers that carry a signed envelope's `p` and `s` when the body
+ * can't: the live upgrade (no body) and `blob/put` (raw bytes).
+ */
+export const BUDDIES_ENVELOPE_HEADERS = {
   payload: 'x-buddies-p',
   signature: 'x-buddies-s',
 } as const
+/** Request headers that carry the live upgrade's `p` and `s`. */
+export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
+
+/**
+ * Photo blobs (encrypted note photos, too big for an event). `blob/put` is
+ * owner-signed like an owner op, but its body is the raw sealed bytes, so the
+ * envelope rides in `BUDDIES_ENVELOPE_HEADERS`. `blob/get` is unsigned (the
+ * read token is the capability) and answers with raw bytes. Neither is in
+ * `BUDDIES_OPS`: both have their own routes. `blob/delete` is an ordinary
+ * owner op.
+ */
+export const BUDDIES_BLOB_PUT_OP = 'blob/put'
+export const BUDDIES_BLOB_GET_OP = 'blob/get'
+/** Ops that also need the photos switch (`buddies:photos`) on. */
+export const BUDDIES_PHOTO_OPS: ReadonlySet<string> = new Set([
+  BUDDIES_BLOB_PUT_OP,
+  BUDDIES_BLOB_GET_OP,
+  'blob/delete',
+])
 /** Close codes the relay sends on live sockets. */
 export const BUDDIES_LIVE_CLOSE = {
   /** The inbox was deleted or wiped for inactivity. */
@@ -60,8 +83,22 @@ export type BuddiesSignedOp =
   | BuddiesWriterOp
 export type BuddiesOp = BuddiesSignedOp | BuddiesUnsignedOp
 export type BuddiesLiveOp = typeof BUDDIES_LIVE_OP
-/** Every op a signature can name: the signed POST ops and the live socket. */
-export type BuddiesSigningOp = BuddiesSignedOp | BuddiesLiveOp
+export type BuddiesBlobPutOp = typeof BUDDIES_BLOB_PUT_OP
+export type BuddiesBlobGetOp = typeof BUDDIES_BLOB_GET_OP
+/**
+ * Every op a signature can name: the signed POST ops, the live socket, and
+ * `blob/put`.
+ */
+export type BuddiesSigningOp =
+  | BuddiesSignedOp
+  | BuddiesLiveOp
+  | BuddiesBlobPutOp
+/** Every op with a route, each counted against a per-caller edge tier. */
+export type BuddiesRouteOp =
+  | BuddiesOp
+  | BuddiesLiveOp
+  | BuddiesBlobPutOp
+  | BuddiesBlobGetOp
 
 export const BUDDIES_OPS: readonly BuddiesOp[] = [
   'inbox/register',
@@ -90,6 +127,12 @@ export const BUDDIES_ERROR_STATUS = {
   disabled: 503,
   /** `inbox/live` without a WebSocket upgrade. */
   upgrade_required: 426,
+  /** A `blob/put` body (declared or streamed) over `blobBytes`. */
+  too_large: 413,
+  /** The photos switch is off (or this worker has no blob bucket). */
+  photos_disabled: 503,
+  /** `blob/put` from an inbox with no buddies: nobody could read the photo. */
+  no_buddies: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
@@ -161,6 +204,17 @@ export const BUDDIES_LIMITS = {
    * sync continues from there. Real inboxes never get close.
    */
   syncEventChars: 4 * 1_024 * KIB,
+  /** A photo blob's sealed bytes (`blob/put` body). */
+  blobBytes: 1_024 * KIB,
+  /**
+   * `blob/put` `expiresAt ≤ now + this`. A Plan 8 weeks out keeps its photo
+   * until a month after it ends; the app uploads photos for later Plans again
+   * as their date nears. The R2 lifecycle rule deletes objects a day past
+   * this (`scripts/r2-lifecycle.mjs`).
+   */
+  maxBlobLifetimeMs: 90 * DAY_MS,
+  /** Blob ids per `blob/delete`. */
+  blobDeleteIds: 50,
 } as const
 
 /**
@@ -194,6 +248,8 @@ export const BUDDIES_PASSIVE_PUSH_KINDS: ReadonlySet<string> = new Set([
 ])
 
 export const BUDDIES_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
+/** `blobId`, `readTokenHash`, and `token`: 32 bytes, so 43 b64u characters. */
+const BYTES32_PATTERN = /^[A-Za-z0-9_-]{43}$/
 const B64U_PATTERN = /^[A-Za-z0-9_-]*$/
 const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{86}$/
 const KIND_PATTERN = /^[a-z][a-z0-9.]*$/
@@ -285,6 +341,12 @@ const fixedBytes = (value: unknown, size: number): string | null => {
   const bytes = decodeB64u(value)
   return bytes && bytes.length === size ? bytesToBase64Url(bytes) : null
 }
+
+/** A canonical b64u encoding of exactly 32 bytes (hashes, ids, tokens). */
+const bytes32 = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  BYTES32_PATTERN.test(value) &&
+  fixedBytes(value, 32) === value
 
 /** An opaque sealed blob: valid base64url, 1..maxBytes once decoded. */
 const blob = (value: unknown, maxBytes: number): string | null => {
@@ -383,6 +445,26 @@ export interface InviteFetchPayload {
   inviteId: string
 }
 
+export interface BlobPutPayload extends InboxFields {
+  /** `b64u(SHA-256(body))`; the Worker recomputes it from the bytes it read. */
+  blobId: string
+  /** The body's exact length, 1..`blobBytes` (checked before reading it). */
+  bytes: number
+  expiresAt: number
+  /** `b64u(SHA-256(token))` of the 32-byte read token the app shares. */
+  readTokenHash: string
+}
+
+export interface BlobGetPayload {
+  inboxId: string
+  blobId: string
+  token: Uint8Array
+}
+
+export interface BlobDeletePayload extends InboxFields {
+  blobIds: string[]
+}
+
 export interface InviteClaimPayload {
   inviteId: string
   claimSecret: Uint8Array
@@ -406,6 +488,9 @@ export interface BuddiesPayloads {
   'invite/fetch': InviteFetchPayload
   'invite/claim': InviteClaimPayload
   'inbox/live': InboxFields
+  'blob/put': BlobPutPayload
+  'blob/get': BlobGetPayload
+  'blob/delete': BlobDeletePayload
 }
 
 type Fields = Record<string, unknown>
@@ -478,7 +563,7 @@ const withBlob = <T extends object>(
 }
 
 type PayloadParsers = {
-  [K in BuddiesOp | BuddiesLiveOp]: (
+  [K in BuddiesRouteOp]: (
     payload: Fields,
     now: number
   ) => BuddiesPayloads[K] | null
@@ -556,6 +641,36 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
     return { inviteId: p.inviteId, claimSecret, blob: claimBlob }
   },
   'inbox/live': inboxFields,
+  // `bytes` past `blobBytes` passes here: the route refuses it as `too_large`.
+  'blob/put': (p, now) => {
+    const base = inboxFields(p)
+    if (!base || !bytes32(p.blobId) || !bytes32(p.readTokenHash)) return null
+    const { bytes, expiresAt } = p
+    if (!isSafeInteger(bytes) || bytes < 1) return null
+    if (!isSafeInteger(expiresAt) || expiresAt <= now) return null
+    if (expiresAt > now + BUDDIES_LIMITS.maxBlobLifetimeMs) return null
+    return {
+      ...base,
+      blobId: p.blobId,
+      bytes,
+      expiresAt,
+      readTokenHash: p.readTokenHash,
+    }
+  },
+  'blob/get': (p) => {
+    if (!isId(p.inboxId) || !bytes32(p.blobId) || !bytes32(p.token)) return null
+    const token = decodeB64u(p.token)
+    return token ? { inboxId: p.inboxId, blobId: p.blobId, token } : null
+  },
+  'blob/delete': (p) => {
+    const base = inboxFields(p)
+    const { blobIds } = p
+    if (!base || !Array.isArray(blobIds)) return null
+    if (blobIds.length < 1 || blobIds.length > BUDDIES_LIMITS.blobDeleteIds)
+      return null
+    if (!blobIds.every(bytes32)) return null
+    return { ...base, blobIds: [...new Set(blobIds)] }
+  },
 }
 
 // --- Durable Object call shapes -------------------------------------------
@@ -603,6 +718,10 @@ export interface InviteView {
   expiresAt: number
   status: 'open' | 'claimed'
 }
+
+/** A blob's R2 object key: `v1/<inboxId>/<blobId>` (the sender's inbox). */
+export const buddyBlobKey = (inboxId: string, blobId: string): string =>
+  `v1/${inboxId}/${blobId}`
 
 /** Relay-created events carry this empty slot id. */
 export const RELAY_SLOT_ID = ''

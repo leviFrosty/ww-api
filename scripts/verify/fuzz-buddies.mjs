@@ -19,6 +19,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   ALL_OPS,
+  ENVELOPE_HEADERS,
   SIGNED_OPS,
   WIRE_EDGE_LIMITS,
   WIRE_LIMITS as L,
@@ -130,7 +131,7 @@ const clip = (text, max) =>
  * Sends one request. `expect` is a status list (or predicate); `error` the
  * expected buddies error code. Global invariants apply to every request.
  */
-const send = async ({ op, path, method = 'POST', body, headers = {}, expect, error, note }) => {
+const send = async ({ op, path, method = 'POST', body, headers = {}, expect, error, note, raw = false }) => {
   const url = `${BASE}${path ?? `/buddies/v1/${op}`}`
   const finalHeaders = { 'cf-connecting-ip': nextIp(), ...headers }
   let payload = body
@@ -146,6 +147,11 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
   const started = performance.now()
   let response
   let text
+  let bytes
+  const read = async () => {
+    bytes = new Uint8Array(await response.arrayBuffer())
+    text = new TextDecoder().decode(bytes)
+  }
   try {
     response = await fetch(url, {
       method,
@@ -154,7 +160,7 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
       duplex: payload instanceof ReadableStream ? 'half' : undefined,
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
-    text = await response.text()
+    await read()
     // `wrangler dev` only: after the worker cancels a chunked upload (the
     // oversized-envelope case), wrangler's local ProxyWorker answers the next
     // non-GET request with this canned 503 instead of forwarding it. It never
@@ -169,7 +175,7 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
         body: payload,
         signal: AbortSignal.timeout(TIMEOUT_MS),
       })
-      text = await response.text()
+      await read()
     }
   } catch (cause) {
     const ms = Math.round(performance.now() - started)
@@ -189,13 +195,15 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
   } catch {
     // checked below
   }
-  exchange.response = { status: response.status, body: clip(text, 2_000), ms }
+  // `raw` answers (blob/get) are bytes on 200: record their size, not the bytes.
+  const binary = raw && response.status === 200
+  exchange.response = { status: response.status, body: binary ? describeBody(bytes) : clip(text, 2_000), ms }
 
   if (response.status >= 500 && !(response.status === 503 && json?.error === 'disabled')) {
     throw new FuzzFailure(`server error ${response.status}`, exchange)
   }
   if (ms > TIMEOUT_MS) throw new FuzzFailure(`slow: ${ms}ms > ${TIMEOUT_MS}ms`, exchange)
-  if (url.includes('/buddies/v1/') && response.status !== 404 && !json) {
+  if (url.includes('/buddies/v1/') && response.status !== 404 && !json && !binary) {
     throw new FuzzFailure('non-JSON buddies response', exchange)
   }
   if (response.status >= 400 && json && typeof json.error !== 'string') {
@@ -208,7 +216,7 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
   if (error && json?.error !== error) {
     throw new FuzzFailure(`expected error "${error}", got ${JSON.stringify(json)}`, exchange)
   }
-  return { status: response.status, json, text, headers: response.headers }
+  return { status: response.status, json, text, bytes, headers: response.headers }
 }
 
 const signed = async (op, key, payload) =>
@@ -277,6 +285,8 @@ const validPayload = async (op, ctx) => {
     }
     case 'invite/delete':
       return { ...base, inviteId: rid() }
+    case 'blob/delete':
+      return { ...base, blobIds: [b64u(randomBytes(32))] }
     case 'card/put':
       return { ...base, slotId: writer.slotId, blob: blob(64) }
     case 'event/put':
@@ -334,7 +344,47 @@ const INVALID = {
     Object.fromEntries(Array.from({ length: L.templates + 1 }, (_, i) => [`k${i}`, { title: 't', body: 'b' }])),
   ],
   claimSecret: [b64u(randomBytes(31)), '', null, 'not b64!', b64u(randomBytes(33))],
+  blobIds: [
+    [],
+    'x',
+    null,
+    ['x'],
+    [b64u(randomBytes(31))],
+    [b64u(randomBytes(33))],
+    Array.from({ length: L.blobDeleteIds + 1 }, () => b64u(randomBytes(32))),
+  ],
 }
+
+// --- Photo blobs ------------------------------------------------------------------
+
+/** Sealed-looking bytes, their id, and a read token, as the app makes them. */
+const photo = async (size) => {
+  const bytes = new Uint8Array(randomBytes(size))
+  const token = randomBytes(32)
+  return { bytes, blobId: b64u(await sha256(bytes)), token: b64u(token), readTokenHash: b64u(await sha256(token)) }
+}
+
+/** `blob/put`: the signed envelope in headers, `body` (default the photo's bytes) raw. */
+const putBlob = async (owner, blob, { fields = {}, body = blob.bytes, key = owner.key, expect = [200], error, note } = {}) => {
+  const envelope = await signedEnvelope(
+    'blob/put',
+    { inboxId: owner.inboxId, blobId: blob.blobId, bytes: blob.bytes.length, expiresAt: Date.now() + 86_400_000, readTokenHash: blob.readTokenHash, ts: Date.now(), nonce: rid(), ...fields },
+    key
+  )
+  return send({
+    op: 'blob/put',
+    body,
+    headers: { 'content-type': 'application/octet-stream', [ENVELOPE_HEADERS.payload]: envelope.p, [ENVELOPE_HEADERS.signature]: envelope.s },
+    expect,
+    error,
+    note: note ?? `blob/put ${body.length} bytes`,
+  })
+}
+
+const getBlob = (inboxId, blob, token = blob.token, expect = [200], error) =>
+  send({ op: 'blob/get', body: unsignedEnvelope({ inboxId, blobId: blob.blobId, token }), raw: true, expect, error, note: 'blob/get' })
+
+const sameBytes = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i])
 
 // --- Generators -----------------------------------------------------------------
 // Each receives (rng, canary) and throws FuzzFailure on an oracle violation.
@@ -484,9 +534,22 @@ const GENERATORS = {
       ['json', { p: b64u(Buffer.from([0xff, 0xfe, 0x7b, 0x7d])) }],
       ['json', { p: b64u(Buffer.from([0xef, 0xbb, 0xbf, 0x7b, 0x7d])) }],
       ['bytes', Uint8Array.from([0xff, 0xfe, 0xfd])],
-      ['bytes', new TextEncoder().encode(`﻿{"p":"${goodP}"}`)],
+      ['bom', null],
     ]
     const [kind, value] = rng.pick(cases)
+    if (kind === 'bom') {
+      // A UTF-8 byte-order mark is ignored (JSON decoding strips it): the
+      // signed envelope after it counts.
+      const env = await signed('inbox/sync', canary.owner.key, await validPayload('inbox/sync', canary))
+      await send({
+        op: 'inbox/sync',
+        body: new TextEncoder().encode(`\ufeff${JSON.stringify(env)}`),
+        headers: { 'content-type': rng.pick(['application/json', 'text/plain', 'application/x-www-form-urlencoded']) },
+        expect: [200],
+        note: 'byte-order mark before a signed inbox/sync envelope',
+      })
+      return
+    }
     await send({
       op,
       body: value,
@@ -708,6 +771,57 @@ const GENERATORS = {
       }
     }
     throw new FuzzFailure(`no 429 after ${2 * limit + 1} ${tier} requests from one caller`, caseLog.at(-1))
+  },
+
+  /**
+   * Photo blobs: the bytes read back exactly, 1 MiB is fine and one byte more
+   * is `too_large`, bytes that don't hash to `blobId` or a stranger's
+   * signature are refused, every miss (wrong token, unknown blob, deleted
+   * blob) is the same 404, and an inbox with no buddies can't store one.
+   */
+  'photo-blobs': async (rng) => {
+    const owner = await newOwner()
+    const variant = rng.pick(['roundtrip', 'boundary', 'mismatch', 'signature', 'misses', 'no-buddies'])
+    if (variant === 'no-buddies') {
+      await putBlob(owner, await photo(64), { expect: [403], error: 'no_buddies', note: 'blob/put from an inbox with no buddies' })
+      return
+    }
+    await newWriter(owner)
+    if (variant === 'roundtrip') {
+      const blob = await photo(rng.int(1, 256 * 1024))
+      await putBlob(owner, blob)
+      const got = await getBlob(owner.inboxId, blob)
+      if (!sameBytes(got.bytes, blob.bytes)) throw new FuzzFailure('blob/get bytes differ from blob/put', caseLog.at(-1))
+      // A retry is idempotent.
+      await putBlob(owner, blob, { note: 'blob/put retry' })
+    } else if (variant === 'boundary') {
+      const over = rng.bool()
+      const blob = await photo(L.blobBytes + (over ? 1 : 0))
+      await putBlob(owner, blob, { expect: over ? [413] : [200], error: over ? 'too_large' : undefined })
+      // wrangler dev's proxy can break the request after an unread upload.
+      if (over) await send({ path: '/verify-drain', body: '{}', expect: [404], note: 'drain wrangler-dev proxy after refused upload' })
+    } else if (variant === 'mismatch') {
+      const blob = await photo(rng.int(1, 4096))
+      const body = new Uint8Array(blob.bytes)
+      body[rng.int(0, body.length - 1)] ^= 1 << rng.int(0, 7)
+      await putBlob(owner, blob, { body, expect: [400], error: 'bad_request', note: 'blob/put with a flipped bit' })
+    } else if (variant === 'signature') {
+      const blob = await photo(64)
+      await putBlob(owner, blob, { key: await newKey(), expect: [401], error: 'bad_signature', note: 'blob/put by a stranger' })
+    } else {
+      const blob = await photo(64)
+      await putBlob(owner, blob)
+      const misses = [
+        () => getBlob(owner.inboxId, blob, b64u(randomBytes(32)), [404], 'not_found'),
+        async () => getBlob(owner.inboxId, await photo(64), undefined, [404], 'not_found'),
+        () => getBlob(rid(), blob, blob.token, [404], 'not_found'),
+      ]
+      const bodies = new Set()
+      for (const miss of misses) bodies.add((await miss()).text)
+      await owner.send('blob/delete', { blobIds: [blob.blobId] })
+      bodies.add((await getBlob(owner.inboxId, blob, blob.token, [404], 'not_found')).text)
+      if (bodies.size !== 1) throw new FuzzFailure(`blob/get misses differ: ${[...bodies].join(' | ')}`, caseLog.at(-1))
+    }
   },
 
   /** Concurrent same-eventId writes dedupe to one seq. */

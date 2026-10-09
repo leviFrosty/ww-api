@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+  BUDDIES_ERROR_STATUS,
+  BUDDIES_LIMITS,
   BUDDIES_OPS,
   BUDDIES_PAYLOAD_PARSERS,
+  buddyBlobKey,
   decodeSignature,
   isImmediatePushKind,
 } from './contracts'
+import { BUDDIES_ABUSE_LIMITS } from './limits'
 import { bytesToBase64Url } from '../crypto'
 
 const NOW = Date.UTC(2026, 8, 23)
@@ -318,6 +322,88 @@ describe('inbox/live', () => {
     expect(parse('inbox/live', { ...signed, since: 3 })).toEqual(signed)
     expect(parse('inbox/live', { ...signed, inboxId: 'x' })).toBeNull()
     expect(BUDDIES_OPS).not.toContain('inbox/live')
+  })
+})
+
+describe('photo blobs', () => {
+  const blobId = b64uOfBytes(32)
+  const put = {
+    ...signed,
+    blobId,
+    bytes: 1_024,
+    expiresAt: NOW + 1,
+    readTokenHash: b64uOfBytes(32),
+  }
+  const DAY = 24 * 60 * 60 * 1_000
+
+  it('sizes blobs, lifetimes, deletes, and caps as the contract says', () => {
+    expect(BUDDIES_LIMITS.blobBytes).toBe(1_048_576)
+    expect(BUDDIES_LIMITS.maxBlobLifetimeMs).toBe(90 * DAY)
+    expect(BUDDIES_LIMITS.blobDeleteIds).toBe(50)
+    expect(BUDDIES_ABUSE_LIMITS).toMatchObject({
+      inboxBlobs: 300,
+      inboxBlobBytes: 150 * 1_048_576,
+      blobUploads: 100,
+      blobUploadWindowMs: DAY,
+    })
+    expect(BUDDIES_ABUSE_LIMITS.edge.blobPut.perMinute).toBe(60)
+    expect(BUDDIES_ABUSE_LIMITS.edge.blobGet.perMinute).toBe(600)
+    expect(BUDDIES_ERROR_STATUS.too_large).toBe(413)
+    expect(BUDDIES_ERROR_STATUS.photos_disabled).toBe(503)
+    expect(buddyBlobKey(id('I'), blobId)).toBe(`v1/${id('I')}/${blobId}`)
+  })
+
+  it('keeps blob/put and blob/get out of the JSON ops; blob/delete is one', () => {
+    expect(BUDDIES_OPS).not.toContain('blob/put')
+    expect(BUDDIES_OPS).not.toContain('blob/get')
+    expect(BUDDIES_OPS).toContain('blob/delete')
+  })
+
+  it('blob/put takes canonical 32-byte hashes, bytes ≥ 1, and expiresAt in (now, now + 90 days]', () => {
+    expect(parse('blob/put', put)).toEqual(put)
+    // `bytes` past 1 MiB parses: the route answers `too_large` for it.
+    expect(parse('blob/put', { ...put, bytes: 2 * 1_048_576 })).not.toBeNull()
+    expect(
+      parse('blob/put', { ...put, expiresAt: NOW + 90 * DAY })
+    ).not.toBeNull()
+    for (const bad of [
+      { bytes: 0 },
+      { bytes: -1 },
+      { bytes: 1.5 },
+      { expiresAt: NOW },
+      { expiresAt: NOW + 90 * DAY + 1 },
+      { blobId: b64uOfBytes(31) },
+      { blobId: b64uOfBytes(33) },
+      // 43 characters whose last one carries stray bits: not canonical.
+      { blobId: `${blobId.slice(0, 42)}B` },
+      { readTokenHash: undefined },
+    ]) {
+      expect(parse('blob/put', { ...put, ...bad }), JSON.stringify(bad)).toBeNull()
+    }
+  })
+
+  it('blob/get decodes the token; blob/delete takes 1–50 ids, deduplicated', () => {
+    const token = b64uOfBytes(32)
+    expect(
+      parse('blob/get', { inboxId: id('I'), blobId, token })
+    ).toEqual({
+      inboxId: id('I'),
+      blobId,
+      token: new Uint8Array(32).fill(7),
+    })
+    expect(parse('blob/get', { inboxId: id('I'), blobId })).toBeNull()
+    expect(
+      parse('blob/delete', { ...signed, blobIds: [blobId, blobId] })
+    ).toEqual({ ...signed, blobIds: [blobId] })
+    expect(parse('blob/delete', { ...signed, blobIds: [] })).toBeNull()
+    expect(
+      parse('blob/delete', {
+        ...signed,
+        blobIds: Array.from({ length: 51 }, (_, i) =>
+          bytesToBase64Url(new Uint8Array(32).fill(i))
+        ),
+      })
+    ).toBeNull()
   })
 })
 

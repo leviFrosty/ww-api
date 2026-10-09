@@ -27,7 +27,13 @@ export const WIRE_LIMITS = {
   kindChars: 40,
   requestBytes: 256 * 1024,
   maxInviteLifetimeMs: 7 * 24 * 60 * 60 * 1000 + 5 * 60 * 1000,
+  blobBytes: 1024 * 1024,
+  maxBlobLifetimeMs: 90 * 24 * 60 * 60 * 1000,
+  blobDeleteIds: 50,
 }
+
+/** `blob/put` carries its signed envelope in these headers; the body is the blob. */
+export const ENVELOPE_HEADERS = { payload: 'x-buddies-p', signature: 'x-buddies-s' }
 
 /** Per-caller requests per minute by edge tier (BUDDIES_ABUSE_LIMITS.edge). */
 export const WIRE_EDGE_LIMITS = {
@@ -35,6 +41,8 @@ export const WIRE_EDGE_LIMITS = {
   register: 60,
   read: 600,
   write: 600,
+  blobPut: 60,
+  blobGet: 600,
 }
 
 export const SIGNED_OPS = [
@@ -48,6 +56,7 @@ export const SIGNED_OPS = [
   'roster/put',
   'invite/create',
   'invite/delete',
+  'blob/delete',
   'card/put',
   'event/put',
   'slot/leave',

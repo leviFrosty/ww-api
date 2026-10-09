@@ -217,8 +217,10 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
-  caller), migration `v6`, four per-caller rate limiters (below), and the
-  `BUDDIES_ENABLED` var (`"false"` prod, `"true"` dev).
+  caller), migration `v6`, six per-caller rate limiters (below), the
+  `BUDDY_BLOBS` R2 bucket (photo blobs: `ww-buddy-blobs` prod,
+  `ww-buddy-blobs-dev` dev), and the `BUDDIES_ENABLED` var (`"false"` prod,
+  `"true"` dev) and `BUDDIES_PHOTOS` var (dev `"on"` only).
 - **Abuse limits**: all in `BUDDIES_ABUSE_LIMITS` (`src/buddies/limits.ts`),
   each with its sizing rationale. They only stop scripted abuse; size them
   from the heaviest real use with at least 10× headroom. Hits log
@@ -227,9 +229,11 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
     /64), never the target inbox. `BUDDIES_RATE_LIMITER` 120/min for
     `invite/fetch` + `invite/claim`, `BUDDIES_REGISTER_LIMITER` 60/min for
     `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync` +
-    `inbox/live`, `BUDDIES_WRITE_LIMITER` 600/min for every other op
-    (namespaces 1002-1005 prod, 2002-2005 dev; `limits.test.ts` keeps
-    `wrangler.toml` equal to the constants). Refusals are 429 `rate_limited`
+    `inbox/live`, `BUDDIES_BLOB_PUT_LIMITER` 60/min for `blob/put`,
+    `BUDDIES_BLOB_GET_LIMITER` 600/min for `blob/get`,
+    `BUDDIES_WRITE_LIMITER` 600/min for every other op (namespaces 1002-1007
+    prod, 2002-2007 dev; `limits.test.ts` keeps `wrangler.toml` equal to the
+    constants). Refusals are 429 `rate_limited`
     with `Retry-After: 60`. Every relay error is `{ok: false, error, code}`
     (`src/buddies/errorResponse.ts`); `rate_limited` and `disabled` always
     carry `Retry-After`/`retryAfter`, computed from the limit's window inside
@@ -244,6 +248,10 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
     totals. Each signer (the owner, or a writer slot) gets 10,000 / 1,000
     requests that take effect per 10 minutes (in memory). Sync pages stop at
     10,000 events as well as 4 MiB.
+  - Per inbox, photo blobs: 300 live blobs and 150 MiB live, and 100
+    uploads (object writes) per rolling day; `blob/put` past them is 429
+    `rate_limited` with `Retry-After` until the soonest blob expires or the
+    oldest upload ages out.
   - Only requests that take effect record a nonce, so refused ones add no
     rows; replay protection is unchanged.
 - **Secrets** (per environment): `APNS_KEY_ID` and `APNS_PRIVATE_KEY` (the
@@ -260,6 +268,32 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   other value disables, and an absent key falls back to `BUDDIES_ENABLED`. The
   read is edge-cached for 60 seconds. `inbox/delete`, `slot/remove`, and
   `slot/leave` work even when disabled.
+- **Photo blobs** (photos in Plan notes; contract in the protocol's "Photo
+  blobs"): `POST /buddies/v1/blob/put` takes the raw sealed bytes as its body
+  with the owner-signed envelope (op `blob/put`) in `x-buddies-p` /
+  `x-buddies-s`; the Worker reads at most 1 MiB, recomputes
+  `blobId = b64u(SHA-256(body))`, and hands the bytes to the sender's inbox
+  DO, which checks the signature, nonce, and caps and writes R2 object
+  `v1/<inboxId>/<blobId>`. `blob/get` (unsigned; the read token is the
+  capability, only its hash is stored) streams the object back with
+  `Cache-Control: no-store`; every miss is the same 404. `blob/delete` is an
+  owner op, and only an inbox with a slot (a buddy) can put (`no_buddies`).
+  Bookkeeping is the inbox's `blob`, `blob_upload`, `pending_blob_delete`,
+  `blob_delete_backoff`, and `blob_sweep` tables (created in place on first
+  use, no wrangler migration). The inbox alarm deletes blobs at `expiresAt`,
+  retries failed R2 deletes after 1 min doubling to 6 h, and sweeps the
+  inbox's `v1/<inboxId>/` prefix weekly for objects with no row; a failed put
+  keeps its unwritten row 10 min so its expiry deletes an object that landed
+  anyway. `inbox/delete` and the 180-day wipe delete every blob and list the
+  prefix for leftovers. `expiresAt` is at most 90 days out and a re-put that
+  moves it rewrites the object, so no live object is older than 90 days and
+  the bucket's 91-day lifecycle rule (`scripts/r2-lifecycle.mjs`, run by every
+  deploy) is only a backstop. Switch: KV `buddies:photos` in `NOTES_KV`, `"on"` (or `"true"`)
+  enables, any other value disables, absent falls back to `BUDDIES_PHOTOS`
+  (dev `"on"`, prod unset = off); edge-cached 60 s. Off (or no bucket bound),
+  all three return 503 `photos_disabled` and `inbox/sync` reports
+  `capabilities.photos: false`, the flag the app gates its photo picker on.
+  Buddies' own switch wins (`disabled`).
 - **Push**: each device registers `pushService` `apns` (iOS; the default) or
   `fcm` (Android), stored in the inbox's `push_device` table (inboxes from
   before FCM move their `device` rows there on first use). `src/apns.ts` is
@@ -302,7 +336,9 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   Workers traces do record subrequest URLs, APNs included.
 - **Not yet built** (required before any production rollout): App Attest on
   `inbox/register` and `invite/*` (`attest` is accepted and ignored; Android
-  will use Play Integrity). The protocol's durable push outbox (retries for
+  will use Play Integrity). `blob/put` isn't attested either; the plan is to
+  attest an inbox once per few days through a Notes Import purpose and have
+  `blob/put` require a recent one, rather than attesting each upload. The protocol's durable push outbox (retries for
   6 h, outcome history, deferred instead of dropped alerts inside the 60 s
   spacing, `apns-expiration`) is specified but not built either;
   today each push gets one immediate attempt plus one retry.
@@ -324,6 +360,24 @@ migration applies on the next `pnpm run deploy`. Buddies stays off there
 (`BUDDIES_ENABLED = "false"`) until the KV key flips it. The AASA `/b` entry
 only goes live with a prod deploy. iOS caches the AASA, so ship it at least one
 app version before the invite UI.
+
+Photo blobs need their R2 buckets **before the first deploy that carries the
+`BUDDY_BLOBS` binding** (a deploy naming a missing bucket fails), plus a
+lifecycle rule as a backstop (blobs are deleted by the inbox at `expiresAt`;
+the rule only catches objects the relay lost track of). Every deploy runs
+`scripts/r2-lifecycle.mjs` first, which creates the bucket if it's missing and
+sets its rules (`v1/` objects deleted 91 days after their last write); the
+GitHub deploy's `CLOUDFLARE_API_TOKEN` needs **Workers R2 Storage: Edit**.
+`node scripts/r2-lifecycle.mjs <bucket> --check` only reads.
+
+```bash
+pnpm run deploy:dev   # photos are on in dev through BUDDIES_PHOTOS = "on"
+pnpm run deploy       # or push a v* tag (GitHub deploy)
+# Production photos stay off until:
+wrangler kv key put --binding NOTES_KV buddies:photos on
+# Off again (stored blobs stay until they expire):
+wrangler kv key put --binding NOTES_KV buddies:photos off
+```
 
 ## App Store ratings (paywall social proof)
 

@@ -341,6 +341,8 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   502 `upstream_error`.
 - The HTML pages (`/c`, `/c/:payload`, `/b`) are for browsers and always
   answer 200.
+- `POST /buddies/v1/blob/get` answers a Buddies photo blob's raw bytes
+  (`application/octet-stream`) on success; its errors use the envelope.
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
 bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,

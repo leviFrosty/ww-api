@@ -17,7 +17,7 @@ node scripts/verify/dev.mjs up --secrets-from ~/dev/ww-api/.dev.vars # opt in to
 
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
-- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development` and `BUDDIES_ENABLED=true`. The fresh KV has no `buddies:enabled` key, so the relay is on with no switch to flip.
+- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, and `BUDDIES_PHOTOS=on`. The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
 - `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN` and `ADMIN_API_TOKEN`, plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
@@ -35,6 +35,7 @@ Read-only. Each check prints an `ok` or `FAIL` line, and the command exits 1 on 
 - `/health` answers `ok`;
 - the git HEAD matches the one recorded at `up` (a mismatch only warns, because wrangler hot-reloads `src/`);
 - Buddies is enabled (an unknown `invite/fetch` returns `not_found`, not `disabled`);
+- Buddies photos are enabled (an unknown `blob/get` returns `not_found`, not `photos_disabled`);
 - the dev bypass works (the value is never printed);
 - which optional credentials are set.
 
@@ -53,8 +54,8 @@ node scripts/verify/dev.mjs kv get app-store-ratings:summary
 node scripts/verify/dev.mjs kv delete buddies:enabled
 ```
 
-- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/route-planning/*`, and `/admin/*` each count separately), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
-- Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl.
+- Send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/route-planning/*`, and `/admin/*` each count separately), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 60/min for `blob/put`, 600/min for `blob/get`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
+- Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl. Photo blobs: `photoBlob()` makes sealed-looking bytes with their id and token, `RelayOwner.putBlob` and `getBlob` send them (raw bytes, envelope in headers).
 - KV edits take effect on the next request (no 60 s edge cache locally).
 
 ## Fuzz
@@ -67,19 +68,20 @@ pnpm fuzz:buddies --seed 42 --case 17   # replay one failing case
 
 The seed decides each case's mutation and its parameters. Ids, keys, and nonces are fresh every run, so you can replay a seed against the same persisted state.
 
-There are 18 generators:
+There are 19 generators:
 
 - **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `s`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
 - **Bad payloads:** a wrong-typed field, a missing field, malformed envelopes (bad JSON, base64, UTF-8), unicode and huge strings.
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
+- **Photo blobs:** `blob/put` → `blob/get` round trip with an idempotent retry, 1 MiB accepted and one byte more `too_large`, a flipped bit (`bad_request`), a stranger's signature, and the same 404 for a wrong token, an unknown blob or inbox, and a deleted blob.
 - **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
 
 The oracle checks every request:
 
 - no 5xx;
 - no response slower than 5 s (`--timeout-ms`);
-- Buddies errors are `{error}` JSON (the full body is `{ok: false, error, code}`);
+- Buddies errors are `{error}` JSON (the full body is `{ok: false, error, code}`); only a 200 `blob/get` is raw bytes;
 - each mutation gets its documented status (for example, a bad signature is 401 `bad_signature`).
 
 After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapshot, and `/health` must still be ok. When a case fails, the fuzzer prints the seed, a `--case` repro command, and the exact failing request, then exits 1.

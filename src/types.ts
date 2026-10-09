@@ -237,6 +237,24 @@ export interface Environment {
   BUDDIES_READ_LIMITER: RateLimit;
   /** Per-caller limiter for every other signed op. */
   BUDDIES_WRITE_LIMITER: RateLimit;
+  /** Per-caller limiter for `blob/put` (photo uploads). */
+  BUDDIES_BLOB_PUT_LIMITER: RateLimit;
+  /** Per-caller limiter for `blob/get` (photo downloads). */
+  BUDDIES_BLOB_GET_LIMITER: RateLimit;
+
+  /**
+   * Encrypted Buddies note photos, one object per blob at
+   * `v1/<inboxId>/<blobId>` (sealed bytes only; keys never reach the relay).
+   * Bookkeeping (size, read-token hash, expiry) lives in the sender's inbox
+   * DO. Without the binding, photo ops answer `photos_disabled`.
+   */
+  BUDDY_BLOBS?: R2Bucket;
+
+  /**
+   * Photos switch fallback (`"on"` enables) when KV `buddies:photos` is
+   * absent. `"on"` in dev; unset (off) in prod.
+   */
+  BUDDIES_PHOTOS?: string;
 
   /**
    * One SQLite DO per caller (hashed client IP, IPv6 by /64): its signed
