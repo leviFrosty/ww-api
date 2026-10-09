@@ -10,6 +10,7 @@ import {
   liveHeaders,
   randomId,
   unsignedEnvelope,
+  relayError,
   type Harness,
 } from '../test/buddies'
 
@@ -52,7 +53,7 @@ afterEach(() => {
 
 const error = (status: number, code: string) => ({
   status,
-  body: { error: code },
+  body: relayError(code),
   socket: null,
 })
 

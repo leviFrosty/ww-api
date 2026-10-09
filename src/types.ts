@@ -279,6 +279,8 @@ export interface HealthCheckResponse {
   status: 'ok';
   /** Current server time (request handling time). */
   timestamp: string;
+  /** The same instant as epoch milliseconds, for clock calibration. */
+  serverTime: number;
   /** Deployed Worker version id (from the version_metadata binding). */
   versionId: string;
   /** Optional version tag, if one was set at upload (`wrangler versions upload --tag`). */
@@ -287,10 +289,15 @@ export interface HealthCheckResponse {
   deployedAt: string;
 }
 
+/** Notes Import's error body: the shared envelope (src/errors.ts) plus extras. */
 export interface ErrorResponse {
+  ok: false;
+  /** Human-readable message, kept for shipped builds; branch on `code`. */
   error: string;
   /** Stable machine-readable code so the app can branch (e.g. show the paywall). */
-  code?: string;
+  code: string;
+  /** Seconds to wait before retrying; repeats the `Retry-After` header. */
+  retryAfter?: number;
   /** Stable App Attest or Play Integrity failure reason (additive to `code`). */
   reason?:
     | import('./appAttest/errors').AppAttestReason

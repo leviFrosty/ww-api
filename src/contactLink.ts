@@ -1,5 +1,6 @@
 import type { AppContext } from './types'
 import { HTTP_STATUS } from './config'
+import { apiError } from './errors'
 import { nameTransactionAfterRoute } from './sentry'
 import {
   contactLinkTranslations,
@@ -110,10 +111,9 @@ export function handleAasaRequest(context: AppContext) {
   if (!teamId) {
     // Fail loud so misconfigured deploys show up immediately instead of
     // silently breaking universal links.
-    return context.json(
-      { error: 'APPLE_TEAM_ID not configured' },
-      HTTP_STATUS.INTERNAL_SERVER_ERROR
-    )
+    return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, 'server_error', {
+      extras: { message: 'APPLE_TEAM_ID not configured' },
+    })
   }
   // Apple requires Content-Type: application/json and no redirects. Hono's
   // c.json() sets the right header.

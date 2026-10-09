@@ -3,6 +3,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { AppContext, Environment } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
+import { retryAfterHeaders } from '../errors'
 import { isSupporter, RevenueCatError } from '../revenuecat'
 import {
   ROUTE_PLANNING_LIMITS as LIMITS,
@@ -45,6 +46,11 @@ const defaultDependencies: RoutePlanningDependencies = {
   now: () => Date.now(),
 }
 
+/** The kill switch is read through a 60-second edge cache. */
+const UNAVAILABLE_RETRY_AFTER_SECONDS = 60
+/** RevenueCat trouble is usually brief. */
+const SUPPORTER_CHECK_RETRY_AFTER_SECONDS = 30
+
 const fail = (
   ctx: AppContext,
   status: ContentfulStatusCode,
@@ -52,12 +58,12 @@ const fail = (
   error: string,
   retryAfterSeconds?: number
 ) => {
-  const body: RouteOptimizeErrorResponse = { error, code }
+  const body: RouteOptimizeErrorResponse = { ok: false, error, code }
   if (retryAfterSeconds != null) {
+    body.retryAfter = retryAfterSeconds
     body.retryAfterSeconds = retryAfterSeconds
-    return ctx.json(body, status, { 'Retry-After': String(retryAfterSeconds) })
   }
-  return ctx.json(body, status)
+  return ctx.json(body, status, retryAfterHeaders(retryAfterSeconds))
 }
 
 const quota = (env: Environment, accountId: string) =>
@@ -75,7 +81,8 @@ export const createRoutePlanningRoutes = (
         ctx,
         HTTP_STATUS.SERVICE_UNAVAILABLE,
         'unavailable',
-        'Route planning is unavailable'
+        'Route planning is unavailable',
+        UNAVAILABLE_RETRY_AFTER_SECONDS
       )
     }
 
@@ -123,7 +130,8 @@ export const createRoutePlanningRoutes = (
           ctx,
           HTTP_STATUS.SERVICE_UNAVAILABLE,
           'supporter_check_failed',
-          'Could not confirm Supporter status'
+          'Could not confirm Supporter status',
+          SUPPORTER_CHECK_RETRY_AFTER_SECONDS
         )
       }
       if (!supporter) {

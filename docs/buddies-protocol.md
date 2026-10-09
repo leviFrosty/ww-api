@@ -45,21 +45,24 @@ Ed25519 public keys are 32 raw bytes, `b64u`-encoded (43 chars).
 
 ### Responses
 
-Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "error": "<code>" }` with:
+Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "ok": false, "error": "<code>", "code": "<code>" }` (`code` repeats `error`; older relays sent `error` alone) with:
 
 | HTTP | `error`            | Meaning                                                               |
 | ---- | ------------------ | --------------------------------------------------------------------- |
 | 400  | `bad_request`      | Malformed envelope/payload, wrong sizes, bad ids                      |
 | 401  | `bad_signature`    | Signature missing or invalid                                          |
-| 401  | `stale`            | `ts` outside ±5 min                                                   |
+| 401  | `stale`            | `ts` outside ±5 min; carries `serverTime` (ms) and a `Date` header    |
 | 409  | `replay`           | Nonce reused                                                          |
 | 404  | `not_found`        | Unknown inbox / invite (includes expired, deleted, or burned invites) |
 | 409  | `conflict`         | Inbox already registered with a different key; invite already claimed |
 | 410  | `gone`             | Slot does not exist (buddy removed you)                               |
 | 429  | `limit`            | A count cap was hit (slots, invites, devices)                         |
-| 429  | `rate_limited`     | A rate limit or a stored-event cap was hit; may carry `Retry-After`   |
-| 503  | `disabled`         | Kill switch is off                                                    |
+| 429  | `rate_limited`     | A rate limit or a stored-event cap was hit; carries `Retry-After`     |
+| 503  | `disabled`         | Kill switch is off; carries `Retry-After`                             |
 | 426  | `upgrade_required` | `inbox/live` requested without a WebSocket upgrade                    |
+
+- Every `rate_limited` and `disabled` refusal sends `Retry-After` (seconds) and repeats it as `retryAfter` in the body: the time until the limit's window frees a request (a minute for the per-caller limits, the rest of the hour for writes per slot, until the oldest stored event expires for the stored-event caps), or 60 s for the kill switch. `limit` has none: only the User freeing a spot helps.
+- A `stale` refusal carries the relay's clock as `serverTime` (epoch ms, the unit of `ts`) and in the `Date` header. A client corrects its clock offset from it and re-signs once with a fresh `ts` and `nonce`. `GET /health` also returns `Date` and `serverTime`, uncached, for calibrating before a request.
 
 ## Operations
 
@@ -130,7 +133,7 @@ While the app is in the foreground it keeps a WebSocket open to its own inbox, s
 | `invite/create` | Owner  | `inboxId`, `inviteId`, `claimVerifier` (`b64u` SHA-256, 32 bytes), `blob` (≤ 4 KB), `expiresAt`, `attest?` | `{ ok }`                          | `expiresAt ≤ now + 7 days + 5 min`. `limit` when the inbox has 3 open invites or `slots + open invites ≥ 5`. `conflict` if the `inviteId` exists.                                                                                                                                                                           |
 | `invite/delete` | Owner  | `inboxId`, `inviteId`                                                                                      | `{ ok }`                          | Only the creating inbox may delete. Idempotent. Used for cancel, confirm, and reject.                                                                                                                                                                                                                                       |
 | `invite/fetch`  | —      | `inviteId`                                                                                                 | `{ ok, blob, expiresAt, status }` | `status` is `"open"` or `"claimed"`. Expired/deleted/burned → `not_found`.                                                                                                                                                                                                                                                  |
-| `invite/claim`  | —      | `inviteId`, `claimSecret` (`b64u`, 32 bytes), `blob` (≤ 4 KB)                                              | `{ ok }`                          | Constant-time compare `SHA-256(claimSecret)` to `claimVerifier`. First valid claim wins (`conflict` afterwards). 5 wrong secrets burn the invite. On success the relay appends an event `{ slotId: "", kind: "invite.claimed", eventId: inviteId, blob }` to the creator's inbox and pushes with template `invite.claimed`. |
+| `invite/claim`  | —      | `inviteId`, `claimSecret` (`b64u`, 32 bytes), `blob` (≤ 4 KB)                                              | `{ ok }`                          | Constant-time compare `SHA-256(claimSecret)` to `claimVerifier`. First valid claim wins (`conflict` afterwards), except that the winner's exact retry (same `claimSecret` and byte-identical `blob`, e.g. after a lost response) gets `{ ok }` again without a second event or push. A retry while the first claim is still being delivered, or a newly sealed blob, still gets `conflict`. 5 wrong secrets burn the invite. On success the relay appends an event `{ slotId: "", kind: "invite.claimed", eventId: inviteId, blob }` to the creator's inbox and pushes with template `invite.claimed`. |
 
 The relay keeps `inviteId → creator inboxId` only until the invite is deleted or expires.
 

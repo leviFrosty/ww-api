@@ -14,13 +14,13 @@ describe('POST /admin/notes-import/reset', () => {
   it('404s without a token', async () => {
     const res = await reset({})
     expect(res.status).toBe(404)
-    expect(res.body).toEqual({ error: 'Not found' })
+    expect(res.body).toEqual({ ok: false, error: 'not_found', code: 'not_found' })
   })
 
   it('404s with a wrong token, identical to no token', async () => {
     const res = await reset({ 'x-ww-admin-token': 'wrong-token' })
     expect(res.status).toBe(404)
-    expect(res.body).toEqual({ error: 'Not found' })
+    expect(res.body).toEqual({ ok: false, error: 'not_found', code: 'not_found' })
   })
 
   it('404s for GET (route is POST only)', async () => {
@@ -34,7 +34,11 @@ describe('POST /admin/notes-import/reset', () => {
     it('400s on an invalid meterId', async () => {
       const res = await reset(auth(), { meterId: 'bad id!' })
       expect(res.status).toBe(400)
-      expect(res.body).toEqual({ error: 'Invalid meterId' })
+      expect(res.body).toEqual({
+        ok: false,
+        error: 'Invalid meterId',
+        code: 'bad_request',
+      })
     })
 
     it('resets a meter', async () => {

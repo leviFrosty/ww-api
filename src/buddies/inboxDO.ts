@@ -3,7 +3,6 @@ import type { Environment } from '../types'
 import { acceptedBundleIds } from '../appAttest/appId'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
-  BUDDIES_ERROR_STATUS,
   BUDDIES_LIMITS as LIMITS,
   BUDDIES_LIVE_CLOSE,
   BUDDIES_LIVE_OP,
@@ -14,6 +13,7 @@ import {
   isPlainObject,
   ok,
   type BuddiesErrorCode,
+  type BuddiesFailure,
   type BuddiesResult,
   type BuddiesSigningOp,
   type CardPutPayload,
@@ -44,6 +44,8 @@ import {
   verifyBuddiesSignature,
 } from './envelope'
 import { BUDDIES_ABUSE_LIMITS as ABUSE, SignerBudget, logLimitHit } from './limits'
+import { buddiesErrorResponse } from './errorResponse'
+import { retryAfterSeconds } from '../errors'
 
 type Empty = Record<string, never>
 
@@ -127,8 +129,10 @@ const closeQuietly = (ws: WebSocket, code: number, reason: string): void => {
   }
 }
 
-const liveError = (error: BuddiesErrorCode): Response =>
-  Response.json({ error }, { status: BUDDIES_ERROR_STATUS[error] })
+const liveError = (failure: BuddiesFailure): Response =>
+  buddiesErrorResponse(failure.error, {
+    retryAfterSeconds: failure.retryAfterSeconds,
+  })
 
 /**
  * Every table is created on first registration, never for a probe: an
@@ -503,7 +507,15 @@ export class BuddyInbox extends DurableObject<Environment> {
           LIMITS.inviteCreations
         ) {
           logLimitHit('invite/create', 'inviteCreations')
-          return fail('rate_limited')
+          const { oldest } = this.#sql
+            .exec<{
+              oldest: number
+            }>('SELECT MIN(created_at) AS oldest FROM invite_creation')
+            .one()
+          return fail(
+            'rate_limited',
+            retryAfterSeconds(oldest + LIMITS.inviteCreationWindowMs - now)
+          )
         }
         this.#sql.exec(
           "INSERT INTO invite (invite_id, status, expires_at) VALUES (?, 'open', ?)",
@@ -570,8 +582,8 @@ export class BuddyInbox extends DurableObject<Environment> {
     const auth = await this.#authenticate('card/put', call, 'writer')
     if (!auth.ok) return auth
     const result = this.#commit(call, 'writer', auth.value, (now) => {
-      if (!this.#recordWrite('card/put', call.slotId, now))
-        return fail('rate_limited')
+      const refused = this.#recordWrite('card/put', call.slotId, now)
+      if (refused) return refused
       const seq = this.#nextSeq()
       this.#sql.exec(
         `INSERT INTO card (slot_id, blob, seq, updated_at) VALUES (?, ?, ?, ?)
@@ -600,10 +612,10 @@ export class BuddyInbox extends DurableObject<Environment> {
       const cap = this.#eventCapHit(call.slotId, call.blob.length)
       if (cap) {
         logLimitHit('event/put', cap)
-        return fail('rate_limited')
+        return fail('rate_limited', this.#eventCapWait(cap, call.slotId, now))
       }
-      if (!this.#recordWrite('event/put', call.slotId, now))
-        return fail('rate_limited')
+      const refused = this.#recordWrite('event/put', call.slotId, now)
+      if (refused) return refused
       const seq = this.#nextSeq()
       this.#sql.exec(
         `INSERT INTO event (event_id, slot_id, kind, blob, seq, created_at)
@@ -672,11 +684,11 @@ export class BuddyInbox extends DurableObject<Environment> {
    * not owner activity for the 180-day retention.
    */
   async fetch(request: Request): Promise<Response> {
-    if (!isWebSocketUpgrade(request)) return liveError('upgrade_required')
+    if (!isWebSocketUpgrade(request)) return liveError(fail('upgrade_required'))
     const call = readLiveCall(request.headers, Date.now())
-    if (!call.ok) return liveError(call.error)
+    if (!call.ok) return liveError(call)
     const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
-    if (!auth.ok) return liveError(auth.error)
+    if (!auth.ok) return liveError(auth)
     const admitted = this.#commit(
       call.value,
       'owner',
@@ -684,7 +696,7 @@ export class BuddyInbox extends DurableObject<Environment> {
       () => ok(this.#meta()?.seq ?? 0),
       { activity: false }
     )
-    if (!admitted.ok) return liveError(admitted.error)
+    if (!admitted.ok) return liveError(admitted)
 
     const [client, server] = Object.values(new WebSocketPair())
     this.ctx.acceptWebSocket(server)
@@ -864,9 +876,14 @@ export class BuddyInbox extends DurableObject<Environment> {
       ref === 'owner'
         ? [ABUSE.ownerRequests, 'ownerRequests']
         : [ABUSE.writerRequests, 'writerRequests']
-    if (!this.#signers.allows(signerOf(call, ref), budget, Date.now())) {
+    const now = Date.now()
+    const signer = signerOf(call, ref)
+    if (!this.#signers.allows(signer, budget, now)) {
       logLimitHit(op, limit)
-      return fail('rate_limited')
+      return fail(
+        'rate_limited',
+        retryAfterSeconds(this.#signers.waitMs(signer, now))
+      )
     }
     return key
   }
@@ -1092,27 +1109,68 @@ export class BuddyInbox extends DurableObject<Environment> {
     )
   }
 
-  /** Sliding one-hour window of writes per slot. */
-  #recordWrite(op: BuddiesSigningOp, slotId: string, now: number): boolean {
+  /**
+   * Sliding one-hour window of writes per slot. A refusal says when the
+   * oldest write in the window ages out.
+   */
+  #recordWrite(
+    op: BuddiesSigningOp,
+    slotId: string,
+    now: number
+  ): BuddiesFailure | null {
     this.#sql.exec(
       'DELETE FROM slot_write WHERE slot_id = ? AND at <= ?',
       slotId,
       now - LIMITS.writeWindowMs
     )
-    const writes = this.#count(
-      'SELECT COUNT(*) AS n FROM slot_write WHERE slot_id = ?',
-      slotId
-    )
+    const { writes, oldest } = this.#sql
+      .exec<{
+        writes: number
+        oldest: number | null
+      }>(
+        'SELECT COUNT(*) AS writes, MIN(at) AS oldest FROM slot_write WHERE slot_id = ?',
+        slotId
+      )
+      .one()
     if (writes >= LIMITS.writesPerSlot) {
       logLimitHit(op, 'writesPerSlot')
-      return false
+      return fail(
+        'rate_limited',
+        retryAfterSeconds((oldest ?? now) + LIMITS.writeWindowMs - now)
+      )
     }
     this.#sql.exec(
       'INSERT INTO slot_write (slot_id, at) VALUES (?, ?)',
       slotId,
       now
     )
-    return true
+    return null
+  }
+
+  /**
+   * When a full slot or inbox gets room back: its oldest stored writer event
+   * reaching the 30-day retention. Long, but true; the sender keeps the event.
+   */
+  #eventCapWait(cap: string, slotId: string, now: number): number {
+    const { oldest } =
+      cap === 'inboxEventBytes'
+        ? this.#sql
+            .exec<{
+              oldest: number | null
+            }>(
+              'SELECT MIN(created_at) AS oldest FROM event WHERE slot_id <> ?',
+              RELAY_SLOT_ID
+            )
+            .one()
+        : this.#sql
+            .exec<{
+              oldest: number | null
+            }>(
+              'SELECT MIN(created_at) AS oldest FROM event WHERE slot_id = ?',
+              slotId
+            )
+            .one()
+    return retryAfterSeconds((oldest ?? now) + LIMITS.eventRetentionMs - now)
   }
 
   /**

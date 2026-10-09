@@ -24,6 +24,11 @@ describe('health and status', () => {
     expect(typeof res.body.timestamp).toBe('string')
     expect(Number.isNaN(Date.parse(res.body.timestamp))).toBe(false)
     expect(typeof res.body.versionId).toBe('string')
+    // Clock calibration: uncached, with the server time in ms and as Date.
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.body.serverTime).toBe(Date.parse(res.body.timestamp))
+    const date = Date.parse(res.headers.get('date') ?? '')
+    expect(Math.abs(date - res.body.serverTime)).toBeLessThan(1_000)
   })
 
   it('GET /notes-import/status returns availability, capabilities, no-store', async () => {
@@ -45,7 +50,32 @@ describe('health and status', () => {
   it('unknown routes are a JSON 404', async () => {
     const res = await http('GET', '/definitely-not-a-route')
     expect(res.status).toBe(404)
-    expect(res.body).toEqual({ error: 'Not found' })
+    expect(res.body).toEqual({ ok: false, error: 'not_found', code: 'not_found' })
+  })
+})
+
+describe('per-IP rate limits', () => {
+  it('refuses a family past 60/min with Retry-After, leaving other families open', async () => {
+    const ip = `198.19.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`
+    const headers = { 'cf-connecting-ip': ip }
+    let refused: Awaited<ReturnType<typeof http>> | null = null
+    // The admin route is the cheapest in its family: no token, a fast 404.
+    for (let i = 0; i < 70 && !refused; i++) {
+      const res = await http('POST', '/admin/notes-import/reset', { headers, body: {} })
+      if (res.status === 429) refused = res
+      else expect(res.status).toBe(404)
+    }
+    expect(refused?.body).toEqual({
+      ok: false,
+      error: 'rate_limited',
+      code: 'rate_limited',
+      retryAfter: 60,
+    })
+    expect(refused?.headers.get('retry-after')).toBe('60')
+
+    // Same IP, another family: its own bucket.
+    const status = await http('GET', '/notes-import/status', { headers })
+    expect(status.status).toBe(200)
   })
 })
 
@@ -60,8 +90,14 @@ describe('app store ratings', () => {
   it('serves 503 no-store before a sweep, then the stored summary', async () => {
     const first = await http('GET', '/app-store/ratings')
     if (first.status === 503) {
-      expect(first.body).toEqual({ error: 'Ratings unavailable' })
+      expect(first.body).toEqual({
+        ok: false,
+        error: 'unavailable',
+        code: 'unavailable',
+        retryAfter: 3600,
+      })
       expect(first.headers.get('cache-control')).toBe('no-store')
+      expect(first.headers.get('retry-after')).toBe('3600')
       if (!LOCAL_LAUNCHER) return
       // Seed what the hourly cron would publish, then read it back.
       localKv('put', 'app-store-ratings:summary', JSON.stringify(summary))

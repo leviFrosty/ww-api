@@ -181,6 +181,11 @@ export class SignerBudget {
     this.#window(signer, now).used++
   }
 
+  /** Milliseconds until `signer`'s current window ends and its budget refills. */
+  waitMs(signer: string, now: number): number {
+    return this.#window(signer, now).start + this.windowMs - now
+  }
+
   #window(signer: string, now: number) {
     const start = now - (now % this.windowMs)
     let window = this.#windows.get(signer)

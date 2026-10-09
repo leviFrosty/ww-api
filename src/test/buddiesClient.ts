@@ -1,3 +1,4 @@
+import { expect } from 'vitest'
 import { signedMessage } from '../buddies/envelope'
 import {
   BUDDIES_LIVE_HEADERS,
@@ -101,3 +102,21 @@ export const hexToken = (size: number): string =>
   [...randomBytes(size)]
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('')
+
+/**
+ * The relay's error body for `code` (src/buddies/errorResponse.ts):
+ * `rate_limited` and `disabled` add `retryAfter`, `stale` adds `serverTime`.
+ * Pass `extras` to pin those values.
+ */
+export const relayError = (
+  code: string,
+  extras: Record<string, unknown> = {}
+) => ({
+  ok: false,
+  error: code,
+  code,
+  ...(code === 'rate_limited' ? { retryAfter: expect.any(Number) } : {}),
+  ...(code === 'disabled' ? { retryAfter: 60 } : {}),
+  ...(code === 'stale' ? { serverTime: expect.any(Number) } : {}),
+  ...extras,
+})

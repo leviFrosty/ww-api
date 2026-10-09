@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import { timingSafeEqual } from '../crypto'
+import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import {
   BUDDIES_LIMITS as LIMITS,
   fail,
@@ -37,6 +37,11 @@ type InviteRow = {
   expiresAt: number
   status: 'open' | 'claimed'
   badClaims: number
+  /**
+   * b64u SHA-256 of the delivered claim's blob. Null until delivery succeeds,
+   * and on invites claimed before it was kept.
+   */
+  claimBlobHash: string | null
 }
 
 const SCHEMA = `CREATE TABLE IF NOT EXISTS invite (
@@ -49,7 +54,8 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS invite (
   expires_at       INTEGER NOT NULL,
   status           TEXT NOT NULL,
   bad_claims       INTEGER NOT NULL,
-  claimed_at       INTEGER
+  claimed_at       INTEGER,
+  claim_blob_hash  TEXT
 )`
 
 /**
@@ -60,6 +66,12 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS invite (
  * The creator's `BuddyInbox` owns the caps and reserves a spot before calling
  * `create`. A successful claim is marked here synchronously (first claim wins),
  * then delivered to the creator inbox as its `invite.claimed` event.
+ *
+ * Claims are idempotent for the winner: a retry with the same secret and the
+ * same claim blob (a client whose response was lost resends its request
+ * unchanged) gets the original `ok` again, without a second event or push.
+ * Anyone else, including the same person re-sealing a fresh blob, still gets
+ * `conflict`.
  */
 export class BuddyInvite extends DurableObject<Environment> {
   #schemaReady = false
@@ -99,10 +111,20 @@ export class BuddyInvite extends DurableObject<Environment> {
   async claim(
     args: ClaimInviteArgs
   ): Promise<BuddiesResult<{ push: PushJob | null }>> {
+    // Hashed before reading the invite: from the read through marking it
+    // claimed below, nothing may await, or two claims could both see `open`.
+    const blobHash = await blobDigest(args.blob)
     const now = Date.now()
     const invite = this.#live(args.inviteId, now)
     if (!invite) return fail('not_found')
-    if (invite.status !== 'open') return fail('conflict')
+    if (invite.status !== 'open') {
+      // Wrong secrets here count nothing: a claimed invite can't be burned.
+      return invite.claimBlobHash != null &&
+        timingSafeEqual(args.claimHash, invite.claimVerifier) &&
+        timingSafeEqual(blobHash, invite.claimBlobHash)
+        ? ok({ push: null })
+        : fail('conflict')
+    }
 
     if (!timingSafeEqual(args.claimHash, invite.claimVerifier)) {
       if (invite.badClaims + 1 >= LIMITS.badClaims) {
@@ -138,6 +160,15 @@ export class BuddyInvite extends DurableObject<Environment> {
       return fail('not_found')
     }
     if (delivery.status === 'claimed_elsewhere') return fail('conflict')
+    // Only a delivered claim is repeatable: a retry while delivery is still in
+    // flight (or after it failed and reopened) can't be told it succeeded.
+    if (this.#ready()) {
+      this.ctx.storage.sql.exec(
+        'UPDATE invite SET claim_blob_hash = ? WHERE singleton = 1 AND claimed_at = ?',
+        blobHash,
+        now
+      )
+    }
     return ok({ push: delivery.push })
   }
 
@@ -172,7 +203,20 @@ export class BuddyInvite extends DurableObject<Environment> {
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'invite'"
         )
         .toArray().length > 0
+    // Invites from before idempotent claims gain the column in place.
+    if (this.#schemaReady && !this.#hasClaimBlobHash()) {
+      this.ctx.storage.sql.exec(
+        'ALTER TABLE invite ADD COLUMN claim_blob_hash TEXT'
+      )
+    }
     return this.#schemaReady
+  }
+
+  #hasClaimBlobHash(): boolean {
+    return this.ctx.storage.sql
+      .exec<{ name: string }>('PRAGMA table_info(invite)')
+      .toArray()
+      .some((row) => row.name === 'claim_blob_hash')
   }
 
   #load(): InviteRow | null {
@@ -182,7 +226,7 @@ export class BuddyInvite extends DurableObject<Environment> {
         .exec<InviteRow>(
           `SELECT invite_id AS inviteId, creator_inbox_id AS creatorInboxId,
                   claim_verifier AS claimVerifier, blob, expires_at AS expiresAt,
-                  status, bad_claims AS badClaims
+                  status, bad_claims AS badClaims, claim_blob_hash AS claimBlobHash
            FROM invite WHERE singleton = 1`
         )
         .toArray()[0] ?? null
@@ -229,3 +273,7 @@ export class BuddyInvite extends DurableObject<Environment> {
     this.#schemaReady = false
   }
 }
+
+/** Compared instead of the blob itself, so a stored claim can't be read back. */
+const blobDigest = async (blob: string): Promise<string> =>
+  bytesToBase64Url(await sha256Bytes(new TextEncoder().encode(blob)))

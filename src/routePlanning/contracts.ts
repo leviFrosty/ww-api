@@ -47,9 +47,13 @@ export type RouteOptimizeErrorCode =
   | 'no_route'
   | 'upstream_error'
 
+/** The shared error envelope (src/errors.ts); `error` is a human message. */
 export interface RouteOptimizeErrorResponse {
+  ok: false
   error: string
   code: RouteOptimizeErrorCode
-  /** Set on `daily_limit` and `rate_limited`; mirrors `Retry-After`. */
+  /** Set on every 429 and 503; mirrors `Retry-After`. */
+  retryAfter?: number
+  /** The same as `retryAfter`, kept for shipped builds. */
   retryAfterSeconds?: number
 }

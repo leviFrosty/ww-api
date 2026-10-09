@@ -67,6 +67,15 @@ export interface RunResultSnapshot {
 const REASONING_FLUSH_CHARS = 120
 
 /**
+ * While a run is live, every subscriber gets an SSE comment line this often,
+ * so a client can tell a quiet model from a dead connection with an idle
+ * watchdog (anything over this interval plus slack means the stream is gone).
+ * Comments carry no event, id, or data, so parsers skip them by spec.
+ */
+export const SSE_HEARTBEAT_MS = 15_000
+const SSE_HEARTBEAT_FRAME = ':\n\n'
+
+/**
  * A live SSE subscriber. Wraps a ReadableStream controller with a `closed` guard
  * so a hung-up client (whose stream is already cancelled/closed) can never throw
  * "the stream is not in a state that permits close/enqueue" from a broadcast.
@@ -96,6 +105,8 @@ interface Subscriber {
 export class NotesImportRun extends DurableObject<Environment> {
   #subscribers = new Set<Subscriber>()
   #encoder = new TextEncoder()
+  /** Runs only while there are live subscribers (see `#heartbeat`). */
+  #heartbeatTimer: ReturnType<typeof setInterval> | null = null
   #reasonBuf = ''
   /**
    * Aborts the in-flight model call when the client interrupts the import. Held
@@ -249,6 +260,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     }
     for (const s of this.#subscribers) s.close()
     this.#subscribers.clear()
+    this.#stopHeartbeat()
     await this.ctx.storage.deleteAll()
   }
 
@@ -587,17 +599,25 @@ export class NotesImportRun extends DurableObject<Environment> {
         } catch {
           /* enqueue raced a disconnect */
         }
-        // Already finished → nothing to tail; close after the replay.
+        // Nothing live to tail (finished, cancelled, or no run at all) →
+        // close after the replay rather than hold a silent stream open.
         const status = this.#status()
-        if (status === 'done' || status === 'error') {
+        if (
+          status === null ||
+          status === 'done' ||
+          status === 'error' ||
+          status === 'cancelled'
+        ) {
           sub.close()
           return
         }
         this.#subscribers.add(sub)
+        this.#startHeartbeat()
       },
       cancel: () => {
         closed = true
         this.#subscribers.delete(sub)
+        if (this.#subscribers.size === 0) this.#stopHeartbeat()
       },
     })
 
@@ -637,15 +657,35 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #broadcast(ev: ImportEvent | UnsequencedEvent): void {
-    const frame = this.#encoder.encode(formatSSE(ev))
+    this.#sendAll(this.#encoder.encode(formatSSE(ev)))
+    if (isTerminalEvent(ev)) {
+      for (const s of this.#subscribers) s.close()
+      this.#subscribers.clear()
+      this.#stopHeartbeat()
+    }
+  }
+
+  #sendAll(frame: Uint8Array): void {
     for (const s of this.#subscribers) {
       s.send(frame)
       if (s.closed) this.#subscribers.delete(s)
     }
-    if (isTerminalEvent(ev)) {
-      for (const s of this.#subscribers) s.close()
-      this.#subscribers.clear()
-    }
+  }
+
+  /** One timer for all subscribers; stops when the last one leaves. */
+  #startHeartbeat(): void {
+    if (this.#heartbeatTimer) return
+    const frame = this.#encoder.encode(SSE_HEARTBEAT_FRAME)
+    this.#heartbeatTimer = setInterval(() => {
+      this.#sendAll(frame)
+      if (this.#subscribers.size === 0) this.#stopHeartbeat()
+    }, SSE_HEARTBEAT_MS)
+  }
+
+  #stopHeartbeat(): void {
+    if (!this.#heartbeatTimer) return
+    clearInterval(this.#heartbeatTimer)
+    this.#heartbeatTimer = null
   }
 
   // --- tiny meta helpers --------------------------------------------------

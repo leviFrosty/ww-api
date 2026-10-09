@@ -4,7 +4,6 @@ import { Sentry } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ALWAYS_ALLOWED_OPS,
-  BUDDIES_ERROR_STATUS,
   BUDDIES_LIMITS,
   BUDDIES_LIVE_OP,
   BUDDIES_OPS,
@@ -12,6 +11,7 @@ import {
   BUDDIES_UNSIGNED_OPS,
   ok,
   type BuddiesErrorCode,
+  type BuddiesFailure,
   type BuddiesOp,
   type BuddiesPayloads,
   type BuddiesResult,
@@ -30,6 +30,7 @@ import {
   type Envelope,
 } from './envelope'
 import { isBuddiesEnabled } from './killSwitch'
+import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
 import {
   EDGE_RETRY_AFTER_SECONDS,
   allowBuddiesCaller,
@@ -45,7 +46,8 @@ import { deliverPushJob, type PushDependencies } from './push'
  *
  * Privacy: every id travels in the body (or, for the live socket, in headers),
  * and nothing here logs or reports the body, headers, payload, or any value
- * from them. Errors are `{ "error": "<code>" }`.
+ * from them. Errors are `{ "ok": false, "error": "<code>", "code": "<code>" }`
+ * (src/buddies/errorResponse.ts).
  *
  * Abuse limits (src/buddies/limits.ts): every request first counts against its
  * op tier's per-caller limit, keyed on the client IP (IPv6 by /64), never on
@@ -64,9 +66,7 @@ interface OpOutcome {
 }
 
 /** A failure may say how long to wait (`Retry-After`). */
-type Outcome =
-  | { ok: true; value: OpOutcome }
-  | { ok: false; error: BuddiesErrorCode; retryAfterSeconds?: number }
+type Outcome = { ok: true; value: OpOutcome } | BuddiesFailure
 
 const inbox = (env: Environment, inboxId: string) =>
   env.BUDDY_INBOX.get(env.BUDDY_INBOX.idFromName(inboxId))
@@ -229,21 +229,13 @@ const runUnsigned = async <K extends BuddiesUnsignedOp>(
 }
 
 const errorResponse = (
-  c: AppContext,
   error: BuddiesErrorCode,
   retryAfterSeconds?: number
-): Response =>
-  c.json(
-    { error },
-    BUDDIES_ERROR_STATUS[error],
-    retryAfterSeconds == null
-      ? undefined
-      : { 'Retry-After': String(retryAfterSeconds) }
-  )
+): Response => buddiesErrorResponse(error, { retryAfterSeconds })
 
 /** A per-caller edge limit refused the request. */
-const edgeLimited = (c: AppContext): Response =>
-  errorResponse(c, 'rate_limited', EDGE_RETRY_AFTER_SECONDS)
+const edgeLimited = (): Response =>
+  errorResponse('rate_limited', EDGE_RETRY_AFTER_SECONDS)
 
 const handleBuddiesOp = async (
   c: AppContext,
@@ -255,21 +247,21 @@ const handleBuddiesOp = async (
       !BUDDIES_ALWAYS_ALLOWED_OPS.has(op) &&
       !(await isBuddiesEnabled(c.env))
     ) {
-      return errorResponse(c, 'disabled')
+      return errorResponse('disabled')
     }
     const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
     if (!(await allowBuddiesCaller(c.env, op, callerKey)))
-      return edgeLimited(c)
+      return edgeLimited()
 
     const text = await readEnvelopeText(c.req.raw)
     const envelope = text == null ? null : parseEnvelope(text)
-    if (!envelope) return errorResponse(c, 'bad_request')
+    if (!envelope) return errorResponse('bad_request')
 
     const result = isUnsignedOp(op)
       ? await runUnsigned(op, c.env, envelope)
       : await runSigned(op, c.env, envelope, callerKey)
     if (!result.ok)
-      return errorResponse(c, result.error, result.retryAfterSeconds)
+      return errorResponse(result.error, result.retryAfterSeconds)
 
     const { body, push } = result.value
     if (push) c.executionCtx.waitUntil(deliverPushJob(c.env, push, deps.push))
@@ -278,7 +270,7 @@ const handleBuddiesOp = async (
     // Report the failure, never the request: bodies hold ids, keys, and blobs.
     console.error('buddies: request failed', { op })
     Sentry.captureException(error)
-    return c.json({ error: 'internal' }, 500)
+    return buddiesInternalError()
   }
 }
 
@@ -291,21 +283,21 @@ const handleBuddiesOp = async (
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
-    if (!(await isBuddiesEnabled(c.env))) return errorResponse(c, 'disabled')
+    if (!(await isBuddiesEnabled(c.env))) return errorResponse('disabled')
     const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
     if (!(await allowBuddiesCaller(c.env, BUDDIES_LIVE_OP, callerKey)))
-      return edgeLimited(c)
+      return edgeLimited()
     if (!isWebSocketUpgrade(c.req.raw))
-      return errorResponse(c, 'upgrade_required')
+      return errorResponse('upgrade_required')
     const now = Date.now()
     const call = readLiveCall(c.req.raw.headers, now)
-    if (!call.ok) return errorResponse(c, call.error)
-    if (isStale(call.value.ts, now)) return errorResponse(c, 'stale')
+    if (!call.ok) return errorResponse(call.error)
+    if (isStale(call.value.ts, now)) return errorResponse('stale')
     return await inbox(c.env, call.value.inboxId).fetch(c.req.raw)
   } catch (error) {
     console.error('buddies: request failed', { op: BUDDIES_LIVE_OP })
     Sentry.captureException(error)
-    return c.json({ error: 'internal' }, 500)
+    return buddiesInternalError()
   }
 }
 

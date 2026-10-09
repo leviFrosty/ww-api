@@ -7,6 +7,7 @@ import {
   randomBytes,
   randomId,
   unsignedEnvelope,
+  relayError,
 } from '../test/buddiesClient'
 import {
   LOCAL_LAUNCHER,
@@ -53,7 +54,7 @@ describe('pairing happy path', () => {
       ownerPub: stranger.publicKey,
     })
     expect(hijack.status).toBe(409)
-    expect(hijack.body).toEqual({ error: 'conflict' })
+    expect(hijack.body).toEqual(relayError('conflict'))
 
     const empty = await levi.sync()
     expect(empty.status).toBe(200)
@@ -120,12 +121,22 @@ describe('pairing happy path', () => {
     })
     expect(claimed.status).toBe(200)
     expect(claimed.body).toEqual({ ok: true })
-    const reclaim = await sendUnsigned('invite/claim', {
+    // A retry of the same claim (its response was lost) gets the same ok …
+    const retried = await sendUnsigned('invite/claim', {
       inviteId: invite.inviteId,
       claimSecret: invite.claimSecret,
       blob: claimBlob,
     })
+    expect(retried.status).toBe(200)
+    expect(retried.body).toEqual({ ok: true })
+    // … but a freshly sealed claim is someone else's, even with the secret.
+    const reclaim = await sendUnsigned('invite/claim', {
+      inviteId: invite.inviteId,
+      claimSecret: invite.claimSecret,
+      blob: blobOfSize(200),
+    })
     expect(reclaim.status).toBe(409)
+    expect(reclaim.body).toEqual(relayError('conflict'))
     expect((await sendUnsigned('invite/fetch', { inviteId: invite.inviteId })).body.status).toBe('claimed')
 
     // 6. Levi syncs and sees the relay's invite.claimed event with Maria's claim blob.
@@ -208,7 +219,7 @@ describe('pairing happy path', () => {
     // 11. Authentication holds on the live relay.
     const foreign = await sendSigned('inbox/sync', maria.key, { inboxId: levi.inboxId, since: 0 })
     expect(foreign.status).toBe(401)
-    expect(foreign.body).toEqual({ error: 'bad_signature' })
+    expect(foreign.body).toEqual(relayError('bad_signature'))
     const replayed = await envelope(
       'inbox/sync',
       { ts: Date.now(), nonce: randomId(), inboxId: levi.inboxId, since: 0 },
@@ -217,13 +228,13 @@ describe('pairing happy path', () => {
     expect((await buddies('inbox/sync', replayed)).status).toBe(200)
     const replay = await buddies('inbox/sync', replayed)
     expect(replay.status).toBe(409)
-    expect(replay.body).toEqual({ error: 'replay' })
+    expect(replay.body).toEqual(relayError('replay'))
     const stale = await buddies(
       'inbox/sync',
       await envelope('inbox/sync', { ts: Date.now() - 6 * 60_000, nonce: randomId(), inboxId: levi.inboxId, since: 0 }, levi.key)
     )
     expect(stale.status).toBe(401)
-    expect(stale.body).toEqual({ error: 'stale' })
+    expect(stale.body).toEqual(relayError('stale'))
     const wrongSlot = new RelayWriter(levi.inboxId, randomId(), mariaWriterKey)
     expect((await wrongSlot.send('card/put', { blob: blobOfSize(8) })).status).toBe(410)
 
@@ -241,7 +252,7 @@ describe('pairing happy path', () => {
     expect((await maria.send('inbox/delete')).body).toEqual({ ok: true })
     const gone = await levi.sync()
     expect(gone.status).toBe(404)
-    expect(gone.body).toEqual({ error: 'not_found' })
+    expect(gone.body).toEqual(relayError('not_found'))
   })
 })
 
@@ -264,19 +275,24 @@ describe('inbox ownership across delete-all', () => {
       ...intruders.map((key) => register(key)),
     ])
     expect(deleted.body).toEqual({ ok: true })
-    for (const attempt of raced) expect(attempt.body).toEqual({ error: 'conflict' })
+    for (const attempt of raced)
+      expect(
+        attempt.body
+      ).toEqual(relayError('conflict'))
 
-    expect((await register(intruders[0])).body).toEqual({ error: 'conflict' })
-    expect((await owner.sync()).body).toEqual({ error: 'not_found' })
+    expect((await register(intruders[0])).body).toEqual(relayError('conflict'))
+    expect((await owner.sync()).body).toEqual(relayError('not_found'))
     const wiped = await writer.send('card/put', { blob: blobOfSize(8) })
-    expect([wiped.status, wiped.body]).toEqual([404, { error: 'not_found' }])
+    expect([wiped.status, wiped.body]).toEqual([404, relayError('not_found')])
 
     const back = await register(owner.key)
     expect([back.status, back.body]).toEqual([200, { ok: true }])
     expect((await owner.sync()).body).toEqual({ ok: true, seq: 0, slots: [], cards: [], events: [], roster: null })
     const unslotted = await writer.send('card/put', { blob: blobOfSize(8) })
-    expect([unslotted.status, unslotted.body]).toEqual([410, { error: 'gone' }])
-    expect((await register(intruders[1])).body).toEqual({ error: 'conflict' })
+    expect(
+      [unslotted.status, unslotted.body]
+    ).toEqual([410, relayError('gone')])
+    expect((await register(intruders[1])).body).toEqual(relayError('conflict'))
 
     expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
   })
@@ -315,7 +331,7 @@ describe('relay limits and abuse', () => {
       fetchFrom(`${prefix}::${(i + 1).toString(16)}`)
     )
     expect(statuses.slice(0, limit).every((s) => s === 404)).toBe(true)
-    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    expect(refused?.body).toEqual(relayError('rate_limited'))
     expect(refused?.headers.get('retry-after')).toBe('60')
     expect((await fetchFrom(`${freshPrefix()}::1`)).status).toBe(404)
   })
@@ -337,7 +353,7 @@ describe('relay limits and abuse', () => {
     )
     // Re-registering is idempotent, and each one still counts.
     expect(statuses.slice(0, limit).every((s) => s === 200)).toBe(true)
-    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    expect(refused?.body).toEqual(relayError('rate_limited'))
     expect(refused?.headers.get('retry-after')).toBe('60')
   })
 
@@ -358,7 +374,7 @@ describe('relay limits and abuse', () => {
         })
     )
     expect(statuses.filter((s) => s !== 429).every((s) => s === 401)).toBe(true)
-    expect(refused?.body).toEqual({ error: 'rate_limited' })
+    expect(refused?.body).toEqual(relayError('rate_limited'))
     const sync = await owner.sync()
     expect(sync.status).toBe(200)
     expect((await owner.send('inbox/delete')).status).toBe(200)
@@ -431,22 +447,24 @@ describe('live socket', () => {
 
     const notUpgraded = await http('GET', '/buddies/v1/inbox/live', { headers: plain })
     expect(notUpgraded.status).toBe(426)
-    expect(notUpgraded.body).toEqual({ error: 'upgrade_required' })
+    expect(notUpgraded.body).toEqual(relayError('upgrade_required'))
     expect((await http('POST', '/buddies/v1/inbox/live', { body: {} })).status).toBe(404)
 
     const first = await openLive(headers)
     expect(first.status).toBe(101)
     if ('connection' in first) first.connection.end()
-    expect(await openLive(headers)).toEqual({ status: 409, body: { error: 'replay' } })
+    expect(
+      await openLive(headers)
+    ).toEqual({ status: 409, body: relayError('replay') })
 
     const stranger = await SigningKey.generate()
     expect(await openLive(await owner.liveHeaders(stranger))).toEqual({
       status: 401,
-      body: { error: 'bad_signature' },
+      body: relayError('bad_signature'),
     })
     expect(await openLive({ upgrade: 'websocket' })).toEqual({
       status: 400,
-      body: { error: 'bad_request' },
+      body: relayError('bad_request'),
     })
     await owner.send('inbox/delete')
   })
@@ -460,9 +478,11 @@ describe.skipIf(!LOCAL_LAUNCHER)('kill switch (local KV)', () => {
       const fresh = await SigningKey.generate()
       const blocked = await sendSigned('inbox/register', fresh, { inboxId: randomId(), ownerPub: fresh.publicKey })
       expect(blocked.status).toBe(503)
-      expect(blocked.body).toEqual({ error: 'disabled' })
-      expect((await owner.sync()).body).toEqual({ error: 'disabled' })
-      expect(await openLive(await owner.liveHeaders())).toEqual({ status: 503, body: { error: 'disabled' } })
+      expect(blocked.body).toEqual(relayError('disabled'))
+      expect((await owner.sync()).body).toEqual(relayError('disabled'))
+      expect(
+        await openLive(await owner.liveHeaders())
+      ).toEqual({ status: 503, body: relayError('disabled') })
       expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
     } finally {
       localKv('delete', 'buddies:enabled')

@@ -1,6 +1,8 @@
 import type { AppContext, ErrorResponse } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
+import { retryAfterHeaders } from '../errors'
+import { PLAY_INTEGRITY_CHALLENGE_TTL_SECONDS } from '../playIntegrity/protocol'
 import { sha256Hex, timingSafeEqual, randomToken } from '../crypto'
 import {
   getNotesImportConfig,
@@ -77,24 +79,45 @@ const track = (ctx: AppContext, event: AnalyticsEvent) => {
   }
 }
 
+/**
+ * A 503 that didn't say otherwise (storage, Google, or provider trouble):
+ * worth one more try after a short wait.
+ */
+const UNAVAILABLE_RETRY_AFTER_SECONDS = 30
+/**
+ * The kill switch and provider health are read through 60-second caches, so
+ * nothing changes for at least that long.
+ */
+const KILL_SWITCH_RETRY_AFTER_SECONDS = 60
+/** A run usually settles within a minute; poll for a free slot meanwhile. */
+const ACTIVE_CAP_RETRY_AFTER_SECONDS = 15
+
+/**
+ * Notes Import's error response: the shared envelope (src/errors.ts) with the
+ * human message in `error`, as shipped builds expect, and the stable `code`.
+ * Every 503 carries `Retry-After`; 429s pass theirs explicitly.
+ */
 const err = (
   ctx: AppContext,
   status: number,
   error: string,
-  code?: string,
+  code: string,
   detail?: string,
   credits?: CreditsSnapshot,
   reason?: AppAttestReason | PlayIntegrityReason,
-  action?: AppAttestAction | PlayIntegrityAction
+  action?: AppAttestAction | PlayIntegrityAction,
+  retryAfter: number | undefined = status === 503
+    ? UNAVAILABLE_RETRY_AFTER_SECONDS
+    : undefined
 ) => {
-  const body: ErrorResponse = { error }
-  if (code) body.code = code
+  const body: ErrorResponse = { ok: false, error, code }
+  if (retryAfter != null) body.retryAfter = retryAfter
   if (detail) body.detail = detail
   if (credits) body.credits = credits
   if (reason) body.reason = reason
   if (action) body.action = action
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return ctx.json(body, status as any)
+  return ctx.json(body, status as any, retryAfterHeaders(retryAfter))
 }
 
 /** Serialize a caught value to a useful single-string detail for dev debugging. */
@@ -306,7 +329,12 @@ const playIntegrityFailureResponse = (
     undefined,
     undefined,
     error.reason,
-    error.action
+    error.action,
+    error.status === 429
+      ? PLAY_INTEGRITY_CHALLENGE_TTL_SECONDS
+      : error.status === 503
+        ? UNAVAILABLE_RETRY_AFTER_SECONDS
+        : undefined
   )
 }
 
@@ -707,7 +735,11 @@ async function authenticateAndGate(
         HTTP_STATUS.SERVICE_UNAVAILABLE,
         'Notes Import is temporarily unavailable',
         'unavailable',
-        status.reason
+        status.reason,
+        undefined,
+        undefined,
+        undefined,
+        KILL_SWITCH_RETRY_AFTER_SECONDS
       ),
     }
   }
@@ -1010,10 +1042,12 @@ async function authenticateAndGate(
           : 'imports'
       )
     )
+    // No Retry-After: neither denial frees with a short wait (the import
+    // window resets at `credits.resetsAt`; refinements never reset).
     return {
       ok: false,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      response: ctx.json(denial.body, denial.status as any),
+      response: ctx.json({ ok: false, ...denial.body }, denial.status as any),
     }
   }
 
@@ -1101,7 +1135,12 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       ctx,
       HTTP_STATUS.TOO_MANY_REQUESTS,
       `You already have ${acquired.active} imports running (max ${cap}).`,
-      'active_cap'
+      'active_cap',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      ACTIVE_CAP_RETRY_AFTER_SECONDS
     )
   }
 
@@ -1336,7 +1375,12 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       ctx,
       HTTP_STATUS.TOO_MANY_REQUESTS,
       `You already have ${acquired.active} imports running (max ${cap}).`,
-      'active_cap'
+      'active_cap',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      ACTIVE_CAP_RETRY_AFTER_SECONDS
     )
   }
 
