@@ -4,11 +4,15 @@ import { Sentry } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ALWAYS_ALLOWED_OPS,
+  BUDDIES_BLOB_GET_OP,
+  BUDDIES_BLOB_PUT_OP,
   BUDDIES_LIMITS,
   BUDDIES_LIVE_OP,
   BUDDIES_OPS,
   BUDDIES_PAYLOAD_PARSERS,
+  BUDDIES_PHOTO_OPS,
   BUDDIES_UNSIGNED_OPS,
+  buddyBlobKey,
   ok,
   type BuddiesErrorCode,
   type BuddiesFailure,
@@ -23,13 +27,15 @@ import {
 import {
   isWebSocketUpgrade,
   parseEnvelope,
+  readBlobBody,
+  readBlobPutCall,
   readEnvelopeText,
   readLiveCall,
   signedCall,
   verifyBuddiesSignature,
   type Envelope,
 } from './envelope'
-import { isBuddiesEnabled } from './killSwitch'
+import { isBuddiesEnabled, isBuddiesPhotosEnabled } from './killSwitch'
 import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
 import {
   EDGE_RETRY_AFTER_SECONDS,
@@ -42,7 +48,8 @@ import { deliverPushJob, type PushDependencies } from './push'
 
 /**
  * `POST /buddies/v1/{op}` — the Buddies relay (docs/buddies-protocol.md) —
- * and `GET /buddies/v1/inbox/live`, the owner's live socket.
+ * `GET /buddies/v1/inbox/live`, the owner's live socket, and the photo blob
+ * routes `POST /buddies/v1/blob/put` (raw body) and `blob/get` (raw answer).
  *
  * Privacy: every id travels in the body (or, for the live socket, in headers),
  * and nothing here logs or reports the body, headers, payload, or any value
@@ -80,6 +87,13 @@ const empty = (result: BuddiesResult<unknown>): Outcome =>
 const withSeq = (result: BuddiesResult<{ seq: number }>): Outcome =>
   result.ok ? ok({ body: { seq: result.value.seq } }) : result
 
+/**
+ * Photo blobs work only with the `buddies:photos` switch on and an R2 bucket
+ * bound. Callers check Buddies' own switch first.
+ */
+const photosAvailable = async (env: Environment): Promise<boolean> =>
+  env.BUDDY_BLOBS != null && (await isBuddiesPhotosEnabled(env))
+
 type SignedRunners = {
   [K in BuddiesSignedOp]: (
     env: Environment,
@@ -90,9 +104,12 @@ type SignedRunners = {
 const SIGNED_OPS: SignedRunners = {
   'inbox/register': async (env, call) =>
     empty(await inbox(env, call.inboxId).register(call)),
+  // `capabilities` tells the app which optional relay features it may use.
   'inbox/sync': async (env, call) => {
     const result = await inbox(env, call.inboxId).sync(call)
-    return result.ok ? ok({ body: { ...result.value } }) : result
+    if (!result.ok) return result
+    const capabilities = { photos: await photosAvailable(env) }
+    return ok({ body: { ...result.value, capabilities } })
   },
   'inbox/delete': async (env, call) =>
     empty(await inbox(env, call.inboxId).deleteInbox(call)),
@@ -110,6 +127,8 @@ const SIGNED_OPS: SignedRunners = {
     empty(await inbox(env, call.inboxId).createInvite(call)),
   'invite/delete': async (env, call) =>
     empty(await inbox(env, call.inboxId).deleteInvite(call)),
+  'blob/delete': async (env, call) =>
+    empty(await inbox(env, call.inboxId).deleteBlobs(call)),
   'card/put': async (env, call) =>
     withSeq(await inbox(env, call.inboxId).putCard(call)),
   'event/put': async (env, call) => {
@@ -249,6 +268,8 @@ const handleBuddiesOp = async (
     ) {
       return errorResponse('disabled')
     }
+    if (BUDDIES_PHOTO_OPS.has(op) && !(await photosAvailable(c.env)))
+      return errorResponse('photos_disabled')
     const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
     if (!(await allowBuddiesCaller(c.env, op, callerKey)))
       return edgeLimited()
@@ -301,6 +322,102 @@ const handleLive = async (c: AppContext): Promise<Response> => {
   }
 }
 
+/** Bytes only: never sniffed, cached, or stored anywhere on the way. */
+const BLOB_HEADERS = {
+  'Content-Type': 'application/octet-stream',
+  'Cache-Control': 'no-store',
+  'X-Content-Type-Options': 'nosniff',
+} as const
+
+/** Shared refusals before any blob op: both switches, then the caller's edge limit. */
+const refuseBlobOp = async (
+  c: AppContext,
+  op: typeof BUDDIES_BLOB_PUT_OP | typeof BUDDIES_BLOB_GET_OP
+): Promise<Response | null> => {
+  if (!(await isBuddiesEnabled(c.env))) return errorResponse('disabled')
+  if (!(await photosAvailable(c.env))) return errorResponse('photos_disabled')
+  const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
+  if (!(await allowBuddiesCaller(c.env, op, callerKey))) return edgeLimited()
+  return null
+}
+
+/**
+ * `POST blob/put`: an owner-signed upload of one sealed photo. The envelope
+ * rides in the `x-buddies-p` / `x-buddies-s` headers (op `blob/put`) and the
+ * body is the raw sealed bytes. `bytes` is checked before the body is read
+ * and the read stops past it; the body's SHA-256 must be `blobId`, so the
+ * signature covers the bytes too. The inbox DO verifies the signature, takes
+ * the nonce, applies the caps, and writes the object.
+ */
+const handleBlobPut = async (c: AppContext): Promise<Response> => {
+  try {
+    const refused = await refuseBlobOp(c, BUDDIES_BLOB_PUT_OP)
+    if (refused) return refused
+    const now = Date.now()
+    const call = readBlobPutCall(c.req.raw.headers, now)
+    if (!call.ok) return errorResponse(call.error)
+    if (isStale(call.value.ts, now)) return errorResponse('stale')
+    if (call.value.bytes > BUDDIES_LIMITS.blobBytes)
+      return errorResponse('too_large')
+    const body = await readBlobBody(c.req.raw, call.value.bytes)
+    if (!body.ok) return errorResponse(body.error)
+    // Content addressing of the ciphertext the relay holds, never of plaintext.
+    const blobId = bytesToBase64Url(await sha256Bytes(body.value))
+    if (blobId !== call.value.blobId) return errorResponse('bad_request')
+    const result = await inbox(c.env, call.value.inboxId).putBlob(
+      call.value,
+      body.value
+    )
+    if (!result.ok) return errorResponse(result.error, result.retryAfterSeconds)
+    return c.json({ ok: true, expiresAt: result.value.expiresAt })
+  } catch (error) {
+    console.error('buddies: request failed', { op: BUDDIES_BLOB_PUT_OP })
+    Sentry.captureException(error)
+    return buddiesInternalError()
+  }
+}
+
+/**
+ * `POST blob/get`: an unsigned `{ "p": … }` envelope whose payload names the
+ * sender's inbox, the blob, and the read token (the capability). Answers the
+ * raw sealed bytes, or one `not_found` for an unknown inbox or blob, an
+ * expired blob, and a wrong token alike.
+ */
+const handleBlobGet = async (c: AppContext): Promise<Response> => {
+  try {
+    const refused = await refuseBlobOp(c, BUDDIES_BLOB_GET_OP)
+    if (refused) return refused
+    const text = await readEnvelopeText(c.req.raw)
+    const envelope = text == null ? null : parseEnvelope(text)
+    const payload = envelope
+      ? BUDDIES_PAYLOAD_PARSERS[BUDDIES_BLOB_GET_OP](
+          envelope.payload,
+          Date.now()
+        )
+      : null
+    if (!payload) return errorResponse('bad_request')
+    // Only the hash crosses into the DO; it's compared in constant time there.
+    const tokenHash = bytesToBase64Url(await sha256Bytes(payload.token))
+    const allowed = await inbox(c.env, payload.inboxId).authorizeBlobRead({
+      inboxId: payload.inboxId,
+      blobId: payload.blobId,
+      tokenHash,
+    })
+    if (!allowed.ok) return errorResponse(allowed.error)
+    const object = await c.env.BUDDY_BLOBS?.get(
+      buddyBlobKey(payload.inboxId, payload.blobId)
+    )
+    if (!object) return errorResponse('not_found')
+    return new Response(object.body, {
+      headers: { ...BLOB_HEADERS, 'Content-Length': String(object.size) },
+    })
+  } catch (error) {
+    console.error('buddies: request failed', { op: BUDDIES_BLOB_GET_OP })
+    Sentry.captureException(error)
+    return buddiesInternalError()
+  }
+}
+
 /** Mounted at `/buddies/v1` by the Worker entry point. */
 export const createBuddiesRoutes = (
   deps: BuddiesRouteDependencies = { push: defaultApnsDependencies }
@@ -310,5 +427,7 @@ export const createBuddiesRoutes = (
     routes.post(`/${op}`, (c) => handleBuddiesOp(c, op, deps))
   }
   routes.get(`/${BUDDIES_LIVE_OP}`, handleLive)
+  routes.post(`/${BUDDIES_BLOB_PUT_OP}`, handleBlobPut)
+  routes.post(`/${BUDDIES_BLOB_GET_OP}`, handleBlobGet)
   return routes
 }

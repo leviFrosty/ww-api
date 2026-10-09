@@ -444,6 +444,24 @@ async function doctor() {
   }
 
   try {
+    // Unknown blob: `not_found` proves photo blobs are on (BUDDIES_PHOTOS in dev) with a bucket bound.
+    const zeros = Buffer.alloc(32).toString('base64url')
+    const probe = await fetchJson(`${state.url}/buddies/v1/blob/get`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.3' },
+      body: JSON.stringify({
+        p: Buffer.from(JSON.stringify({ inboxId: 'doctorProbe00000000000', blobId: zeros, token: zeros })).toString('base64url'),
+      }),
+    })
+    if (probe.status === 404 && probe.body?.error === 'not_found') ok('buddies photos enabled')
+    else if (probe.body?.error === 'photos_disabled')
+      bad('buddies photos disabled: KV buddies:photos is not "on"; run `node scripts/verify/dev.mjs kv delete buddies:photos`')
+    else bad(`buddies photos probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
+  } catch (error) {
+    bad(`buddies photos probe failed: ${error.message}`)
+  }
+
+  try {
     const verify = await fetchJson(`${state.url}/notes-import/verify`, {
       method: 'POST',
       headers: {

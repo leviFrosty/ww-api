@@ -28,3 +28,33 @@ export const isBuddiesEnabled = async (
   if (value != null) return value.trim() === 'true'
   return env.BUDDIES_ENABLED?.trim() === 'true'
 }
+
+export const BUDDIES_PHOTOS_KEY = 'buddies:photos'
+/** Values of `buddies:photos` / `BUDDIES_PHOTOS` that turn photos on. */
+const PHOTOS_ON = new Set(['on', 'true'])
+
+export type PhotosSwitchEnv = Pick<Environment, 'BUDDIES_PHOTOS'> & {
+  NOTES_KV: Pick<KVNamespace, 'get'>
+}
+
+/**
+ * Photo blobs (`blob/put`, `blob/get`, `blob/delete`) are on iff KV
+ * `buddies:photos` is `"on"` (`"true"` is accepted too). When the key is
+ * absent (or KV can't be read) the `BUDDIES_PHOTOS` var decides: `"on"` in
+ * dev, unset (off) in prod. Edge-cached for 60 seconds like
+ * `buddies:enabled`, and only consulted when Buddies itself is on.
+ */
+export const isBuddiesPhotosEnabled = async (
+  env: PhotosSwitchEnv
+): Promise<boolean> => {
+  let value: string | null = null
+  try {
+    value = await env.NOTES_KV.get(BUDDIES_PHOTOS_KEY, {
+      cacheTtl: CACHE_TTL_SECONDS,
+    })
+  } catch {
+    console.warn('buddies: photos KV read failed; using BUDDIES_PHOTOS')
+  }
+  if (value != null) return PHOTOS_ON.has(value.trim())
+  return PHOTOS_ON.has(env.BUDDIES_PHOTOS?.trim() ?? '')
+}

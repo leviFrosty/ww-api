@@ -9,11 +9,13 @@ import { fileURLToPath } from 'node:url'
 import type { BuddiesSignedOp } from '../buddies/contracts'
 import {
   SigningKey,
+  blobPutHeaders,
   envelope,
   liveHeaders,
   randomId,
   unsignedEnvelope,
   type Envelope,
+  type PhotoBlob,
 } from './buddiesClient'
 
 /**
@@ -122,6 +124,73 @@ export const http = async (
   return { status: response.status, headers: response.headers, body, text, ms }
 }
 
+export interface BytesExchange {
+  status: number
+  headers: Headers
+  /** The response body on 200. */
+  bytes: Uint8Array | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any
+  ms: number
+}
+
+const describeBytes = (bytes: Uint8Array) =>
+  `<${bytes.byteLength} raw bytes>`
+
+/**
+ * A request whose body or answer is raw bytes (`blob/put`, `blob/get`). The
+ * transcript records sizes, never the bytes or `x-buddies-*` values.
+ */
+export const httpBytes = async (
+  path: string,
+  init: { bytes?: Uint8Array; json?: unknown; headers?: Record<string, string> }
+): Promise<BytesExchange> => {
+  const headers: Record<string, string> = {
+    'cf-connecting-ip': nextIp(),
+    'content-type': init.bytes ? 'application/octet-stream' : 'application/json',
+    ...init.headers,
+  }
+  const requestBody = init.bytes ?? JSON.stringify(init.json ?? {})
+  const started = Date.now()
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers,
+    body: requestBody,
+    signal: AbortSignal.timeout(10_000),
+  })
+  const raw = new Uint8Array(await response.arrayBuffer())
+  const ms = Date.now() - started
+  const binary =
+    response.status === 200 &&
+    response.headers.get('content-type') === 'application/octet-stream'
+  let body: unknown = null
+  if (!binary) {
+    const text = new TextDecoder().decode(raw)
+    try {
+      body = JSON.parse(text)
+    } catch {
+      body = text
+    }
+  }
+  transcript.push({
+    method: 'POST',
+    path,
+    headers: Object.keys(headers),
+    request:
+      typeof requestBody === 'string' ? clip(requestBody) : describeBytes(requestBody),
+    status: response.status,
+    response: binary ? describeBytes(raw) : clip(JSON.stringify(body)),
+    ms,
+  })
+  return {
+    status: response.status,
+    headers: response.headers,
+    bytes: binary ? raw : null,
+    body,
+    ms,
+  }
+}
+
 /** Writes this file's request/response transcript as proof. */
 export const writeTranscript = (name: string): string => {
   mkdirSync(ARTIFACTS_DIR, { recursive: true })
@@ -175,6 +244,10 @@ export const sendSigned = async (
 export const sendUnsigned = (op: string, payload: Record<string, unknown>) =>
   buddies(op, unsignedEnvelope(payload))
 
+/** `blob/get`: an unsigned `{p}` envelope; raw bytes back on 200. */
+export const getBlob = (payload: Record<string, unknown>) =>
+  httpBytes('/buddies/v1/blob/get', { json: unsignedEnvelope(payload) })
+
 /** One synthetic person: an inbox and the owner key that signs for it. */
 export class RelayOwner {
   readonly inboxId = randomId()
@@ -197,6 +270,49 @@ export class RelayOwner {
 
   sync(since = 0) {
     return this.send('inbox/sync', { since })
+  }
+
+  /** Adds a buddy's slot, as `blob/put` requires one. */
+  async addWriter(slotId = randomId()): Promise<RelayWriter> {
+    const key = await SigningKey.generate()
+    const response = await this.send('slot/add', {
+      slotId,
+      writerPub: key.publicKey,
+    })
+    if (response.status !== 200) {
+      throw new Error(`slot/add ${response.status} ${response.text}`)
+    }
+    return new RelayWriter(this.inboxId, slotId, key)
+  }
+
+  /**
+   * `blob/put` of `blob`: the signed envelope in headers, the bytes as the
+   * body. `fields` override the signed payload; `init` the body and headers.
+   */
+  async putBlob(
+    blob: PhotoBlob,
+    fields: Record<string, unknown> = {},
+    init: { bytes?: Uint8Array; headers?: Record<string, string> } = {}
+  ) {
+    const payload = {
+      inboxId: this.inboxId,
+      blobId: blob.blobId,
+      bytes: blob.bytes.byteLength,
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      readTokenHash: blob.readTokenHash,
+      ts: Date.now(),
+      nonce: randomId(),
+      ...fields,
+    }
+    return httpBytes('/buddies/v1/blob/put', {
+      bytes: init.bytes ?? blob.bytes,
+      headers: { ...(await blobPutHeaders(payload, this.key)), ...init.headers },
+    })
+  }
+
+  /** `blob/get` of one of this inbox's blobs, with its token unless given. */
+  getBlob(blob: PhotoBlob, token = blob.token) {
+    return getBlob({ inboxId: this.inboxId, blobId: blob.blobId, token })
   }
 
   /** Signed `inbox/live` upgrade headers (fresh nonce each call). */

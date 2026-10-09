@@ -1,5 +1,10 @@
 import { expect, it } from 'vitest'
-import { BUDDIES_LIMITS, BUDDIES_OPS, BUDDIES_UNSIGNED_OPS } from '../../src/buddies/contracts'
+import {
+  BUDDIES_ENVELOPE_HEADERS,
+  BUDDIES_LIMITS,
+  BUDDIES_OPS,
+  BUDDIES_UNSIGNED_OPS,
+} from '../../src/buddies/contracts'
 import { BUDDIES_ABUSE_LIMITS } from '../../src/buddies/limits'
 import { signedMessage, verifyBuddiesSignature } from '../../src/buddies/envelope'
 import * as wire from './buddies-wire.mjs'
@@ -22,6 +27,7 @@ it('mirrors the per-caller edge limits', () => {
 it('knows every op', () => {
   expect([...wire.ALL_OPS].sort()).toEqual([...BUDDIES_OPS].sort())
   expect(wire.UNSIGNED_OPS).toEqual([...BUDDIES_UNSIGNED_OPS])
+  expect(wire.ENVELOPE_HEADERS).toEqual(BUDDIES_ENVELOPE_HEADERS)
 })
 
 it('signs exactly what the relay verifies', async () => {

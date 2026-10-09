@@ -256,6 +256,7 @@ describe('inbox/sync', () => {
       cards: [],
       events: [],
       roster: null,
+      capabilities: { photos: true },
     })
 
     const alice = await owner.addWriter()
@@ -297,6 +298,7 @@ describe('inbox/sync', () => {
         },
       ],
       roster: { blob: roster, seq: 1 },
+      capabilities: { photos: true },
     })
 
     const partial = (await owner.sync(1)).body

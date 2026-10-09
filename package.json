@@ -5,8 +5,8 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
-    "deploy:dev": "wrangler deploy --env dev --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
+    "deploy": "node scripts/r2-lifecycle.mjs ww-buddy-blobs && wrangler deploy --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
+    "deploy:dev": "node scripts/r2-lifecycle.mjs ww-buddy-blobs-dev && wrangler deploy --env dev --outdir dist --var SENTRY_RELEASE:$(sentry-cli releases propose-version) && pnpm run sentry:sourcemaps",
     "sentry:sourcemaps": "sentry-cli releases new $(sentry-cli releases propose-version) && sentry-cli sourcemaps upload --release=$(sentry-cli releases propose-version) --strip-prefix 'dist/..' dist",
     "test": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",

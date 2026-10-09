@@ -10,6 +10,7 @@ import { resetGoogleAuthState } from '../googleAuth'
 import type { BuddiesSignedOp } from '../buddies/contracts'
 import type { Environment } from '../types'
 import { makeMemoryKv, type MemoryKv } from './memoryKv'
+import { makeMemoryR2, type MemoryR2 } from './memoryR2'
 import { createTestServiceAccount } from './googleServiceAccount'
 import {
   WORKERS_WEBSOCKET_GLOBALS,
@@ -21,18 +22,22 @@ import {
   SigningKey,
   b64u,
   blobOfSize,
+  blobPutHeaders,
   envelope,
   hexToken,
   liveHeaders,
   randomBytes,
   randomId,
+  unsignedEnvelope,
+  type PhotoBlob,
 } from './buddiesClient'
 
 export * from './buddiesClient'
 
 /**
  * End-to-end harness for the Buddies relay: the real Hono routes, the real
- * Durable Object classes on SQLite, an in-memory KV, rate limiters that count
+ * Durable Object classes on SQLite, an in-memory KV and R2 bucket (photos on
+ * through `BUDDIES_PHOTOS`, as in dev), rate limiters that count
  * like the local runtime's (fixed windows on the faked clock, production
  * limits unless overridden), a recording APNs and FCM `fetch` (Google's
  * OAuth token exchange answered with a fixed token), and fake Workers
@@ -73,6 +78,15 @@ export interface ApiResponse {
   body: any
 }
 
+/** A `blob/get` answer: the bytes on 200, else the JSON error. */
+export interface BlobResponse {
+  status: number
+  headers: Headers
+  bytes: Uint8Array | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any
+}
+
 /** An `inbox/live` answer: the client end on 101, else the JSON error. */
 export interface LiveResponse {
   status: number
@@ -88,11 +102,19 @@ export interface HarnessOptions {
   fcmConfigured?: boolean
   /** Per-minute limit for unsigned ops; production's by default. */
   unsignedLimit?: number
+  /** The `BUDDIES_PHOTOS` var; `"on"` (dev's) by default. */
+  photos?: string
+  /** KV `buddies:photos`, when set. */
+  kvPhotos?: string
+  /** Bind the R2 bucket (default true). */
+  blobBucket?: boolean
 }
 
 export interface Harness {
   env: Environment
   kv: MemoryKv
+  /** The `BUDDY_BLOBS` bucket (present even when unbound, for assertions). */
+  r2: MemoryR2
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -119,6 +141,8 @@ export interface Harness {
   ): Promise<ApiResponse>
   /** `inbox/live` with these request headers; GET unless `method` says. */
   live(headers: Record<string, string>, method?: string): Promise<LiveResponse>
+  /** `blob/get` for `{ inboxId, blobId, token }` (or a raw body). */
+  getBlob(payload: Record<string, unknown> | string): Promise<BlobResponse>
   /** Awaits every `waitUntil` task (push delivery). */
   flush(): Promise<void>
 }
@@ -164,6 +188,8 @@ export const createHarness = async (
   const kv = makeMemoryKv()
   if (options.kvEnabled != null)
     await kv.put('buddies:enabled', options.kvEnabled)
+  if (options.kvPhotos != null) await kv.put('buddies:photos', options.kvPhotos)
+  const r2 = makeMemoryR2()
 
   const apnsKeys = (await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
@@ -196,6 +222,8 @@ export const createHarness = async (
     IOS_BUNDLE_ID: BUNDLE_ID,
     IOS_ADDITIONAL_BUNDLE_IDS: BETA_BUNDLE_ID,
     BUDDIES_ENABLED: options.enabled ?? 'true',
+    BUDDIES_PHOTOS: options.photos ?? 'on',
+    ...(options.blobBucket === false ? {} : { BUDDY_BLOBS: r2 }),
     ...limiters,
     ...(options.apnsConfigured === false
       ? {}
@@ -233,6 +261,7 @@ export const createHarness = async (
   const harness: Harness = {
     env,
     kv,
+    r2,
     inboxes,
     invites,
     quotas,
@@ -251,6 +280,9 @@ export const createHarness = async (
       throw new Error('replaced below')
     },
     live: async () => {
+      throw new Error('replaced below')
+    },
+    getBlob: async () => {
       throw new Error('replaced below')
     },
     flush: async () => {
@@ -317,6 +349,34 @@ export const createHarness = async (
       // Not JSON (e.g. Hono's plain 404).
     }
     return { status: response.status, body, socket: null }
+  }
+
+  harness.getBlob = async (payload) => {
+    const response = await harness.request('/blob/get', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'cf-connecting-ip': '203.0.113.7',
+      },
+      body:
+        typeof payload === 'string'
+          ? payload
+          : JSON.stringify(unsignedEnvelope(payload)),
+    })
+    if (response.status === 200) {
+      return {
+        status: 200,
+        headers: response.headers,
+        bytes: new Uint8Array(await response.arrayBuffer()),
+        body: null,
+      }
+    }
+    return {
+      status: response.status,
+      headers: response.headers,
+      bytes: null,
+      body: await response.json(),
+    }
   }
 
   harness.send = async (op, key, payload) =>
@@ -421,6 +481,55 @@ export class Owner {
       fcmToken: token,
       templates,
       ...(appAlerts === undefined ? {} : { appAlerts }),
+    })
+  }
+
+  /**
+   * `blob/put` of `blob`, signed by this owner; `fields` override the signed
+   * payload, `init` the request (body, headers; an empty value drops one).
+   * Sends `Content-Length` unless `init.headers` says otherwise.
+   */
+  async putBlob(
+    blob: PhotoBlob,
+    fields: Record<string, unknown> = {},
+    init: { body?: BodyInit; headers?: Record<string, string> } = {}
+  ): Promise<ApiResponse & { headers: Headers }> {
+    const payload = {
+      inboxId: this.inboxId,
+      blobId: blob.blobId,
+      bytes: blob.bytes.byteLength,
+      expiresAt: Date.now() + 30 * DAY_MS,
+      readTokenHash: blob.readTokenHash,
+      ts: Date.now(),
+      nonce: randomId(),
+      ...fields,
+    }
+    const headers = Object.entries({
+      'cf-connecting-ip': '203.0.113.7',
+      'content-length': String(blob.bytes.byteLength),
+      ...(await blobPutHeaders(payload, this.key)),
+      ...init.headers,
+    }).filter(([, value]) => value !== '')
+    const response = await this.harness.request('/blob/put', {
+      method: 'POST',
+      headers: Object.fromEntries(headers),
+      body: init.body ?? blob.bytes,
+      // Streamed bodies (the cutoff tests) need half-duplex in Node.
+      ...({ duplex: 'half' } as object),
+    })
+    return {
+      status: response.status,
+      headers: response.headers,
+      body: await response.json(),
+    }
+  }
+
+  /** `blob/get` of one of this owner's blobs with `token` (its own by default). */
+  getBlob(blob: PhotoBlob, token = blob.token): Promise<BlobResponse> {
+    return this.harness.getBlob({
+      inboxId: this.inboxId,
+      blobId: blob.blobId,
+      token,
     })
   }
 

@@ -12,11 +12,11 @@ In: inbox registration, device/push registration, invite create → fetch → cl
 
 Deferred (must land before any production rollout): App Attest on `inbox/register` and `invite/*` (reserved `attest` field below; Android will use Play Integrity, as Notes Import does in ADR 0017), QR invites, safety codes, activity sharing.
 
-Since the MVP: shared Plans and Follow-up invitations, requests to join, and badges with reactions to them (Encourage; event kinds below), which need no relay changes; [named alerts](#named-alerts), whose pushes carry the event they're about; Android (FCM pushes, a `pushService` on `device/register`, and a Block Store root seed), with every pairing of iOS and Android devices.
+Since the MVP: shared Plans and Follow-up invitations, requests to join, and badges with reactions to them (Encourage; event kinds below), which need no relay changes; [named alerts](#named-alerts), whose pushes carry the event they're about; Android (FCM pushes, a `pushService` on `device/register`, and a Block Store root seed), with every pairing of iOS and Android devices; [photo blobs](#photo-blobs) for photos in Plan notes (`blob/put`, `blob/get`, `blob/delete`, and `capabilities` on `inbox/sync`).
 
 ## Conventions
 
-- **Transport:** `POST {BASE}/buddies/v1/{op}` with a JSON body. All ids travel in bodies — **never in URLs** (production persists request URLs in logs). The one exception to POST is the [live signal](#live-signal), a WebSocket whose signed envelope travels in headers.
+- **Transport:** `POST {BASE}/buddies/v1/{op}` with a JSON body. All ids travel in bodies — **never in URLs** (production persists request URLs in logs). The one exception to POST is the [live signal](#live-signal), a WebSocket whose signed envelope travels in headers. The one exception to a JSON body is [`blob/put`](#photo-blobs), whose body is raw bytes and whose signed envelope travels in the same headers; `blob/get` answers raw bytes.
 - **Binary encoding:** base64url without padding everywhere (`b64u`).
 - **Time:** integer milliseconds since the Unix epoch.
 - **Ids:** `inboxId`, `slotId`, `inviteId`, `deviceId`, `eventId` are `b64u` of 16 random or derived bytes (22 chars). Servers validate `^[A-Za-z0-9_-]{22}$`.
@@ -37,9 +37,9 @@ Since the MVP: shared Plans and Follow-up invitations, requests to join, and bad
 | Kind        | Ops                                                                                                                                             | Verifying key                                                                    |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Self-signed | `inbox/register`                                                                                                                                | `payload.ownerPub` (proof of possession)                                         |
-| Owner       | `inbox/sync`, `inbox/delete`, `device/register`, `device/unregister`, `slot/add`, `slot/remove`, `roster/put`, `invite/create`, `invite/delete` | the `ownerPub` stored for `payload.inboxId`                                      |
+| Owner       | `inbox/sync`, `inbox/delete`, `device/register`, `device/unregister`, `slot/add`, `slot/remove`, `roster/put`, `invite/create`, `invite/delete`, `blob/delete`, `blob/put` (envelope in headers) | the `ownerPub` stored for `payload.inboxId`                                      |
 | Writer      | `card/put`, `event/put`, `slot/leave`                                                                                                           | the `writerPub` stored for `(payload.inboxId, payload.slotId)`                   |
-| Unsigned    | `invite/fetch`, `invite/claim`                                                                                                                  | none — capability is knowledge of `inviteId` / `claimSecret`; rate-limited by IP |
+| Unsigned    | `invite/fetch`, `invite/claim`, `blob/get`                                                                                                      | none — capability is knowledge of `inviteId` / `claimSecret` / a blob's read `token`; rate-limited by IP |
 
 Ed25519 public keys are 32 raw bytes, `b64u`-encoded (43 chars).
 
@@ -60,8 +60,11 @@ Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "ok": false, "error": 
 | 429  | `rate_limited`     | A rate limit or a stored-event cap was hit; carries `Retry-After`     |
 | 503  | `disabled`         | Kill switch is off; carries `Retry-After`                             |
 | 426  | `upgrade_required` | `inbox/live` requested without a WebSocket upgrade                    |
+| 413  | `too_large`        | A `blob/put` body, declared or streamed, over 1 MiB                   |
+| 503  | `photos_disabled`  | Photo blobs are off (their own switch); carries `Retry-After`         |
+| 403  | `no_buddies`       | A `blob/put` from an inbox with no buddies (no slots)                 |
 
-- Every `rate_limited` and `disabled` refusal sends `Retry-After` (seconds) and repeats it as `retryAfter` in the body: the time until the limit's window frees a request (a minute for the per-caller limits, the rest of the hour for writes per slot, until the oldest stored event expires for the stored-event caps), or 60 s for the kill switch. `limit` has none: only the User freeing a spot helps.
+- Every `rate_limited`, `disabled`, and `photos_disabled` refusal sends `Retry-After` (seconds) and repeats it as `retryAfter` in the body: the time until the limit's window frees a request (a minute for the per-caller limits, the rest of the hour for writes per slot, until the oldest stored event expires for the stored-event caps, until the soonest live blob expires or the oldest upload leaves the rolling day for the blob caps), or 60 s for either kill switch. `limit` has none: only the User freeing a spot helps.
 - A `stale` refusal carries the relay's clock as `serverTime` (epoch ms, the unit of `ts`) and in the `Date` header. A client corrects its clock offset from it and re-signs once with a fresh `ts` and `nonce`. `GET /health` also returns `Date` and `serverTime`, uncached, for calibrating before a request.
 
 ## Operations
@@ -99,11 +102,13 @@ Payload fields listed are **in addition** to `ts` and `nonce` for signed ops.
       "createdAt": 0
     }
   ],
-  "roster": { "blob": "…", "seq": 12 }
+  "roster": { "blob": "…", "seq": 12 },
+  "capabilities": { "photos": true }
 }
 ```
 
 - Every write to an inbox (card, event, roster) takes the next value of a per-inbox monotonic `seq`.
+- `capabilities` says which optional relay features this relay offers right now: `photos` is true when [photo blobs](#photo-blobs) are on. Relays before it send none; read a missing `capabilities` (or field) as false.
 - `cards`, `events`, and `roster` include only items with `seq > since`; `roster` is `null` when unchanged. `slots` is always the complete current list (≤ 5), so a missing slot tells the owner that buddy ended the connection.
 - Events created by the relay itself (invite claims) use `slotId: ""`.
 
@@ -137,11 +142,75 @@ While the app is in the foreground it keeps a WebSocket open to its own inbox, s
 
 The relay keeps `inviteId → creator inboxId` only until the invite is deleted or expires.
 
+### Photo blobs
+
+Plan notes can carry photos. A photo is far too big for an event (8 KB), so the sender uploads it once, sealed, as a **blob** in their own inbox, and the share event carries a reference to it, sealed with the event: `{ blobId, senderInbox, readToken, key, w, h, bytes }` (the app's plaintext; the relay never sees it). One blob serves every recipient of the note.
+
+- **Bytes:** sealed by the app like any other blob, `0x01 ‖ nonce[12] ‖ ciphertext ‖ tag[16]` (ChaCha20-Poly1305 under the photo's own `key`), sent **raw, not base64**, 1 to 1,048,576 bytes. The relay treats them as opaque.
+- **`blobId`:** `b64u(SHA-256(bytes))`, 43 characters: the address of the ciphertext, never of the plaintext (a fresh key and nonce make the same photo a new blob every time it's sealed). The relay recomputes it from the body and refuses a mismatch.
+- **`readToken`:** 32 random bytes per blob (`b64u`, 43 characters), chosen by the sender and shared in the reference. The relay keeps only `readTokenHash = b64u(SHA-256(readToken))`. It is the read capability: anyone holding it, the blob's id, and the sender's `inboxId` can fetch the ciphertext, which only `key` opens.
+- **Where:** the sender's inbox. `inboxId` in all three ops is the sender's, and the blob lives and dies with it.
+
+| Op            | Signed                | Request                                                                                       | Response                       |
+| ------------- | --------------------- | --------------------------------------------------------------------------------------------- | ------------------------------ |
+| `blob/put`    | Owner, in headers     | headers `x-buddies-p`, `x-buddies-s`; payload `inboxId`, `blobId`, `bytes`, `expiresAt`, `readTokenHash`; raw body | `{ ok, expiresAt }`            |
+| `blob/get`    | —                     | `{ "p": b64u(JSON { inboxId, blobId, token }) }`                                              | the raw bytes (200)            |
+| `blob/delete` | Owner                 | `inboxId`, `blobIds` (1–50)                                                                   | `{ ok }`                       |
+
+#### `blob/put`
+
+```http
+POST {BASE}/buddies/v1/blob/put
+Content-Type: application/octet-stream
+Content-Length: <bytes>
+x-buddies-p: <b64u(UTF-8 JSON payload)>
+x-buddies-s: <b64u(Ed25519 signature)>
+
+<the sealed bytes>
+```
+
+- **Payload** (JSON, then UTF-8, then `b64u` into `x-buddies-p`): `{ "inboxId": "<22>", "blobId": "<43>", "bytes": <int>, "expiresAt": <ms>, "readTokenHash": "<43>", "ts": <ms>, "nonce": "<22>" }`. Field order doesn't matter; the relay verifies the bytes it got.
+- **Signature:** an owner op like any other, with op `blob/put`: Ed25519 by the owner key over the bytes `UTF-8("ww-buddies/v1\nblob/put\n") ‖ decoded(x-buddies-p)`, `b64u` into `x-buddies-s`. Same `ts` (±5 min, `stale`) and `nonce` (`replay`) rules. Because the signed `blobId` is the body's SHA-256, which the relay recomputes, the signature covers the bytes too. In the app this is `envelope('blob/put', ownerSeed, { inboxId, blobId, bytes, expiresAt, readTokenHash })`, sent as headers as `openLive` does.
+- **`bytes`:** the body's exact length, 1 to 1,048,576. Over that is `413 too_large` before the body is read. `Content-Length`, when sent, must equal `bytes` (over 1 MiB: `too_large`; otherwise different: `bad_request`). The relay stops reading one chunk past `bytes`: more than 1 MiB is `too_large`, any other length mismatch is `bad_request`.
+- **`expiresAt`:** integer ms with `now < expiresAt ≤ now + 90 days` (the relay's clock), else `bad_request`. The app keeps a photo until a month after its Plan ends, which covers a Plan 8 weeks out; for a later Plan it asks for 90 days and uploads the photo again as the Plan nears.
+- **Checks, in order:** `disabled`, `photos_disabled`, the per-caller limit (`rate_limited`), envelope and payload shape (`bad_request`), signature shape (`bad_signature`), `stale`, `too_large`, the body (`too_large`, `bad_request`), `SHA-256(body) ≠ blobId` (`bad_request`), then in the inbox: unknown inbox (`not_found`), signature (`bad_signature`), `replay`, no slots (`no_buddies`: a photo is for buddies to read, so an inbox with none can't store one), the caps (`rate_limited`).
+- **Idempotent per `blobId`.** A repeat keeps the first `readTokenHash` (a different one is ignored, so retries must reuse the token) and moves the expiry to the later of the two. The answer's `expiresAt` is the stored expiry. A repeat that doesn't move the expiry stores nothing and costs no upload; one that moves it rewrites the object and counts as an upload.
+- **Answer:** `200 { "ok": true, "expiresAt": <ms> }`. A `not_found` after the body was accepted means the blob (or the whole inbox) was deleted while it uploaded. If storing the object fails, the answer is a `500` and the blob's record stays, unreadable, for 10 minutes: a retry finishes the upload, and otherwise its expiry deletes the object in case it was stored anyway.
+
+#### `blob/get`
+
+```http
+POST {BASE}/buddies/v1/blob/get
+Content-Type: application/json
+
+{ "p": "<b64u(UTF-8 JSON { "inboxId": "<sender's 22>", "blobId": "<43>", "token": "<readToken, 43>" })>" }
+```
+
+- The same unsigned envelope as `invite/fetch` (no `s`, `ts`, or `nonce`).
+- **200:** the exact bytes put, with `Content-Type: application/octet-stream`, `Content-Length`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. The app may check `b64u(SHA-256(body)) = blobId` before opening it; the AEAD tag catches tampering either way.
+- **One `404 not_found`** for an unknown inbox or blob, a deleted or expired blob, one whose upload hasn't finished, and a wrong token: same status, same body. The relay compares token hashes in constant time.
+- Not owner activity, and it changes nothing in the inbox.
+
+#### `blob/delete`
+
+- Owner op (JSON envelope as usual), payload `{ "inboxId", "blobIds": ["<43>", …], "ts", "nonce" }` with 1 to 50 canonical ids (duplicates are fine). `{ ok }`.
+- Idempotent: unknown ids succeed, and their objects are deleted too in case one outlived its record. Reads stop at once; the stored objects go right after, retried from the inbox's alarm if storage fails.
+
+#### Lifetime, limits, and the switch
+
+- **Deleted:** at `expiresAt` (unreadable from that instant, removed by the inbox's alarm), by `blob/delete`, by `inbox/delete`, and by the 180-day inactivity wipe, so a blob never outlives its sender's inbox. A wipe also deletes everything under the inbox's prefix (`v1/<inboxId>/`), records or not.
+- **Leftovers:** while an inbox stores blobs, its alarm lists its prefix once a week and deletes objects no record knows (older than an hour, so an upload in flight is left alone), then once more a week after it stores none. As the last resort, the bucket's lifecycle rule deletes any object 91 days after its last write; a blob is never live longer than 90 days past its last write, so the rule only removes leftovers. `scripts/r2-lifecycle.mjs` creates the bucket and sets the rule on every deploy.
+- **Failed deletions** are retried from the alarm after a minute, then twice as long after each failure in a row, up to every 6 hours.
+- **Caps per sender inbox:** 1 MiB per blob; 300 live blobs and 150 MiB of live blobs (until they expire or are deleted); 100 uploads (object writes) per rolling 24 h. Over a cap, `blob/put` is `429 rate_limited` with `Retry-After` until the soonest live blob expires (count and bytes) or the oldest upload leaves the rolling day. Per caller (client IP, IPv6 by /64): 60 `blob/put` and 600 `blob/get` a minute; `blob/delete` counts with the other signed ops.
+- **Switch:** photo blobs need Buddies on and their own switch, KV `buddies:photos`: `"on"` (or `"true"`) enables, any other value disables, and an absent key falls back to `BUDDIES_PHOTOS` (dev `"on"`, prod unset, so off). Off, all three ops answer `503 photos_disabled` (with `Retry-After: 60`) and `inbox/sync` says `capabilities.photos: false`; stored blobs stay until they expire, and `inbox/delete` still deletes them. The app offers photos only while its last sync said `photos: true`, and treats `photos_disabled` on a read as transient.
+- **What the relay learns:** blob sizes and times, which inbox stored them, and which callers fetch them (by IP); never keys, plaintext, or which buddy a token was given to (every recipient of a note gets the same token).
+- **Attestation:** not required, like every Buddies op today.
+
 ## Limits and retention
 
 Stored-event caps count a slot's events (by number and by base64url bytes) until they expire. An `event/put` past a cap fails with `rate_limited` and stores nothing; stored events are never dropped to make room, and room comes back as they expire. Cards and the roster are replaced in place, so only their blob sizes cap them.
 
-Every op is also rate-limited per caller (the client IP, IPv6 by /64), never per target inbox. Unsigned invite ops, `inbox/register` (also capped per caller per day), reads (`inbox/sync` and `inbox/live`), and every other signed op each have their own budget, sized far above real use. A refused request gets 429 `rate_limited`, usually with `Retry-After` in seconds. Clients treat it like any transient failure and retry later, never in a tight loop.
+Every op is also rate-limited per caller (the client IP, IPv6 by /64), never per target inbox. Unsigned invite ops, `inbox/register` (also capped per caller per day), reads (`inbox/sync` and `inbox/live`), `blob/put`, `blob/get`, and every other signed op each have their own budget, sized far above real use. A refused request gets 429 `rate_limited`, usually with `Retry-After` in seconds. Clients treat it like any transient failure and retry later, never in a tight loop.
 
 | Item                                       | Limit                                                                                  |
 | ------------------------------------------ | -------------------------------------------------------------------------------------- |
@@ -153,6 +222,8 @@ Every op is also rate-limited per caller (the client IP, IPv6 by /64), never per
 | Stored events per inbox                    | 128 MiB across all slots (see above)                                                   |
 | Pushes per slot                            | 10 per 24 h; non-immediate kinds at least 60 s apart (see [Push budget](#push-budget)) |
 | Devices per inbox                          | 10                                                                                     |
+| Photo blobs per inbox                      | 1 MiB each; 300 and 150 MiB live; 100 uploads per 24 h (see [Photo blobs](#photo-blobs)) |
+| Photo blobs                                | Deleted at `expiresAt` (≤ 90 days after the last upload), or with the inbox             |
 | Events                                     | Deleted 30 days after creation                                                         |
 | Invites                                    | Deleted at `expiresAt` (plus a short grace)                                            |
 | Inbox                                      | Wiped after 180 days without an owner op                                               |
@@ -224,6 +295,8 @@ Per slot (sender) in the recipient's inbox:
 ## Kill switch
 
 Buddies is enabled when KV `buddies:enabled` is `"true"`; if the key is absent, the `BUDDIES_ENABLED` env var decides (dev `"true"`, prod `"false"`). When disabled every op returns `disabled` except `inbox/delete`, `slot/remove`, and `slot/leave`, so people can always leave and delete.
+
+Photo blobs have a second switch, KV `buddies:photos` (`"on"` enables; absent falls back to `BUDDIES_PHOTOS`: dev `"on"`, prod off). Off, `blob/put`, `blob/get`, and `blob/delete` return `photos_disabled` and `inbox/sync` reports `capabilities.photos: false`. Buddies' own switch wins: with Buddies off they return `disabled`.
 
 ## Client cryptography (app only — the relay never sees any of this)
 

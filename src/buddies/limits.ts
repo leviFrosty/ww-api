@@ -1,5 +1,5 @@
 import type { Environment } from '../types'
-import type { BuddiesLiveOp, BuddiesOp } from './contracts'
+import type { BuddiesRouteOp } from './contracts'
 
 /**
  * Anti-abuse limits for the Buddies relay, all in one place for tuning. They
@@ -32,6 +32,10 @@ export const BUDDIES_ABUSE_LIMITS = {
     read: { binding: 'BUDDIES_READ_LIMITER', perMinute: 600 },
     /** Other signed ops: one edit of a shared recurring Plan fans out ~60 events, cards, and a roster → 10×. */
     write: { binding: 'BUDDIES_WRITE_LIMITER', perMinute: 600 },
+    /** Photo uploads: a note's photos (each uploaded once, whoever it's shared with), ~6 a minute on one Wi-Fi → 10×. */
+    blobPut: { binding: 'BUDDIES_BLOB_PUT_LIMITER', perMinute: 60 },
+    /** Photo downloads: each buddy device fetches each photo once; a household opening a few shared Plans ≈ 60/min → 10×. */
+    blobGet: { binding: 'BUDDIES_BLOB_GET_LIMITER', perMinute: 600 },
   },
   /** Signed registrations per caller per rolling day: ~200 people starting Buddies on one assembly-hall Wi-Fi → 10×. */
   registrationsPerDay: 2_000,
@@ -50,6 +54,21 @@ export const BUDDIES_ABUSE_LIMITS = {
   writerRequests: 1_000,
   /** Signer windows match nonce retention, so the two caps above bound the nonce table. */
   signerWindowMs: 10 * MINUTE_MS,
+  /**
+   * Live (unexpired) photo blobs per inbox: a power user keeping 3 photos on
+   * each of ~10 shared Plans at a time ≈ 30 → 10×. A blob is uploaded once
+   * for all of a note's recipients.
+   */
+  inboxBlobs: 300,
+  /** Live photo bytes per inbox: those ~30 photos at ~0.5 MiB ≈ 15 MiB → 10×. */
+  inboxBlobBytes: 150 * MIB,
+  /**
+   * Photo uploads per inbox per rolling day, counting every `blob/put` that
+   * writes the object (new blobs, and re-puts that extend an expiry): a busy
+   * day attaching ~10 photos → 10×.
+   */
+  blobUploads: 100,
+  blobUploadWindowMs: DAY_MS,
 } as const
 
 export type BuddiesEdgeTier = keyof typeof BUDDIES_ABUSE_LIMITS.edge
@@ -57,20 +76,19 @@ export type BuddiesEdgeTier = keyof typeof BUDDIES_ABUSE_LIMITS.edge
 /** Seconds a client should wait after an edge limit: the limiter's period. */
 export const EDGE_RETRY_AFTER_SECONDS = 60
 
-const TIER_BY_OP: Partial<
-  Record<BuddiesOp | BuddiesLiveOp, BuddiesEdgeTier>
-> = {
+const TIER_BY_OP: Partial<Record<BuddiesRouteOp, BuddiesEdgeTier>> = {
   'invite/fetch': 'unsigned',
   'invite/claim': 'unsigned',
   'inbox/register': 'register',
   'inbox/sync': 'read',
   'inbox/live': 'read',
+  'blob/put': 'blobPut',
+  'blob/get': 'blobGet',
 }
 
 /** The edge tier an op counts against; every other signed op is a write. */
-export const buddiesEdgeTier = (
-  op: BuddiesOp | BuddiesLiveOp
-): BuddiesEdgeTier => TIER_BY_OP[op] ?? 'write'
+export const buddiesEdgeTier = (op: BuddiesRouteOp): BuddiesEdgeTier =>
+  TIER_BY_OP[op] ?? 'write'
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
 
@@ -143,7 +161,7 @@ const reportedOutages = new Set<BuddiesEdgeTier>()
  */
 export const allowBuddiesCaller = async (
   env: Environment,
-  op: BuddiesOp | BuddiesLiveOp,
+  op: BuddiesRouteOp,
   callerKey: string
 ): Promise<boolean> => {
   const tier = buddiesEdgeTier(op)

@@ -3,7 +3,9 @@ import {
   SigningKey,
   b64u,
   blobOfSize,
+  blobPutHeaders,
   envelope,
+  photoBlob,
   randomBytes,
   randomId,
   unsignedEnvelope,
@@ -14,7 +16,9 @@ import {
   RelayOwner,
   RelayWriter,
   buddies,
+  getBlob,
   http,
+  httpBytes,
   localKv,
   openLive,
   sendSigned,
@@ -23,6 +27,7 @@ import {
   type Exchange,
 } from '../test/e2e'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
+import { BUDDIES_LIMITS } from '../buddies/contracts'
 
 /**
  * Two synthetic identities pair through the live relay following the
@@ -58,7 +63,15 @@ describe('pairing happy path', () => {
 
     const empty = await levi.sync()
     expect(empty.status).toBe(200)
-    expect(empty.body).toEqual({ ok: true, seq: 0, slots: [], cards: [], events: [], roster: null })
+    expect(empty.body).toEqual({
+      ok: true,
+      seq: 0,
+      slots: [],
+      cards: [],
+      events: [],
+      roster: null,
+      capabilities: { photos: true },
+    })
 
     // 2. Levi registers a device (APNs is not configured locally: pushes skip).
     const device = await levi.send('device/register', {
@@ -287,7 +300,15 @@ describe('inbox ownership across delete-all', () => {
 
     const back = await register(owner.key)
     expect([back.status, back.body]).toEqual([200, { ok: true }])
-    expect((await owner.sync()).body).toEqual({ ok: true, seq: 0, slots: [], cards: [], events: [], roster: null })
+    expect((await owner.sync()).body).toEqual({
+      ok: true,
+      seq: 0,
+      slots: [],
+      cards: [],
+      events: [],
+      roster: null,
+      capabilities: { photos: true },
+    })
     const unslotted = await writer.send('card/put', { blob: blobOfSize(8) })
     expect(
       [unslotted.status, unslotted.body]
@@ -470,9 +491,166 @@ describe('live socket', () => {
   })
 })
 
+describe('photo blobs', () => {
+  it('refuses photos from an inbox with no buddies', async () => {
+    const owner = await RelayOwner.register()
+    const refused = await owner.putBlob(await photoBlob(512))
+    expect(refused.status).toBe(403)
+    expect(refused.body).toEqual(relayError('no_buddies'))
+    await owner.send('inbox/delete')
+  })
+
+  it('put → get round trip, idempotent re-put, one 404 for every miss, delete', async () => {
+    const owner = await RelayOwner.register()
+    await owner.addWriter()
+    expect((await owner.sync()).body.capabilities).toEqual({ photos: true })
+    const photo = await photoBlob(200 * 1_024)
+    const expiresAt = Date.now() + 7 * DAY_MS
+
+    const put = await owner.putBlob(photo, { expiresAt })
+    expect(put.status).toBe(200)
+    expect(put.body).toEqual({ ok: true, expiresAt })
+
+    // Read back the exact bytes, never cached.
+    const got = await owner.getBlob(photo)
+    expect(got.status).toBe(200)
+    expect(got.bytes).toEqual(photo.bytes)
+    expect(got.headers.get('content-type')).toBe('application/octet-stream')
+    expect(got.headers.get('cache-control')).toBe('no-store')
+
+    // A retry with an earlier expiry and another token changes nothing; a
+    // later expiry moves it. The first token keeps working.
+    const other = await photoBlob(16)
+    const retry = await owner.putBlob(photo, {
+      expiresAt: expiresAt - DAY_MS,
+      readTokenHash: other.readTokenHash,
+    })
+    expect(retry.body).toEqual({ ok: true, expiresAt })
+    const extended = await owner.putBlob(photo, { expiresAt: expiresAt + DAY_MS })
+    expect(extended.body).toEqual({ ok: true, expiresAt: expiresAt + DAY_MS })
+    expect((await owner.getBlob(photo)).bytes).toEqual(photo.bytes)
+
+    // Wrong token, unknown blob, unknown inbox: the same 404.
+    const misses = [
+      await owner.getBlob(photo, other.token),
+      await owner.getBlob(other),
+      await getBlob({ inboxId: randomId(), blobId: photo.blobId, token: photo.token }),
+    ]
+    for (const miss of misses) {
+      expect(miss.status).toBe(404)
+      expect(miss.body).toEqual(relayError('not_found'))
+    }
+
+    // blob/delete, then the read is a 404 too.
+    const deleted = await owner.send('blob/delete', { blobIds: [photo.blobId] })
+    expect(deleted.body).toEqual({ ok: true })
+    expect((await owner.getBlob(photo)).status).toBe(404)
+    expect((await owner.send('blob/delete', { blobIds: [photo.blobId] })).body).toEqual({ ok: true })
+    await owner.send('inbox/delete')
+  })
+
+  it('refuses mismatched bytes, oversize, bad signatures, and replays', async () => {
+    const owner = await RelayOwner.register()
+    await owner.addWriter()
+    const photo = await photoBlob(4_096)
+
+    const mismatch = await owner.putBlob(photo, {}, { bytes: randomBytes(4_096) })
+    expect(mismatch.status).toBe(400)
+    expect(mismatch.body).toEqual(relayError('bad_request'))
+
+    // Signed `bytes` past 1 MiB: refused before the body is read.
+    const oversize = await owner.putBlob(photo, { bytes: BUDDIES_LIMITS.blobBytes + 1 })
+    expect(oversize.status).toBe(413)
+    expect(oversize.body).toEqual(relayError('too_large'))
+    // A declared body past 1 MiB is refused unread; a resendable request
+    // drains wrangler dev's proxy afterwards (see the fuzzer's note).
+    const big = await photoBlob(BUDDIES_LIMITS.blobBytes + 1)
+    const declared = await owner.putBlob(big)
+    expect(declared.status).toBe(413)
+    expect(declared.body).toEqual(relayError('too_large'))
+    await http('POST', '/verify-drain', { body: {} })
+
+    const stranger = await SigningKey.generate()
+    const forged = await httpBytes('/buddies/v1/blob/put', {
+      bytes: photo.bytes,
+      headers: await blobPutHeaders(
+        {
+          inboxId: owner.inboxId,
+          blobId: photo.blobId,
+          bytes: photo.bytes.byteLength,
+          expiresAt: Date.now() + DAY_MS,
+          readTokenHash: photo.readTokenHash,
+          ts: Date.now(),
+          nonce: randomId(),
+        },
+        stranger
+      ),
+    })
+    expect(forged.status).toBe(401)
+    expect(forged.body).toEqual(relayError('bad_signature'))
+
+    const headers = await blobPutHeaders(
+      {
+        inboxId: owner.inboxId,
+        blobId: photo.blobId,
+        bytes: photo.bytes.byteLength,
+        expiresAt: Date.now() + DAY_MS,
+        readTokenHash: photo.readTokenHash,
+        ts: Date.now(),
+        nonce: randomId(),
+      },
+      owner.key
+    )
+    const first = await httpBytes('/buddies/v1/blob/put', { bytes: photo.bytes, headers })
+    expect(first.status).toBe(200)
+    const replay = await httpBytes('/buddies/v1/blob/put', { bytes: photo.bytes, headers })
+    expect(replay.status).toBe(409)
+    expect(replay.body).toEqual(relayError('replay'))
+    expect((await owner.getBlob(photo)).bytes).toEqual(photo.bytes)
+    await owner.send('inbox/delete')
+  })
+
+  it('purges an inbox’s blobs with inbox/delete', async () => {
+    const owner = await RelayOwner.register()
+    await owner.addWriter()
+    const photo = await photoBlob(1_024)
+    expect((await owner.putBlob(photo)).status).toBe(200)
+    expect((await owner.send('inbox/delete')).body).toEqual({ ok: true })
+    // Even after the owner comes back, the blob is gone.
+    expect((await owner.send('inbox/register', { ownerPub: owner.key.publicKey })).status).toBe(200)
+    expect((await owner.getBlob(photo)).status).toBe(404)
+    await owner.send('inbox/delete')
+  })
+})
+
+describe.skipIf(!LOCAL_LAUNCHER)('photos switch (local KV)', () => {
+  it('turns blob ops off with photos_disabled and reports it in inbox/sync', async () => {
+    const owner = await RelayOwner.register()
+    await owner.addWriter()
+    const photo = await photoBlob(512)
+    expect((await owner.putBlob(photo)).status).toBe(200)
+    try {
+      localKv('put', 'buddies:photos', 'off')
+      const put = await owner.putBlob(await photoBlob(512))
+      expect(put.status).toBe(503)
+      expect(put.body).toEqual(relayError('photos_disabled'))
+      expect(put.headers.get('retry-after')).toBe('60')
+      expect((await owner.getBlob(photo)).body).toEqual(relayError('photos_disabled'))
+      expect((await owner.send('blob/delete', { blobIds: [photo.blobId] })).status).toBe(503)
+      expect((await owner.sync()).body.capabilities).toEqual({ photos: false })
+    } finally {
+      localKv('delete', 'buddies:photos')
+    }
+    expect((await owner.sync()).body.capabilities).toEqual({ photos: true })
+    expect((await owner.getBlob(photo)).bytes).toEqual(photo.bytes)
+    await owner.send('inbox/delete')
+  })
+})
+
 describe.skipIf(!LOCAL_LAUNCHER)('kill switch (local KV)', () => {
   it('disables everything except leave/delete, then recovers', async () => {
     const owner = await RelayOwner.register()
+    await owner.addWriter()
     try {
       localKv('put', 'buddies:enabled', 'false')
       const fresh = await SigningKey.generate()

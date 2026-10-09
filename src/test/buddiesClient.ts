@@ -1,6 +1,8 @@
 import { expect } from 'vitest'
 import { signedMessage } from '../buddies/envelope'
 import {
+  BUDDIES_BLOB_PUT_OP,
+  BUDDIES_ENVELOPE_HEADERS,
   BUDDIES_LIVE_HEADERS,
   BUDDIES_LIVE_OP,
   type BuddiesSigningOp,
@@ -15,8 +17,13 @@ export const b64u = (bytes: Uint8Array): string =>
   Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString(
     'base64url'
   )
-export const randomBytes = (size: number): Uint8Array =>
-  crypto.getRandomValues(new Uint8Array(size))
+/** `size` random bytes (filled in 64 KiB steps, `getRandomValues`' ceiling). */
+export const randomBytes = (size: number): Uint8Array => {
+  const bytes = new Uint8Array(size)
+  for (let i = 0; i < size; i += 65_536)
+    crypto.getRandomValues(bytes.subarray(i, i + 65_536))
+  return bytes
+}
 export const randomId = (): string => b64u(randomBytes(16))
 export const blobOfSize = (size: number): string => b64u(randomBytes(size))
 
@@ -91,6 +98,50 @@ export const liveHeaders = async (
   }
 }
 
+/**
+ * Headers for `blob/put`: the signed envelope (op `blob/put`) as `x-buddies-p`
+ * and `x-buddies-s`. `payload` must hold `inboxId`, `blobId`, `bytes`,
+ * `expiresAt`, `readTokenHash`, `ts`, and `nonce`.
+ */
+export const blobPutHeaders = async (
+  payload: Record<string, unknown> | string,
+  key: SigningKey
+): Promise<Record<string, string>> => {
+  const { p, s } = await envelope(BUDDIES_BLOB_PUT_OP, payload, key)
+  return {
+    'content-type': 'application/octet-stream',
+    [BUDDIES_ENVELOPE_HEADERS.payload]: p,
+    [BUDDIES_ENVELOPE_HEADERS.signature]: s ?? '',
+  }
+}
+
+export const sha256B64u = async (bytes: Uint8Array): Promise<string> =>
+  b64u(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+
+/** A photo blob as the app uploads it: sealed bytes, their id, and a read token. */
+export interface PhotoBlob {
+  bytes: Uint8Array
+  /** `b64u(SHA-256(bytes))`. */
+  blobId: string
+  /** The 32-byte read token (b64u) the app shares with recipients. */
+  token: string
+  /** `b64u(SHA-256(token))`, what `blob/put` stores. */
+  readTokenHash: string
+}
+
+/** Random "sealed" bytes (`0x01 ‖ nonce ‖ ciphertext ‖ tag` to the relay). */
+export const photoBlob = async (size = 2_048): Promise<PhotoBlob> => {
+  const bytes = randomBytes(size)
+  bytes[0] = 0x01
+  const token = randomBytes(32)
+  return {
+    bytes,
+    blobId: await sha256B64u(bytes),
+    token: b64u(token),
+    readTokenHash: await sha256B64u(token),
+  }
+}
+
 export const unsignedEnvelope = (
   payload: Record<string, unknown>
 ): Envelope => ({
@@ -105,7 +156,8 @@ export const hexToken = (size: number): string =>
 
 /**
  * The relay's error body for `code` (src/buddies/errorResponse.ts):
- * `rate_limited` and `disabled` add `retryAfter`, `stale` adds `serverTime`.
+ * `rate_limited`, `disabled`, and `photos_disabled` add `retryAfter`, `stale`
+ * adds `serverTime`.
  * Pass `extras` to pin those values.
  */
 export const relayError = (
@@ -116,7 +168,9 @@ export const relayError = (
   error: code,
   code,
   ...(code === 'rate_limited' ? { retryAfter: expect.any(Number) } : {}),
-  ...(code === 'disabled' ? { retryAfter: 60 } : {}),
+  ...(code === 'disabled' || code === 'photos_disabled'
+    ? { retryAfter: 60 }
+    : {}),
   ...(code === 'stale' ? { serverTime: expect.any(Number) } : {}),
   ...extras,
 })
