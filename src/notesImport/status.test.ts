@@ -8,6 +8,7 @@ import {
 import type { NotesImportConfig } from './config'
 import type { Environment } from '../types'
 import { makeMemoryKv } from '../test/memoryKv'
+import { clearFeatureFlagCache } from '../featureFlags/posthog'
 
 const CONFIG: NotesImportConfig = {
   model: 'deepseek/deepseek-v4-flash',
@@ -24,6 +25,12 @@ const CONFIG: NotesImportConfig = {
   resultRetentionSeconds: 3_600,
   subscribeTokenTtlSeconds: 3_600,
   reasoningEffort: 'low',
+  anthropic: {
+    model: 'claude-haiku-5-5',
+    effort: 'medium',
+    inferenceGeo: 'us',
+    maxOutputTokens: 32_000,
+  },
 }
 
 const ENV = {} as Environment
@@ -241,6 +248,34 @@ describe('getNotesImportStatus — provider health and caching', () => {
       limits: DEFAULT_PUBLIC_LIMITS,
     })
     expect(kv.store.get('notes-import:provider-health')).toBe('up')
+  })
+
+  it('skips the OpenRouter probe while the Claude flag is on', async () => {
+    clearFeatureFlagCache()
+    const kv = makeMemoryKv()
+    // OpenRouter is down, but imports run on Claude, so the feature is up.
+    await kv.put('notes-import:provider-health', 'down')
+    const fetchFn = vi.fn(async (url: string) =>
+      url.includes('posthog')
+        ? Response.json({ flags: { 'notes-import-claude': { enabled: true } } })
+        : new Response('unexpected', { status: 500 })
+    )
+    const result = await getNotesImportStatus({
+      kv: kv as unknown as StatusKv,
+      env: {
+        ANTHROPIC_API_KEY: 'anthropic-key',
+        POSTHOG_PROJECT_TOKEN: 'phc_test',
+      } as Environment,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    })
+    expect(result).toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
+    })
+    expect(fetchFn).toHaveBeenCalledOnce()
   })
 
   it('returns unavailable without limits and caches when all providers are down', async () => {

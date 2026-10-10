@@ -194,10 +194,13 @@ same page with a server-rendered "Open app" link; the payload stays out of
 ### Notes Import (`/notes-import*`)
 
 LLM-backed parsing of free-form ministry notes into structured WitnessWork
-records. The proxy owns the prompt + JSON schema, calls the model through
-OpenRouter with routing pinned ZDR-only (`zdr: true` + `data_collection: 'deny'`,
-restricted to a vetted Western provider allowlist) so the request can only reach
-a zero-data-retention host that never trains on or stores it — failing rather
+records. The proxy owns the prompt + JSON schema and calls the model through a
+provider adapter (`src/llm/`). The PostHog flag `notes-import-claude` picks the
+provider per run: on → Claude Platform (`claude-haiku-5-5`, native structured
+outputs, prompt caching, US inference); off or undecidable → OpenRouter with
+routing pinned ZDR-only (`zdr: true` + `data_collection: 'deny'`, restricted to
+a vetted Western provider allowlist) so the request can only reach a
+zero-data-retention host that never trains on or stores it — failing rather
 than ever downgrading to a data-retaining provider (ADR 0008). It persists
 non-content authentication/runtime metadata in KV and aggregate usage plus
 permanent replay/refinement records in a per-user Durable Object—never imported
@@ -228,6 +231,7 @@ pnpm exec wrangler kv namespace create NOTES_KV
 # → paste the printed id into wrangler.toml [[kv_namespaces]] id
 
 pnpm exec wrangler secret put OPENROUTER_API_KEY
+pnpm exec wrangler secret put ANTHROPIC_API_KEY   # Claude path; also --env dev
 pnpm exec wrangler secret put REVENUECAT_API_KEY
 pnpm exec wrangler secret put ADMIN_API_TOKEN
 pnpm exec wrangler secret put ADMIN_API_TOKEN --env dev  # use a DIFFERENT value

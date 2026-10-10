@@ -27,7 +27,9 @@ export interface Environment {
 
   /**
    * PostHog project token (`phc_…`, write-only ingestion key, not secret) for
-   * anonymous server-side usage events (`src/analytics.ts`). Unset = off.
+   * anonymous server-side usage events (`src/analytics.ts`) and server-side
+   * feature flags (`src/featureFlags/posthog.ts`). Unset = both off (every
+   * flag reads as off).
    */
   POSTHOG_PROJECT_TOKEN?: string;
 
@@ -82,6 +84,12 @@ export interface Environment {
 
   /** OpenRouter API key (secret). Routed ZDR-only to the inference host. */
   OPENROUTER_API_KEY: string;
+
+  /**
+   * Claude Platform API key (secret). Notes Import uses Claude only when this
+   * is set AND the `notes-import-claude` PostHog flag is on for the run.
+   */
+  ANTHROPIC_API_KEY?: string;
 
   /** RevenueCat REST v1 secret key (`sk_...`) for server-side supporter checks (secret). */
   REVENUECAT_API_KEY: string;
@@ -203,6 +211,18 @@ export interface Environment {
    * the JSON into the reasoning channel, which the run DO recovers.
    */
   NOTES_IMPORT_REASONING_EFFORT?: string;
+
+  /** Claude model for Notes Import. Default `claude-haiku-5-5`. */
+  NOTES_IMPORT_ANTHROPIC_MODEL?: string;
+
+  /** Claude effort: `low`, `medium` (default), `high`, `xhigh`, `max`. */
+  NOTES_IMPORT_ANTHROPIC_EFFORT?: string;
+
+  /** Claude `inference_geo`: `us` (default, 1.1× price) or `global`. */
+  NOTES_IMPORT_ANTHROPIC_INFERENCE_GEO?: string;
+
+  /** Claude `max_tokens` (thinking + answer). Default 32000. */
+  NOTES_IMPORT_ANTHROPIC_MAX_OUTPUT_TOKENS?: string;
 
   /**
    * When set, a request carrying header `x-ww-dev-bypass: <this value>` skips

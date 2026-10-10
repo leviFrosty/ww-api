@@ -8,6 +8,7 @@ import {
 } from './config'
 import { decideStartOutcome, type StartOutcome } from './cap'
 import { runNotesImportModel, type ModelProgress } from './llm'
+import { resolveNotesImportAdapter } from './provider'
 import type { CreditDecision } from '../credits'
 import {
   formatSSE,
@@ -323,8 +324,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#aborter = new AbortController()
     try {
       const out = await runNotesImportModel({
-        apiKey: this.env.OPENROUTER_API_KEY,
-        config,
+        adapter: await resolveNotesImportAdapter(this.env, config, input.uuid),
         notesText: input.notesText,
         context: input.context,
         refinement: input.refinement,
@@ -393,16 +393,16 @@ export class NotesImportRun extends DurableObject<Environment> {
         result: out.result,
         credits: payload.credits,
         emptyCharged: payload.emptyCharged,
-        model: config.model,
+        model: out.model,
         provider: out.resolvedProvider,
         usage: out.usage,
       })
       console.log(
         `notes-import[${objectId}] run done in ${
           Date.now() - startedAt
-        }ms (provider=${out.resolvedProvider ?? 'unknown'} reasoningTokens=${
-          out.usage.reasoningTokens ?? 0
-        })`
+        }ms (provider=${out.provider} host=${
+          out.resolvedProvider ?? 'unknown'
+        } reasoningTokens=${out.usage.reasoningTokens})`
       )
     } catch (e) {
       // A client `cancel()` aborts the model call; that's not a failure and must

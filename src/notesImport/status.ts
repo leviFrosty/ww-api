@@ -8,6 +8,7 @@ import type { Environment } from '../types'
 import { APP_ATTEST_PROTOCOL_VERSION } from '../appAttest/protocol'
 import { playIntegrityConfig } from '../playIntegrity/config'
 import { PLAY_INTEGRITY_PROTOCOL_VERSION } from '../playIntegrity/protocol'
+import { notesImportStatusUsesClaude } from './provider'
 
 /** The KV subset this module uses — keeps it trivially mockable in tests. */
 export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
@@ -32,7 +33,9 @@ export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
  *      `status`. We check whether ANY provider on our ZDR allowlist is currently
  *      healthy for the configured model. This is a metadata call: it consumes NO
  *      tokens / inference credits. Result is cached in KV (short TTL) so the
- *      probe stays fast and we don't hammer the upstream.
+ *      probe stays fast and we don't hammer the upstream. Skipped while the
+ *      `notes-import-claude` flag routes imports to Claude Platform, which has
+ *      no equivalent free probe.
  *
  * Fail-open by design: if the upstream check itself errors, we report available.
  * A flaky probe must never block a feature that would actually work — the real
@@ -280,6 +283,11 @@ const resolveNotesImportStatus = async ({
   const override = parseEnabledOverride(overrideRaw)
   if (override && !override.available) {
     return { available: false, reason: override.reason ?? 'disabled' }
+  }
+
+  // OpenRouter host health is irrelevant while imports run on Claude.
+  if (await notesImportStatusUsesClaude(env, fetchFn)) {
+    return availableWithSchedule()
   }
 
   // 2. Provider health cache. Its read may fail open, but cannot bypass the

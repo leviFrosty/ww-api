@@ -4,8 +4,9 @@ import { DEV_BYPASS_TOKEN, configured, http, writeTranscript } from '../test/e2e
 
 /**
  * Notes Import without inference: the dev-bypass verify probe, the App Attest
- * challenge, and kickoff's auth gate. A real kickoff calls OpenRouter (paid),
- * so it only runs with WW_API_E2E_ALLOW_PAID=1 and OPENROUTER_API_KEY set.
+ * challenge, and kickoff's auth gate. A real kickoff calls a paid model (Claude
+ * Platform when the `notes-import-claude` flag is on, else OpenRouter), so it
+ * only runs with WW_API_E2E_ALLOW_PAID=1 and a model key set.
  */
 
 afterAll(() => {
@@ -111,7 +112,7 @@ describe('App Attest handshake (no inference)', () => {
 
 const allowPaid =
   process.env.WW_API_E2E_ALLOW_PAID === '1' &&
-  configured('OPENROUTER_API_KEY') &&
+  (configured('ANTHROPIC_API_KEY') || configured('OPENROUTER_API_KEY')) &&
   Boolean(DEV_BYPASS_TOKEN)
 
 describe.skipIf(!allowPaid)('PAID: kickoff → result (WW_API_E2E_ALLOW_PAID=1)', () => {

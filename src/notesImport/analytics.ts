@@ -1,6 +1,6 @@
-import type { LanguageModelUsage } from 'ai'
 import type { AnalyticsEvent } from '../analytics'
 import type { CreditsSnapshot } from '../credits'
+import type { LlmUsage } from '../llm'
 import { isEmptyImportResult, type NotesImportResult } from './schema'
 
 /**
@@ -87,7 +87,7 @@ export interface NotesImportSuccessDetails {
   emptyCharged: boolean
   model: string
   provider?: string
-  usage: LanguageModelUsage
+  usage: LlmUsage
 }
 
 export const notesImportFinishedEvent = (

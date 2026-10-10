@@ -109,6 +109,7 @@ wrangler kv namespace create NOTES_KV --env dev
 
 # 2. Set the dev worker's secrets (the --env dev flag keeps them off prod).
 wrangler secret put OPENROUTER_API_KEY --env dev
+wrangler secret put ANTHROPIC_API_KEY --env dev   # Claude Platform path
 wrangler secret put REVENUECAT_API_KEY --env dev
 wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN --env dev   # dev only
 wrangler secret put ADMIN_API_TOKEN --env dev  # unique dev reset token
@@ -137,6 +138,49 @@ isolated worker on 8790-8799, and 8787 belongs to the user's own `wrangler dev`.
 
 Neither gives a stable public URL for an iOS device — use the deployed
 `--env dev` worker (or a `cloudflared` tunnel) for real-device App Attest tests.
+
+## Notes Import model provider (Claude Platform / OpenRouter)
+
+Model calls go through the feature-neutral adapter layer in `src/llm/`
+(`LlmAdapter`, `streamStructuredObject`); features pass prompt blocks, a JSON
+schema, and cache hints, never a provider SDK. `src/notesImport/provider.ts`
+picks the adapter per run:
+
+- PostHog flag **`notes-import-claude`** (project 492895, evaluated server-side
+  through `/flags?v=2` with the public `POSTHOG_PROJECT_TOKEN` var) on **and**
+  the `ANTHROPIC_API_KEY` secret set → Claude Platform, `claude-haiku-5-5`.
+- Flag off, PostHog unreachable or quota-limited, or no key → OpenRouter.
+- The token is the same one that turns on Notes Import analytics (below), so
+  dev, which leaves it commented out to keep test runs out of the dashboards,
+  always reads the flag as off. To try Claude on dev, uncomment it there
+  (analytics then flows too, tagged `environment: development`).
+- PostHog gets a SHA-256-derived id per meter (never the meter id itself) plus
+  the person property `ww_api_environment` (`production` / `development`), so
+  the flag can roll out by percentage or target one worker. Results are cached
+  per isolate for 30 s, so a toggle takes effect within about 30 s.
+- While the flag is on, `GET /notes-import/status` skips the OpenRouter
+  host-health probe (evaluated for a fixed status id, so it's exact at 0% and
+  100% rollouts).
+
+Claude settings (`NOTES_IMPORT_ANTHROPIC_*` vars, defaults in `config.ts`):
+model `claude-haiku-5-5`, effort `medium`, `inference_geo` `us` (1.1x price,
+keeps ADR 0008's Western-jurisdiction bound), `max_tokens` 32000 (thinking
+counts toward it). Structured output is native `output_config.format`
+(constrained decoding), so the answer always matches the schema. The SDK
+moves unsupported keywords (`minimum`/`maximum`) into descriptions. Adaptive
+thinking streams a summary (`display: summarized`) for the progress UI.
+
+Prompt caching: the system prompt is split into `NOTES_IMPORT_INSTRUCTIONS`
+(identical for every user, 1h cache) and the per-user context (5m), and the
+notes come first in the user turn (5m), so refinements reuse the cached prefix
+through the notes. **Never interpolate per-request data into
+`NOTES_IMPORT_INSTRUCTIONS`**; it would miss the cache for everyone. The worker
+logs `notes-import model provider=… cacheReadTokens=… cacheWriteTokens=…` per
+run.
+
+Data retention: OpenRouter is pinned to ZDR hosts. The Claude API keeps
+inputs/outputs under Anthropic's standard commercial retention unless the
+organization has a ZDR arrangement, which is enabled by Anthropic sales.
 
 ## Notes Import runtime limits and admin reset
 

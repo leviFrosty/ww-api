@@ -1,6 +1,6 @@
 # Notes Import
 
-Notes Import turns a publisher's free-form notes into contacts, visits, and time entries through an LLM. Every metered call is gated by App Attest on iOS and Play Integrity on Android; simulators, emulators and agents use the development-only bypass header instead. The safe verification surface is the attested no-op `verify` probe and the auth gate in front of `kickoff`. A real kickoff spends OpenRouter credits and is opt-in only.
+Notes Import turns a publisher's free-form notes into contacts, visits, and time entries through an LLM. Every metered call is gated by App Attest on iOS and Play Integrity on Android; simulators, emulators and agents use the development-only bypass header instead. The safe verification surface is the attested no-op `verify` probe and the auth gate in front of `kickoff`. A real kickoff spends model credits (Claude Platform when the `notes-import-claude` PostHog flag is on, else OpenRouter) and is opt-in only.
 
 ## Sub-features
 
@@ -29,8 +29,8 @@ Preconditions:
 - **v2 probe.** Run `H=$(printf verify | shasum -a 256 | cut -d' ' -f1); curl -s -X POST $URL/notes-import/verify -H "x-ww-dev-bypass: $BYPASS" -H "cf-connecting-ip: 198.18.2.2" -d "{\"protocolVersion\":2,\"operation\":\"assert\",\"operationId\":\"op_verify01\",\"purpose\":\"notes-import-verify\",\"contentHash\":\"$H\",\"requestHash\":\"$H\"}"`. The body is `{"ok":true,"protocolVersion":2,"operationId":"op_verify01"}`.
 - **Wrong token.** Repeat the v1 probe with `-H "x-ww-dev-bypass: nope"`. You get 400 with `Missing uuid, keyId, challenge, assertion, or contentHash`.
 - **Challenge.** Run `curl -s -X POST $URL/notes-import/challenge -H "cf-connecting-ip: 198.18.2.3" -d '{}'`. The body includes a `challenge` string.
-- **Kickoff gate.** Run `curl -s -X POST $URL/notes-import/kickoff -H "cf-connecting-ip: 198.18.2.4" -d '{"uuid":"u1","notesText":"x","context":{"now":"2026-10-01T00:00:00Z","timeZone":"UTC","existingContacts":[],"existingCategories":[]}}'`. You get 401 `attestation_required`, and `.verify/wrangler.log` shows no OpenRouter call.
-- **Paid kickoff (opt-in only).** Run `WW_API_E2E_ALLOW_PAID=1 pnpm test:e2e src/e2e/notesImport.e2e.test.ts` after `up --secrets-from <file with OPENROUTER_API_KEY>`. The `PAID:` test passes with result `status:"done"`.
+- **Kickoff gate.** Run `curl -s -X POST $URL/notes-import/kickoff -H "cf-connecting-ip: 198.18.2.4" -d '{"uuid":"u1","notesText":"x","context":{"now":"2026-10-01T00:00:00Z","timeZone":"UTC","existingContacts":[],"existingCategories":[]}}'`. You get 401 `attestation_required`, and `.verify/wrangler.log` shows no model call.
+- **Paid kickoff (opt-in only).** Run `WW_API_E2E_ALLOW_PAID=1 pnpm test:e2e src/e2e/notesImport.e2e.test.ts` after `up --secrets-from <file with ANTHROPIC_API_KEY and/or OPENROUTER_API_KEY>`. The worker logs `notes-import model provider=…` with cache token counts. The `PAID:` test passes with result `status:"done"`.
 - **Proof.** Run `pnpm test:e2e src/e2e/notesImport.e2e.test.ts`. The free tests pass, the `PAID:` test shows as skipped unless opted in, and the transcript is in `.verify/artifacts/e2e-notes-import-*.json`.
 
 ## Gotchas

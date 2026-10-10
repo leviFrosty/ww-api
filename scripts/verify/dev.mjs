@@ -47,6 +47,7 @@ const READY_TIMEOUT_MS = 90_000
 const OPTIONAL_SECRETS = [
   'HERE_API_KEY',
   'OPENROUTER_API_KEY',
+  'ANTHROPIC_API_KEY',
   'REVENUECAT_API_KEY',
   'APPLE_TEAM_ID',
   // Buddies Android pushes: FCM is plain HTTPS, so unlike APNs it works from
