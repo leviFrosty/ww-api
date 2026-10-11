@@ -318,7 +318,7 @@ const INVALID = {
   deviceId: ID_POOL,
   eventId: ID_POOL,
   nonce: ID_POOL,
-  ts: ['1700000000000', null, 1.5, 1e300, [], true, {}, 2 ** 53],
+  ts: ['1700000000000', null, 1e300, [], true, {}, 2 ** 53],
   since: [-1, 1.5, '0', null, 2 ** 53, true, {}],
   ownerPub: ['', 'A'.repeat(42), 'A'.repeat(44), b64u(randomBytes(31)), b64u(randomBytes(33)), null, 7, '+/+/'.repeat(11)],
   writerPub: ['', 'A'.repeat(42), b64u(randomBytes(31)), null, 7],

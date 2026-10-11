@@ -670,3 +670,21 @@ describe.skipIf(!LOCAL_LAUNCHER)('kill switch (local KV)', () => {
     await back.send('inbox/delete')
   })
 })
+
+describe('fractional ts', () => {
+  it('accepts the fractional ms a calibrated app clock stamps', async () => {
+    const key = await SigningKey.generate()
+    const inboxId = randomId()
+    const ts = () => Date.now() + 0.4567
+    const register = await buddies(
+      'inbox/register',
+      await envelope('inbox/register', { ts: ts(), nonce: randomId(), inboxId, ownerPub: key.publicKey }, key)
+    )
+    expect(register.body).toEqual({ ok: true })
+    const sync = await buddies(
+      'inbox/sync',
+      await envelope('inbox/sync', { ts: ts(), nonce: randomId(), inboxId, since: 0 }, key)
+    )
+    expect(sync.status).toBe(200)
+  })
+})

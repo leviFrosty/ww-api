@@ -29,7 +29,7 @@ Since the MVP: shared Plans and Follow-up invitations, requests to join, and bad
 
 - The signed message is `UTF-8("ww-buddies/v1\n" + op + "\n")` followed by the **decoded bytes of `p`**. The server verifies against those exact bytes; it never re-serializes JSON.
 - `op` is the path segment after `/buddies/v1/`, e.g. `inbox/sync`.
-- Every signed payload carries `ts` (ms) and `nonce` (`b64u` of 16 random bytes). The server rejects `|now − ts| > 300 000` with `stale`, and a nonce seen within the last 10 minutes for the same inbox with `replay`.
+- Every signed payload carries `ts` (ms; a fractional value is accepted and floored) and `nonce` (`b64u` of 16 random bytes). The server rejects `|now − ts| > 300 000` with `stale`, and a nonce seen within the last 10 minutes for the same inbox with `replay`.
 - Unsigned ops (`invite/fetch`, `invite/claim`) send `{ "p": "…" }` only; `ts`/`nonce` are not required there.
 
 ### Which key verifies

@@ -543,10 +543,22 @@ const pushAddress = (p: Fields): PushAddress | null => {
   }
 }
 
-const inboxFields = (p: Fields): InboxFields | null =>
-  isSafeInteger(p.ts) && isId(p.nonce) && isId(p.inboxId)
-    ? { ts: p.ts, nonce: p.nonce, inboxId: p.inboxId }
+/**
+ * `ts` in whole ms. App builds that stamp it from a calibrated clock send a
+ * fraction (the signature covers it as sent), so it's floored, not refused.
+ */
+const timestamp = (value: unknown): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  const ms = Math.floor(value)
+  return isSafeInteger(ms) ? ms : null
+}
+
+const inboxFields = (p: Fields): InboxFields | null => {
+  const ts = timestamp(p.ts)
+  return ts != null && isId(p.nonce) && isId(p.inboxId)
+    ? { ts, nonce: p.nonce, inboxId: p.inboxId }
     : null
+}
 
 const slotFields = (p: Fields): SlotPayload | null => {
   const base = inboxFields(p)

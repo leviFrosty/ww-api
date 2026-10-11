@@ -33,11 +33,16 @@ describe('ids, keys, and signatures', () => {
     expect(parse('inbox/delete', { ...signed, inboxId }) !== null).toBe(valid)
   })
 
-  it('requires an integer ts and a 22-char nonce', () => {
-    expect(parse('inbox/delete', { ...signed, ts: NOW + 0.5 })).toBeNull()
+  it('requires a numeric ts and a 22-char nonce', () => {
     expect(parse('inbox/delete', { ...signed, ts: String(NOW) })).toBeNull()
+    expect(parse('inbox/delete', { ...signed, ts: Number.NaN })).toBeNull()
+    expect(parse('inbox/delete', { ...signed, ts: 2 ** 60 })).toBeNull()
     expect(parse('inbox/delete', { ...signed, nonce: 'short' })).toBeNull()
     expect(parse('inbox/delete', { ...signed, nonce: undefined })).toBeNull()
+  })
+
+  it('floors a fractional ts (calibrated app clocks send one)', () => {
+    expect(parse('inbox/delete', { ...signed, ts: NOW + 0.5 })?.ts).toBe(NOW)
   })
 
   it('requires 32-byte keys and returns them canonically encoded', () => {
