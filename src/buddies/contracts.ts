@@ -167,7 +167,7 @@ const KIB = 1_024
 export const BUDDIES_LIMITS = {
   /** `slot/add` and `invite/create` fail with `limit` at this many slots + open invites. */
   slotsPlusOpenInvites: 5,
-  openInvites: 3,
+  openInvites: 5,
   inviteCreations: 20,
   inviteCreationWindowMs: DAY_MS,
   writesPerSlot: 60,

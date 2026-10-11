@@ -677,7 +677,7 @@ const GENERATORS = {
     }
   },
 
-  /** Count caps: slots + open invites ≤ 5, open invites ≤ 3, templates/kind limits. */
+  /** Count caps: slots + open invites ≤ 5, open invites ≤ 5, templates/kind limits. */
   'cap-boundaries': async (rng) => {
     const owner = await newOwner()
     const variant = rng.pick(['slots', 'invites', 'templates', 'kind', 'expiry'])

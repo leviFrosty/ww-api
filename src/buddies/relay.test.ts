@@ -826,9 +826,9 @@ describe('caps and rate limits', () => {
     ).toEqual(relayError('limit'))
   })
 
-  it('limits open invites to 3', async () => {
+  it('limits open invites to 5', async () => {
     const owner = await Owner.create(h)
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 5; i++) {
       expect((await createInvite(owner)).response.status).toBe(200)
     }
     expect(
