@@ -401,10 +401,10 @@ describe('relay limits and abuse', () => {
     expect((await owner.send('inbox/delete')).status).toBe(200)
   }, 60_000)
 
-  it('caps open invites at 3', async () => {
+  it('caps open invites at 5', async () => {
     const owner = await RelayOwner.register()
     const statuses: number[] = []
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 6; i++) {
       const secrets = await inviteSecrets()
       const res = await owner.send('invite/create', {
         inviteId: secrets.inviteId,
@@ -414,7 +414,7 @@ describe('relay limits and abuse', () => {
       })
       statuses.push(res.status)
     }
-    expect(statuses).toEqual([200, 200, 200, 429])
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 429])
     expect((await owner.send('inbox/delete')).status).toBe(200)
   })
 

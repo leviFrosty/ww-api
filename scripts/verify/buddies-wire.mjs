@@ -15,7 +15,7 @@ export const SIGNING_CONTEXT = 'ww-buddies/v1\n'
 /** Copy of BUDDIES_LIMITS fields the fuzzer probes (checked by the unit test). */
 export const WIRE_LIMITS = {
   slotsPlusOpenInvites: 5,
-  openInvites: 3,
+  openInvites: 5,
   timestampSkewMs: 5 * 60 * 1000,
   rosterBytes: 32 * 1024,
   cardBytes: 16 * 1024,
