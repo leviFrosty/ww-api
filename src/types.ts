@@ -214,6 +214,16 @@ export interface Environment {
   /** Dedicated admin reset credential. Secret; distinct per prod/dev worker. */
   ADMIN_API_TOKEN?: string;
 
+  // --- Accounts ------------------------------------------------------------
+
+  /**
+   * The accounts database (src/accounts/schema.ts, witness-work ADR 0024):
+   * anonymous accounts, their status, and which Buddies inboxes they own.
+   * Without it, accounts are off: `account/register` answers `disabled` and
+   * `inbox/register` ignores account proofs.
+   */
+  ACCOUNTS_DB?: D1Database;
+
   // --- Buddies relay -------------------------------------------------------
 
   /**

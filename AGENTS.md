@@ -379,6 +379,57 @@ wrangler kv key put --binding NOTES_KV buddies:photos on
 wrangler kv key put --binding NOTES_KV buddies:photos off
 ```
 
+## Accounts
+
+Anonymous accounts (witness-work ADR 0024, `docs/accounts-protocol.md` there):
+one row per User, with no name, email, or phone number. The server mints a
+random `accountId` and stores only the public key of the account signing key,
+which every device derives from the User's account key. Accounts let us
+suspend someone for abuse; later phases add moving between iOS and Android.
+Code in `src/accounts/`, schema in `src/accounts/schema.ts` (Drizzle on D1).
+
+- `POST /accounts/v1/account/register`: self-signed under the
+  `ww-account/v1` context; idempotent per key. Counts against the Buddies
+  register edge tier and the per-caller daily quota.
+- `inbox/register` takes an optional `account: { accountId, signature }`,
+  the account key's signature over the inbox id and owner key. The link
+  (`account_inboxes`) is written only after the inbox accepted the
+  owner-signed registration, so it takes both keys (Option A in the ADR).
+- A suspended account's inboxes refuse every owner op except `inbox/delete`
+  and `slot/remove` with `403 suspended`, and its live sockets close with
+  4003. The database is the authority (registration checks it); each inbox
+  keeps a copy so its hot path never reads D1.
+
+Without the `ACCOUNTS_DB` binding, accounts are off: `account/register`
+answers `disabled` and proofs are ignored. Prod uses `ww-accounts`, dev
+`ww-accounts-dev`.
+
+```bash
+# Schema change: edit src/accounts/schema.ts, then
+pnpm db:generate --name <change>
+wrangler d1 migrations apply ww-accounts-dev --env dev --remote   # dev
+# Prod: the tag deploy (.github/workflows/deploy.yml) applies them before
+# deploying. Dev deploys by hand, so apply them first.
+```
+
+Moderation, with `x-ww-admin-token: $ADMIN_API_TOKEN` (404 without it). The
+tokens are in 1Password's Agents vault, "ww-api admin token (prod)" and
+"(dev)":
+
+```bash
+# A report names the buddy's inboxId; find the account behind it.
+curl -sX POST "$BASE/admin/accounts/lookup" -H "x-ww-admin-token: $TOKEN" \
+  -H 'content-type: application/json' -d '{"inboxId":"<22 chars>"}'
+# Suspend (reason: report | automated | appeal | admin); "active" reinstates.
+curl -sX POST "$BASE/admin/accounts/status" -H "x-ww-admin-token: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"accountId":"<22 chars>","status":"suspended","reason":"report"}'
+```
+
+`/status` records every change in `account_status_events` and updates each
+of the account's inboxes. If `inboxesFailed` is above 0, send the same
+request again.
+
 ## App Store ratings (paywall social proof)
 
 `GET /app-store/ratings` returns `{averageRating, ratingCount, countryCount,

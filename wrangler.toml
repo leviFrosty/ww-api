@@ -127,6 +127,16 @@ class_name = "BuddyRegistrationQuota"
 binding = "BUDDY_BLOBS"
 bucket_name = "ww-buddy-blobs-dev"
 
+# Anonymous accounts (witness-work ADR 0024): accounts, their status, and which
+# Buddies inboxes they own. Not inherited, like every binding. Migrations come
+# from `pnpm db:generate` (drizzle-kit); apply them before deploying code that
+# needs them: `wrangler d1 migrations apply ww-accounts-dev --env dev --remote`.
+[[env.dev.d1_databases]]
+binding = "ACCOUNTS_DB"
+database_name = "ww-accounts-dev"
+database_id = "1467a58d-1e32-44cb-902c-e26df1827ad0"
+migrations_dir = "migrations/accounts"
+
 [[env.dev.migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -410,6 +420,16 @@ namespace_id = "1007"
   [ratelimits.simple]
   limit = 600
   period = 60
+
+# Anonymous accounts (witness-work ADR 0024). Without this binding, accounts
+# are off: `account/register` answers `disabled` and `inbox/register` ignores
+# account proofs. Apply migrations before deploying code that needs them:
+# `wrangler d1 migrations apply ww-accounts --remote`. Repeated under [env.dev].
+[[d1_databases]]
+binding = "ACCOUNTS_DB"
+database_name = "ww-accounts"
+database_id = "f11965ab-53e7-4748-bc27-48d9b77c3d8d"
+migrations_dir = "migrations/accounts"
 
 # Buddies note photos: sealed blobs at v1/<inboxId>/<blobId>, written and
 # deleted by the sender's BuddyInbox DO (bookkeeping, expiry, sweeps, wipes).

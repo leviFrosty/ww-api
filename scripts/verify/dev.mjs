@@ -303,6 +303,14 @@ async function up(args) {
     : existing?.persistDir ?? DEFAULT_PERSIST
   mkdirSync(persistDir, { recursive: true })
 
+  // The accounts database's migrations, into this run's local D1 (idempotent).
+  const migrate = spawnSync(
+    process.execPath,
+    [WRANGLER_BIN, 'd1', 'migrations', 'apply', 'ww-accounts-dev', '--env', 'dev', '--local', '--persist-to', persistDir],
+    { cwd: ROOT, encoding: 'utf8', env: { ...process.env, CI: '1', WRANGLER_SEND_METRICS: 'false', NO_COLOR: '1' } }
+  )
+  if (migrate.status !== 0) fail(`applying the accounts migrations failed:\n${migrate.stderr || migrate.stdout}`)
+
   const port = await pickPort(HTTP_PORTS)
   const inspectorPort = await pickPort(INSPECTOR_PORTS)
   const { tokens, configured } = writeVarsFile(flags, existing?.tokens)

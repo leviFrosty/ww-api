@@ -308,6 +308,27 @@ const TOMBSTONE_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_tombstone (
    owner_key_hash TEXT NOT NULL
  )`
 
+/**
+ * The account that owns this inbox, and whether it's suspended (witness-work
+ * ADR 0024). Not in `SCHEMA`: an inbox registered without an account doesn't
+ * have it. A wipe deletes it; the accounts database keeps the link, and the
+ * Worker passes it back on the next registration.
+ */
+const OWNER_ACCOUNT_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_account (
+   singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+   account_id TEXT NOT NULL,
+   suspended  INTEGER NOT NULL DEFAULT 0
+ )`
+
+/**
+ * Owner ops a suspended account keeps, so people can always leave: removing a
+ * buddy and deleting the inbox.
+ */
+const SUSPENDED_ALLOWED_OPS: ReadonlySet<BuddiesSigningOp> = new Set([
+  'inbox/delete',
+  'slot/remove',
+])
+
 const encoder = new TextEncoder()
 
 /** b64u SHA-256 of a domain label and the canonical b64u `ownerPub`. */
@@ -346,7 +367,15 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   // --- Owner ops ----------------------------------------------------------
 
-  async register(call: Signed<RegisterPayload>): Promise<BuddiesResult<Empty>> {
+  /**
+   * `accountId` is the account that owns the inbox, once the Worker has checked
+   * the link (null for registrations without one). It never clears a
+   * suspension: only `setAccountStatus` does.
+   */
+  async register(
+    call: Signed<RegisterPayload>,
+    accountId: string | null = null
+  ): Promise<BuddiesResult<Empty>> {
     const valid = await verifyBuddiesSignature(
       call.ownerPub,
       'inbox/register',
@@ -365,6 +394,7 @@ export class BuddyInbox extends DurableObject<Environment> {
         // A wiped inbox stays bound to its owner's key.
         const tombstone = this.#tombstone()
         if (tombstone != null && tombstone !== keyHash) return fail('conflict')
+        if (this.#suspended()) return fail('suspended')
         this.#ensureSchema()
         if (!this.#claimNonce(call, now)) return fail('replay')
         if (meta) {
@@ -377,6 +407,14 @@ export class BuddyInbox extends DurableObject<Environment> {
             call.ownerPub,
             now,
             now
+          )
+        }
+        if (accountId) {
+          this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+          this.#sql.exec(
+            `INSERT INTO owner_account (singleton, account_id) VALUES (1, ?)
+             ON CONFLICT (singleton) DO UPDATE SET account_id = excluded.account_id`,
+            accountId
           )
         }
         return ok({})
@@ -1040,6 +1078,27 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
+   * The accounts admin suspended or reinstated this inbox's account. Owner ops
+   * other than leaving answer `suspended` until it's reinstated, and live
+   * sockets close. An inbox that isn't registered keeps nothing: the Worker
+   * checks the accounts database before it registers again.
+   */
+  async setAccountStatus(accountId: string, suspended: boolean): Promise<void> {
+    if (!this.#ready() || !this.#meta()) return
+    this.ctx.storage.transactionSync(() => {
+      this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+      this.#sql.exec(
+        `INSERT INTO owner_account (singleton, account_id, suspended) VALUES (1, ?, ?)
+         ON CONFLICT (singleton) DO UPDATE
+         SET account_id = excluded.account_id, suspended = excluded.suspended`,
+        accountId,
+        suspended ? 1 : 0
+      )
+    })
+    if (suspended) this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.suspended)
+  }
+
+  /**
    * Retention: events at 30 days, blobs at their `expiresAt`, the weekly
    * blob sweep, invite bookkeeping, and the 180-day wipe.
    */
@@ -1100,6 +1159,8 @@ export class BuddyInbox extends DurableObject<Environment> {
       call.signature
     )
     if (!valid) return fail('bad_signature')
+    if (ref === 'owner' && !SUSPENDED_ALLOWED_OPS.has(op) && this.#suspended())
+      return fail('suspended')
     const [budget, limit] =
       ref === 'owner'
         ? [ABUSE.ownerRequests, 'ownerRequests']
@@ -1278,6 +1339,18 @@ export class BuddyInbox extends DurableObject<Environment> {
     return meta && now - meta.lastActiveAt >= LIMITS.inboxInactivityMs
       ? meta.ownerPub
       : null
+  }
+
+  /** Whether this inbox's account is suspended. */
+  #suspended(): boolean {
+    if (!this.#hasTable('owner_account')) return false
+    return (
+      this.#sql
+        .exec<{
+          suspended: number
+        }>('SELECT suspended FROM owner_account WHERE singleton = 1')
+        .toArray()[0]?.suspended === 1
+    )
   }
 
   /** The wiped owner's key hash; null if this inbox was never wiped. */
