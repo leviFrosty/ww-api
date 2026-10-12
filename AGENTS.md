@@ -483,6 +483,18 @@ Before claiming backend work is done, run the `verify-ww-api` loop
 (`.agents/skills/verify-ww-api/SKILL.md`): `node scripts/verify/dev.mjs up`,
 `doctor`, `pnpm test:e2e`, `pnpm fuzz:buddies` for relay changes, then `down`.
 
+## Architecture diagram
+
+The diagram of how the app, this Worker, its Durable Objects, R2 and KV, and
+outside services connect lives in witness-work's
+[`readme.md`](https://github.com/leviFrosty/witness-work/blob/main/readme.md#architecture).
+When a change here adds, removes, or moves one of those connections, open a PR
+in witness-work that updates the diagram, and link the two PRs. Examples: a new
+route group the app calls; a new Durable Object, R2 bucket, KV namespace, or
+cron job; or a new or different outside service, such as a model provider. A
+new endpoint in an existing route group, or a change inside one service,
+doesn't need it.
+
 ## Sentry source maps
 
 Errors are reported with `release: SENTRY_RELEASE` (the git commit sha,
