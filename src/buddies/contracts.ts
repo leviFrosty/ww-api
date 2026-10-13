@@ -72,6 +72,8 @@ export const BUDDIES_LIVE_CLOSE = {
   gone: { code: 4001, reason: 'gone' },
   /** A newer socket for the inbox pushed this one past the cap. */
   replaced: { code: 4002, reason: 'replaced' },
+  /** The inbox's account was suspended. */
+  suspended: { code: 4003, reason: 'suspended' },
 } as const
 
 export type BuddiesOwnerOp = (typeof BUDDIES_OWNER_OPS)[number]
@@ -133,6 +135,10 @@ export const BUDDIES_ERROR_STATUS = {
   photos_disabled: 503,
   /** `blob/put` from an inbox with no buddies: nobody could read the photo. */
   no_buddies: 403,
+  /** The inbox's account is suspended: every owner op is refused. */
+  suspended: 403,
+  /** `inbox/register` named an account the accounts database doesn't have. */
+  unknown_account: 404,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
@@ -389,8 +395,20 @@ export interface InboxFields extends SignedFields {
   inboxId: string
 }
 
+/**
+ * The account that owns an inbox (witness-work ADR 0024): its id, and the
+ * account signing key's signature over `inboxLinkMessage(accountId, inboxId,
+ * ownerPub)` (src/accounts/contracts.ts).
+ */
+export interface InboxAccountProof {
+  accountId: string
+  signature: Uint8Array
+}
+
 export interface RegisterPayload extends InboxFields {
   ownerPub: string
+  /** Absent from builds before accounts, and when the app has none yet. */
+  account?: InboxAccountProof
 }
 
 export interface SyncPayload extends InboxFields {
@@ -590,7 +608,17 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
   'inbox/register': (p) => {
     const base = inboxFields(p)
     const ownerPub = fixedBytes(p.ownerPub, 32)
-    return base && ownerPub ? { ...base, ownerPub } : null
+    if (!base || !ownerPub) return null
+    if (p.account === undefined) return { ...base, ownerPub }
+    if (!isPlainObject(p.account) || !isId(p.account.accountId)) return null
+    const signature = decodeSignature(p.account.signature)
+    return signature
+      ? {
+          ...base,
+          ownerPub,
+          account: { accountId: p.account.accountId, signature },
+        }
+      : null
   },
   'inbox/sync': (p) => {
     const base = inboxFields(p)

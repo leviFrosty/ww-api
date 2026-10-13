@@ -26,6 +26,8 @@ import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
 import { runRatingsSweepStep } from "./appStoreRatings/ratings";
 import { Sentry, createSentryConfig } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
+import { createAccountsRoutes } from "./accounts/route";
+import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
 
@@ -111,6 +113,8 @@ app.post("/notes-import/:importId/destroy", handleNotesImportDestroyRequest);
 app.post("/notes-import", handleNotesImportRequest);
 // Maintainer-only usage reset (secret auth inside handler; 404 fail-closed).
 app.post("/admin/notes-import/reset", handleNotesImportAdminResetRequest);
+// Account moderation: look up and suspend accounts (token auth; 404 fail-closed).
+app.route("/admin/accounts", createAccountsAdminRoutes());
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.
 app.get("/.well-known/apple-app-site-association", handleAasaRequest);
@@ -121,6 +125,9 @@ app.get("/c/:payload", handleLegacyContactLinkRequest);
 // Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
 // rate-limited per caller inside the handler (src/buddies/limits.ts).
 app.route("/buddies/v1", createBuddiesRoutes());
+// Anonymous accounts (witness-work ADR 0024): POST /accounts/v1/{op}, signed
+// like Buddies ops and rate-limited per caller inside the handler.
+app.route("/accounts/v1", createAccountsRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 app.get("/b", handleBuddyInvitePage);
 // Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,

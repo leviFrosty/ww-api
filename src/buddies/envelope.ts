@@ -219,13 +219,12 @@ export const signedMessage = (
 }
 
 /**
- * Verifies an Ed25519 signature with WebCrypto against a stored `b64u` public
- * key. Any malformed key or signature is simply "not valid".
+ * Verifies an Ed25519 signature over `message` with WebCrypto against a `b64u`
+ * public key. Any malformed key or signature is simply "not valid".
  */
-export const verifyBuddiesSignature = async (
+export const verifyEd25519 = async (
   publicKey: string,
-  op: BuddiesSigningOp,
-  payloadBytes: Uint8Array,
+  message: Uint8Array,
   signature: Uint8Array
 ): Promise<boolean> => {
   const raw = decodeB64u(publicKey)
@@ -242,9 +241,18 @@ export const verifyBuddiesSignature = async (
       { name: 'Ed25519' },
       key,
       signature,
-      signedMessage(op, payloadBytes)
+      message
     )
   } catch {
     return false
   }
 }
+
+/** Verifies a signed op against a stored `b64u` public key. */
+export const verifyBuddiesSignature = (
+  publicKey: string,
+  op: BuddiesSigningOp,
+  payloadBytes: Uint8Array,
+  signature: Uint8Array
+): Promise<boolean> =>
+  verifyEd25519(publicKey, signedMessage(op, payloadBytes), signature)

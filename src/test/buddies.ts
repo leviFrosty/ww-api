@@ -11,6 +11,7 @@ import type { BuddiesSignedOp } from '../buddies/contracts'
 import type { Environment } from '../types'
 import { makeMemoryKv, type MemoryKv } from './memoryKv'
 import { makeMemoryR2, type MemoryR2 } from './memoryR2'
+import { makeMemoryD1, type MemoryD1 } from './memoryD1'
 import { createTestServiceAccount } from './googleServiceAccount'
 import {
   WORKERS_WEBSOCKET_GLOBALS,
@@ -108,6 +109,8 @@ export interface HarnessOptions {
   kvPhotos?: string
   /** Bind the R2 bucket (default true). */
   blobBucket?: boolean
+  /** Bind the accounts database (default true). */
+  accountsDb?: boolean
 }
 
 export interface Harness {
@@ -115,6 +118,8 @@ export interface Harness {
   kv: MemoryKv
   /** The `BUDDY_BLOBS` bucket (present even when unbound, for assertions). */
   r2: MemoryR2
+  /** The `ACCOUNTS_DB` database, when bound. */
+  accountsDb: MemoryD1 | null
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -190,6 +195,7 @@ export const createHarness = async (
     await kv.put('buddies:enabled', options.kvEnabled)
   if (options.kvPhotos != null) await kv.put('buddies:photos', options.kvPhotos)
   const r2 = makeMemoryR2()
+  const accountsDb = options.accountsDb === false ? null : makeMemoryD1()
 
   const apnsKeys = (await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
@@ -224,6 +230,7 @@ export const createHarness = async (
     BUDDIES_ENABLED: options.enabled ?? 'true',
     BUDDIES_PHOTOS: options.photos ?? 'on',
     ...(options.blobBucket === false ? {} : { BUDDY_BLOBS: r2 }),
+    ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
     ...limiters,
     ...(options.apnsConfigured === false
       ? {}
@@ -262,6 +269,7 @@ export const createHarness = async (
     env,
     kv,
     r2,
+    accountsDb,
     inboxes,
     invites,
     quotas,

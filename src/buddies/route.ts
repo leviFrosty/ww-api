@@ -13,6 +13,7 @@ import {
   BUDDIES_PHOTO_OPS,
   BUDDIES_UNSIGNED_OPS,
   buddyBlobKey,
+  fail,
   ok,
   type BuddiesErrorCode,
   type BuddiesFailure,
@@ -33,8 +34,16 @@ import {
   readLiveCall,
   signedCall,
   verifyBuddiesSignature,
+  verifyEd25519,
   type Envelope,
 } from './envelope'
+import { inboxLinkMessage } from '../accounts/contracts'
+import {
+  accountsDb,
+  findAccount,
+  findInboxAccount,
+  linkInbox,
+} from '../accounts/store'
 import { isBuddiesEnabled, isBuddiesPhotosEnabled } from './killSwitch'
 import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
 import {
@@ -101,9 +110,79 @@ type SignedRunners = {
   ) => Promise<Outcome>
 }
 
+/** The accounts side of `inbox/register`; see `registerInbox`. */
+type InboxAccount =
+  | { ok: true; linked: string | null; claim: string | null }
+  | BuddiesFailure
+
+/**
+ * Checks `inbox/register` against the accounts database (witness-work ADR
+ * 0024). `linked` is the account the inbox already belongs to; `claim` is the
+ * account a valid proof names, when the inbox isn't linked yet. A suspended
+ * account's inbox is refused, with or without a proof.
+ */
+const checkInboxAccount = async (
+  db: ReturnType<typeof accountsDb>,
+  call: Signed<BuddiesPayloads['inbox/register']>
+): Promise<InboxAccount> => {
+  const linked = await findInboxAccount(db, call.inboxId)
+  if (linked?.status === 'suspended') return fail('suspended')
+  if (!call.account) return { ok: true, linked: linked?.id ?? null, claim: null }
+  const account = await findAccount(db, call.account.accountId)
+  if (!account) return fail('unknown_account')
+  const valid = await verifyEd25519(
+    account.accountPub,
+    inboxLinkMessage(account.id, call.inboxId, call.ownerPub),
+    call.account.signature
+  )
+  if (!valid) return fail('bad_signature')
+  if (linked && linked.id !== account.id) return fail('conflict')
+  if (account.status === 'suspended') return fail('suspended')
+  return linked
+    ? { ok: true, linked: linked.id, claim: null }
+    : { ok: true, linked: null, claim: account.id }
+}
+
+/**
+ * `inbox/register`, linking the inbox to the account its proof names. The link
+ * is written only after the inbox accepted the owner-signed registration, so it
+ * takes both the owner key and the account key. The answer carries `accountId`
+ * once the inbox belongs to an account. Without the accounts database (or while
+ * it fails) registration works as before accounts, without links.
+ */
+const registerInbox = async (
+  env: Environment,
+  call: Signed<BuddiesPayloads['inbox/register']>
+): Promise<Outcome> => {
+  const db = env.ACCOUNTS_DB ? accountsDb(env.ACCOUNTS_DB) : null
+  let check: InboxAccount = { ok: true, linked: null, claim: null }
+  if (db) {
+    try {
+      check = await checkInboxAccount(db, call)
+    } catch (error) {
+      console.warn('buddies: accounts database unavailable; registering unlinked')
+      Sentry.captureException(error)
+    }
+  }
+  if (!check.ok) return check
+  const accountId = check.linked ?? check.claim
+  const result = await inbox(env, call.inboxId).register(call, accountId)
+  if (!result.ok) return result
+  if (db && check.claim) {
+    try {
+      const owner = await linkInbox(db, call.inboxId, check.claim)
+      if (owner !== check.claim) return fail('conflict')
+    } catch (error) {
+      console.warn('buddies: linking an inbox failed')
+      Sentry.captureException(error)
+      return ok({ body: {} })
+    }
+  }
+  return ok({ body: accountId ? { accountId } : {} })
+}
+
 const SIGNED_OPS: SignedRunners = {
-  'inbox/register': async (env, call) =>
-    empty(await inbox(env, call.inboxId).register(call)),
+  'inbox/register': registerInbox,
   // `capabilities` tells the app which optional relay features it may use.
   'inbox/sync': async (env, call) => {
     const result = await inbox(env, call.inboxId).sync(call)
