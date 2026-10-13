@@ -80,6 +80,30 @@ ${refinement.instruction}
 /** Emit a `progress` tick at most every N streamed output chars. */
 const PROGRESS_CHAR_STRIDE = 400
 
+/** Include the failed thinking attempt in the run's billed token totals. */
+const combinedUsage = (first: LanguageModelUsage, second: LanguageModelUsage): LanguageModelUsage => {
+  const sum = (a: number | undefined, b: number | undefined) =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+  const cacheReadTokens = sum(first.inputTokenDetails.cacheReadTokens, second.inputTokenDetails.cacheReadTokens)
+  const reasoningTokens = sum(first.outputTokenDetails.reasoningTokens, second.outputTokenDetails.reasoningTokens)
+  return {
+    inputTokens: sum(first.inputTokens, second.inputTokens),
+    outputTokens: sum(first.outputTokens, second.outputTokens),
+    totalTokens: sum(first.totalTokens, second.totalTokens),
+    inputTokenDetails: {
+      noCacheTokens: sum(first.inputTokenDetails.noCacheTokens, second.inputTokenDetails.noCacheTokens),
+      cacheReadTokens,
+      cacheWriteTokens: sum(first.inputTokenDetails.cacheWriteTokens, second.inputTokenDetails.cacheWriteTokens),
+    },
+    outputTokenDetails: {
+      textTokens: sum(first.outputTokenDetails.textTokens, second.outputTokenDetails.textTokens),
+      reasoningTokens,
+    },
+    cachedInputTokens: cacheReadTokens,
+    reasoningTokens,
+  }
+}
+
 /**
  * Runs the notes-import model through OpenRouter, streaming. Routing is pinned to
  * the configured provider allowlist with `zdr: true` and `data_collection:
@@ -228,6 +252,25 @@ export const runNotesImportModel = async ({
       finishReason === 'stop' && !(await result.text).trim()
         ? recoverNotesImportJson(reasoningBuffer)
         : null
+    if (!salvaged && finishReason === 'length' && config.reasoningEffort &&
+      !(await result.text).trim() && !abortSignal?.aborted) {
+      // The response budget was spent entirely on thinking. Retry once with
+      // thinking explicitly off; a null effort prevents this branch recurring.
+      // Nonblank truncated JSON and schema-invalid output never take this path.
+      console.warn(
+        `notes-import reasoning budget exhausted model=${config.model} ` +
+          `provider=${resolvedProvider ?? 'unknown'} outputTokens=${usage.outputTokens ?? 0} retry=without-thinking`
+      )
+      const retry = await runNotesImportModel({
+        apiKey, config: { ...config, reasoningEffort: null }, notesText, context,
+        refinement, abortSignal,
+        onProgress: (event) => {
+          if (event.kind === 'phase' && event.phase === 'starting') return
+          onProgress?.(event)
+        },
+      })
+      return { ...retry, usage: combinedUsage(usage, retry.usage) }
+    }
     if (!salvaged) {
       console.warn(
         `notes-import structured output failed model=${config.model} ` +
