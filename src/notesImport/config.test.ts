@@ -20,12 +20,23 @@ describe('getNotesImportConfig — environment-only knobs', () => {
     expect(cfg.model).toBe('deepseek/deepseek-v4.1-flash')
     expect(cfg.providers).toEqual(['fireworks', 'digitalocean'])
     expect(cfg.maxChars).toBe(100_000)
-    expect(cfg.maxOutputTokens).toBe(16_000)
+    expect(cfg.maxOutputTokens).toBe(32_000)
+    expect(cfg.reasoningEffort).toBe('low')
     expect(cfg.emptyWindowSeconds).toBe(604_800)
     expect(cfg.emptyWindowLimit).toBe(5)
     expect(cfg.entitlementId).toBe('Supporter')
     expect(cfg.devBypassToken).toBeNull()
     expect(cfg.requireProduction).toBe(true)
+  })
+
+  it('uses the model catalog efforts and preserves legacy maximum overrides', () => {
+    for (const effort of ['low', 'high', 'max']) {
+      expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: effort } as Environment).reasoningEffort).toBe(effort)
+    }
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'xhigh' } as Environment).reasoningEffort).toBe('max')
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'off' } as Environment).reasoningEffort).toBeNull()
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'medium' } as Environment).reasoningEffort).toBe('low')
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_MODEL: 'other/model', NOTES_IMPORT_REASONING_EFFORT: 'xhigh' } as Environment).reasoningEffort).toBe('xhigh')
   })
 
   it('uses the explicit environment and rejects a production bypass', () => {

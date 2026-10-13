@@ -209,7 +209,12 @@ notes; refinements keep that notes prefix and append the previous result and
 correction. Strict JSON-schema output is validated locally before delivery,
 including recovery from a completed response with misrouted reasoning-channel
 JSON. Monthly totals become one dated time entry without an automatic warning.
-Model logs include only routing, finish reason, and token/cache counts.
+The default uses `low` reasoning with a 32,000-token combined reasoning/JSON
+budget. Higher efforts exhausted that budget in historical replay tests.
+Ambiguous dates are resolved once with a warning; conflicting house numbers
+prevent fuzzy-name merges, and unnamed people identified by address retain
+their visits. Model logs include only routing, finish reason, and token/cache
+counts.
 
 Core routes (all rate-limited):
 
