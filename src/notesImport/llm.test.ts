@@ -127,7 +127,32 @@ describe('OpenRouter Notes Import structured output', () => {
     mockStream('{"broken": true}', JSON.stringify(validResult))
     await expect(run()).rejects.toThrow()
     mockStream('', JSON.stringify(validResult), 'length')
+    await expect(run({ config: { ...config, reasoningEffort: null } })).rejects.toThrow()
+  })
+
+  it('retries blank reasoning-only exhaustion once with thinking off and sums usage', async () => {
+    const first = mockStream('', 'Thinking but no answer', 'length')
+    const second = mockStream(JSON.stringify(validResult))
+    const fetchMock = vi.fn().mockImplementationOnce(first).mockImplementationOnce(second)
+    vi.stubGlobal('fetch', fetchMock)
+    const out = await run()
+    expect(out.result).toEqual(validResult)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).reasoning).toEqual({ enabled: false })
+    expect(out.usage.inputTokens).toBe(200)
+    expect(out.usage.outputTokens).toBe(100)
+    expect(out.usage.outputTokenDetails.reasoningTokens).toBe(40)
+  })
+
+  it('never retries truncated nonblank output or a cancelled run', async () => {
+    let fetchMock = mockStream('{"contacts": [', 'draft', 'length')
     await expect(run()).rejects.toThrow()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const controller = new AbortController()
+    fetchMock = mockStream('', 'draft', 'length')
+    fetchMock.mockImplementationOnce(async () => { controller.abort(); return new Response('') })
+    await expect(run({ abortSignal: controller.signal })).rejects.toThrow()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('keeps missing presentation-string defaults for otherwise valid recovery', async () => {

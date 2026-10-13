@@ -210,7 +210,10 @@ correction. Strict JSON-schema output is validated locally before delivery,
 including recovery from a completed response with misrouted reasoning-channel
 JSON. Monthly totals become one dated time entry without an automatic warning.
 The default uses `low` reasoning with a 32,000-token combined reasoning/JSON
-budget. Higher efforts exhausted that budget in historical replay tests.
+budget. Higher efforts exhausted that budget in historical replay tests. A
+blank completion that spent its full budget on reasoning gets one retry with
+thinking explicitly disabled; partial/invalid JSON is never accepted, and
+both attempts count toward the run's token usage.
 Ambiguous dates are resolved once with a warning; conflicting house numbers
 prevent fuzzy-name merges, and unnamed people identified by address retain
 their visits. Model logs include only routing, finish reason, and token/cache

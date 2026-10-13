@@ -587,7 +587,10 @@ on raw `wrangler deploy`.
   conflicting house number prevents fuzzy-name deduplication, and people
   identified by address retain their visits even when their names are unknown.
   A buggy host parser can misroute JSON into reasoning; recovery requires a
-  completed blank response and valid nested records. Logs include model, host,
+  completed blank response and valid nested records. Reasoning-only exhaustion
+  gets one retry with thinking explicitly off; nonblank invalid/truncated JSON
+  never retries, cancellation prevents a retry, and usage includes both attempts.
+  Logs include model, host,
   finish reason, and token/cache counts, never content. Architecture + resolved
   decisions:
   [`docs/notes-import-streaming-durable-objects.md`](docs/notes-import-streaming-durable-objects.md).
