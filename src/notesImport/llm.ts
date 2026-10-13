@@ -2,18 +2,16 @@ import {
   streamText,
   Output,
   jsonSchema,
-  type JSONSchema7,
   type LanguageModelUsage,
 } from 'ai'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { NOTES_IMPORT_INSTRUCTIONS, buildNotesImportContext } from './prompt'
 import {
-  NOTES_IMPORT_SCHEMA,
-  notesImportResultValidator,
   type NotesImportContext,
   type NotesImportResult,
 } from './schema'
 import type { NotesImportConfig } from './config'
+import { NOTES_IMPORT_MODEL_SCHEMA, parseNotesImportModelResult } from './modelSchema'
 
 export interface RefinementInput {
   /** The model's previous full result, as the JSON string the client cached. */
@@ -143,10 +141,10 @@ export const runNotesImportModel = async ({
     model: openrouter(config.model, { structuredOutputs: { strict: true } }),
     output: Output.object({
       schema: jsonSchema<NotesImportResult>(
-        NOTES_IMPORT_SCHEMA as unknown as JSONSchema7,
+        NOTES_IMPORT_MODEL_SCHEMA,
         {
           validate: (value) => {
-            const parsed = notesImportResultValidator.safeParse(value)
+            const parsed = parseNotesImportModelResult(value)
             return parsed.success
               ? { success: true, value: parsed.data as NotesImportResult }
               : { success: false, error: new Error('Invalid Notes Import result') }
@@ -161,7 +159,8 @@ export const runNotesImportModel = async ({
     // reuse a prefix without provider-specific cache markers.
     system: `${NOTES_IMPORT_INSTRUCTIONS}\n\n${buildNotesImportContext(context)}`,
     prompt: buildUserPrompt(notesText, refinement),
-    temperature: 0,
+    // Azure GPT-6 Luna does not support temperature. Strict parameter routing
+    // would exclude every allowlisted endpoint if we sent it.
     maxOutputTokens: config.maxOutputTokens,
     maxRetries: 2,
     abortSignal,
@@ -325,7 +324,7 @@ const recoverNotesImportJson = (reasoning: string): NotesImportResult | null => 
     return null
   }
   const object = parsed as Record<string, unknown>
-  const validated = notesImportResultValidator.safeParse({
+  const validated = parseNotesImportModelResult({
     ...object,
     summary: object.summary ?? '',
     assistantMessage: object.assistantMessage ?? '',

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runNotesImportModel, type ModelProgress } from './llm'
 import { getNotesImportConfig } from './config'
 import { NOTES_IMPORT_INSTRUCTIONS, buildNotesImportContext } from './prompt'
-import { NOTES_IMPORT_SCHEMA } from './schema'
+import { NOTES_IMPORT_MODEL_SCHEMA } from './modelSchema'
 import type { Environment } from '../types'
 
 const context = {
@@ -63,9 +63,11 @@ describe('OpenRouter Notes Import structured output', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string)
     expect(body.model).toBe('openai/gpt-6-luna')
     expect(body.max_tokens).toBe(32_000)
+    // Azure rejects temperature when strict parameter routing is enabled.
+    expect(body).not.toHaveProperty('temperature')
     expect(body.response_format).toMatchObject({
       type: 'json_schema',
-      json_schema: { name: 'NotesImport', strict: true, schema: NOTES_IMPORT_SCHEMA },
+      json_schema: { name: 'NotesImport', strict: true, schema: NOTES_IMPORT_MODEL_SCHEMA },
     })
     expect(body.provider).toEqual({
       only: ['azure'], order: ['azure'],
@@ -84,6 +86,18 @@ describe('OpenRouter Notes Import structured output', () => {
     const fetchMock = mockStream(JSON.stringify(validResult))
     await run({ config: { ...config, reasoningEffort: null } })
     expect(JSON.parse(fetchMock.mock.calls[0][1]!.body as string).reasoning).toEqual({ enabled: false })
+  })
+
+  it('normalizes nullable Azure output on both normal and reasoning-recovery paths', async () => {
+    const nullable = { ...validResult,
+      contacts: [{ tempId: 'c1', name: 'Jordan', phone: null, address: null }],
+      visits: [{ ...validResult.visits[0], contactTempId: null, followUp: null }],
+    }
+    const expected = { ...validResult, contacts: [{ tempId: 'c1', name: 'Jordan' }] }
+    mockStream(JSON.stringify(nullable))
+    expect((await run()).result).toEqual(expected)
+    mockStream('', JSON.stringify(nullable))
+    expect((await run()).result).toEqual(expected)
   })
 
   it('keeps the initial prompt as the refinement prefix and returns the whole object', async () => {
