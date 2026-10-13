@@ -203,6 +203,14 @@ non-content authentication/runtime metadata in KV and aggregate usage plus
 permanent replay/refinement records in a per-user Durable Object—never imported
 text or model output in either meter store.
 
+Both production and development use `deepseek/deepseek-v4.1-flash` through
+OpenRouter. The fixed extraction instructions precede user context and tagged
+notes; refinements keep that notes prefix and append the previous result and
+correction. Strict JSON-schema output is validated locally before delivery,
+including recovery from a completed response with misrouted reasoning-channel
+JSON. Monthly totals become one dated time entry without an automatic warning.
+Model logs include only routing, finish reason, and token/cache counts.
+
 Core routes (all rate-limited):
 
 - **`POST /notes-import/challenge`** → `{ challenge }`. One-time App Attest nonce.

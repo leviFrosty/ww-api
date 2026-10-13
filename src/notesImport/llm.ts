@@ -6,9 +6,10 @@ import {
   type LanguageModelUsage,
 } from 'ai'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
-import { buildNotesImportSystemPrompt } from './prompt'
+import { NOTES_IMPORT_INSTRUCTIONS, buildNotesImportContext } from './prompt'
 import {
   NOTES_IMPORT_SCHEMA,
+  notesImportResultValidator,
   type NotesImportContext,
   type NotesImportResult,
 } from './schema'
@@ -51,19 +52,20 @@ export interface RunModelOutput {
   resolvedProvider?: string
 }
 
-const buildRefinementPrompt = (
+/** Keep the same notes prefix for an initial import and every refinement. */
+const buildUserPrompt = (
   notesText: string,
-  refinement: RefinementInput
-): string =>
-  `Here are the user's ORIGINAL notes:
+  refinement?: RefinementInput
+): string => {
+  const notes = `<ORIGINAL NOTES>\n${notesText}\n</ORIGINAL NOTES>`
+  if (!refinement) return notes
+  return `${notes}
 
-<ORIGINAL NOTES>
-${notesText}
-</ORIGINAL NOTES>
+You previously produced this structured result for the notes above:
 
-You previously produced this structured result:
-
+<PREVIOUS RESULT>
 ${refinement.previousResultJSON}
+</PREVIOUS RESULT>
 
 The user has a correction. Apply it and return a FRESH, COMPLETE structured
 result for the ORIGINAL notes above — not a diff, the whole object — with the
@@ -72,8 +74,8 @@ implies otherwise.
 
 <USER CORRECTION>
 ${refinement.instruction}
-</USER CORRECTION>
-`
+</USER CORRECTION>`
+}
 
 /** Emit a `progress` tick at most every N streamed output chars. */
 const PROGRESS_CHAR_STRIDE = 400
@@ -114,19 +116,27 @@ export const runNotesImportModel = async ({
   onProgress?.({ kind: 'phase', phase: 'starting' })
 
   const result = streamText({
-    model: openrouter(config.model),
+    model: openrouter(config.model, { structuredOutputs: { strict: true } }),
     output: Output.object({
       schema: jsonSchema<NotesImportResult>(
-        NOTES_IMPORT_SCHEMA as unknown as JSONSchema7
+        NOTES_IMPORT_SCHEMA as unknown as JSONSchema7,
+        {
+          validate: (value) => {
+            const parsed = notesImportResultValidator.safeParse(value)
+            return parsed.success
+              ? { success: true, value: parsed.data as NotesImportResult }
+              : { success: false, error: new Error('Invalid Notes Import result') }
+          },
+        }
       ),
       name: 'NotesImport',
       description:
         'Structured WitnessWork records parsed from free-form ministry notes.',
     }),
-    system: buildNotesImportSystemPrompt(context),
-    prompt: refinement
-      ? buildRefinementPrompt(notesText, refinement)
-      : notesText,
+    // Stable instructions first, then per-user context; OpenRouter hosts can
+    // reuse a prefix without provider-specific cache markers.
+    system: `${NOTES_IMPORT_INSTRUCTIONS}\n\n${buildNotesImportContext(context)}`,
+    prompt: buildUserPrompt(notesText, refinement),
     temperature: 0,
     maxOutputTokens: config.maxOutputTokens,
     maxRetries: 2,
@@ -147,6 +157,7 @@ export const runNotesImportModel = async ({
           data_collection: 'deny',
           zdr: true,
           allow_fallbacks: true,
+          require_parameters: true,
         },
         // "Thinking" stream — ON by default (config.reasoningEffort, `xhigh` =
         // the model's max). If a routed ZDR host's reasoning parser misroutes
@@ -200,6 +211,8 @@ export const runNotesImportModel = async ({
     providerMetadata?.openrouter as { provider?: string } | undefined
   )?.provider
 
+  const finishReason = await result.finishReason
+
   // The authoritative, schema-shaped object. `result.output` rejects on a
   // non-conforming (or blank) completion — which, with reasoning on, usually
   // means a buggy provider parser dumped the JSON into the reasoning channel.
@@ -209,15 +222,30 @@ export const runNotesImportModel = async ({
   try {
     object = await result.output
   } catch (err) {
-    const salvaged = recoverNotesImportJson(reasoningBuffer)
-    if (!salvaged) throw err
+    // Only a completed, blank response can be the known channel-routing bug.
+    // Never replace truncated or invalid nonblank output with a thinking draft.
+    const salvaged =
+      finishReason === 'stop' && !(await result.text).trim()
+        ? recoverNotesImportJson(reasoningBuffer)
+        : null
+    if (!salvaged) {
+      console.warn(
+        `notes-import structured output failed model=${config.model} ` +
+          `provider=${resolvedProvider ?? 'unknown'} finishReason=${finishReason} ` +
+          `outputTokens=${usage.outputTokens ?? 0}`
+      )
+      throw err
+    }
     object = salvaged
     recovered = true
   }
 
   console.log(
-    `notes-import model resolved provider=${resolvedProvider ?? 'unknown'} ` +
-      `reasoningTokens=${usage.reasoningTokens ?? 0} ` +
+    `notes-import model=${config.model} provider=${resolvedProvider ?? 'unknown'} ` +
+      `finishReason=${finishReason} inputTokens=${usage.inputTokens ?? 0} ` +
+      `cacheReadTokens=${usage.inputTokenDetails?.cacheReadTokens ?? 0} ` +
+      `cacheWriteTokens=${usage.inputTokenDetails?.cacheWriteTokens ?? 0} ` +
+      `reasoningTokens=${usage.outputTokenDetails?.reasoningTokens ?? 0} ` +
       `outputTokens=${usage.outputTokens ?? 0}` +
       (recovered ? ' recovered=reasoning-channel' : '')
   )
@@ -230,7 +258,7 @@ export const runNotesImportModel = async ({
  * final JSON into the reasoning channel (leaving the completion blank, so
  * `result.output` rejects). The reasoning buffer in that case holds the
  * complete, schema-shaped JSON. Strip any `<think>` wrapper, slice to the
- * outermost object, parse, and structurally sanity-check it. Returns null when
+ * outermost object, parse, and validate the entire schema. Returns null when
  * the buffer is not a usable result, so the caller surfaces the real error.
  */
 const recoverNotesImportJson = (reasoning: string): NotesImportResult | null => {
@@ -245,33 +273,16 @@ const recoverNotesImportJson = (reasoning: string): NotesImportResult | null => 
   } catch {
     return null
   }
-  if (!isNotesImportResultShape(parsed)) return null
-  // `summary` and `assistantMessage` are schema-required, but this salvage path
-  // bypasses `Output.object`'s strict validation; default them so the recovered
-  // object stays type-sound.
-  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
-  return {
-    ...parsed,
-    summary: str((parsed as { summary?: unknown }).summary),
-    assistantMessage: str((parsed as { assistantMessage?: unknown }).assistantMessage),
+  // Some misrouted completions omit the two presentation strings. Preserve the
+  // existing compatibility defaults, then validate the entire nested contract.
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return null
   }
-}
-
-/**
- * Light structural guard for a recovered result. The provider already enforced
- * the full schema via `response_format` strict mode; this only confirms we
- * salvaged a plausibly-complete object (all required top-level collections
- * present) before bypassing `Output.object`'s own validation.
- */
-const isNotesImportResultShape = (v: unknown): v is NotesImportResult => {
-  if (typeof v !== 'object' || v === null) return false
-  const o = v as Record<string, unknown>
-  return (
-    Array.isArray(o.contacts) &&
-    Array.isArray(o.visits) &&
-    Array.isArray(o.timeEntries) &&
-    Array.isArray(o.categories) &&
-    Array.isArray(o.warnings) &&
-    'publisher' in o
-  )
+  const object = parsed as Record<string, unknown>
+  const validated = notesImportResultValidator.safeParse({
+    ...object,
+    summary: object.summary ?? '',
+    assistantMessage: object.assistantMessage ?? '',
+  })
+  return validated.success ? validated.data as NotesImportResult : null
 }

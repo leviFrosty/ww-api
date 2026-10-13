@@ -17,7 +17,7 @@ const limitsKv = (value: string | null): LimitsKv => ({
 describe('getNotesImportConfig — environment-only knobs', () => {
   it('falls back to provider, model, concurrency, and Empty Import defaults', () => {
     const cfg = getNotesImportConfig(baseEnv)
-    expect(cfg.model).toBe('deepseek/deepseek-v4-flash')
+    expect(cfg.model).toBe('deepseek/deepseek-v4.1-flash')
     expect(cfg.providers).toEqual(['fireworks', 'digitalocean'])
     expect(cfg.maxChars).toBe(100_000)
     expect(cfg.maxOutputTokens).toBe(16_000)

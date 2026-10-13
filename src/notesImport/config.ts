@@ -58,27 +58,21 @@ export interface NotesImportConfig {
   /** TTL of a subscribe capability token in KV (seconds). */
   subscribeTokenTtlSeconds: number
   /**
-   * OpenRouter reasoning effort, or null to disable. DEFAULT `xhigh` — on
-   * `deepseek-v4-flash` OpenRouter accepts only `high` and `xhigh`, and `xhigh`
-   * IS the model's max ("Think Max", ~4.2× the reasoning tokens of `high`). NOTE:
-   * `max` is DeepSeek's *native*-API token, NOT valid on OpenRouter — sending it
-   * silently degrades to default effort, so we coerce `max → xhigh`. The notes
-   * task (date-math + dedup + role inference over messy text) is exactly where
-   * reasoning lifts accuracy.
+   * OpenRouter reasoning effort, or null to disable. DEFAULT `xhigh` ("Think
+   * Max"). `max` is a native DeepSeek value; this API normalizes it to `xhigh`.
+   * Reasoning helps with date math, deduplication, and role inference.
    *
-   * `deepseek-v4-flash` co-emits reasoning AND strict structured output (via
-   * `response_format: json_schema`, which is what `Output.object` maps to — NOT
-   * tool calling, which V4 rejects in thinking mode). The earlier "reasoning
-   * breaks structured output" symptom was a provider-side reasoning-parser bug
-   * (cf. vLLM deepseek-parser issue): a buggy ZDR host misroutes the final JSON
-   * into the reasoning channel and leaves the completion blank. `runNotesImportModel`
-   * recovers that JSON from the reasoning buffer, so reasoning stays on.
+   * The model co-emits reasoning and strict structured output through
+   * `response_format: json_schema` (`Output.object`, rather than tool calling).
+   * Some hosts misroute the final JSON into the reasoning channel and leave
+   * the completion blank. `runNotesImportModel` recovers a schema-valid object
+   * only when that blank response finished normally.
    */
   reasoningEffort: ReasoningEffort
 }
 
 const DEFAULTS = {
-  model: 'deepseek/deepseek-v4-flash',
+  model: 'deepseek/deepseek-v4.1-flash',
   // Western ZDR hosts, in routing-priority order (ADR 0008). Fireworks first —
   // the verified genuine-reasoning host; DigitalOcean is the large, reliable
   // fallback when Fireworks' shared pool is rate-limited (429). DeepInfra stays
@@ -140,9 +134,7 @@ const REASONING_EFFORTS = new Set([
 
 /**
  * Parse the reasoning-effort env override; empty / `off` / `none` disables.
- * `max` is coerced to `xhigh`: on OpenRouter's normalized API `max` is invalid
- * for `deepseek-v4-flash` (it silently degrades to default effort), and `xhigh`
- * is the model's true maximum ("Think Max").
+ * `max` is coerced to OpenRouter's normalized `xhigh` effort.
  */
 const reasoningOr = (
   raw: string | undefined,

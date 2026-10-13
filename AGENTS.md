@@ -575,11 +575,13 @@ on raw `wrangler deploy`.
   → result snapshot (`/result`); the legacy `POST /notes-import` remains as a
   fallback. First deploy applies the `v1` DO migration automatically (prod +
   `--env dev`). Reasoning is ON by default at `xhigh`
-  (`NOTES_IMPORT_REASONING_EFFORT`) — on OpenRouter `deepseek-v4-flash` accepts
-  only `high`/`xhigh`, and `xhigh` IS its max ("Think Max"); `max` is invalid
-  there and coerced to `xhigh`. The model co-emits reasoning and strict
-  structured output. A buggy ZDR-host parser can misroute the JSON into the
-  reasoning channel (blank completion); the run DO recovers it, so reasoning
-  stays on. `usage.reasoningTokens` is logged per run. Architecture + resolved
+  (`NOTES_IMPORT_REASONING_EFFORT`); native `max` is normalized to OpenRouter's
+  `xhigh` ("Think Max"). Both environments use `deepseek/deepseek-v4.1-flash`
+  with the existing Fireworks/DigitalOcean ZDR allowlist. Fixed instructions
+  precede user context and tagged notes; refinements preserve the notes prefix.
+  Strict structured output is validated locally against the same JSON schema.
+  A buggy host parser can misroute JSON into reasoning; recovery requires a
+  completed blank response and valid nested records. Logs include model, host,
+  finish reason, and token/cache counts, never content. Architecture + resolved
   decisions:
   [`docs/notes-import-streaming-durable-objects.md`](docs/notes-import-streaming-durable-objects.md).
