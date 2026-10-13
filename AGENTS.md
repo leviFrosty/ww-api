@@ -574,12 +574,18 @@ on raw `wrangler deploy`.
   /notes-import/kickoff`) → SSE progress stream (`GET /notes-import/:id/events`)
   → result snapshot (`/result`); the legacy `POST /notes-import` remains as a
   fallback. First deploy applies the `v1` DO migration automatically (prod +
-  `--env dev`). Reasoning is ON by default at `xhigh`
-  (`NOTES_IMPORT_REASONING_EFFORT`); native `max` is normalized to OpenRouter's
-  `xhigh` ("Think Max"). Both environments use `deepseek/deepseek-v4.1-flash`
+  `--env dev`). Reasoning is ON by default at `low`
+  (`NOTES_IMPORT_REASONING_EFFORT`). V4.1 Flash supports `low`, `high`, and
+  `max`; legacy `xhigh` overrides normalize to `max` for this model. Both
+  environments use `deepseek/deepseek-v4.1-flash`
   with the existing Fireworks/DigitalOcean ZDR allowlist. Fixed instructions
   precede user context and tagged notes; refinements preserve the notes prefix.
   Strict structured output is validated locally against the same JSON schema.
+  The 32,000-token default includes reasoning and JSON; historical multi-contact
+  imports exhausted 16,000 before producing the object. Date rules prioritize
+  month/day over a conflicting weekday and resolve each ambiguity once. A
+  conflicting house number prevents fuzzy-name deduplication, and people
+  identified by address retain their visits even when their names are unknown.
   A buggy host parser can misroute JSON into reasoning; recovery requires a
   completed blank response and valid nested records. Logs include model, host,
   finish reason, and token/cache counts, never content. Architecture + resolved

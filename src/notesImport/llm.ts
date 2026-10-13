@@ -94,8 +94,8 @@ const PROGRESS_CHAR_STRIDE = 400
  * surface progress via `onProgress`; the structured result is never built from
  * those deltas.
  *
- * Reasoning is ON by default (`config.reasoningEffort`, `xhigh` = the model's
- * "Think Max"). The model co-emits reasoning and strict JSON, but some ZDR hosts
+ * Reasoning is ON by default at `low` (`config.reasoningEffort`). The model
+ * co-emits reasoning and strict JSON, but some ZDR hosts
  * ship a buggy reasoning parser that misroutes the final JSON into the reasoning
  * channel and returns a blank completion (cf. the vLLM deepseek reasoning-parser
  * bug). When that happens `result.output` rejects, so we recover the
@@ -159,13 +159,13 @@ export const runNotesImportModel = async ({
           allow_fallbacks: true,
           require_parameters: true,
         },
-        // "Thinking" stream — ON by default (config.reasoningEffort, `xhigh` =
-        // the model's max). If a routed ZDR host's reasoning parser misroutes
+        // Thinking stays on at the configured effort. An explicit off override
+        // must disable the model's default thinking. If a host misroutes
         // the JSON into the reasoning channel (blank completion), the recovery
         // path below salvages it. See the function-level doc.
-        ...(config.reasoningEffort
-          ? { reasoning: { enabled: true, effort: config.reasoningEffort } }
-          : {}),
+        reasoning: config.reasoningEffort
+          ? { enabled: true, effort: config.reasoningEffort }
+          : { enabled: false },
       },
     },
   })
@@ -221,7 +221,7 @@ export const runNotesImportModel = async ({
   let recovered = false
   try {
     object = await result.output
-  } catch (err) {
+  } catch {
     // Only a completed, blank response can be the known channel-routing bug.
     // Never replace truncated or invalid nonblank output with a thinking draft.
     const salvaged =
@@ -234,7 +234,10 @@ export const runNotesImportModel = async ({
           `provider=${resolvedProvider ?? 'unknown'} finishReason=${finishReason} ` +
           `outputTokens=${usage.outputTokens ?? 0}`
       )
-      throw err
+      // SDK parse/validation errors carry the raw model output in their
+      // message/cause. Routes report errors to logs and Sentry, so replace that
+      // exception rather than forwarding any imported content to telemetry.
+      throw new Error('Invalid Notes Import structured output')
     }
     object = salvaged
     recovered = true

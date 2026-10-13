@@ -5,14 +5,20 @@ import { DEV_BYPASS_TOKEN, configured, http, writeTranscript } from '../test/e2e
 /**
  * Notes Import without inference: the dev-bypass verify probe, the App Attest
  * challenge, and kickoff's auth gate. A real kickoff calls OpenRouter (paid),
- * so it only runs with WW_API_E2E_ALLOW_PAID=1 and OPENROUTER_API_KEY set.
+ * so it only runs with WW_API_E2E_ALLOW_PAID=1 plus a dev bypass. Local
+ * workers also need OPENROUTER_API_KEY; deployed workers use their own secret.
  */
 
 afterAll(() => {
   writeTranscript('notes-import')
 })
 
-const bypass = (token = DEV_BYPASS_TOKEN ?? '') => ({ 'x-ww-dev-bypass': token })
+const bypass = (token = DEV_BYPASS_TOKEN ?? '') => ({
+  'x-ww-dev-bypass': token,
+  ...(process.env.WW_API_VERSION_OVERRIDES
+    ? { 'Cloudflare-Workers-Version-Overrides': process.env.WW_API_VERSION_OVERRIDES }
+    : {}),
+})
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex')
 
 describe.skipIf(!DEV_BYPASS_TOKEN)('POST /notes-import/verify with the dev bypass', () => {
@@ -111,32 +117,96 @@ describe('App Attest handshake (no inference)', () => {
 
 const allowPaid =
   process.env.WW_API_E2E_ALLOW_PAID === '1' &&
-  configured('OPENROUTER_API_KEY') &&
+  (Boolean(process.env.WW_API_URL) || configured('OPENROUTER_API_KEY')) &&
   Boolean(DEV_BYPASS_TOKEN)
 
 describe.skipIf(!allowPaid)('PAID: kickoff → result (WW_API_E2E_ALLOW_PAID=1)', () => {
-  it('runs one tiny import to completion', { timeout: 180_000 }, async () => {
+  const context = {
+    now: '2026-10-12T09:00:00-04:00',
+    timeZone: 'America/New_York',
+    existingContacts: [
+      { id: 'existing-jane', name: 'Jane Doe', address: '12 Main St' },
+      { id: 'existing-kami', name: 'Kami', address: '211 E Jefferson St' },
+    ],
+    existingCategories: [
+      { id: 'standard', name: 'Standard', isCredit: false },
+      { id: 'ldc', name: 'LDC', isCredit: true },
+    ],
+  }
+  const notesText = `June 2026: 12 hours in field service.
+October 1, 2026: 90 minutes RBC construction.
+Yesterday visited Jane Doe, 12 Main St. Not at home. Return Friday October 16, 2026 at 6pm to discuss lesson 1.
+I started as a regular pioneer on March 1, 2024.
+October 2, 2026: visited Cammy at 2 E Jefferson St.
+October 3, 2026: visited an older woman at 9 Oak St and left a contact card.`
+
+  const importResult = async (body: unknown) => {
     const kickoff = await http('POST', '/notes-import/kickoff', {
-      headers: bypass(),
-      body: {
-        uuid: randomUUID(),
-        notesText: 'Oct 1: 2 hours in service. Return visit with Jane Doe, 12 Main St.',
-        context: {
-          now: new Date().toISOString(),
-          timeZone: 'UTC',
-          existingContacts: [],
-          existingCategories: [],
-        },
-      },
+      headers: bypass(), body,
     })
     expect(kickoff.status).toBe(200)
     const { importId, subscribeToken } = kickoff.body
-    let result = { status: 'running' } as { status: string }
+    let result = { status: 'running' } as {
+      status: string
+      payload?: { result: import('../notesImport/schema').NotesImportResult }
+    }
     const deadline = Date.now() + 170_000
     while (Date.now() < deadline && !['done', 'error', 'cancelled'].includes(result.status)) {
-      await new Promise((r) => setTimeout(r, 3_000))
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
       result = (await http('GET', `/notes-import/${importId}/result?token=${subscribeToken}`)).body
     }
     expect(result.status).toBe('done')
-  })
+    expect(result.payload).toBeDefined()
+    return result.payload!.result
+  }
+
+  it('extracts dates, durations, deduplication, and roles, then preserves them through a correction',
+    { timeout: 360_000 }, async () => {
+      const uuid = randomUUID()
+      const initial = await importResult({ uuid, notesText, context })
+      expect(initial.contacts).toHaveLength(2)
+      const cammy = initial.contacts.find(contact => contact.name === 'Cammy')!
+      const unnamed = initial.contacts.find(contact => contact.name.toLowerCase().includes('older woman'))!
+      expect(cammy.address?.line1).toContain('2 E Jefferson')
+      expect(unnamed.address?.line1).toContain('9 Oak')
+      expect(initial.visits.some(visit => visit.contactId === 'existing-kami')).toBe(false)
+      expect(initial.categories).toEqual([])
+      expect(initial.visits).toHaveLength(3)
+      const jane = initial.visits.find(visit => visit.contactId === 'existing-jane')!
+      expect(jane).toMatchObject({
+        contactId: 'existing-jane', date: '2026-10-11',
+        notAtHome: true, isBibleStudy: false,
+      })
+      expect(jane.followUp?.date).toContain('2026-10-16T18:00')
+      expect(initial.timeEntries).toHaveLength(2)
+      expect(initial.timeEntries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ date: '2026-06-01', hours: 12, minutes: 0, categoryId: 'standard' }),
+        expect.objectContaining({ date: '2026-10-01', hours: 1, minutes: 30, categoryId: 'ldc', credit: true }),
+      ]))
+      expect(initial.publisher).toEqual({ role: 'regularPioneer', tenureStartDate: '2024-03-01' })
+      expect(initial.warnings.some(warning => /monthly|representative/i.test(warning.message))).toBe(false)
+
+      const corrected = await importResult({
+        uuid, notesText, context,
+        refinement: {
+          previousResultJSON: JSON.stringify(initial),
+          instruction: 'The RBC construction was 75 minutes. The visit to Jane was October 10, 2026, not yesterday. Keep everything else the same.',
+        },
+      })
+      expect(corrected.contacts).toEqual(initial.contacts)
+      expect(corrected.categories).toEqual(initial.categories)
+      expect(corrected.publisher).toEqual(initial.publisher)
+      expect(corrected.timeEntries).toHaveLength(2)
+      expect(corrected.timeEntries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ date: '2026-06-01', hours: 12, minutes: 0, categoryId: 'standard' }),
+        expect.objectContaining({ date: '2026-10-01', hours: 1, minutes: 15, categoryId: 'ldc', credit: true }),
+      ]))
+      expect(corrected.visits).toHaveLength(3)
+      const correctedJane = corrected.visits.find(visit => visit.contactId === 'existing-jane')!
+      expect(correctedJane).toMatchObject({ contactId: 'existing-jane', date: '2026-10-10', notAtHome: true, isBibleStudy: false })
+      expect(correctedJane.followUp).toEqual(jane.followUp)
+      for (const contact of initial.contacts) {
+        expect(corrected.visits.find(visit => visit.contactTempId === contact.tempId)).toEqual(initial.visits.find(visit => visit.contactTempId === contact.tempId))
+      }
+    })
 })

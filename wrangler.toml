@@ -51,6 +51,8 @@ crons = ["17 * * * *"]
 [env.dev.vars]
 # Named environments do not inherit the production model override.
 NOTES_IMPORT_MODEL = "deepseek/deepseek-v4.1-flash"
+NOTES_IMPORT_REASONING_EFFORT = "low"
+NOTES_IMPORT_MAX_OUTPUT_TOKENS = "32000"
 # Explicitly permits development App Attest receipts and the simulator bypass.
 APP_ATTEST_ENVIRONMENT = "development"
 # Dev iOS bundle id (witness-work app.config.ts IS_DEV branch).
@@ -257,9 +259,10 @@ IOS_ADDITIONAL_BUNDLE_IDS = "com.leviwilkerson.jwtimebeta"
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
 # Notes Import knobs — all optional; see src/notesImport/config.ts for defaults.
 NOTES_IMPORT_MODEL = "deepseek/deepseek-v4.1-flash"
+NOTES_IMPORT_REASONING_EFFORT = "low"
+NOTES_IMPORT_MAX_OUTPUT_TOKENS = "32000"
 # NOTES_IMPORT_PROVIDERS = "fireworks,digitalocean"   # Western ZDR, priority order (ADR 0008)
 # NOTES_IMPORT_MAX_CHARS = "100000"
-# NOTES_IMPORT_MAX_OUTPUT_TOKENS = "16000"
 # Runtime-limit env fallbacks. Keep all five explicit here and under
 # [env.dev.vars]; one malformed/missing KV field falls through independently.
 NOTES_IMPORT_FREE_CREDITS = "3"

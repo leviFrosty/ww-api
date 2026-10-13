@@ -62,6 +62,7 @@ describe('OpenRouter Notes Import structured output', () => {
     expect(out.resolvedProvider).toBe('Fireworks')
     const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string)
     expect(body.model).toBe('deepseek/deepseek-v4.1-flash')
+    expect(body.max_tokens).toBe(32_000)
     expect(body.response_format).toMatchObject({
       type: 'json_schema',
       json_schema: { name: 'NotesImport', strict: true, schema: NOTES_IMPORT_SCHEMA },
@@ -70,13 +71,19 @@ describe('OpenRouter Notes Import structured output', () => {
       only: ['fireworks', 'digitalocean'], order: ['fireworks', 'digitalocean'],
       zdr: true, data_collection: 'deny', allow_fallbacks: true, require_parameters: true,
     })
-    expect(body.reasoning).toEqual({ enabled: true, effort: 'xhigh' })
+    expect(body.reasoning).toEqual({ enabled: true, effort: 'low' })
     expect(body.messages[0].content).toEqual([{ type: 'text', text:
       `${NOTES_IMPORT_INSTRUCTIONS}\n\n${buildNotesImportContext(context)}`,
     }])
     expect(body.messages[1].content).toBe('<ORIGINAL NOTES>\nOctober 1: 90 min. Visited Jane Doe.\n</ORIGINAL NOTES>')
     expect(progress).toContainEqual({ kind: 'phase', phase: 'thinking' })
     expect(progress).toContainEqual({ kind: 'phase', phase: 'structuring' })
+  })
+
+  it('explicitly disables model-default thinking for an off override', async () => {
+    const fetchMock = mockStream(JSON.stringify(validResult))
+    await run({ config: { ...config, reasoningEffort: null } })
+    expect(JSON.parse(fetchMock.mock.calls[0][1]!.body as string).reasoning).toEqual({ enabled: false })
   })
 
   it('keeps the initial prompt as the refinement prefix and returns the whole object', async () => {
@@ -105,6 +112,15 @@ describe('OpenRouter Notes Import structured output', () => {
     await expect(run()).rejects.toThrow()
     mockStream('', JSON.stringify(invalid))
     await expect(run()).rejects.toThrow()
+  })
+
+  it('keeps model content out of errors reported by the routes', async () => {
+    mockStream(JSON.stringify({ ...validResult, privateField: 'private-notes-marker' }))
+    const error = await run().catch(error => error as Error)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('Invalid Notes Import structured output')
+    expect((error as Error).cause).toBeUndefined()
+    expect((error as Error).stack).not.toContain('private-notes-marker')
   })
 
   it('does not use a reasoning draft when a completion is nonblank or truncated', async () => {

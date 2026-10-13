@@ -58,8 +58,9 @@ export interface NotesImportConfig {
   /** TTL of a subscribe capability token in KV (seconds). */
   subscribeTokenTtlSeconds: number
   /**
-   * OpenRouter reasoning effort, or null to disable. DEFAULT `xhigh` ("Think
-   * Max"). `max` is a native DeepSeek value; this API normalizes it to `xhigh`.
+   * OpenRouter reasoning effort, or null to disable. V4.1 Flash supports
+   * `low`, `high`, and `max`. Legacy `xhigh` overrides normalize to `max`
+   * for that model; other models retain the gateway's broader effort range.
    * Reasoning helps with date math, deduplication, and role inference.
    *
    * The model co-emits reasoning and strict structured output through
@@ -79,7 +80,9 @@ const DEFAULTS = {
   // excluded (mislabels reasoning). `zdr: true` gates each endpoint's retention.
   providers: ['fireworks', 'digitalocean'],
   maxChars: 100_000,
-  maxOutputTokens: 16_000,
+  // Includes reasoning and the final JSON. Historical multi-contact imports
+  // exhausted 16k before emitting a complete object at xhigh.
+  maxOutputTokens: 32_000,
   emptyWindowSeconds: 7 * 24 * 60 * 60,
   emptyWindowLimit: 5,
   entitlementId: 'Supporter',
@@ -87,9 +90,9 @@ const DEFAULTS = {
   activeImportCapSupporter: 5,
   resultRetentionSeconds: 3_600,
   subscribeTokenTtlSeconds: 3_600,
-  // `xhigh` = the model's max ("Think Max") on OpenRouter. See the
-  // NotesImportConfig.reasoningEffort doc above (and why `max` is NOT used).
-  reasoningEffort: 'xhigh' as ReasoningEffort,
+  // Higher effort repeatedly exhausted the output budget on historical notes.
+  // Low still reasons, and leaves room for the complete structured result.
+  reasoningEffort: 'low' as ReasoningEffort,
 } as const
 
 export interface NotesImportLimits {
@@ -130,21 +133,27 @@ const REASONING_EFFORTS = new Set([
   'medium',
   'high',
   'xhigh',
+  'max',
 ])
 
 /**
  * Parse the reasoning-effort env override; empty / `off` / `none` disables.
- * `max` is coerced to OpenRouter's normalized `xhigh` effort.
+ * V4.1 Flash's catalog exposes low/high/max, not the older model's xhigh.
+ * Preserve legacy xhigh overrides as max, and reject other unsupported levels.
  */
 const reasoningOr = (
   raw: string | undefined,
-  fallback: ReasoningEffort
+  fallback: ReasoningEffort,
+  model: string
 ): ReasoningEffort => {
   if (raw == null) return fallback
   const v = raw.trim().toLowerCase()
   if (v === '' || v === 'off' || v === 'none') return null
-  if (v === 'max') return 'xhigh'
-  return REASONING_EFFORTS.has(v) ? (v as ReasoningEffort) : fallback
+  if (model.startsWith('deepseek/deepseek-v4.1-flash')) {
+    if (v === 'xhigh') return 'max'
+    return ['low', 'high', 'max'].includes(v) ? v as ReasoningEffort : fallback
+  }
+  return REASONING_EFFORTS.has(v) ? v as ReasoningEffort : fallback
 }
 
 const intOr = (raw: string | undefined, fallback: number): number => {
@@ -445,6 +454,7 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   ),
   reasoningEffort: reasoningOr(
     env.NOTES_IMPORT_REASONING_EFFORT,
-    DEFAULTS.reasoningEffort
+    DEFAULTS.reasoningEffort,
+    env.NOTES_IMPORT_MODEL?.trim() || DEFAULTS.model
   ),
 })

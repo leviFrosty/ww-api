@@ -10,7 +10,7 @@ Notes Import turns a publisher's free-form notes into contacts, visits, and time
 - `verify-wrong-bypass` treats a wrong token as unattested and returns 400 `Missing uuid, …`.
 - `challenge` issues an App Attest challenge.
 - `kickoff-gate` returns 401 `attestation_required` for kickoff without credentials (503 when no provider is healthy). No inference runs.
-- `kickoff-paid` runs kickoff with the bypass, then polls `/notes-import/:id/result` until it reaches `done`. This spends money and is opt-in.
+- `kickoff-paid` checks dates, duration conversion, existing contact/category reuse, and publisher role, then applies a correction and checks the complete result. It makes two real model calls, spends money, and is opt-in.
 
 ## How to get to it (user POV)
 
@@ -30,7 +30,7 @@ Preconditions:
 - **Wrong token.** Repeat the v1 probe with `-H "x-ww-dev-bypass: nope"`. You get 400 with `Missing uuid, keyId, challenge, assertion, or contentHash`.
 - **Challenge.** Run `curl -s -X POST $URL/notes-import/challenge -H "cf-connecting-ip: 198.18.2.3" -d '{}'`. The body includes a `challenge` string.
 - **Kickoff gate.** Run `curl -s -X POST $URL/notes-import/kickoff -H "cf-connecting-ip: 198.18.2.4" -d '{"uuid":"u1","notesText":"x","context":{"now":"2026-10-01T00:00:00Z","timeZone":"UTC","existingContacts":[],"existingCategories":[]}}'`. You get 401 `attestation_required`, and `.verify/wrangler.log` shows no OpenRouter call.
-- **Paid kickoff (opt-in only).** Run `WW_API_E2E_ALLOW_PAID=1 pnpm test:e2e src/e2e/notesImport.e2e.test.ts` after `up --secrets-from <file with OPENROUTER_API_KEY>`. The `PAID:` test passes with result `status:"done"`.
+- **Paid kickoff (opt-in only).** Run `WW_API_E2E_ALLOW_PAID=1 pnpm test:e2e src/e2e/notesImport.e2e.test.ts` after `up --secrets-from <file with OPENROUTER_API_KEY>`. The `PAID:` test checks both complete results and their records. For a deployed dev worker, set `WW_API_URL` and `WW_API_DEV_BYPASS_TOKEN`; its existing provider secret is used and no local OpenRouter key is required. `WW_API_VERSION_OVERRIDES` optionally supplies Cloudflare's dictionary header for a 0%-traffic dev version, e.g. `ww-proxy-dev="<version-id>"`.
 - **Proof.** Run `pnpm test:e2e src/e2e/notesImport.e2e.test.ts`. The free tests pass, the `PAID:` test shows as skipped unless opted in, and the transcript is in `.verify/artifacts/e2e-notes-import-*.json`.
 
 ## Gotchas
