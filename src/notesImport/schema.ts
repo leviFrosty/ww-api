@@ -1,3 +1,5 @@
+import { z } from 'zod'
+
 /**
  * Notes Import — wire contract (schema + DTO types).
  *
@@ -296,7 +298,7 @@ export const NOTES_IMPORT_SCHEMA = {
     timeEntries: {
       type: 'array',
       description:
-        'Logged ministry TIME, broken into hours + minutes per session/day. A monthly total stated as one number is a single entry on a representative date in that month (flag it in warnings).',
+        'Logged ministry TIME, broken into hours + minutes per session/day. A monthly total stated as one number is a single entry on a representative date in that month.',
       items: {
         type: 'object',
         additionalProperties: false,
@@ -433,3 +435,8 @@ export const NOTES_IMPORT_SCHEMA = {
     },
   },
 } as const
+
+/** Validate the same contract locally, including the reasoning recovery path. */
+export const notesImportResultValidator = z.fromJSONSchema(
+  NOTES_IMPORT_SCHEMA as unknown as Parameters<typeof z.fromJSONSchema>[0]
+)

@@ -10,7 +10,7 @@ import type { Environment } from '../types'
 import { makeMemoryKv } from '../test/memoryKv'
 
 const CONFIG: NotesImportConfig = {
-  model: 'deepseek/deepseek-v4-flash',
+  model: 'deepseek/deepseek-v4.1-flash',
   providers: ['fireworks', 'digitalocean'],
   maxChars: 100_000,
   maxOutputTokens: 16_000,
