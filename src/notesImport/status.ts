@@ -1,6 +1,7 @@
 import {
   resolveNotesImportLimits,
   resolveNotesImportMinAppVersion,
+  resolveTranscribeMaxBytes,
   type NotesImportConfig,
   type NotesImportLimits,
 } from './config'
@@ -69,7 +70,16 @@ export interface NotesImportCapabilities {
     protocolVersions: readonly [typeof PLAY_INTEGRITY_PROTOCOL_VERSION]
     cloudProjectNumber: string
   }
+  /**
+   * Import from Paper: `POST /notes-import/transcribe` reads one page image.
+   * The app picks at most `maxPages` per batch and resizes each page to fit
+   * `maxBytes`. Absent on workers without the endpoint.
+   */
+  transcribe: { maxPages: number; maxBytes: number }
 }
+
+/** Pages the app may send in one Import from Paper batch. */
+export const TRANSCRIBE_MAX_PAGES = 10
 
 export type NotesImportStatusResponse = NotesImportStatusState & {
   capabilities: NotesImportCapabilities
@@ -85,6 +95,10 @@ const notesImportCapabilities = (env: Environment): NotesImportCapabilities => {
   const playIntegrity = playIntegrityConfig(env)
   return {
     appAttest: { protocolVersions: [1, APP_ATTEST_PROTOCOL_VERSION] },
+    transcribe: {
+      maxPages: TRANSCRIBE_MAX_PAGES,
+      maxBytes: resolveTranscribeMaxBytes(env),
+    },
     ...(playIntegrity
       ? {
           playIntegrity: {

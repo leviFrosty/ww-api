@@ -13,9 +13,11 @@ export type AppAttestOperation = 'bind' | 'enroll' | 'assert'
 export type AppAttestAssertionPurpose =
   | 'notes-import-kickoff'
   | 'notes-import-verify'
+  | 'notes-import-transcribe'
 
 export const NOTES_IMPORT_KICKOFF_PURPOSE = 'notes-import-kickoff'
 export const NOTES_IMPORT_VERIFY_PURPOSE = 'notes-import-verify'
+export const NOTES_IMPORT_TRANSCRIBE_PURPOSE = 'notes-import-transcribe'
 
 export interface V2ChallengeRequest {
   protocolVersion: 2
@@ -177,6 +179,19 @@ export const computeNotesImportRequestHash = (
   input: NotesImportRequestHashInput
 ): Promise<string> => sha256Hex(buildNotesImportRequestCanonicalJson(input))
 
+/**
+ * Lowercase hexadecimal SHA-256 of a page transcription request. The content
+ * hash already covers the image bytes (as sent, base64), so the request hash
+ * binds only the rest of the payload.
+ */
+export const computeNotesImportTranscribeRequestHash = (input: {
+  imageHash: string
+  mimeType: string
+}): Promise<string> =>
+  sha256Hex(
+    stableCanonicalJson({ imageHash: input.imageHash, mimeType: input.mimeType })
+  )
+
 /** Byte-for-byte App Attest client data for an initial or recovery bind. */
 export const buildV2BindClientData = (args: {
   operationId: string
@@ -328,4 +343,5 @@ export const isAppAttestAssertionPurpose = (
   value: string
 ): value is AppAttestAssertionPurpose =>
   value === NOTES_IMPORT_KICKOFF_PURPOSE ||
-  value === NOTES_IMPORT_VERIFY_PURPOSE
+  value === NOTES_IMPORT_VERIFY_PURPOSE ||
+  value === NOTES_IMPORT_TRANSCRIBE_PURPOSE

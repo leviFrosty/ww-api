@@ -432,6 +432,7 @@ describe('Play Integrity on the Notes Import routes', () => {
     } as Environment)
     expect(partial.capabilities).toEqual({
       appAttest: { protocolVersions: [1, 2] },
+      transcribe: { maxPages: 10, maxBytes: 4 * 1024 * 1024 },
     })
   })
 })
