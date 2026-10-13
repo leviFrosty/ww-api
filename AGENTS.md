@@ -577,7 +577,7 @@ on raw `wrangler deploy`.
   `--env dev`). Reasoning is ON by default at `low`
   (`NOTES_IMPORT_REASONING_EFFORT`). V4.1 Flash supports `low`, `high`, and
   `max`; legacy `xhigh` overrides normalize to `max` for this model. Both
-  environments use `deepseek/deepseek-v4.1-flash`
+  environments use `openai/gpt-6-luna`
   with the existing Fireworks/DigitalOcean ZDR allowlist. Fixed instructions
   precede user context and tagged notes; refinements preserve the notes prefix.
   Strict structured output is validated locally against the same JSON schema.

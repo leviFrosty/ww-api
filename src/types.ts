@@ -135,14 +135,14 @@ export interface Environment {
   /** @deprecated Ignored; Supporter status follows witness-work ADR 0014. */
   REVENUECAT_ENTITLEMENT_ID?: string;
 
-  /** Override the model slug. Default `deepseek/deepseek-v4-flash`. */
+  /** Override the model slug. Default `openai/gpt-6-luna`. */
   NOTES_IMPORT_MODEL?: string;
 
   /**
    * Comma-separated OpenRouter provider allowlist, in routing-priority order
    * (drives both `only` and `order`). Pins inference to vetted **Western** ZDR
    * hosts (ADR 0008) — keep it Western-only; `zdr: true` enforces retention
-   * separately. Default `fireworks,digitalocean` (Fireworks preferred for
+   * separately. Default `azure` (the only OpenRouter host for GPT-6 Luna). Previously `fireworks,digitalocean` (Fireworks preferred for
    * genuine reasoning, DigitalOcean the large 429 fallback; DeepInfra excluded —
    * mislabels reasoning).
    */

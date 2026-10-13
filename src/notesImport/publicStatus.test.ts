@@ -84,7 +84,7 @@ describe('public status freshness', () => {
       .mockResolvedValueOnce(new Response('failed', { status: 503 }))
       .mockResolvedValueOnce(
         Response.json({
-          data: { endpoints: [{ provider_name: 'Fireworks', status: 0 }] },
+          data: { endpoints: [{ provider_name: 'Azure', status: 0 }] },
         }),
       )
     vi.stubGlobal('fetch', fetchFn)

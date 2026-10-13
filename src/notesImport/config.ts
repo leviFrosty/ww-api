@@ -73,12 +73,10 @@ export interface NotesImportConfig {
 }
 
 const DEFAULTS = {
-  model: 'deepseek/deepseek-v4.1-flash',
-  // Western ZDR hosts, in routing-priority order (ADR 0008). Fireworks first —
-  // the verified genuine-reasoning host; DigitalOcean is the large, reliable
-  // fallback when Fireworks' shared pool is rate-limited (429). DeepInfra stays
-  // excluded (mislabels reasoning). `zdr: true` gates each endpoint's retention.
-  providers: ['fireworks', 'digitalocean'],
+  model: 'openai/gpt-6-luna',
+  // Western ZDR hosts, in routing-priority order (ADR 0008). Azure is the only
+  // OpenRouter host serving GPT-6 Luna. `zdr: true` gates each endpoint's retention.
+  providers: ['azure'],
   maxChars: 100_000,
   // Includes reasoning and the final JSON. Historical multi-contact imports
   // exhausted 16k before emitting a complete object at xhigh.
