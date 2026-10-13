@@ -73,6 +73,10 @@ export interface KickoffCreditsArgs {
   windowDurationMs: number
 }
 
+export type TakeTranscribePageResult =
+  | { ok: true; remaining: number }
+  | { ok: false; retryAfterMs: number }
+
 export interface ResetUsageResult {
   previousCount: number
   hadActiveWindow: boolean
@@ -108,6 +112,9 @@ export class NotesImportIndex extends DurableObject<Environment> {
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS empty_run (ts INTEGER NOT NULL)`
     )
+    ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS transcribed_page (ts INTEGER NOT NULL)`
+    )
   }
 
   // --- Active concurrency (unchanged) -----------------------------------
@@ -137,6 +144,35 @@ export class NotesImportIndex extends DurableObject<Environment> {
         'SELECT importId, status, startedAt FROM active ORDER BY startedAt DESC'
       )
       .toArray()
+  }
+
+  // --- Page transcription (Import from Paper) ---------------------------
+
+  /**
+   * Counts one page toward the rolling per-identity transcription limit, or
+   * refuses it with the wait until the oldest counted page ages out. Pages are
+   * counted before the model runs, so a failed page still counts: it cost a
+   * real model call.
+   */
+  takeTranscribePage(limit: number, windowMs: number): TakeTranscribePageResult {
+    const now = Date.now()
+    this.ctx.storage.sql.exec(
+      'DELETE FROM transcribed_page WHERE ts <= ?',
+      now - windowMs
+    )
+    const { n, oldest } = this.ctx.storage.sql
+      .exec<{ n: number; oldest: number | null }>(
+        'SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM transcribed_page'
+      )
+      .one()
+    if (n >= limit) {
+      return {
+        ok: false,
+        retryAfterMs: Math.max(0, (oldest ?? now) + windowMs - now),
+      }
+    }
+    this.ctx.storage.sql.exec('INSERT INTO transcribed_page (ts) VALUES (?)', now)
+    return { ok: true, remaining: limit - n - 1 }
   }
 
   // --- Allowances --------------------------------------------------------
@@ -270,6 +306,7 @@ export class NotesImportIndex extends DurableObject<Environment> {
     const deletedEmptyRuns = this.#allEmptyRunCount()
     this.ctx.storage.sql.exec('DELETE FROM credit_meta')
     this.ctx.storage.sql.exec('DELETE FROM empty_run')
+    this.ctx.storage.sql.exec('DELETE FROM transcribed_page')
     return {
       previousCount: window.count,
       hadActiveWindow: window.startedAt != null,

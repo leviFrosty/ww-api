@@ -33,7 +33,10 @@ const DEFAULT_PUBLIC_LIMITS = {
   windowDays: 30,
 }
 const APP_ATTEST_CAPABILITIES = {
-  capabilities: { appAttest: { protocolVersions: [1, 2] } },
+  capabilities: {
+    appAttest: { protocolVersions: [1, 2] },
+    transcribe: { maxPages: 10, maxBytes: 4 * 1024 * 1024 },
+  },
 }
 
 const endpointsBody = (
@@ -118,6 +121,7 @@ describe('getNotesImportStatus — discriminated schedule', () => {
     for (const result of results) {
       expect(result.capabilities).toEqual({
         appAttest: { protocolVersions: [1, 2] },
+        transcribe: { maxPages: 10, maxBytes: 4 * 1024 * 1024 },
       })
     }
     expect(unavailableFetch).not.toHaveBeenCalled()

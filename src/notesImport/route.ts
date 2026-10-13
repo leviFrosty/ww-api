@@ -14,6 +14,12 @@ import {
 import { isSupporter, RevenueCatError } from '../revenuecat'
 import type { CreditDecision, CreditsSnapshot } from '../credits'
 import { runNotesImportModel } from './llm'
+import {
+  base64DecodedBytes,
+  isTranscribeMimeType,
+  matchesImageMagic,
+  transcribeNotesPage,
+} from './transcribe'
 import { getNotesImportStatus } from './status'
 import { getPublicNotesImportStatus } from './publicStatus'
 import {
@@ -21,6 +27,7 @@ import {
   appAttestProtocolVersion,
   AppAttestError,
   NOTES_IMPORT_KICKOFF_PURPOSE,
+  NOTES_IMPORT_TRANSCRIBE_PURPOSE,
   NOTES_IMPORT_VERIFY_PURPOSE,
   type AppAttestAction,
   type AppAttestReason,
@@ -29,6 +36,7 @@ import {
 import { appAttestHttpCode } from '../appAttest/errors'
 import {
   computeNotesImportRequestHash,
+  computeNotesImportTranscribeRequestHash,
   isAppAttestAssertionPurpose,
   isAppAttestChallenge,
   isAppAttestKeyId,
@@ -1469,4 +1477,233 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   } finally {
     await idx.release(slotKey)
   }
+}
+
+const TRANSCRIBE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
+ * POST /notes-import/transcribe — attested Import from Paper step: reads one
+ * photographed page into plain text with a vision model on the ZDR allowlist
+ * and returns it. Nothing is stored; the app shows the text for the user to
+ * edit, then sends it through the ordinary kickoff, which is where the Import
+ * Credit is spent. Pages are free but counted per identity per rolling day,
+ * and a free user with no imports left is refused before any page is read.
+ */
+export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
+  const config = getNotesImportConfig(ctx.env)
+  const status = await getNotesImportStatus({
+    kv: ctx.env.NOTES_KV,
+    env: ctx.env,
+    apiKey: ctx.env.OPENROUTER_API_KEY,
+    config,
+    includeLimits: false,
+  })
+  if (!status.available) {
+    return err(
+      ctx,
+      HTTP_STATUS.SERVICE_UNAVAILABLE,
+      'Notes Import is temporarily unavailable',
+      'unavailable',
+      status.reason,
+      undefined,
+      undefined,
+      undefined,
+      KILL_SWITCH_RETRY_AFTER_SECONDS
+    )
+  }
+
+  let parsed: unknown
+  try {
+    parsed = await ctx.req.json()
+  } catch {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON', 'bad_request')
+  }
+  const record = asRecord(parsed)
+  if (!record) {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON body', 'bad_request')
+  }
+
+  const uuid = asString(record.uuid)
+  const image = asString(record.image)
+  const mimeType = record.mimeType
+  if (!uuid || !image || !isTranscribeMimeType(mimeType)) {
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_REQUEST,
+      'Missing uuid, image, or a supported mimeType',
+      'bad_request'
+    )
+  }
+  const accountId = record.accountId != null ? asString(record.accountId) : null
+  if (record.accountId != null && (!accountId || !isValidAccountId(accountId))) {
+    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request')
+  }
+
+  const bytes = base64DecodedBytes(image)
+  if (bytes == null || !matchesImageMagic(image, mimeType)) {
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_REQUEST,
+      'image is not a base64 image of the declared type',
+      'bad_request'
+    )
+  }
+  if (bytes > config.transcribeMaxBytes) {
+    return err(
+      ctx,
+      HTTP_STATUS.PAYLOAD_TOO_LARGE,
+      `Image exceeds the ${config.transcribeMaxBytes}-byte limit`,
+      'too_large'
+    )
+  }
+
+  // Both hashes are authoritative: the signed assertion must cover exactly
+  // this image and mime type.
+  const contentHash = await sha256Hex(image)
+  const requestHash = await computeNotesImportTranscribeRequestHash({
+    imageHash: contentHash,
+    mimeType,
+  })
+  if (record.contentHash !== contentHash || record.requestHash !== requestHash) {
+    return appAttestBadRequest(
+      ctx,
+      'contentHash or requestHash does not match the transcription payload'
+    )
+  }
+
+  // --- Request authentication (v2 App Attest or Play Integrity only) ----
+  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
+  const devBypass =
+    config.devBypassToken != null &&
+    timingSafeEqual(bypassHeader, config.devBypassToken)
+  if (!devBypass && isPlayIntegrityRequest(record)) {
+    const failure = await verifyPlayIntegrityRecord(
+      ctx,
+      record,
+      NOTES_IMPORT_TRANSCRIBE_PURPOSE
+    )
+    if (failure) return failure
+  } else if (!devBypass) {
+    const v2Request =
+      appAttestProtocolVersion(record) === 2
+        ? parseV2AssertionFinalRequest(record, NOTES_IMPORT_TRANSCRIBE_PURPOSE)
+        : null
+    if (!v2Request) {
+      return err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Page transcription requires App Attest v2 or Play Integrity',
+        'bad_request',
+        undefined,
+        undefined,
+        'unsupported_protocol',
+        'none'
+      )
+    }
+    try {
+      await verifyV2Assertion(ctx, v2Request)
+    } catch (e) {
+      if (e instanceof AppAttestError) {
+        return appAttestFailureResponse(ctx, e, record)
+      }
+      Sentry.captureException(e)
+      return err(
+        ctx,
+        HTTP_STATUS.INTERNAL_SERVER_ERROR,
+        'Auth error',
+        'server_error'
+      )
+    }
+  }
+
+  // --- Entitlement, import allowance, and page limit --------------------
+  const meterId = accountId ?? uuid
+  let supporter = false
+  if (!devBypass) {
+    try {
+      supporter = await isSupporter({
+        apiKey: ctx.env.REVENUECAT_API_KEY,
+        appUserId: meterId,
+        entitlementId: config.entitlementId,
+      })
+    } catch (e) {
+      if (!(e instanceof RevenueCatError)) Sentry.captureException(e)
+      supporter = false
+    }
+  }
+  const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
+  const allowances = selectEffectiveAllowances(limits, supporter, devBypass)
+  const idx = ctx.env.NOTES_IMPORT_INDEX.get(
+    ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
+  )
+  // Read-only pre-flight: the transcript can only be imported with a credit,
+  // so don't read pages for someone who can't import them.
+  const checked = await idx.checkCredit({
+    hash: contentHash,
+    isSupporter: supporter,
+    isRefinement: false,
+    importLimit: allowances.imports,
+    refinementLimit: allowances.refinements,
+    windowDurationMs: limitsWindowDurationMs(limits),
+  })
+  if (!checked.decision.allowed) {
+    const denial = buildAllowanceDenial(
+      checked.decision.reason!,
+      checked.credits
+    )
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return ctx.json({ ok: false, ...denial.body }, denial.status as any)
+  }
+  const pageLimit =
+    supporter || devBypass
+      ? config.transcribePagesPerDaySupporter
+      : config.transcribePagesPerDay
+  const taken = await idx.takeTranscribePage(pageLimit, TRANSCRIBE_WINDOW_MS)
+  if (!taken.ok) {
+    return err(
+      ctx,
+      HTTP_STATUS.TOO_MANY_REQUESTS,
+      `You've read ${pageLimit} pages today. Try again later.`,
+      'transcribe_limit',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      Math.max(1, Math.ceil(taken.retryAfterMs / 1000))
+    )
+  }
+
+  let output
+  try {
+    output = await transcribeNotesPage({
+      apiKey: ctx.env.OPENROUTER_API_KEY,
+      config,
+      image,
+      mimeType,
+      abortSignal: ctx.req.raw?.signal,
+    })
+  } catch (e) {
+    Sentry.captureException(e)
+    console.error('notes-import transcribe model_error', errorDetail(e))
+    return err(
+      ctx,
+      HTTP_STATUS.BAD_GATEWAY,
+      'The page could not be read',
+      'model_error',
+      devBypass ? errorDetail(e) : undefined
+    )
+  }
+  // Usage and routing only, for cost and ZDR audits; never the text or image.
+  console.log(
+    `notes-import transcribe model=${config.transcribeModel} ` +
+      `provider=${output.resolvedProvider ?? 'unknown'} bytes=${bytes} ` +
+      `chars=${output.text.length} finishReason=${output.finishReason} ` +
+      `inputTokens=${output.usage.inputTokens ?? 0} outputTokens=${output.usage.outputTokens ?? 0}`
+  )
+  return ctx.json({
+    ok: true,
+    text: output.text,
+    truncated: output.finishReason === 'length',
+    pagesRemaining: taken.remaining,
+  })
 }

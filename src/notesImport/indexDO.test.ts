@@ -15,6 +15,8 @@ interface FakeState {
   meta: Map<string, number>
   hashes: Map<string, { charged: number; refinements: number }>
   emptyRuns: number[]
+  /** Optional so existing fixtures stay unchanged. */
+  transcribedPages?: number[]
 }
 
 const cursor = <T>(rows: T[]) => ({
@@ -43,6 +45,27 @@ const fakeContext = (state: FakeState): DurableObjectState =>
           }
           if (query === 'DELETE FROM credit_meta') {
             state.meta.clear()
+            return cursor([])
+          }
+          if (query === 'DELETE FROM transcribed_page') {
+            state.transcribedPages = []
+            return cursor([])
+          }
+          if (query === 'DELETE FROM transcribed_page WHERE ts <= ?') {
+            const before = Number(args[0])
+            state.transcribedPages = (state.transcribedPages ?? []).filter(
+              (ts) => ts > before
+            )
+            return cursor([])
+          }
+          if (query.startsWith('SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM transcribed_page')) {
+            const pages = state.transcribedPages ?? []
+            return cursor([
+              { n: pages.length, oldest: pages.length ? Math.min(...pages) : null },
+            ])
+          }
+          if (query === 'INSERT INTO transcribed_page (ts) VALUES (?)') {
+            state.transcribedPages = [...(state.transcribedPages ?? []), Number(args[0])]
             return cursor([])
           }
           if (query === 'DELETE FROM empty_run') {
@@ -150,5 +173,34 @@ describe('NotesImportIndex resetUsage', () => {
       charged: 1,
       refinements: 1,
     })
+  })
+})
+
+describe('NotesImportIndex takeTranscribePage', () => {
+  it('counts pages in a rolling window and says when the oldest ages out', async () => {
+    const now = 1_000_000_000
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now)
+    const day = 24 * 60 * 60 * 1000
+    const state: FakeState = {
+      meta: new Map(),
+      hashes: new Map(),
+      emptyRuns: [],
+      // One page has aged out; two still count.
+      transcribedPages: [now - day - 1, now - 3_000, now - 1_000],
+    }
+    const { NotesImportIndex } = await import('./indexDO')
+    const index = new NotesImportIndex(fakeContext(state), {} as never)
+
+    expect(index.takeTranscribePage(3, day)).toEqual({ ok: true, remaining: 0 })
+    expect(state.transcribedPages).toEqual([now - 3_000, now - 1_000, now])
+    expect(index.takeTranscribePage(3, day)).toEqual({
+      ok: false,
+      retryAfterMs: day - 3_000,
+    })
+    expect(state.transcribedPages).toHaveLength(3)
+
+    index.resetUsage()
+    expect(state.transcribedPages).toEqual([])
+    nowSpy.mockRestore()
   })
 })

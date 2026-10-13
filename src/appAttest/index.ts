@@ -17,6 +17,7 @@ export {
   APP_ATTEST_V2_DOMAIN,
   NOTES_IMPORT_KICKOFF_PURPOSE,
   NOTES_IMPORT_VERIFY_PURPOSE,
+  NOTES_IMPORT_TRANSCRIBE_PURPOSE,
   buildV2BindClientData,
   buildV2EnrollClientData,
   buildV2AssertionClientData,

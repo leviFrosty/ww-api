@@ -205,6 +205,24 @@ export interface Environment {
   NOTES_IMPORT_REASONING_EFFORT?: string;
 
   /**
+   * Vision model slug for Import from Paper page transcription. Must accept
+   * image input on the ZDR provider allowlist. Default: NOTES_IMPORT_MODEL.
+   */
+  NOTES_IMPORT_TRANSCRIBE_MODEL?: string;
+
+  /** Largest accepted page image in decoded bytes. Default 4194304 (4 MiB). */
+  NOTES_IMPORT_TRANSCRIBE_MAX_BYTES?: string;
+
+  /** `maxOutputTokens` for one page transcription. Default 8000. */
+  NOTES_IMPORT_TRANSCRIBE_MAX_OUTPUT_TOKENS?: string;
+
+  /** Pages per identity per rolling day (non-Supporter). Default 40. */
+  NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY?: string;
+
+  /** Pages per identity per rolling day (Supporter). Default 200. */
+  NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY_SUPPORTER?: string;
+
+  /**
    * When set, a request carrying header `x-ww-dev-bypass: <this value>` skips
    * App Attest verification. Set ONLY on a dev/staging worker so the iOS
    * simulator (no Secure Enclave) can exercise the flow. Unset in production.

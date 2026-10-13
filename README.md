@@ -226,6 +226,18 @@ Core routes (all rate-limited):
 - **`POST /notes-import/kickoff`** starts a streaming run and returns its handle,
   capability token, and strict `credits` preview; `GET .../events` / `.../result`
   carry the terminal result and authoritative `credits` snapshot.
+- **`POST /notes-import/transcribe`** (Import from Paper) reads one page image
+  (base64 JPEG or PNG, ≤ `NOTES_IMPORT_TRANSCRIBE_MAX_BYTES`) into plain text
+  with `NOTES_IMPORT_TRANSCRIBE_MODEL` on the same ZDR allowlist, and returns
+  `{ text, truncated, pagesRemaining }`. Attested with App Attest v2 or Play
+  Integrity under purpose `notes-import-transcribe`: the content hash is the
+  SHA-256 of the base64 string, and the request hash covers
+  `{ imageHash, mimeType }`. The image is never stored or logged. Pages spend
+  no credit (the app sends the edited text through kickoff), but a free user
+  with no imports left is refused, and each identity gets
+  `NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY` pages per rolling day (`…_SUPPORTER`
+  for Supporters); over it → 429 `transcribe_limit` with `Retry-After`.
+  `GET /notes-import/status` advertises `capabilities.transcribe`.
 - **`POST /notes-import`** is the synchronous fallback under identical rules.
 - **`GET /notes-import/status`** is public and supplies a fresh allowance
   schedule only when availability is confirmed.

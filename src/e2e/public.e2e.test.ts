@@ -38,6 +38,7 @@ describe('health and status', () => {
     expect(typeof res.body.available).toBe('boolean')
     expect(res.body.capabilities).toEqual({
       appAttest: { protocolVersions: [1, 2] },
+      transcribe: { maxPages: 10, maxBytes: expect.any(Number) },
     })
     if (res.body.available && res.body.limits) {
       expect(res.body.limits).toMatchObject({

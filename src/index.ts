@@ -16,6 +16,7 @@ import {
   handleNotesImportRequest,
   handleNotesImportStatusRequest,
   handleNotesImportKickoffRequest,
+  handleNotesImportTranscribeRequest,
   handleNotesImportEventsRequest,
   handleNotesImportResultRequest,
   handleNotesImportCancelRequest,
@@ -105,6 +106,7 @@ app.post("/notes-import/attest", handleAttestRequest);
 app.post("/notes-import/verify", handleNotesImportVerifyRequest);
 // Streaming import: attested kickoff → SSE progress stream → result snapshot.
 app.post("/notes-import/kickoff", handleNotesImportKickoffRequest);
+app.post("/notes-import/transcribe", handleNotesImportTranscribeRequest);
 app.get("/notes-import/:importId/events", handleNotesImportEventsRequest);
 app.get("/notes-import/:importId/result", handleNotesImportResultRequest);
 app.post("/notes-import/:importId/cancel", handleNotesImportCancelRequest);

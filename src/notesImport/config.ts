@@ -70,6 +70,20 @@ export interface NotesImportConfig {
    * only when that blank response finished normally.
    */
   reasoningEffort: ReasoningEffort
+  /**
+   * Vision model that reads a photographed page into plain text before the
+   * text import runs (Import from Paper). Routed through the same Western ZDR
+   * provider allowlist as {@link model}.
+   */
+  transcribeModel: string
+  /** Largest accepted page image, in decoded bytes. */
+  transcribeMaxBytes: number
+  /** `maxOutputTokens` ceiling for one page's transcription. */
+  transcribeMaxOutputTokens: number
+  /** Pages one identity may transcribe per rolling day (non-Supporter). */
+  transcribePagesPerDay: number
+  /** Pages one identity may transcribe per rolling day (Supporter). */
+  transcribePagesPerDaySupporter: number
 }
 
 const DEFAULTS = {
@@ -91,6 +105,11 @@ const DEFAULTS = {
   // Higher effort repeatedly exhausted the output budget on historical notes.
   // Low still reasons, and leaves room for the complete structured result.
   reasoningEffort: 'low' as ReasoningEffort,
+  transcribeMaxBytes: 4 * 1024 * 1024,
+  transcribeMaxOutputTokens: 8_000,
+  // A full paper backlog is 10 pages per batch; leave room for a few batches.
+  transcribePagesPerDay: 40,
+  transcribePagesPerDaySupporter: 200,
 } as const
 
 export interface NotesImportLimits {
@@ -418,6 +437,10 @@ const appAttestConfig = (
   throw new Error('APP_ATTEST_ENVIRONMENT must be explicitly configured')
 }
 
+/** Read alone by the public status probe, which has no App Attest config. */
+export const resolveTranscribeMaxBytes = (env: Environment): number =>
+  intOr(env.NOTES_IMPORT_TRANSCRIBE_MAX_BYTES, DEFAULTS.transcribeMaxBytes)
+
 export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
   model: env.NOTES_IMPORT_MODEL?.trim() || DEFAULTS.model,
   providers: listOr(env.NOTES_IMPORT_PROVIDERS, DEFAULTS.providers),
@@ -454,5 +477,22 @@ export const getNotesImportConfig = (env: Environment): NotesImportConfig => ({
     env.NOTES_IMPORT_REASONING_EFFORT,
     DEFAULTS.reasoningEffort,
     env.NOTES_IMPORT_MODEL?.trim() || DEFAULTS.model
+  ),
+  transcribeModel:
+    env.NOTES_IMPORT_TRANSCRIBE_MODEL?.trim() ||
+    env.NOTES_IMPORT_MODEL?.trim() ||
+    DEFAULTS.model,
+  transcribeMaxBytes: resolveTranscribeMaxBytes(env),
+  transcribeMaxOutputTokens: intOr(
+    env.NOTES_IMPORT_TRANSCRIBE_MAX_OUTPUT_TOKENS,
+    DEFAULTS.transcribeMaxOutputTokens
+  ),
+  transcribePagesPerDay: intOr(
+    env.NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY,
+    DEFAULTS.transcribePagesPerDay
+  ),
+  transcribePagesPerDaySupporter: intOr(
+    env.NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY_SUPPORTER,
+    DEFAULTS.transcribePagesPerDaySupporter
   ),
 })
