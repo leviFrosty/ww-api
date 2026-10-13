@@ -405,3 +405,9 @@ Response to Client
 - **Package Manager**: pnpm
 - **Monitoring**: Sentry
 - **Wrangler**: v4.42.2
+
+## App OTA updates
+
+Hot Updater runs in separate dev, beta and prod Workers, each with its own D1
+catalog and private R2 bucket. See [the OTA runbook](docs/ota-updates.md) for
+resource identities, migration/deployment commands and credential setup.

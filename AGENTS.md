@@ -8,12 +8,26 @@ details, primarily the **environments**.
 
 ## Environments
 
-There are two deployed Workers, defined in `wrangler.toml`:
+There are two deployed API Workers, defined in `wrangler.toml`:
 
 | Env  | Worker name    | URL                                          | Deploy command        |
 | ---- | -------------- | -------------------------------------------- | --------------------- |
 | prod | `ww-proxy`     | `https://ww-proxy.leviwilkerson.com`         | `pnpm run deploy`     |
 | dev  | `ww-proxy-dev` | `https://ww-proxy-dev.<subdomain>.workers.dev` | `pnpm run deploy:dev` |
+
+Three app-update Workers (Hot Updater) are defined separately in
+`wrangler-updates.json`, one per app channel, each with its own D1 database and
+private R2 bucket of the same name:
+
+| Env  | Worker / D1 / R2  | URL                                                  | Deploy command                                          |
+| ---- | ----------------- | ---------------------------------------------------- | ------------------------------------------------------- |
+| dev  | `ww-updates-dev`  | `https://ww-updates-dev.levi-wilkerson.workers.dev`  | `pnpm updates:migrate:dev && pnpm updates:deploy:dev`   |
+| beta | `ww-updates-beta` | `https://ww-updates-beta.levi-wilkerson.workers.dev` | `pnpm updates:migrate:beta && pnpm updates:deploy:beta` |
+| prod | `ww-updates-prod` | `https://ww-updates-prod.levi-wilkerson.workers.dev` | `pnpm updates:migrate:prod && pnpm updates:deploy:prod` |
+
+They share no bindings with ww-proxy, and plain `wrangler deploy` never touches
+them. The tag deploy migrates and deploys all three alongside ww-proxy. Setup,
+credentials and verification are in [`docs/ota-updates.md`](./docs/ota-updates.md).
 
 Prefer the `pnpm run deploy*` scripts over raw `wrangler deploy` — they also
 inject the `SENTRY_RELEASE` var and upload source maps to Sentry (see
