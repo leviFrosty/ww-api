@@ -17,8 +17,8 @@ const limitsKv = (value: string | null): LimitsKv => ({
 describe('getNotesImportConfig — environment-only knobs', () => {
   it('falls back to provider, model, concurrency, and Empty Import defaults', () => {
     const cfg = getNotesImportConfig(baseEnv)
-    expect(cfg.model).toBe('deepseek/deepseek-v4.1-flash')
-    expect(cfg.providers).toEqual(['fireworks', 'digitalocean'])
+    expect(cfg.model).toBe('openai/gpt-6-luna')
+    expect(cfg.providers).toEqual(['azure'])
     expect(cfg.maxChars).toBe(100_000)
     expect(cfg.maxOutputTokens).toBe(32_000)
     expect(cfg.reasoningEffort).toBe('low')
@@ -33,9 +33,9 @@ describe('getNotesImportConfig — environment-only knobs', () => {
     for (const effort of ['low', 'high', 'max']) {
       expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: effort } as Environment).reasoningEffort).toBe(effort)
     }
-    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'xhigh' } as Environment).reasoningEffort).toBe('max')
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_MODEL: 'deepseek/deepseek-v4.1-flash', NOTES_IMPORT_REASONING_EFFORT: 'xhigh' } as Environment).reasoningEffort).toBe('max')
     expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'off' } as Environment).reasoningEffort).toBeNull()
-    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_REASONING_EFFORT: 'medium' } as Environment).reasoningEffort).toBe('low')
+    expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_MODEL: 'deepseek/deepseek-v4.1-flash', NOTES_IMPORT_REASONING_EFFORT: 'medium' } as Environment).reasoningEffort).toBe('low')
     expect(getNotesImportConfig({ ...baseEnv, NOTES_IMPORT_MODEL: 'other/model', NOTES_IMPORT_REASONING_EFFORT: 'xhigh' } as Environment).reasoningEffort).toBe('xhigh')
   })
 

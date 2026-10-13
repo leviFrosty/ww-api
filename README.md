@@ -203,7 +203,7 @@ non-content authentication/runtime metadata in KV and aggregate usage plus
 permanent replay/refinement records in a per-user Durable Object—never imported
 text or model output in either meter store.
 
-Both production and development use `deepseek/deepseek-v4.1-flash` through
+Both production and development use `openai/gpt-6-luna` through
 OpenRouter. The fixed extraction instructions precede user context and tagged
 notes; refinements keep that notes prefix and append the previous result and
 correction. Strict JSON-schema output is validated locally before delivery,

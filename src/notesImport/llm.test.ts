@@ -61,14 +61,14 @@ describe('OpenRouter Notes Import structured output', () => {
     expect(out.result).toEqual(validResult)
     expect(out.resolvedProvider).toBe('Fireworks')
     const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string)
-    expect(body.model).toBe('deepseek/deepseek-v4.1-flash')
+    expect(body.model).toBe('openai/gpt-6-luna')
     expect(body.max_tokens).toBe(32_000)
     expect(body.response_format).toMatchObject({
       type: 'json_schema',
       json_schema: { name: 'NotesImport', strict: true, schema: NOTES_IMPORT_SCHEMA },
     })
     expect(body.provider).toEqual({
-      only: ['fireworks', 'digitalocean'], order: ['fireworks', 'digitalocean'],
+      only: ['azure'], order: ['azure'],
       zdr: true, data_collection: 'deny', allow_fallbacks: true, require_parameters: true,
     })
     expect(body.reasoning).toEqual({ enabled: true, effort: 'low' })
