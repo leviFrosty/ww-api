@@ -69,6 +69,12 @@ export const nextIp = (): string => {
   return `198.18.${ipCounter >> 8}.${ipCounter & 255}`
 }
 
+/** Cloudflare rejects synthetic caller IPs on real deployments. */
+const callerHeaders = (): Record<string, string> =>
+  ['localhost', '127.0.0.1', '[::1]'].includes(new URL(BASE_URL).hostname)
+    ? { 'cf-connecting-ip': nextIp() }
+    : {}
+
 export interface Exchange {
   status: number
   headers: Headers
@@ -88,7 +94,7 @@ export const http = async (
   init: { body?: unknown; headers?: Record<string, string>; raw?: string } = {}
 ): Promise<Exchange> => {
   const headers: Record<string, string> = {
-    'cf-connecting-ip': nextIp(),
+    ...callerHeaders(),
     ...(init.body !== undefined || init.raw !== undefined
       ? { 'content-type': 'application/json' }
       : {}),
@@ -146,7 +152,7 @@ export const httpBytes = async (
   init: { bytes?: Uint8Array; json?: unknown; headers?: Record<string, string> }
 ): Promise<BytesExchange> => {
   const headers: Record<string, string> = {
-    'cf-connecting-ip': nextIp(),
+    ...callerHeaders(),
     'content-type': init.bytes ? 'application/octet-stream' : 'application/json',
     ...init.headers,
   }
@@ -448,7 +454,7 @@ export const openLive = (headers: Record<string, string>): Promise<LiveAttempt> 
           connection: 'Upgrade',
           'sec-websocket-version': '13',
           'sec-websocket-key': nodeRandomBytes(16).toString('base64'),
-          'cf-connecting-ip': nextIp(),
+          ...callerHeaders(),
           ...headers,
         },
         timeout: 10_000,
