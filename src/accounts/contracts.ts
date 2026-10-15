@@ -15,7 +15,7 @@ import {
  * Buddies one or the other way round.
  */
 
-export const ACCOUNTS_OPS = ['account/register'] as const
+export const ACCOUNTS_OPS = ['account/register', 'account/info'] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
 const SIGNING_CONTEXT = 'ww-account/v1\n'
@@ -49,7 +49,8 @@ export const inboxLinkMessage = (
     `${SIGNING_CONTEXT}inbox/link\n${accountId}\n${inboxId}\n${ownerPub}`
   )
 
-export interface AccountRegisterPayload {
+/** `account/register` and `account/info` both name the signing key. */
+export interface AccountKeyPayload {
   accountPub: string
   ts: number
   nonce: string
@@ -65,10 +66,13 @@ const publicKey = (value: unknown): string | null => {
   return bytes && bytes.length === 32 ? bytesToBase64Url(bytes) : null
 }
 
-/** Validates `account/register`'s payload; null means `bad_request`. */
-export const parseAccountRegister = (
+/**
+ * Validates `account/register`'s or `account/info`'s payload; null means
+ * `bad_request`.
+ */
+export const parseAccountKeyPayload = (
   payload: unknown
-): AccountRegisterPayload | null => {
+): AccountKeyPayload | null => {
   if (!isPlainObject(payload)) return null
   const accountPub = publicKey(payload.accountPub)
   const ts = payload.ts

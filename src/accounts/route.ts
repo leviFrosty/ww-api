@@ -18,9 +18,14 @@ import {
   EDGE_RETRY_AFTER_SECONDS,
   logLimitHit,
 } from '../buddies/limits'
-import { accountSignedMessage, parseAccountRegister } from './contracts'
-import { accountsDb, registerAccount } from './store'
-import { accountRegisterDocs } from './openapi'
+import {
+  type AccountKeyPayload,
+  type AccountsOp,
+  accountSignedMessage,
+  parseAccountKeyPayload,
+} from './contracts'
+import { accountsDb, findAccountInfo, registerAccount } from './store'
+import { accountInfoDocs, accountRegisterDocs } from './openapi'
 
 const randomAccountId = (): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))
@@ -59,6 +64,33 @@ const refuseOverQuota = async (
 }
 
 /**
+ * The payload of a self-signed account op, after the envelope, its signature
+ * by the named key, and its timestamp check out; otherwise the refusal.
+ */
+const verifiedKeyPayload = async (
+  c: AppContext,
+  op: AccountsOp
+): Promise<{ payload: AccountKeyPayload } | { refusal: Response }> => {
+  const text = await readEnvelopeText(c.req.raw)
+  const envelope = text == null ? null : parseEnvelope(text)
+  const payload = envelope ? parseAccountKeyPayload(envelope.payload) : null
+  if (!envelope || !payload)
+    return { refusal: buddiesErrorResponse('bad_request') }
+  const signature = decodeSignature(envelope.signature)
+  if (!signature) return { refusal: buddiesErrorResponse('bad_signature') }
+  if (Math.abs(Date.now() - payload.ts) > BUDDIES_LIMITS.timestampSkewMs)
+    return { refusal: buddiesErrorResponse('stale') }
+  const valid = await verifyEd25519(
+    payload.accountPub,
+    accountSignedMessage(op, envelope.payloadBytes),
+    signature
+  )
+  return valid
+    ? { payload }
+    : { refusal: buddiesErrorResponse('bad_signature') }
+}
+
+/**
  * `POST /accounts/v1/account/register`: the account for a signing key, created
  * on first use. Self-signed, like `inbox/register`, and idempotent: the same
  * key always gets the same `accountId`, so a replay learns nothing new. It
@@ -75,20 +107,9 @@ const handleRegister = async (c: AppContext): Promise<Response> => {
         retryAfterSeconds: EDGE_RETRY_AFTER_SECONDS,
       })
 
-    const text = await readEnvelopeText(c.req.raw)
-    const envelope = text == null ? null : parseEnvelope(text)
-    const payload = envelope ? parseAccountRegister(envelope.payload) : null
-    if (!envelope || !payload) return buddiesErrorResponse('bad_request')
-    const signature = decodeSignature(envelope.signature)
-    if (!signature) return buddiesErrorResponse('bad_signature')
-    if (Math.abs(Date.now() - payload.ts) > BUDDIES_LIMITS.timestampSkewMs)
-      return buddiesErrorResponse('stale')
-    const valid = await verifyEd25519(
-      payload.accountPub,
-      accountSignedMessage('account/register', envelope.payloadBytes),
-      signature
-    )
-    if (!valid) return buddiesErrorResponse('bad_signature')
+    const verified = await verifiedKeyPayload(c, 'account/register')
+    if ('refusal' in verified) return verified.refusal
+    const { payload } = verified
 
     const refused = await refuseOverQuota(c.env, callerKey)
     if (refused) return refused
@@ -106,9 +127,45 @@ const handleRegister = async (c: AppContext): Promise<Response> => {
   }
 }
 
+/**
+ * `POST /accounts/v1/account/info`: what the database holds for the signing
+ * key's own account, for the app's developer tools. Read-only and self-signed,
+ * so only the account key's holder can read it; it never creates an account
+ * (an unknown key is 404 `unknown_account`). Counts against the read edge tier.
+ *
+ * Privacy: nothing here logs or reports the body, the key, or the account id.
+ */
+const handleInfo = async (c: AppContext): Promise<Response> => {
+  try {
+    if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
+    const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
+    if (!(await allowBuddiesCaller(c.env, 'inbox/sync', callerKey)))
+      return buddiesErrorResponse('rate_limited', {
+        retryAfterSeconds: EDGE_RETRY_AFTER_SECONDS,
+      })
+
+    const verified = await verifiedKeyPayload(c, 'account/info')
+    if ('refusal' in verified) return verified.refusal
+    const { payload } = verified
+
+    const info = await findAccountInfo(
+      accountsDb(c.env.ACCOUNTS_DB),
+      payload.accountPub
+    )
+    if (!info) return buddiesErrorResponse('unknown_account')
+    const { id, ...rest } = info
+    return c.json({ ok: true, accountId: id, ...rest })
+  } catch (error) {
+    console.error('accounts: request failed', { op: 'account/info' })
+    Sentry.captureException(error)
+    return buddiesInternalError()
+  }
+}
+
 /** Mounted at `/accounts/v1` by the Worker entry point. */
 export const createAccountsRoutes = () => {
   const routes = new Hono<{ Bindings: Environment }>()
   routes.post('/account/register', accountRegisterDocs, handleRegister)
+  routes.post('/account/info', accountInfoDocs, handleInfo)
   return routes
 }

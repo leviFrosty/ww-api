@@ -405,6 +405,11 @@ Code in `src/accounts/`, schema in `src/accounts/schema.ts` (Drizzle on D1).
 - `POST /accounts/v1/account/register`: self-signed under the
   `ww-account/v1` context; idempotent per key. Counts against the Buddies
   register edge tier and the per-caller daily quota.
+- `POST /accounts/v1/account/info`: the same self-signed envelope (op
+  `account/info`), read-only. Returns the key's own account (`accountId`,
+  `accountPub`, `status`, `createdAt`, `inboxIds`, and `statusChanges`
+  without their reasons) for the app's developer tools; an unregistered key
+  is 404 `unknown_account`. Counts against the Buddies read edge tier.
 - `inbox/register` takes an optional `account: { accountId, signature }`,
   the account key's signature over the inbox id and owner key. The link
   (`account_inboxes`) is written only after the inbox accepted the
