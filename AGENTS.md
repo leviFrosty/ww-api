@@ -212,6 +212,13 @@ kill-switch and authoritative allowances. The OpenRouter metadata probe has a
 2-second deadline covering both headers and body consumption. Worker requests
 do not share pending I/O promises; simultaneous cold misses may probe separately.
 
+Its result lives in KV `notes-import:provider-health` as `{healthy, checkedAt}`
+for 5 minutes. Under a minute old it is served as is; older, it is still served
+while `waitUntil` re-probes and rewrites it, so a request only waits on
+OpenRouter when no result is stored. A provider outage can therefore take a
+minute plus one request to show. The kill-switch, provider, allowance, and
+minimum-version KV reads all start at once.
+
 Sentry traces retain 100% of development and Notes Import operation traffic.
 Production status, HERE proxy, health, contact-link and other routine routes use
 10% trace sampling, overriding propagated parent sampling decisions. Error

@@ -244,7 +244,10 @@ describe('getNotesImportStatus — provider health and caching', () => {
       available: true,
       limits: DEFAULT_PUBLIC_LIMITS,
     })
-    expect(kv.store.get('notes-import:provider-health')).toBe('up')
+    expect(JSON.parse(kv.store.get('notes-import:provider-health')!)).toEqual({
+      healthy: true,
+      checkedAt: expect.any(Number),
+    })
   })
 
   it('returns unavailable without limits and caches when all providers are down', async () => {
@@ -258,7 +261,10 @@ describe('getNotesImportStatus — provider health and caching', () => {
       available: false,
       reason: 'no_provider',
     })
-    expect(kv.store.get('notes-import:provider-health')).toBe('down')
+    expect(JSON.parse(kv.store.get('notes-import:provider-health')!)).toEqual({
+      healthy: false,
+      checkedAt: expect.any(Number),
+    })
   })
 
   it('keeps a confirmed unhealthy result when the cache write fails', async () => {
@@ -400,5 +406,153 @@ describe('getNotesImportStatus — minAppVersion', () => {
     })
     expect(result).not.toHaveProperty('minAppVersion')
     warn.mockRestore()
+  })
+})
+
+describe('getNotesImportStatus — stale provider results', () => {
+  const NOW = 1_800_000_000_000
+  const health = (healthy: boolean, ageMs: number) =>
+    JSON.stringify({ healthy, checkedAt: NOW - ageMs })
+  const downFetch = () =>
+    okFetch(endpointsBody([{ provider_name: 'Fireworks', status: -1 }]))
+
+  it('serves a result younger than a minute without probing', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:provider-health', health(false, 59_999))
+    const fetchFn = vi.fn() as unknown as typeof fetch
+    const waitUntil = vi.fn()
+
+    await expect(
+      getNotesImportStatus({
+        kv: kv as unknown as StatusKv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn,
+        waitUntil,
+        now: () => NOW,
+      })
+    ).resolves.toMatchObject({ available: false, reason: 'no_provider' })
+    expect(fetchFn).not.toHaveBeenCalled()
+    expect(waitUntil).not.toHaveBeenCalled()
+  })
+
+  it('serves a stale result at once and refreshes it after the response', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:provider-health', health(true, 60_000))
+    const fetchFn = downFetch()
+    const background: Promise<unknown>[] = []
+
+    await expect(
+      getNotesImportStatus({
+        kv: kv as unknown as StatusKv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn,
+        waitUntil: (promise) => background.push(promise),
+        now: () => NOW,
+      })
+    ).resolves.toEqual({
+      ...APP_ATTEST_CAPABILITIES,
+      available: true,
+      limits: DEFAULT_PUBLIC_LIMITS,
+    })
+
+    // The refresh queues its cache write while it runs.
+    await Promise.all(background)
+    await Promise.all(background)
+    expect(fetchFn).toHaveBeenCalledOnce()
+    expect(JSON.parse(kv.store.get('notes-import:provider-health')!)).toEqual({
+      healthy: false,
+      checkedAt: NOW,
+    })
+  })
+
+  it('keeps the stale result when the background refresh fails', async () => {
+    const kv = makeMemoryKv()
+    const stale = health(true, 120_000)
+    await kv.put('notes-import:provider-health', stale)
+    const background: Promise<unknown>[] = []
+
+    await getNotesImportStatus({
+      kv: kv as unknown as StatusKv,
+      env: ENV,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn: vi.fn(async () => new Response('nope', { status: 500 })) as unknown as typeof fetch,
+      waitUntil: (promise) => background.push(promise),
+      now: () => NOW,
+    })
+
+    await expect(Promise.all(background)).resolves.toBeDefined()
+    expect(kv.store.get('notes-import:provider-health')).toBe(stale)
+  })
+
+  it('re-probes a stale result before answering without waitUntil', async () => {
+    const kv = makeMemoryKv()
+    await kv.put('notes-import:provider-health', health(true, 60_000))
+    const fetchFn = downFetch()
+
+    await expect(
+      getNotesImportStatus({
+        kv: kv as unknown as StatusKv,
+        env: ENV,
+        apiKey: 'k',
+        config: CONFIG,
+        fetchFn,
+        now: () => NOW,
+      })
+    ).resolves.toMatchObject({ available: false, reason: 'no_provider' })
+    expect(fetchFn).toHaveBeenCalledOnce()
+  })
+
+  it('writes a probed result after the response when it can', async () => {
+    const kv = makeMemoryKv()
+    const background: Promise<unknown>[] = []
+
+    await getNotesImportStatus({
+      kv: kv as unknown as StatusKv,
+      env: ENV,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn: okFetch(endpointsBody([{ provider_name: 'Fireworks', status: 0 }])),
+      waitUntil: (promise) => background.push(promise),
+      now: () => NOW,
+    })
+
+    expect(background).toHaveLength(1)
+    await Promise.all(background)
+    expect(JSON.parse(kv.store.get('notes-import:provider-health')!)).toEqual({
+      healthy: true,
+      checkedAt: NOW,
+    })
+  })
+
+  it('starts every KV read before any of them answers', async () => {
+    const pending: string[] = []
+    const kv: StatusKv = {
+      get: vi.fn((key: string) => {
+        pending.push(key)
+        return new Promise<string | null>(() => {})
+      }) as unknown as StatusKv['get'],
+      put: vi.fn() as StatusKv['put'],
+    }
+
+    void getNotesImportStatus({
+      kv,
+      env: ENV,
+      apiKey: 'k',
+      config: CONFIG,
+      fetchFn: vi.fn() as unknown as typeof fetch,
+    })
+    await Promise.resolve()
+
+    expect(pending.sort()).toEqual([
+      'notes-import:enabled',
+      'notes-import:limits',
+      'notes-import:min-version',
+      'notes-import:provider-health',
+    ])
   })
 })

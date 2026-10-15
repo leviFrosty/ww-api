@@ -87,6 +87,19 @@ const track = (ctx: AppContext, event: AnalyticsEvent) => {
   }
 }
 
+/** The request's `waitUntil`, or undefined without an ExecutionContext (unit tests). */
+const waitUntilOf = (
+  ctx: AppContext
+): ((promise: Promise<unknown>) => void) | undefined => {
+  try {
+    const executionCtx = ctx.executionCtx
+    if (!executionCtx) return undefined
+    return (promise) => executionCtx.waitUntil(promise)
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * A 503 that didn't say otherwise (storage, Google, or provider trouble):
  * worth one more try after a short wait.
@@ -402,7 +415,7 @@ const subKey = (token: string) => `notes-import:sub:${token}`
  * a manual KV kill-switch plus OpenRouter's free provider-health metadata.
  */
 export async function handleNotesImportStatusRequest(ctx: AppContext) {
-  const status = await getPublicNotesImportStatus(ctx.env)
+  const status = await getPublicNotesImportStatus(ctx.env, waitUntilOf(ctx))
   // Keep intermediary/browser caches from adding another freshness window.
   return ctx.json(status, 200, { 'Cache-Control': 'no-store' })
 }
@@ -734,6 +747,7 @@ async function authenticateAndGate(
     apiKey: ctx.env.OPENROUTER_API_KEY,
     config,
     includeLimits: false,
+    waitUntil: waitUntilOf(ctx),
   })
   if (!status.available) {
     return {
@@ -1497,6 +1511,7 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
     apiKey: ctx.env.OPENROUTER_API_KEY,
     config,
     includeLimits: false,
+    waitUntil: waitUntilOf(ctx),
   })
   if (!status.available) {
     return err(

@@ -32,8 +32,13 @@ export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
  *   2. Provider health — OpenRouter's endpoints metadata API reports a per-host
  *      `status`. We check whether ANY provider on our ZDR allowlist is currently
  *      healthy for the configured model. This is a metadata call: it consumes NO
- *      tokens / inference credits. Result is cached in KV (short TTL) so the
- *      probe stays fast and we don't hammer the upstream.
+ *      tokens / inference credits. The result is cached in KV with the time it
+ *      was checked. Past `PROVIDER_FRESH_MS` it is still served while a
+ *      background refresh replaces it, so requests only wait on OpenRouter
+ *      when no result is cached at all.
+ *
+ * Every KV read (kill-switch, provider cache, allowances, minimum version)
+ * starts at once; on a cold edge each one is a round trip to KV's storage.
  *
  * Fail-open by design: if the upstream check itself errors, we report available.
  * A flaky probe must never block a feature that would actually work — the real
@@ -112,7 +117,37 @@ const notesImportCapabilities = (env: Environment): NotesImportCapabilities => {
 
 const ENABLED_KEY = 'notes-import:enabled'
 const PROVIDER_CACHE_KEY = 'notes-import:provider-health'
-const PROVIDER_CACHE_TTL_SECONDS = 60
+/** A cached provider result younger than this is served without a refresh. */
+const PROVIDER_FRESH_MS = 60_000
+/** Older results are served while a refresh runs; KV drops them at this age. */
+const PROVIDER_CACHE_TTL_SECONDS = 300
+
+interface ProviderHealth {
+  healthy: boolean
+  /**
+   * Epoch ms of the probe. Null for the older bare `up`/`down` values, which
+   * KV expires within 60 seconds of their write, so they count as fresh.
+   */
+  checkedAt: number | null
+}
+
+const parseProviderHealth = (raw: string | null): ProviderHealth | null => {
+  if (raw === 'up') return { healthy: true, checkedAt: null }
+  if (raw === 'down') return { healthy: false, checkedAt: null }
+  if (raw == null) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') {
+      const { healthy, checkedAt } = parsed as Record<string, unknown>
+      if (typeof healthy === 'boolean' && typeof checkedAt === 'number') {
+        return { healthy, checkedAt }
+      }
+    }
+  } catch {
+    // Unreadable → treat as absent and probe.
+  }
+  return null
+}
 
 /** OpenRouter per-endpoint `status`: 0 = normal, negatives = degraded/disabled. */
 const isHealthyStatus = (status: unknown): boolean => {
@@ -244,8 +279,16 @@ export interface NotesImportStatusDeps {
   config: NotesImportConfig
   /** Internal enforcement probes skip schedule resolution to avoid a second KV read. */
   includeLimits?: boolean
+  /**
+   * The request's `waitUntil`. With it, a stale provider result is served while
+   * the refresh (and every cache write) finishes after the response; without
+   * it, a stale result is re-probed before answering.
+   */
+  waitUntil?: (promise: Promise<unknown>) => void
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchFn?: typeof fetch
+  /** Injectable for tests; defaults to `Date.now`. */
+  now?: () => number
 }
 
 /**
@@ -267,64 +310,87 @@ const publicSchedule = (limits: NotesImportLimits): PublicNotesImportLimits => {
   }
 }
 
+/** A KV read that reports failure as null instead of throwing. */
+const readKv = (
+  kv: StatusKv,
+  key: string
+): Promise<{ value: string | null } | null> =>
+  kv.get(key).then(
+    (value) => ({ value }),
+    () => null
+  )
+
 const resolveNotesImportStatus = async ({
   kv,
   env,
   apiKey,
   config,
   includeLimits = true,
+  waitUntil,
   fetchFn = fetch,
+  now = Date.now,
 }: NotesImportStatusDeps): Promise<NotesImportStatusState> => {
-  const availableWithSchedule = async (): Promise<NotesImportStatusState> =>
-    includeLimits
-      ? {
-          available: true,
-          limits: publicSchedule(await resolveNotesImportLimits(env, kv)),
-        }
+  // All reads start together; the stages below still decide in order.
+  const [overrideRead, cachedRead, limits] = await Promise.all([
+    readKv(kv, ENABLED_KEY),
+    readKv(kv, PROVIDER_CACHE_KEY),
+    includeLimits ? resolveNotesImportLimits(env, kv) : undefined,
+  ])
+  const available = (): NotesImportStatusState =>
+    limits
+      ? { available: true, limits: publicSchedule(limits) }
       : { available: true }
-  // 1. Manual kill-switch. Read and decide this stage independently: once an
-  // explicit OFF value has been observed, a later provider-cache failure must
-  // never turn the feature back on.
-  let overrideRaw: string | null
-  try {
-    overrideRaw = await kv.get(ENABLED_KEY)
-  } catch {
-    return { available: true }
+  const noProvider: NotesImportStatusState = {
+    available: false,
+    reason: 'no_provider',
   }
-  const override = parseEnabledOverride(overrideRaw)
+
+  // 1. Manual kill-switch. Decide this stage independently: once an explicit
+  // OFF value has been observed, a provider-cache failure must never turn the
+  // feature back on.
+  if (overrideRead === null) return { available: true }
+  const override = parseEnabledOverride(overrideRead.value)
   if (override && !override.available) {
     return { available: false, reason: override.reason ?? 'disabled' }
   }
 
   // 2. Provider health cache. Its read may fail open, but cannot bypass the
   // already-decided kill-switch stage above.
-  let cached: string | null
-  try {
-    cached = await kv.get(PROVIDER_CACHE_KEY)
-  } catch {
-    return { available: true }
+  if (cachedRead === null) return { available: true }
+  const cached = parseProviderHealth(cachedRead.value)
+  const refresh = async (): Promise<boolean> => {
+    const healthy = await probeProviderHealth(apiKey, config, fetchFn)
+    // Best effort: a failed write must not reverse the confirmed result.
+    const value = JSON.stringify({ healthy, checkedAt: now() })
+    const write = Promise.resolve()
+      .then(() =>
+        kv.put(PROVIDER_CACHE_KEY, value, {
+          expirationTtl: PROVIDER_CACHE_TTL_SECONDS,
+        })
+      )
+      .catch(() => undefined)
+    if (waitUntil) waitUntil(write)
+    else await write
+    return healthy
   }
-  if (cached === 'up') return availableWithSchedule()
-  if (cached === 'down') return { available: false, reason: 'no_provider' }
+  if (cached) {
+    const stale =
+      cached.checkedAt !== null && now() - cached.checkedAt >= PROVIDER_FRESH_MS
+    if (!stale || waitUntil) {
+      if (stale) waitUntil!(refresh().catch(() => undefined))
+      return cached.healthy ? available() : noProvider
+    }
+  }
 
-  // 3. Probe. Only probe failures fail open. Persisting the confirmed result is
-  // best effort and must not reverse an unhealthy result when KV.put fails.
+  // 3. Probe. Only probe failures fail open, and without a schedule: the probe
+  // did not confirm one.
   let healthy: boolean
   try {
-    healthy = await probeProviderHealth(apiKey, config, fetchFn)
+    healthy = await refresh()
   } catch {
     return { available: true }
   }
-  try {
-    await kv.put(PROVIDER_CACHE_KEY, healthy ? 'up' : 'down', {
-      expirationTtl: PROVIDER_CACHE_TTL_SECONDS,
-    })
-  } catch {
-    // The current probe result is still authoritative for this response.
-  }
-  return healthy
-    ? availableWithSchedule()
-    : { available: false, reason: 'no_provider' }
+  return healthy ? available() : noProvider
 }
 
 export const getNotesImportStatus = async (
