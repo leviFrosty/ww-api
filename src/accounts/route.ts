@@ -20,6 +20,7 @@ import {
 } from '../buddies/limits'
 import { accountSignedMessage, parseAccountRegister } from './contracts'
 import { accountsDb, registerAccount } from './store'
+import { accountRegisterDocs } from './openapi'
 
 const randomAccountId = (): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))
@@ -108,6 +109,6 @@ const handleRegister = async (c: AppContext): Promise<Response> => {
 /** Mounted at `/accounts/v1` by the Worker entry point. */
 export const createAccountsRoutes = () => {
   const routes = new Hono<{ Bindings: Environment }>()
-  routes.post('/account/register', handleRegister)
+  routes.post('/account/register', accountRegisterDocs, handleRegister)
   return routes
 }

@@ -113,6 +113,8 @@ GitHub Actions will automatically deploy to Cloudflare Workers. Monitor deployme
 
 ## API Endpoints
 
+Full API reference: [`/docs`](https://ww-proxy.leviwilkerson.com/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://ww-proxy.leviwilkerson.com/openapi.json). Locally: `http://localhost:8787/docs`.
+
 ### `/autocomplete`
 
 Proxies to HERE Autocomplete API.

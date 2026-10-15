@@ -19,6 +19,7 @@ import {
   setAccountStatus,
   type AccountRecord,
 } from './store'
+import { accountLookupDocs, accountStatusDocs } from './openapi'
 
 /**
  * Maintainer-only account moderation, authorized by `x-ww-admin-token`
@@ -128,7 +129,7 @@ const handleStatus = async (c: AppContext): Promise<Response> => {
 /** Mounted at `/admin/accounts` (behind the `admin` rate limit). */
 export const createAccountsAdminRoutes = () => {
   const routes = new Hono<{ Bindings: Environment }>()
-  routes.post('/lookup', handleLookup)
-  routes.post('/status', handleStatus)
+  routes.post('/lookup', accountLookupDocs, handleLookup)
+  routes.post('/status', accountStatusDocs, handleStatus)
   return routes
 }
