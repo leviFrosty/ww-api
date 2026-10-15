@@ -242,6 +242,22 @@ export interface Environment {
    */
   ACCOUNTS_DB?: D1Database;
 
+  /**
+   * One SQLite DO per handoff `channelId` (Set Up Another Device, witness-work
+   * ADR 0026): the opening account, the claim verifier, a temporary public
+   * key, and two sealed blobs, for at most ten minutes.
+   */
+  ACCOUNT_HANDOFF: DurableObjectNamespace<
+    import('./accounts/handoffDO').AccountHandoff
+  >;
+
+  /**
+   * End-to-end encrypted backups, one object per device slot at
+   * `v1/<accountId>/<slotId>` (ciphertext only). Without it, `backup/*`
+   * answers `disabled`.
+   */
+  ACCOUNT_BACKUPS?: R2Bucket;
+
   // --- Buddies relay -------------------------------------------------------
 
   /**

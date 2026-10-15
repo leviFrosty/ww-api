@@ -89,7 +89,7 @@ export const parseEnvelope = (text: string): Envelope | null => {
 }
 
 /** Decodes `p` and its JSON; `s` passes through. Null means `bad_request`. */
-const envelopeFromParts = (p: unknown, s: unknown): Envelope | null => {
+export const envelopeFromParts = (p: unknown, s: unknown): Envelope | null => {
   if (typeof p !== 'string' || !p) return null
   const payloadBytes = decodeB64u(p)
   if (!payloadBytes) return null
@@ -163,16 +163,17 @@ export const readBlobPutCall = (
 
 /**
  * Reads a `blob/put` body of exactly `expected` bytes (the signed `bytes`,
- * at most `blobBytes`) without buffering past it: a declared
- * `Content-Length` is checked first, and the stream is cancelled one chunk
- * after it overruns. Anything past `blobBytes` is `too_large`; any other
- * length mismatch is `bad_request`.
+ * at most `limit`, `blobBytes` by default) without buffering past it: a
+ * declared `Content-Length` is checked first, and the stream is cancelled one
+ * chunk after it overruns. Anything past `limit` is `too_large`; any other
+ * length mismatch is `bad_request`. Accounts' `backup/put` reads its blob
+ * the same way under its own limit.
  */
 export const readBlobBody = async (
   request: Request,
-  expected: number
+  expected: number,
+  limit: number = BUDDIES_LIMITS.blobBytes
 ): Promise<BuddiesResult<Uint8Array>> => {
-  const limit = BUDDIES_LIMITS.blobBytes
   const declared = request.headers.get('content-length')
   if (declared != null) {
     const length = Number(declared)

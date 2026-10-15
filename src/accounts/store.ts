@@ -33,7 +33,7 @@ export const findAccount = async (
     .where(eq(accounts.id, accountId))
     .get()) ?? null
 
-const findAccountByPub = async (
+export const findAccountByPub = async (
   db: AccountsDb,
   accountPub: string
 ): Promise<AccountRecord | null> =>

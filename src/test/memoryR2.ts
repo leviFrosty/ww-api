@@ -7,6 +7,7 @@
 export interface MemoryR2Object {
   bytes: Uint8Array
   uploaded: number
+  customMetadata?: Record<string, string>
 }
 
 export interface MemoryR2 {
@@ -21,7 +22,7 @@ export interface MemoryR2 {
   put(
     key: string,
     value: ArrayBuffer | ArrayBufferView,
-    options?: { sha256?: string }
+    options?: { sha256?: string; customMetadata?: Record<string, string> }
   ): Promise<{ key: string; size: number }>
   get(key: string): Promise<{ body: ReadableStream; size: number } | null>
   head(key: string): Promise<{ key: string; size: number } | null>
@@ -29,15 +30,23 @@ export interface MemoryR2 {
   /** Keys in order, `limit` (default 1,000) at a time; `cursor` is the last key. */
   list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<
     | {
-        objects: { key: string; size: number; uploaded: Date }[]
+        objects: MemoryR2Listed[]
         truncated: true
         cursor: string
       }
     | {
-        objects: { key: string; size: number; uploaded: Date }[]
+        objects: MemoryR2Listed[]
         truncated: false
       }
   >
+}
+
+/** A listed object; `customMetadata` as R2 returns it with `include`. */
+export interface MemoryR2Listed {
+  key: string
+  size: number
+  uploaded: Date
+  customMetadata?: Record<string, string>
 }
 
 const hex = (bytes: Uint8Array): string =>
@@ -76,7 +85,13 @@ export const makeMemoryR2 = (): MemoryR2 => {
         )
         if (digest !== options.sha256) throw new Error('r2 sha256 mismatch')
       }
-      objects.set(key, { bytes, uploaded: Date.now() })
+      objects.set(key, {
+        bytes,
+        uploaded: Date.now(),
+        ...(options.customMetadata
+          ? { customMetadata: { ...options.customMetadata } }
+          : {}),
+      })
       return { key, size: bytes.byteLength }
     },
     get: async (key) => {
@@ -111,6 +126,9 @@ export const makeMemoryR2 = (): MemoryR2 => {
           key,
           size: object.bytes.byteLength,
           uploaded: new Date(object.uploaded),
+          ...(object.customMetadata
+            ? { customMetadata: { ...object.customMetadata } }
+            : {}),
         }
       })
       return keys.length > limit

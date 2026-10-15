@@ -46,6 +46,7 @@ import { createBuddiesRoutes } from "./buddies/route";
 import { createAccountsRoutes } from "./accounts/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
+import { handleHandoffPage } from "./accounts/handoffPage";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
 import { mountApiDocs } from "./openapi/route";
 import {
@@ -53,6 +54,7 @@ import {
   appStoreRatingsDocs,
   autocompleteDocs,
   buddyInvitePageDocs,
+  handoffPageDocs,
   contactLinkDocs,
   geocodeDocs,
   healthDocs,
@@ -188,11 +190,15 @@ app.get("/c/:payload", legacyContactLinkDocs, handleLegacyContactLinkRequest);
 // Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
 // rate-limited per caller inside the handler (src/buddies/limits.ts).
 app.route("/buddies/v1", createBuddiesRoutes());
-// Anonymous accounts (witness-work ADR 0024): POST /accounts/v1/{op}, signed
-// like Buddies ops and rate-limited per caller inside the handler.
+// Anonymous accounts (witness-work ADR 0024, 0026): POST /accounts/v1/{op},
+// signed like Buddies ops (handoff's new-phone ops carry a claim token
+// instead) and rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 app.get("/b", buddyInvitePageDocs, handleBuddyInvitePage);
+// Set Up Another Device QR codes opened by a camera instead of the app; the
+// handoff secret stays in the URL fragment.
+app.get("/h", handoffPageDocs, handleHandoffPage);
 // Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
 // with per-account limits in the RoutePlanningQuota DO.
 app.route("/route-planning", createRoutePlanningRoutes());

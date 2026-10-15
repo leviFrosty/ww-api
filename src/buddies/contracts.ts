@@ -139,6 +139,8 @@ export const BUDDIES_ERROR_STATUS = {
   suspended: 403,
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,
+  /** A handoff channel another account opened. */
+  forbidden: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
