@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm'
+import { asc, eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/d1'
 import {
   accountInboxes,
@@ -121,4 +121,47 @@ export const setAccountStatus = async (
     db.update(accounts).set({ status }).where(eq(accounts.id, accountId)),
     db.insert(accountStatusEvents).values({ accountId, status, reason }),
   ])
+}
+
+/**
+ * What `account/info` shows the account's own devices: its row, the inboxes
+ * it owns, and when its status changed. Status reasons stay with moderation.
+ */
+export interface AccountInfo extends AccountRecord {
+  createdAt: number
+  inboxIds: string[]
+  statusChanges: { status: AccountStatus; createdAt: number }[]
+}
+
+export const findAccountInfo = async (
+  db: AccountsDb,
+  accountPub: string
+): Promise<AccountInfo | null> => {
+  const account = await db
+    .select({ ...accountColumns, createdAt: accounts.createdAt })
+    .from(accounts)
+    .where(eq(accounts.accountPub, accountPub))
+    .get()
+  if (!account) return null
+  const [inboxIds, statusChanges] = await Promise.all([
+    accountInboxIds(db, account.id),
+    db
+      .select({
+        status: accountStatusEvents.status,
+        createdAt: accountStatusEvents.createdAt,
+      })
+      .from(accountStatusEvents)
+      .where(eq(accountStatusEvents.accountId, account.id))
+      .orderBy(asc(accountStatusEvents.id))
+      .all(),
+  ])
+  return {
+    ...account,
+    createdAt: account.createdAt.getTime(),
+    inboxIds,
+    statusChanges: statusChanges.map((change) => ({
+      status: change.status,
+      createdAt: change.createdAt.getTime(),
+    })),
+  }
 }

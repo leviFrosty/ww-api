@@ -11,7 +11,11 @@ import {
   type Harness,
 } from '../test/buddies'
 import { signedMessage } from '../buddies/envelope'
-import { accountSignedMessage, inboxLinkMessage } from './contracts'
+import {
+  type AccountsOp,
+  accountSignedMessage,
+  inboxLinkMessage,
+} from './contracts'
 import { createAccountsRoutes } from './route'
 import { createAccountsAdminRoutes } from './admin'
 
@@ -71,12 +75,13 @@ const post = async (
 const accountEnvelope = async (
   payload: Record<string, unknown>,
   key: SigningKey,
-  message = accountSignedMessage
+  message = accountSignedMessage,
+  op: AccountsOp = 'account/register'
 ) => {
   const bytes = encoder.encode(JSON.stringify(payload))
   return {
     p: b64u(bytes),
-    s: b64u(await key.sign(message('account/register', bytes))),
+    s: b64u(await key.sign(message(op, bytes))),
   }
 }
 
@@ -210,6 +215,87 @@ describe('account/register', () => {
     h = await createHarness({ accountsDb: false })
     const response = await registerAccount(await SigningKey.generate())
     expect(response).toMatchObject({ status: 503, body: { code: 'disabled' } })
+  })
+})
+
+const accountInfo = async (
+  key: SigningKey,
+  payload: Record<string, unknown> = {},
+  op: AccountsOp = 'account/info'
+) =>
+  post(
+    accountsApp as never,
+    '/account/info',
+    await accountEnvelope(
+      { accountPub: key.publicKey, ts: Date.now(), nonce: randomId(), ...payload },
+      key,
+      accountSignedMessage,
+      op
+    )
+  )
+
+describe('account/info', () => {
+  it('shows the account, its inboxes, and its status changes', async () => {
+    const { account, owner } = await linkedOwner()
+    vi.setSystemTime(START + 60_000)
+    await setStatus(account.accountId, 'suspended')
+    vi.setSystemTime(START + 120_000)
+    await setStatus(account.accountId, 'active', 'appeal')
+    expect(await accountInfo(account.key)).toEqual({
+      status: 200,
+      body: {
+        ok: true,
+        accountId: account.accountId,
+        accountPub: account.key.publicKey,
+        status: 'active',
+        createdAt: START,
+        inboxIds: [owner.inboxId],
+        statusChanges: [
+          { status: 'suspended', createdAt: START + 60_000 },
+          { status: 'active', createdAt: START + 120_000 },
+        ],
+      },
+    })
+  })
+
+  it('never creates an account', async () => {
+    const key = await SigningKey.generate()
+    expect(await accountInfo(key)).toMatchObject({
+      status: 404,
+      body: { code: 'unknown_account' },
+    })
+    expect((await registerAccount(key)).status).toBe(200)
+    expect((await accountInfo(key)).body.inboxIds).toEqual([])
+  })
+
+  it('needs the account key’s signature for account/info', async () => {
+    const { key } = await newAccount()
+    const other = await SigningKey.generate()
+    const forged = await post(
+      accountsApp as never,
+      '/account/info',
+      await accountEnvelope(
+        { accountPub: key.publicKey, ts: Date.now(), nonce: randomId() },
+        other,
+        accountSignedMessage,
+        'account/info'
+      )
+    )
+    expect(forged.body.code).toBe('bad_signature')
+    // A register signature can't be replayed as a read.
+    const crossOp = await accountInfo(key, {}, 'account/register')
+    expect(crossOp.body.code).toBe('bad_signature')
+  })
+
+  it('refuses a stale timestamp, and is off without the database', async () => {
+    const { key } = await newAccount()
+    const stale = await accountInfo(key, { ts: Date.now() - 10 * 60_000 })
+    expect(stale).toMatchObject({ status: 401, body: { code: 'stale' } })
+    h = await createHarness({ accountsDb: false })
+    expect(await accountInfo(key)).toMatchObject({
+      status: 503,
+      body: { code: 'disabled' },
+    })
   })
 })
 
