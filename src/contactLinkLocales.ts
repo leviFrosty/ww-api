@@ -153,10 +153,26 @@ export const contactLinkTranslations = {
     openApp: 'Fungura porogaramu (isanzwe iri ku gikoresho)',
     imageAlt: 'Agashushondanga ka porogaramu ya WitnessWork',
   },
+  // One Arabic for every country, like the app (`ar` has no region).
+  'ar': {
+    title: 'افتح جهة الاتصال هذه في WitnessWork',
+    description: 'تمت مشاركة جهة اتصال معك من WitnessWork — تطبيق إدارة وقت الخدمة وجهات الاتصال لشهود يهوه.',
+    instructions: 'ثبّت WitnessWork لاستيراد جهة الاتصال التي شوركت معك. إذا كان التطبيق مثبّتًا لديك، فمن المفترض أن يكون قد فُتح تلقائيًا.',
+    getApp: 'احصل على WitnessWork',
+    openApp: 'فتح التطبيق (مثبّت بالفعل)',
+    imageAlt: 'أيقونة تطبيق WitnessWork',
+  },
 } satisfies Record<string, ContactLinkMessages>
 
 export type ContactLinkLocale = keyof typeof contactLinkTranslations
 const DEFAULT_LOCALE: ContactLinkLocale = 'en-us'
+
+const RIGHT_TO_LEFT: ReadonlySet<ContactLinkLocale> = new Set(['ar'])
+
+/** The page's text direction in `locale`. */
+export function contactLinkDirection(locale: ContactLinkLocale): 'ltr' | 'rtl' {
+  return RIGHT_TO_LEFT.has(locale) ? 'rtl' : 'ltr'
+}
 
 function matchLocale(value: string): ContactLinkLocale | undefined {
   const locale = value.trim().toLowerCase()
@@ -174,7 +190,7 @@ function matchLocale(value: string): ContactLinkLocale | undefined {
       : 'zh-hans-cn'
   }
   return (Object.keys(contactLinkTranslations) as ContactLinkLocale[])
-    .find((key) => key.startsWith(`${language}-`))
+    .find((key) => key === language || key.startsWith(`${language}-`))
 }
 
 /** Explicit link language wins; otherwise use browser preferences, then English. */

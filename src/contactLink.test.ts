@@ -167,6 +167,27 @@ describe('contact link localization', () => {
     }
   })
 
+  it('renders Arabic right to left on both routes', async () => {
+    const title = 'افتح جهة الاتصال هذه في WitnessWork'
+    for (const path of ['/c', `/c/${PAYLOAD}`]) {
+      const response = await request(path, {
+        headers: { 'Accept-Language': 'ar-SA,ar;q=0.9,en;q=0.5' },
+      })
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-language')).toBe('ar')
+      const page = await response.text()
+      expect(page).toContain('<html lang="ar" dir="rtl">')
+      expect(page).toContain(`<title>${title}</title>`)
+      expect(page).toContain(`<h1>${title}</h1>`)
+      expect(page).toContain('<meta property="og:locale" content="ar_AR">')
+      expect(page).toContain('>احصل على WitnessWork</a>')
+      expect(page).toContain('>فتح التطبيق (مثبّت بالفعل)</a>')
+      expect(ogUrl(page)).toBe(CANONICAL_URL)
+      expect(page.slice(0, page.indexOf('</head>'))).not.toContain(PAYLOAD)
+    }
+    expect(await html('/c?lang=en-us')).toContain('<html lang="en-us">')
+  })
+
   it('translates instructions, buttons, descriptions and image labels', async () => {
     const response = await request('/c', { headers: { 'Accept-Language': 'es-MX' } })
     const page = await response.text()
@@ -199,6 +220,9 @@ describe('contact link localization', () => {
     ['zh-Hans-TW', 'zh-hans-cn'],
     ['zh-CN', 'zh-hans-cn'],
     ['zh', 'zh-hans-cn'],
+    ['ar', 'ar'],
+    ['ar-EG', 'ar'],
+    ['xx, AR-sa;q=0.6', 'ar'],
     ['*', 'en-us'],
     ['xx-XX', 'en-us'],
     ['constructor, __proto__', 'en-us'],
@@ -207,7 +231,7 @@ describe('contact link localization', () => {
       headers: header ? { 'Accept-Language': header } : undefined,
     })
     expect(response.headers.get('content-language')).toBe(locale)
-    expect(await response.text()).toContain(`<html lang="${locale}">`)
+    expect(await response.text()).toContain(`<html lang="${locale}"`)
   })
 
   it('normalizes explicit language and falls back safely for invalid values', async () => {
