@@ -4,6 +4,14 @@ import { RATE_LIMIT_PERIOD_SECONDS, rateLimitKey } from './rateLimit'
 
 vi.mock('cloudflare:workers', () => ({ DurableObject: class {} }))
 
+// The HERE proxy captures `fetch` when its module loads, so its stub has to be
+// in place before the import below.
+const here = vi.hoisted(() => {
+  const state: { fetch?: typeof fetch } = {}
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.fetch!(...args)) as typeof fetch
+  return state
+})
+
 import worker from './index'
 
 const NOW = Date.UTC(2026, 9, 8, 12, 0, 0, 250)
@@ -84,10 +92,7 @@ describe('error envelope', () => {
 describe('per-IP rate limits', () => {
   it('refuses with 429 rate_limited and Retry-After from the limiter window', async () => {
     const env = makeEnv()
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => Response.json({ items: [] }))
-    )
+    here.fetch = vi.fn(async () => Response.json({ items: [] }))
     expect((await call(env, '/autocomplete?q=Main')).status).toBe(200)
 
     const refused = await call(env, '/geocode?q=Main')
@@ -106,10 +111,7 @@ describe('per-IP rate limits', () => {
   it('counts each route family in its own bucket for the same IP', async () => {
     const limiter = singleUseLimiter()
     const env = makeEnv(limiter)
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => Response.json({ items: [] }))
-    )
+    here.fetch = vi.fn(async () => Response.json({ items: [] }))
     expect((await call(env, '/geocode?q=Main')).status).toBe(200)
     expect((await call(env, '/geocode?q=Main')).status).toBe(429)
 

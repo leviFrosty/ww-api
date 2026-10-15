@@ -3,6 +3,18 @@ import type { Environment } from './types'
 
 vi.mock('cloudflare:workers', () => ({ DurableObject: class {} }))
 
+// The proxy captures `fetch` when its module loads, before Sentry wraps the
+// global, so HERE's stub has to be in place before the import below.
+const here = vi.hoisted(() => {
+  const state: { fetch?: typeof fetch } = {}
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.fetch!(...args)) as typeof fetch
+  return state
+})
+
+const stubHere = (mock: unknown) => {
+  here.fetch = mock as typeof fetch
+}
+
 import worker from './index'
 
 const ENV = {
@@ -22,9 +34,22 @@ async function geocode() {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('HERE API proxy', () => {
+  it('bypasses the global fetch that Sentry instruments', async () => {
+    const hereMock = vi.fn(async () => Response.json({ items: [] }))
+    stubHere(hereMock)
+    const instrumented = vi.fn(async () => Response.json({}))
+    vi.stubGlobal('fetch', instrumented)
+
+    const response = await geocode()
+
+    expect(response.status).toBe(200)
+    expect(hereMock).toHaveBeenCalledOnce()
+    expect(instrumented).not.toHaveBeenCalled()
+  })
+
   it('passes JSON responses through with the upstream status', async () => {
     const fetchMock = vi.fn(async () => Response.json({ items: [] }, { status: 200 }))
-    vi.stubGlobal('fetch', fetchMock)
+    stubHere(fetchMock)
 
     const response = await geocode()
 
@@ -35,7 +60,7 @@ describe('HERE API proxy', () => {
   })
 
   it('returns 502 when HERE returns a plain-text Cloudflare error page', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('error code: 520\n', { status: 520 })))
+    stubHere(vi.fn(async () => new Response('error code: 520\n', { status: 520 })))
 
     const response = await geocode()
 
@@ -48,8 +73,7 @@ describe('HERE API proxy', () => {
   })
 
   it('keeps HERE’s error body and adds the envelope and Retry-After on 429', async () => {
-    vi.stubGlobal(
-      'fetch',
+    stubHere(
       vi.fn(async () =>
         Response.json(
           { status: 429, title: 'Too Many Requests' },
@@ -73,8 +97,7 @@ describe('HERE API proxy', () => {
   })
 
   it('defaults Retry-After when HERE is unavailable without one', async () => {
-    vi.stubGlobal(
-      'fetch',
+    stubHere(
       vi.fn(async () => Response.json({ title: 'Unavailable' }, { status: 503 }))
     )
 
@@ -89,8 +112,7 @@ describe('HERE API proxy', () => {
   })
 
   it('passes a HERE 400 through with a bad_request code and no Retry-After', async () => {
-    vi.stubGlobal(
-      'fetch',
+    stubHere(
       vi.fn(async () =>
         Response.json({ title: "Illegal input for parameter 'q'" }, { status: 400 })
       )
@@ -109,8 +131,7 @@ describe('HERE API proxy', () => {
   })
 
   it('returns 502 upstream_error when HERE can’t be reached', async () => {
-    vi.stubGlobal(
-      'fetch',
+    stubHere(
       vi.fn(async () => {
         throw new TypeError('Network connection lost.')
       })
