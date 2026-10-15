@@ -19,6 +19,7 @@ const completed = new WeakMap<
  */
 export async function getPublicNotesImportStatus(
   env: Environment,
+  waitUntil?: (promise: Promise<unknown>) => void,
 ): Promise<NotesImportStatusResponse> {
   const now = Date.now()
   const cached = completed.get(env)
@@ -29,6 +30,7 @@ export async function getPublicNotesImportStatus(
     env,
     apiKey: env.OPENROUTER_API_KEY,
     config: getNotesImportConfig(env),
+    waitUntil,
   })
   // Do not turn a transient fail-open response into a cached availability claim.
   if (!status.available || status.limits) {
