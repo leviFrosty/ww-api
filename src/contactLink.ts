@@ -3,6 +3,7 @@ import { HTTP_STATUS } from './config'
 import { apiError } from './errors'
 import { nameTransactionAfterRoute } from './sentry'
 import {
+  contactLinkDirection,
   contactLinkTranslations,
   resolveContactLinkLocale,
   type ContactLinkLocale,
@@ -180,10 +181,12 @@ function renderFallbackPage(locale: ContactLinkLocale, openAppLink: string): str
   const description = escapeHtml(messages.description)
   const imageAlt = escapeHtml(messages.imageAlt)
   // Open Graph uses language_TERRITORY rather than BCP 47 script subtags.
+  // Region-less Arabic becomes `ar_AR`, the code Open Graph uses for Arabic.
   const [language] = locale.split('-')
   const territory = locale.split('-').at(-1)!.toUpperCase()
+  const dir = contactLinkDirection(locale) === 'rtl' ? ' dir="rtl"' : ''
   return `<!doctype html>
-<html lang="${locale}">
+<html lang="${locale}"${dir}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
