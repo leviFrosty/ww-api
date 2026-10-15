@@ -144,6 +144,25 @@ describe('Sentry scrubbers', () => {
     ).toEqual({ upgrade: 'websocket' })
   })
 
+  it('drops the account backup envelope headers, and only those', () => {
+    const error: ErrorEvent = {
+      type: undefined,
+      request: {
+        url: 'https://ww-proxy.test/accounts/v1/backup/put',
+        headers: {
+          'x-ww-p': 'eyJhY2NvdW50UHViIjoiQUFBQSJ9',
+          'X-WW-S': 'c2lnbmF0dXJl',
+          'x-ww-dev-bypass': 'kept',
+          'content-type': 'application/octet-stream',
+        },
+      },
+    }
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual({
+      'x-ww-dev-bypass': 'kept',
+      'content-type': 'application/octet-stream',
+    })
+  })
+
   it('leaves events without contact links untouched', () => {
     const event: TransactionEvent = {
       type: 'transaction',

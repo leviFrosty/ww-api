@@ -2,6 +2,7 @@ import { vi } from 'vitest'
 import { BuddyInbox } from '../buddies/inboxDO'
 import { BuddyInvite } from '../buddies/inviteDO'
 import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
+import { AccountHandoff } from '../accounts/handoffDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -111,6 +112,8 @@ export interface HarnessOptions {
   blobBucket?: boolean
   /** Bind the accounts database (default true). */
   accountsDb?: boolean
+  /** Bind the account backup bucket (default true). */
+  backupBucket?: boolean
 }
 
 export interface Harness {
@@ -120,6 +123,9 @@ export interface Harness {
   r2: MemoryR2
   /** The `ACCOUNTS_DB` database, when bound. */
   accountsDb: MemoryD1 | null
+  /** The `ACCOUNT_BACKUPS` bucket (present even when unbound, for assertions). */
+  backups: MemoryR2
+  handoffs: FakeNamespace<AccountHandoff>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -195,6 +201,7 @@ export const createHarness = async (
     await kv.put('buddies:enabled', options.kvEnabled)
   if (options.kvPhotos != null) await kv.put('buddies:photos', options.kvPhotos)
   const r2 = makeMemoryR2()
+  const backups = makeMemoryR2()
   const accountsDb = options.accountsDb === false ? null : makeMemoryD1()
 
   const apnsKeys = (await crypto.subtle.generateKey(
@@ -231,6 +238,7 @@ export const createHarness = async (
     BUDDIES_PHOTOS: options.photos ?? 'on',
     ...(options.blobBucket === false ? {} : { BUDDY_BLOBS: r2 }),
     ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
+    ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
     ...limiters,
     ...(options.apnsConfigured === false
       ? {}
@@ -255,6 +263,10 @@ export const createHarness = async (
   env.BUDDY_INVITE = invites.namespace as Environment['BUDDY_INVITE']
   env.BUDDY_REGISTRATION_QUOTA =
     quotas.namespace as Environment['BUDDY_REGISTRATION_QUOTA']
+  const handoffs = createNamespace(
+    (state) => new AccountHandoff(state as never, env as never)
+  )
+  env.ACCOUNT_HANDOFF = handoffs.namespace as Environment['ACCOUNT_HANDOFF']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -270,6 +282,8 @@ export const createHarness = async (
     kv,
     r2,
     accountsDb,
+    backups,
+    handoffs,
     inboxes,
     invites,
     quotas,

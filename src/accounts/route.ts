@@ -1,94 +1,39 @@
 import { Hono } from 'hono'
 import type { AppContext, Environment } from '../types'
 import { Sentry } from '../sentry'
-import { bytesToBase64Url, sha256Bytes } from '../crypto'
-import { BUDDIES_LIMITS, decodeSignature } from '../buddies/contracts'
-import {
-  parseEnvelope,
-  readEnvelopeText,
-  verifyEd25519,
-} from '../buddies/envelope'
+import { bytesToBase64Url } from '../crypto'
 import {
   buddiesErrorResponse,
   buddiesInternalError,
 } from '../buddies/errorResponse'
-import {
-  allowBuddiesCaller,
-  buddiesCallerKey,
-  EDGE_RETRY_AFTER_SECONDS,
-  logLimitHit,
-} from '../buddies/limits'
-import {
-  type AccountKeyPayload,
-  type AccountsOp,
-  accountSignedMessage,
-  parseAccountKeyPayload,
-} from './contracts'
+import { buddiesCallerKey } from '../buddies/limits'
 import { accountsDb, findAccountInfo, registerAccount } from './store'
-import { accountInfoDocs, accountRegisterDocs } from './openapi'
+import {
+  quotaName,
+  refuseAtEdge,
+  refuseOverDailyQuota,
+  verifiedBody,
+} from './signed'
+import { handoffHandlers } from './handoff'
+import { backupHandlers } from './backup'
+import {
+  accountInfoDocs,
+  accountRegisterDocs,
+  backupDeleteDocs,
+  backupGetDocs,
+  backupListDocs,
+  backupPutDocs,
+  handoffCancelDocs,
+  handoffClaimDocs,
+  handoffDoneDocs,
+  handoffOpenDocs,
+  handoffReceiveDocs,
+  handoffSendDocs,
+  handoffStatusDocs,
+} from './openapi'
 
 const randomAccountId = (): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))
-
-const quotaName = async (callerKey: string): Promise<string> =>
-  bytesToBase64Url(
-    await sha256Bytes(
-      new TextEncoder().encode(`ww-account/v1/register-caller\n${callerKey}`)
-    )
-  )
-
-/**
- * The caller's rolling-day registration quota, shared in kind with Buddies'
- * `inbox/register` (a DO per caller, under its own name). Null admits; a quota
- * outage admits too.
- */
-const refuseOverQuota = async (
-  env: Environment,
-  callerKey: string
-): Promise<Response | null> => {
-  try {
-    const quota = env.BUDDY_REGISTRATION_QUOTA
-    const admission = await quota
-      .get(quota.idFromName(await quotaName(callerKey)))
-      .admit(Date.now())
-    if (admission.ok) return null
-    logLimitHit('account/register', 'registrationsPerDay')
-    return buddiesErrorResponse('rate_limited', {
-      retryAfterSeconds: admission.retryAfterSeconds,
-    })
-  } catch (error) {
-    console.warn('accounts: registration quota unavailable; allowing')
-    Sentry.captureException(error)
-    return null
-  }
-}
-
-/**
- * The payload of a self-signed account op, after the envelope, its signature
- * by the named key, and its timestamp check out; otherwise the refusal.
- */
-const verifiedKeyPayload = async (
-  c: AppContext,
-  op: AccountsOp
-): Promise<{ payload: AccountKeyPayload } | { refusal: Response }> => {
-  const text = await readEnvelopeText(c.req.raw)
-  const envelope = text == null ? null : parseEnvelope(text)
-  const payload = envelope ? parseAccountKeyPayload(envelope.payload) : null
-  if (!envelope || !payload)
-    return { refusal: buddiesErrorResponse('bad_request') }
-  const signature = decodeSignature(envelope.signature)
-  if (!signature) return { refusal: buddiesErrorResponse('bad_signature') }
-  if (Math.abs(Date.now() - payload.ts) > BUDDIES_LIMITS.timestampSkewMs)
-    return { refusal: buddiesErrorResponse('stale') }
-  const valid = await verifyEd25519(
-    payload.accountPub,
-    accountSignedMessage(op, envelope.payloadBytes),
-    signature
-  )
-  return valid
-    ? { payload }
-    : { refusal: buddiesErrorResponse('bad_signature') }
-}
 
 /**
  * `POST /accounts/v1/account/register`: the account for a signing key, created
@@ -101,17 +46,23 @@ const verifiedKeyPayload = async (
 const handleRegister = async (c: AppContext): Promise<Response> => {
   try {
     if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
-    const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
-    if (!(await allowBuddiesCaller(c.env, 'inbox/register', callerKey)))
-      return buddiesErrorResponse('rate_limited', {
-        retryAfterSeconds: EDGE_RETRY_AFTER_SECONDS,
-      })
+    const limited = await refuseAtEdge(c, 'inbox/register')
+    if (limited) return limited
 
-    const verified = await verifiedKeyPayload(c, 'account/register')
+    const verified = await verifiedBody(c, 'account/register')
     if ('refusal' in verified) return verified.refusal
     const { payload } = verified
 
-    const refused = await refuseOverQuota(c.env, callerKey)
+    // The caller's rolling-day registration quota, shared in kind with
+    // Buddies' `inbox/register` (a DO per caller, under its own name).
+    const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
+    const refused = await refuseOverDailyQuota(
+      c.env,
+      await quotaName('register-caller', callerKey),
+      undefined,
+      'account/register',
+      'registrationsPerDay'
+    )
     if (refused) return refused
 
     const account = await registerAccount(
@@ -138,13 +89,10 @@ const handleRegister = async (c: AppContext): Promise<Response> => {
 const handleInfo = async (c: AppContext): Promise<Response> => {
   try {
     if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
-    const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
-    if (!(await allowBuddiesCaller(c.env, 'inbox/sync', callerKey)))
-      return buddiesErrorResponse('rate_limited', {
-        retryAfterSeconds: EDGE_RETRY_AFTER_SECONDS,
-      })
+    const limited = await refuseAtEdge(c, 'inbox/sync')
+    if (limited) return limited
 
-    const verified = await verifiedKeyPayload(c, 'account/info')
+    const verified = await verifiedBody(c, 'account/info')
     if ('refusal' in verified) return verified.refusal
     const { payload } = verified
 
@@ -167,5 +115,16 @@ export const createAccountsRoutes = () => {
   const routes = new Hono<{ Bindings: Environment }>()
   routes.post('/account/register', accountRegisterDocs, handleRegister)
   routes.post('/account/info', accountInfoDocs, handleInfo)
+  routes.post('/handoff/open', handoffOpenDocs, handoffHandlers.open)
+  routes.post('/handoff/claim', handoffClaimDocs, handoffHandlers.claim)
+  routes.post('/handoff/status', handoffStatusDocs, handoffHandlers.status)
+  routes.post('/handoff/send', handoffSendDocs, handoffHandlers.send)
+  routes.post('/handoff/receive', handoffReceiveDocs, handoffHandlers.receive)
+  routes.post('/handoff/done', handoffDoneDocs, handoffHandlers.done)
+  routes.post('/handoff/cancel', handoffCancelDocs, handoffHandlers.cancel)
+  routes.post('/backup/put', backupPutDocs, backupHandlers.put)
+  routes.post('/backup/list', backupListDocs, backupHandlers.list)
+  routes.post('/backup/get', backupGetDocs, backupHandlers.get)
+  routes.post('/backup/delete', backupDeleteDocs, backupHandlers.delete)
   return routes
 }

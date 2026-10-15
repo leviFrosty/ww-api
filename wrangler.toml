@@ -125,12 +125,23 @@ class_name = "RoutePlanningQuota"
 name = "BUDDY_REGISTRATION_QUOTA"
 class_name = "BuddyRegistrationQuota"
 
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_HANDOFF"
+class_name = "AccountHandoff"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
 [[env.dev.r2_buckets]]
 binding = "BUDDY_BLOBS"
 bucket_name = "ww-buddy-blobs-dev"
+
+# Account backups (witness-work ADR 0026), separate from prod's bucket.
+# `pnpm run deploy:dev` creates it and sets its 400-day lifecycle rule
+# (scripts/r2-lifecycle.mjs).
+[[env.dev.r2_buckets]]
+binding = "ACCOUNT_BACKUPS"
+bucket_name = "ww-account-backups-dev"
 
 # Anonymous accounts (witness-work ADR 0024): accounts, their status, and which
 # Buddies inboxes they own. Not inherited, like every binding. Migrations come
@@ -165,6 +176,10 @@ new_sqlite_classes = ["RoutePlanningQuota"]
 [[env.dev.migrations]]
 tag = "v6"
 new_sqlite_classes = ["BuddyRegistrationQuota"]
+
+[[env.dev.migrations]]
+tag = "v7"
+new_sqlite_classes = ["AccountHandoff"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -447,6 +462,15 @@ migrations_dir = "migrations/accounts"
 binding = "BUDDY_BLOBS"
 bucket_name = "ww-buddy-blobs"
 
+# Account backups (witness-work ADR 0026): one end-to-end encrypted object per
+# device slot at v1/<accountId>/<slotId>. Without the binding, backup/* answers
+# `disabled`. Every deploy runs scripts/r2-lifecycle.mjs first: it creates the
+# bucket if it's missing and deletes v1/ objects 400 days after their last
+# upload. Repeated (with its own bucket) under [env.dev] above.
+[[r2_buckets]]
+binding = "ACCOUNT_BACKUPS"
+bucket_name = "ww-account-backups"
+
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
 # SQLite-backed (event log / active-import set). See
 # docs/notes-import-streaming-durable-objects.md. Repeated under [env.dev] above.
@@ -486,10 +510,18 @@ class_name = "RoutePlanningQuota"
 
 # Buddies: signed inbox/register calls per caller (hashed client IP, IPv6 by
 # /64) per hour over the last day, nothing else; deletes itself a day after
-# the newest. Repeated under [env.dev] above.
+# the newest. Accounts reuse it under their own hashed names (account/register
+# per caller, handoff/open per account). Repeated under [env.dev] above.
 [[durable_objects.bindings]]
 name = "BUDDY_REGISTRATION_QUOTA"
 class_name = "BuddyRegistrationQuota"
+
+# Accounts: Set Up Another Device, one handoff channel per DO (a temporary
+# public key and two sealed blobs, deleted within ten minutes of opening).
+# Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "ACCOUNT_HANDOFF"
+class_name = "AccountHandoff"
 
 [[migrations]]
 tag = "v1"
@@ -516,6 +548,10 @@ new_sqlite_classes = ["RoutePlanningQuota"]
 [[migrations]]
 tag = "v6"
 new_sqlite_classes = ["BuddyRegistrationQuota"]
+
+[[migrations]]
+tag = "v7"
+new_sqlite_classes = ["AccountHandoff"]
 
 [observability]
 enabled = true

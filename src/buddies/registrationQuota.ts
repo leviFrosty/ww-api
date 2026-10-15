@@ -22,22 +22,28 @@ type Bucket = { hour: number; n: number }
  * how many validly signed `inbox/register` calls it made in each hour of the
  * last day, and nothing else. Single-threaded, so the check and the count
  * can't race. It deletes itself once its newest hour leaves the window.
+ *
+ * Other rolling-day quotas reuse the class under their own hashed names with
+ * their own `limit` (accounts: `handoff/open` per account).
  */
 export class BuddyRegistrationQuota extends DurableObject<Environment> {
   #schemaReady = false
 
-  async admit(now: number): Promise<RegistrationAdmission> {
+  async admit(
+    now: number,
+    limit: number = ABUSE.registrationsPerDay
+  ): Promise<RegistrationAdmission> {
     const hour = Math.floor(now / HOUR_MS)
     const result = this.ctx.storage.transactionSync(
       (): RegistrationAdmission => {
         this.#ensureSchema()
         const buckets = this.#prune(hour)
         let counted = buckets.reduce((sum, bucket) => sum + bucket.n, 0)
-        if (counted >= ABUSE.registrationsPerDay) {
+        if (counted >= limit) {
           // Wait for enough of the oldest hours to leave the window.
           for (const bucket of buckets) {
             counted -= bucket.n
-            if (counted < ABUSE.registrationsPerDay) {
+            if (counted < limit) {
               const frees = (bucket.hour + WINDOW_HOURS) * HOUR_MS
               return {
                 ok: false,

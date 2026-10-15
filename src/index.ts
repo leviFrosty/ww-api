@@ -13,6 +13,7 @@ export { BuddyInbox } from "./buddies/inboxDO";
 export { BuddyInvite } from "./buddies/inviteDO";
 export { RoutePlanningQuota } from "./routePlanning/quotaDO";
 export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
+export { AccountHandoff } from "./accounts/handoffDO";
 
 export default Sentry.withSentry(
   (environment: Environment) => createSentryConfig(environment),

@@ -199,6 +199,14 @@ export const buddyInvitePageDocs = describeRoute({
   responses: { 200: html('The invite landing page.') },
 })
 
+export const handoffPageDocs = describeRoute({
+  tags: ['Links'],
+  summary: 'Set Up Another Device fallback page',
+  description:
+    'Shown when a phone’s camera opens a Set Up Another Device QR code (`/h#1<…>`) instead of WitnessWork: install or open the app on the new phone and scan the code from inside it, with App Store and Google Play buttons. Localized like `/c` (`?lang=`, then `Accept-Language`). The handoff secret stays in the fragment and never reaches the worker.',
+  responses: { 200: html('The handoff landing page.') },
+})
+
 export const notesImportAdminResetDocs = describeRoute({
   tags: ['Admin'],
   summary: 'Reset a Notes Import meter',

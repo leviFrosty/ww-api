@@ -47,10 +47,11 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
 
 /**
  * The Buddies live socket sends its signed envelope (which holds the inbox
- * id) in `x-buddies-*` request headers, and the SDK copies request headers
- * into events. Drop them outright.
+ * id) in `x-buddies-*` request headers, and accounts' `backup/put` sends its
+ * envelope (account key and slot id) in `x-ww-p`/`x-ww-s`. The SDK copies
+ * request headers into events, so drop them outright.
  */
-const BUDDIES_HEADER = /^x-buddies-/i;
+const BUDDIES_HEADER = /^(x-buddies-|x-ww-[ps]$)/i;
 
 function dropBuddiesHeaders(event: Event): void {
   const headers = event.request?.headers;

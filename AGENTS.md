@@ -449,6 +449,74 @@ curl -sX POST "$BASE/admin/accounts/status" -H "x-ww-admin-token: $TOKEN" \
 of the account's inboxes. If `inboxesFailed` is above 0, send the same
 request again.
 
+### Handoff and backup
+
+Moving the account to another phone and backing it up (witness-work ADR 0026;
+"Handoff", "Backup", and "Recovery key" in its `docs/accounts-protocol.md`).
+Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
+
+- **Handoff** (Set Up Another Device): `POST /accounts/v1/handoff/open|claim|
+  status|send|receive|done|cancel`, code in `src/accounts/handoff.ts`. The old
+  phone's ops (`open`, `status`, `send`, and `cancel` with `p`/`s`) are signed
+  by the account key like `account/register` and need a registered account
+  (`unknown_account` otherwise; a suspended one may still hand off). The new
+  phone's (`claim`, `receive`, `done`, and `cancel` without `p`) are plain JSON
+  carrying `claimToken`. One `AccountHandoff` SQLite DO per `channelId`
+  (binding `ACCOUNT_HANDOFF`, migration `v7`, `src/accounts/handoffDO.ts`)
+  holds the opening account, `verifier = b64u(SHA-256(claimToken))`, the new
+  phone's temporary key, and the sealed hello (≤ 2,048 chars) and key
+  (≤ 1,024; over either is `too_large`). Status runs `open → claimed → sent →
+  done`, or `cancelled` from any of them. The first valid claim wins and an
+  identical repeat gets `ok`; five wrong tokens (on any new-phone op) burn the
+  channel to `cancelled`. `done` and `cancel` clear the blobs at once, and the
+  alarm deletes everything 10 minutes after `open`; expired and unknown
+  channels are `not_found`. Another account as the old phone is 403
+  `forbidden`. A wrong token is 401 `bad_signature`, and an op out of order is
+  `conflict`. Limits: `open` uses the Buddies register edge tier plus 20 per
+  account a rolling day (`BUDDY_REGISTRATION_QUOTA` under a hashed
+  `handoff-open` name; `admit` takes the limit), and every other op the read
+  tier.
+- **Backup**: `POST /accounts/v1/backup/put|list|get|delete`, code in
+  `src/accounts/backup.ts`. All four are signed; `put` sends its envelope in
+  `x-ww-p`/`x-ww-s` (Sentry drops both) and the blob as the raw body. R2
+  bucket `ACCOUNT_BACKUPS` (`ww-account-backups` prod,
+  `ww-account-backups-dev` dev), one object per device slot at
+  `v1/<accountId>/<slotId>` with `customMetadata.uploadedAt` (epoch ms). `put`
+  refuses a declared `Content-Length` or signed `size` over 20 MiB (413
+  `too_large`) before reading the body, then reads at most `size` bytes and
+  checks length and SHA-256 (`bad_request`). 8 slots an account (429 `limit`)
+  and one `put` a slot a minute (429 `rate_limited` with `Retry-After`), both
+  read from an R2 prefix listing, so two racing puts can each pass. `put`
+  counts against the Buddies photo-upload edge tier, the rest the read tier.
+  `delete` without `slotId` deletes every slot. Suspended accounts can still
+  back up. Without the bucket or `ACCOUNTS_DB`, every op is 503 `disabled`.
+- **`GET /h`** is the page a camera opens for a handoff QR code
+  (`/h#1<…>`): install or open WitnessWork on the new phone and scan from
+  inside the app. Localized like `/c` (`?lang=`, then `Accept-Language`;
+  strings in `src/accounts/handoffPageLocales.ts`), no script. The AASA
+  matches `/h#1…`; `assetlinks.json` already covers the whole host.
+- **Privacy**: handoff and backup log only the op name. Never log or report
+  bodies, headers, keys, tokens, account ids, channel ids, or slot ids.
+
+The buckets need to exist **before the first deploy that carries the
+`ACCOUNT_BACKUPS` binding**. Every deploy (`pnpm run deploy`, `deploy:dev`,
+and the tag deploy) runs `scripts/r2-lifecycle.mjs` for both buckets first,
+which creates a missing bucket and sets its rules: `v1/` objects deleted 400
+days after their last upload (each `put` rewrites the object, restarting its
+age), plus R2's default multipart-abort rule. By hand:
+
+```bash
+node scripts/r2-lifecycle.mjs ww-account-backups-dev          # dev: create + 400-day rule
+node scripts/r2-lifecycle.mjs ww-account-backups              # prod
+node scripts/r2-lifecycle.mjs ww-account-backups --check      # read-only
+# The same with wrangler alone:
+wrangler r2 bucket create ww-account-backups
+wrangler r2 bucket lifecycle add ww-account-backups account-backups-expiry v1/ --expire-days 400
+```
+
+The `v7` migration (`AccountHandoff`) applies on the next deploy of each
+worker.
+
 ## App Store ratings (paywall social proof)
 
 `GET /app-store/ratings` returns `{averageRating, ratingCount, countryCount,
