@@ -17,6 +17,7 @@ import {
   type RouteOptimizeResponse,
 } from './contracts'
 import { fetchWaypointsSequence } from './here'
+import { routeOptimizeDocs } from './openapi'
 
 /**
  * `POST /route-planning/optimize` — Supporter-only shortest driving order for
@@ -75,7 +76,7 @@ export const createRoutePlanningRoutes = (
   const deps = { ...defaultDependencies, ...overrides }
   const routes = new Hono<{ Bindings: Environment }>()
 
-  routes.post('/optimize', async (ctx) => {
+  routes.post('/optimize', routeOptimizeDocs, async (ctx) => {
     if (!(await isRoutePlanningEnabled(ctx.env))) {
       return fail(
         ctx,

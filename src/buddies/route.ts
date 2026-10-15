@@ -54,6 +54,12 @@ import {
 } from './limits'
 import { defaultApnsDependencies } from '../apns'
 import { deliverPushJob, type PushDependencies } from './push'
+import {
+  buddiesBlobGetDocs,
+  buddiesBlobPutDocs,
+  buddiesLiveDocs,
+  buddiesOpDocs,
+} from './openapi'
 
 /**
  * `POST /buddies/v1/{op}` — the Buddies relay (docs/buddies-protocol.md) —
@@ -503,10 +509,12 @@ export const createBuddiesRoutes = (
 ) => {
   const routes = new Hono<{ Bindings: Environment }>()
   for (const op of BUDDIES_OPS) {
-    routes.post(`/${op}`, (c) => handleBuddiesOp(c, op, deps))
+    routes.post(`/${op}`, buddiesOpDocs[op], (c) =>
+      handleBuddiesOp(c, op, deps)
+    )
   }
-  routes.get(`/${BUDDIES_LIVE_OP}`, handleLive)
-  routes.post(`/${BUDDIES_BLOB_PUT_OP}`, handleBlobPut)
-  routes.post(`/${BUDDIES_BLOB_GET_OP}`, handleBlobGet)
+  routes.get(`/${BUDDIES_LIVE_OP}`, buddiesLiveDocs, handleLive)
+  routes.post(`/${BUDDIES_BLOB_PUT_OP}`, buddiesBlobPutDocs, handleBlobPut)
+  routes.post(`/${BUDDIES_BLOB_GET_OP}`, buddiesBlobGetDocs, handleBlobGet)
   return routes
 }

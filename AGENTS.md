@@ -533,6 +533,29 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
 
 The first deploy applies the `v5` migration (prod and `--env dev`).
 
+## API docs (OpenAPI + Scalar)
+
+`GET /docs` is the Scalar API reference and `GET /openapi.json` its OpenAPI
+3.1 document, on both workers (prod: https://ww-proxy.leviwilkerson.com/docs).
+The repo is public, so the docs are too, admin routes included (they still
+need the token).
+
+- `hono-openapi` builds the document from the routes themselves: each route
+  carries a `describeRoute(...)` middleware, kept in an `openapi.ts` beside its
+  handlers (`src/notesImport/`, `src/buddies/`, `src/accounts/`,
+  `src/routePlanning/`; routes registered in `src/app.ts` use
+  `src/openapi/coreDocs.ts`). Shared helpers and the error envelope are in
+  `src/openapi/schemas.ts`; tags, servers, and the Scalar config in
+  `src/openapi/route.ts`.
+- The schemas describe the wire format for readers; they don't validate.
+  Handlers keep their own parsing, so **a contract change means updating the
+  route's `openapi.ts` in the same PR**.
+- `src/openapi/openapi.test.ts` fails on any route without docs, and on any
+  operation without a tag, summary, or responses.
+- Signed Buddies/accounts ops document the envelope `{p, s}` and list the
+  decoded `p` fields as a table (`signedBody`).
+- The document is built once per isolate. Scalar's UI loads from jsDelivr.
+
 ## Checks before deploy
 
 ```bash

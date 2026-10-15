@@ -1,36 +1,7 @@
-import { Hono } from "hono";
-import type { Environment, AppContext, HealthCheckResponse } from "./types";
-import { HERE_API, HTTP_STATUS } from "./config";
-import { apiError, dateHeader } from "./errors";
-import { rateLimit } from "./rateLimit";
-import { proxyRequestToHereApi } from "./proxy";
-import {
-  handleAasaRequest,
-  handleContactLinkRequest,
-  handleLegacyContactLinkRequest,
-} from "./contactLink";
-import {
-  handleChallengeRequest,
-  handleAttestRequest,
-  handleNotesImportVerifyRequest,
-  handleNotesImportRequest,
-  handleNotesImportStatusRequest,
-  handleNotesImportKickoffRequest,
-  handleNotesImportTranscribeRequest,
-  handleNotesImportEventsRequest,
-  handleNotesImportResultRequest,
-  handleNotesImportCancelRequest,
-  handleNotesImportDestroyRequest,
-  handleNotesImportAdminResetRequest,
-} from "./notesImport/route";
-import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
+import type { Environment } from "./types";
 import { runRatingsSweepStep } from "./appStoreRatings/ratings";
 import { Sentry, createSentryConfig } from "./sentry";
-import { createBuddiesRoutes } from "./buddies/route";
-import { createAccountsRoutes } from "./accounts/route";
-import { createAccountsAdminRoutes } from "./accounts/admin";
-import { handleBuddyInvitePage } from "./buddies/invitePage";
-import { createRoutePlanningRoutes } from "./routePlanning/route";
+import { app } from "./app";
 
 // Durable Object classes must be re-exported from the entry module so Wrangler
 // can bind them (see wrangler.toml [[durable_objects.bindings]] + migrations).
@@ -42,101 +13,6 @@ export { BuddyInbox } from "./buddies/inboxDO";
 export { BuddyInvite } from "./buddies/inviteDO";
 export { RoutePlanningQuota } from "./routePlanning/quotaDO";
 export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
-
-const app = new Hono<{ Bindings: Environment }>();
-
-async function handleGeocodeRequest(context: AppContext) {
-  return proxyRequestToHereApi(context, HERE_API.GEOCODE_URL);
-}
-
-async function handleAutocompleteRequest(context: AppContext) {
-  return proxyRequestToHereApi(context, HERE_API.AUTOCOMPLETE_URL);
-}
-
-/**
- * Liveness plus the server clock. Clients calibrate against `Date` (and
- * `serverTime`, epoch ms) before signing time-bound requests (Buddies `ts`),
- * so it is never cached anywhere: a cached copy would carry an old clock. No
- * I/O, no rate limit.
- */
-function handleHealthCheckRequest(context: AppContext) {
-  const now = Date.now();
-  const response: HealthCheckResponse = {
-    status: "ok",
-    timestamp: new Date(now).toISOString(),
-    serverTime: now,
-    versionId: context.env.CF_VERSION_METADATA.id,
-    versionTag: context.env.CF_VERSION_METADATA.tag || undefined,
-    deployedAt: context.env.CF_VERSION_METADATA.timestamp,
-  };
-  return context.json(response, 200, {
-    "Cache-Control": "no-store",
-    ...dateHeader(now),
-  });
-}
-
-function handleNotFound() {
-  return apiError(HTTP_STATUS.NOT_FOUND, "not_found");
-}
-
-function handleApplicationError(error: Error) {
-  Sentry.captureException(error);
-  console.error("Application error:", error);
-  return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
-}
-
-// Each family counts in its own per-IP bucket (src/rateLimit.ts).
-app.use("/geocode", rateLimit("places"));
-app.use("/autocomplete", rateLimit("places"));
-app.use("/notes-import", rateLimit("notes-import"));
-app.use("/notes-import/*", rateLimit("notes-import"));
-app.use("/admin/*", rateLimit("admin"));
-app.use("/route-planning/*", rateLimit("route-planning"));
-
-app.get("/geocode", handleGeocodeRequest);
-app.get("/autocomplete", handleAutocompleteRequest);
-app.get("/health", handleHealthCheckRequest);
-// Paywall social proof (App Store ratings), edge-cached; refreshed by cron.
-app.get("/app-store/ratings", handleAppStoreRatingsRequest);
-// Notes Import: availability probe, App Attest handshake + the metered call.
-app.get("/notes-import/status", handleNotesImportStatusRequest);
-app.post("/notes-import/challenge", handleChallengeRequest);
-app.post("/notes-import/attest", handleAttestRequest);
-// Attested no-op: dev-tools diagnostics prove the assertion path server-side.
-app.post("/notes-import/verify", handleNotesImportVerifyRequest);
-// Streaming import: attested kickoff → SSE progress stream → result snapshot.
-app.post("/notes-import/kickoff", handleNotesImportKickoffRequest);
-app.post("/notes-import/transcribe", handleNotesImportTranscribeRequest);
-app.get("/notes-import/:importId/events", handleNotesImportEventsRequest);
-app.get("/notes-import/:importId/result", handleNotesImportResultRequest);
-app.post("/notes-import/:importId/cancel", handleNotesImportCancelRequest);
-app.post("/notes-import/:importId/destroy", handleNotesImportDestroyRequest);
-// Legacy synchronous path (fallback during cutover).
-app.post("/notes-import", handleNotesImportRequest);
-// Maintainer-only usage reset (secret auth inside handler; 404 fail-closed).
-app.post("/admin/notes-import/reset", handleNotesImportAdminResetRequest);
-// Account moderation: look up and suspend accounts (token auth; 404 fail-closed).
-app.route("/admin/accounts", createAccountsAdminRoutes());
-// Universal-link support for WitnessWork contact sharing. AASA must be served
-// at this exact path with Content-Type application/json and no redirects.
-app.get("/.well-known/apple-app-site-association", handleAasaRequest);
-// Shared contacts ride in the fragment (`/c#<payload>`), which never reaches
-// the worker. `/c/:payload` keeps links from older app versions working.
-app.get("/c", handleContactLinkRequest);
-app.get("/c/:payload", handleLegacyContactLinkRequest);
-// Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
-// rate-limited per caller inside the handler (src/buddies/limits.ts).
-app.route("/buddies/v1", createBuddiesRoutes());
-// Anonymous accounts (witness-work ADR 0024): POST /accounts/v1/{op}, signed
-// like Buddies ops and rate-limited per caller inside the handler.
-app.route("/accounts/v1", createAccountsRoutes());
-// Buddy invite no-app fallback; the invite secret stays in the URL fragment.
-app.get("/b", handleBuddyInvitePage);
-// Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
-// with per-account limits in the RoutePlanningQuota DO.
-app.route("/route-planning", createRoutePlanningRoutes());
-app.notFound(handleNotFound);
-app.onError(handleApplicationError);
 
 export default Sentry.withSentry(
   (environment: Environment) => createSentryConfig(environment),

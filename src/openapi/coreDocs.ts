@@ -1,0 +1,224 @@
+import { z } from 'zod'
+import { describeRoute } from 'hono-openapi'
+import {
+  errorResponse,
+  jsonBody,
+  jsonResponse,
+  rateLimitedResponse,
+  serverErrorResponse,
+} from './schemas'
+
+/**
+ * OpenAPI descriptions for the routes registered directly in `src/index.ts`.
+ * Feature route groups keep theirs in their own `openapi.ts`.
+ */
+
+const html = (description: string) => ({
+  description,
+  content: { 'text/html': { schema: { type: 'string' as const } } },
+})
+
+export const healthDocs = describeRoute({
+  tags: ['Service'],
+  summary: 'Health and server clock',
+  description:
+    'Liveness plus the server clock. Clients calibrate against `Date` (and `serverTime`) before signing time-bound requests such as Buddies `ts`, so the response is never cached. No rate limit.',
+  responses: {
+    200: jsonResponse(
+      'The worker is up.',
+      z.object({
+        status: z.literal('ok'),
+        timestamp: z.string().meta({
+          description: 'Server time (ISO 8601).',
+          format: 'date-time',
+        }),
+        serverTime: z
+          .number()
+          .int()
+          .meta({ description: 'The same instant in epoch milliseconds.' }),
+        versionId: z
+          .string()
+          .meta({ description: 'Deployed Worker version id.' }),
+        versionTag: z
+          .string()
+          .optional()
+          .meta({ description: 'Version tag, when one was set at upload.' }),
+        deployedAt: z.string().meta({
+          description: 'When this Worker version was uploaded (ISO 8601).',
+          format: 'date-time',
+        }),
+      })
+    ),
+  },
+})
+
+const hereQuery = (extra: string) => [
+  {
+    name: 'q',
+    in: 'query' as const,
+    required: true,
+    schema: { type: 'string' as const },
+    description: extra,
+  },
+]
+
+const hereResponses = {
+  200: {
+    description:
+      'HERE’s response body, passed through unchanged with HERE’s status.',
+    content: { 'application/json': { schema: { type: 'object' as const } } },
+  },
+  400: errorResponse(
+    'HERE rejected the query. HERE’s own error fields are kept beside the envelope.',
+    ['bad_request']
+  ),
+  ...rateLimitedResponse,
+  502: errorResponse('HERE was unreachable or answered with a non-JSON body.', [
+    'upstream_error',
+  ]),
+}
+
+export const geocodeDocs = describeRoute({
+  tags: ['Places'],
+  summary: 'Geocode an address',
+  description:
+    'Proxies [HERE Geocode](https://www.here.com/docs/bundle/geocoding-and-search-api-developer-guide/page/topics-api/code-geocode-address.html). Every HERE query parameter is accepted; any `apiKey` the client sends is removed and replaced with the worker’s.',
+  parameters: hereQuery('The address to geocode.'),
+  responses: hereResponses,
+})
+
+export const autocompleteDocs = describeRoute({
+  tags: ['Places'],
+  summary: 'Autocomplete an address',
+  description:
+    'Proxies [HERE Autocomplete](https://www.here.com/docs/bundle/geocoding-and-search-api-developer-guide/page/topics/endpoint-autocomplete-brief.html). Every HERE query parameter (`limit`, `in`, `lang`, …) is accepted; any `apiKey` the client sends is removed and replaced with the worker’s.',
+  parameters: hereQuery('The partial address typed so far.'),
+  responses: hereResponses,
+})
+
+export const appStoreRatingsDocs = describeRoute({
+  tags: ['App Store'],
+  summary: 'App Store rating totals',
+  description:
+    'Paywall social proof: ratings summed across all 175 App Store storefronts. An hourly cron sweeps 40 storefronts a run and publishes a new summary once a day. Served from the edge cache (`s-maxage` 6 h).',
+  responses: {
+    200: jsonResponse(
+      'The latest completed sweep.',
+      z.object({
+        averageRating: z.number().meta({
+          description:
+            'Rating-count-weighted mean across storefronts, rounded to 2 decimals.',
+        }),
+        ratingCount: z.number().int(),
+        countryCount: z
+          .number()
+          .int()
+          .meta({ description: 'Storefronts with at least one rating.' }),
+        updatedAt: z.string().meta({ format: 'date-time' }),
+      })
+    ),
+    503: errorResponse(
+      'No sweep has completed yet (a fresh deploy). `Retry-After: 3600`.',
+      ['unavailable']
+    ),
+  },
+})
+
+export const aasaDocs = describeRoute({
+  tags: ['Links'],
+  summary: 'Apple App Site Association',
+  description:
+    'Tells iOS which paths open the app: `/c#…` (shared contacts), `/c/…` (contacts from older builds), and `/b#1…` (buddy invites), for the App Store, Beta, and development bundle ids.',
+  responses: {
+    200: {
+      description: 'The AASA document.',
+      content: {
+        'application/json': {
+          schema: { type: 'object' as const },
+          example: {
+            applinks: {
+              details: [
+                {
+                  appIDs: ['TEAMID.com.leviwilkerson.jwtime'],
+                  components: [
+                    { '/': '/c', '#': '?*' },
+                    { '/': '/c/*' },
+                    { '/': '/b', '#': '1?*' },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      },
+    },
+    ...serverErrorResponse,
+  },
+})
+
+const langParameter = {
+  name: 'lang',
+  in: 'query' as const,
+  required: false,
+  schema: { type: 'string' as const },
+  description: 'Page language. Falls back to `Accept-Language`, then English.',
+}
+
+export const contactLinkDocs = describeRoute({
+  tags: ['Links'],
+  summary: 'Shared contact fallback page',
+  description:
+    'Shown when someone opens a shared-contact link without the app. The contact rides in the URL fragment (`/c#<payload>`), which never reaches the worker; the page’s script turns it into an “Open app” link.',
+  parameters: [langParameter],
+  responses: { 200: html('A localized landing page.') },
+})
+
+export const legacyContactLinkDocs = describeRoute({
+  tags: ['Links'],
+  summary: 'Shared contact fallback page (legacy)',
+  description:
+    'The same page for links shared by older app versions, which put the payload in the path. The payload only ever goes into the “Open app” link, never into meta tags.',
+  parameters: [
+    {
+      name: 'payload',
+      in: 'path' as const,
+      required: true,
+      schema: { type: 'string' as const },
+      description: 'The base64url contact payload.',
+    },
+    langParameter,
+  ],
+  responses: { 200: html('A localized landing page.') },
+})
+
+export const buddyInvitePageDocs = describeRoute({
+  tags: ['Links'],
+  summary: 'Buddy invite fallback page',
+  description:
+    'Shown when someone opens a buddy invite (`/b#1<secret>`) without the app, with App Store and Google Play buttons. The invite secret stays in the fragment and never reaches the worker.',
+  responses: { 200: html('The invite landing page.') },
+})
+
+export const notesImportAdminResetDocs = describeRoute({
+  tags: ['Admin'],
+  summary: 'Reset a Notes Import meter',
+  description:
+    'Resets one meter’s rolling allowance and its Empty Import rows, keeping permanent replay and refinement records. Used by `pnpm run admin:reset-usage`.',
+  security: [{ adminToken: [] }],
+  requestBody: jsonBody(
+    z.object({
+      meterId: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]{8,64}$/)
+        .meta({
+          description: 'The account id, or the install id without an account.',
+        }),
+    })
+  ),
+  responses: {
+    200: jsonResponse('Reset.', z.object({ ok: z.literal(true) })),
+    400: errorResponse('Invalid JSON or `meterId`.', ['bad_request']),
+    404: errorResponse('Missing or wrong admin token.', ['not_found']),
+    ...rateLimitedResponse,
+  },
+})
