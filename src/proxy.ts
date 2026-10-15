@@ -70,8 +70,15 @@ function buildHereApiUrl(baseUrl: string, params: URLSearchParams): string {
   return `${baseUrl}?${params.toString()}`;
 }
 
+/**
+ * Captured at module evaluation, before Sentry's fetch integration wraps
+ * `globalThis.fetch`. The wrapped fetch records each request URL as a span and
+ * breadcrumb, and HERE's URL carries both the API key and what the user typed.
+ */
+const uninstrumentedFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+
 async function fetchFromHereApi(url: string): Promise<Response> {
-  return fetch(url);
+  return uninstrumentedFetch(url);
 }
 
 /** Returns the parsed body, or `undefined` when it is not valid JSON. */
