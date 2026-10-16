@@ -1,8 +1,9 @@
 import type { AppContext } from '../types'
 
 /**
- * `GET /b` — no-app fallback for Buddy invite links
- * (`https://ww-proxy.leviwilkerson.com/b#1<secret>`).
+ * `GET /buddies/invite` — no-app fallback for Buddy invite links
+ * (`https://ww-proxy.leviwilkerson.com/buddies/invite#1<secret>`). The short
+ * `/b`, in invites already sent, serves the same page.
  *
  * The secret lives in the fragment, which browsers never send to a server.
  * This handler reads nothing from the request and the page is fully static and
@@ -52,7 +53,12 @@ const COPY_SCRIPT = `
 })();
 `
 
-const PAGE_HTML = `<!doctype html>
+const INVITE_PATH = '/buddies/invite'
+const SHORT_INVITE_PATH = '/b'
+
+const renderPage = (
+  path: typeof INVITE_PATH | typeof SHORT_INVITE_PATH
+): string => `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -67,7 +73,7 @@ const PAGE_HTML = `<!doctype html>
   <meta property="og:site_name" content="WitnessWork">
   <meta property="og:title" content="${OG_TITLE}">
   <meta property="og:description" content="${OG_DESCRIPTION}">
-  <meta property="og:url" content="${SITE_ORIGIN}/b">
+  <meta property="og:url" content="${SITE_ORIGIN}${path}">
   <meta property="og:image" content="${OG_IMAGE_URL}">
   <meta property="og:image:alt" content="WitnessWork app icon">
   <meta name="twitter:card" content="summary">
@@ -164,7 +170,9 @@ export const handleBuddyInvitePage = async (
     "form-action 'none'",
     "frame-ancestors 'none'",
   ].join('; ')
-  return context.html(PAGE_HTML, 200, {
+  const path =
+    context.req.path === SHORT_INVITE_PATH ? SHORT_INVITE_PATH : INVITE_PATH
+  return context.html(renderPage(path), 200, {
     'Cache-Control': 'public, max-age=3600',
     'Content-Security-Policy': policy,
     'Referrer-Policy': 'no-referrer',

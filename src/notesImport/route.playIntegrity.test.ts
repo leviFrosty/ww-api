@@ -26,12 +26,14 @@ import { resetGoogleAuthState } from '../googleAuth'
 import { computePlayIntegrityRequestBinding } from '../playIntegrity/protocol'
 import { getNotesImportStatus, type StatusKv } from './status'
 import {
-  handleAttestRequest,
-  handleChallengeRequest,
   handleNotesImportKickoffRequest,
   handleNotesImportRequest,
-  handleNotesImportVerifyRequest,
 } from './route'
+import {
+  handleAttestationChallengeRequest,
+  handleAttestationRegisterRequest,
+  handleAttestationVerifyRequest,
+} from '../attestation/route'
 
 const UUID = '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C'
 const ACCOUNT_ID = 'account-id-1'
@@ -173,7 +175,7 @@ const setup = async (
         ? { CONTENT_HASH, REQUEST_HASH: CONTENT_HASH }
         : { CONTENT_HASH, REQUEST_HASH }
     )
-    const response = await handleChallengeRequest(context(env, { body: fields }))
+    const response = await handleAttestationChallengeRequest(context(env, { body: fields }))
     expect(response.status).toBe(200)
     const { challenge } = (await response.json()) as { challenge: string }
     pendingBinding = await computePlayIntegrityRequestBinding({
@@ -362,7 +364,7 @@ describe('Play Integrity on the Notes Import routes', () => {
       notesText: NOTES_TEXT,
       context: NOTES_CONTEXT,
     })
-    for (const handler of [handleNotesImportRequest, handleAttestRequest]) {
+    for (const handler of [handleNotesImportRequest, handleAttestationRegisterRequest]) {
       const response = await handler(context(env, { body }))
       expect(response.status).toBe(400)
       await expect(response.json()).resolves.toMatchObject({
@@ -375,7 +377,7 @@ describe('Play Integrity on the Notes Import routes', () => {
     const { env, index, signedBody } = await setup()
     const body = await signedBody('notes-import-verify', {})
 
-    const response = await handleNotesImportVerifyRequest(context(env, { body }))
+    const response = await handleAttestationVerifyRequest(context(env, { body }))
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
@@ -393,7 +395,7 @@ describe('Play Integrity on the Notes Import routes', () => {
       ...env,
       PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON: undefined,
     } as Environment
-    const response = await handleChallengeRequest(
+    const response = await handleAttestationChallengeRequest(
       context(unconfigured, { body: challengeFields('notes-import-kickoff') })
     )
     expect(response.status).toBe(503)

@@ -67,9 +67,10 @@ them in sync with the top-level prod config when adding new bindings.
 
 Android authenticates Notes Import with Google Play Integrity standard requests
 instead of App Attest (witness-work ADR 0017; code in `src/playIntegrity/`). A
-request opts in with `attestationProvider: "play-integrity"` on the existing
-`/notes-import/challenge`, `/kickoff`, and `/verify` routes; bodies without it
-take the unchanged App Attest paths. Challenges live in the
+request opts in with `attestationProvider: "play-integrity"` on
+`/attestation/v1/challenge`, `/attestation/v1/verify`, and
+`/notes-import/kickoff` (and `/transcribe`); bodies without it take the
+unchanged App Attest paths. Challenges live in the
 `PLAY_INTEGRITY_CHALLENGES` Durable Object (migration `v4`), never in
 `AppAttestIdentity`. The worker decodes each token through Google's
 `decodeIntegrityToken` with a service account, then requires the request
@@ -113,6 +114,54 @@ stable `reason`: `device_integrity_failed`, `app_not_recognized`,
 `integrity_token_invalid`, `integrity_unavailable` (Google, credentials, or
 quota; reported to Sentry), or a challenge reason. The default quota is 10,000
 decodes per day; request more through Google's quota form before it matters.
+
+## Attestation
+
+Device attestation is API-wide, under `/attestation/v1/` (code in
+`src/attestation/`): App Attest on iOS, Play Integrity on Android.
+
+| Route | What |
+| --- | --- |
+| `POST /attestation/v1/challenge` | One-time challenge (App Attest v1/v2, Play Integrity) |
+| `POST /attestation/v1/register` | Bind an App Attest key, or enroll a v2 recovery token |
+| `POST /attestation/v1/verify` | Attested no-op for the app's developer tools |
+| `GET /attestation/v1/status` | Accepted providers (Play Integrity once configured) |
+
+- **Purposes**: every App Attest v2 / Play Integrity assertion signs a
+  `purpose`, and each protected route accepts only its own. The registry is
+  `ATTESTATION_PURPOSES` in `src/attestation/purposes.ts`. Installed apps sign
+  these strings, so **never rename a shipped purpose**. `attestation-verify`
+  is verify's purpose; `notes-import-verify` (what deployed apps sign) is
+  accepted on verify too.
+- **Protecting a new route**: add a purpose, have the route recompute its
+  `contentHash`/`requestHash` from the payload and reject a mismatch, then
+  call `requireAttestation(ctx, body, purpose)` (`src/attestation/http.ts`;
+  App Attest v2 or Play Integrity, never v1). Notes Import kickoff keeps its
+  own gate because it still accepts v1.
+- **Old paths**: `POST /notes-import/challenge`, `/notes-import/attest`, and
+  `/notes-import/verify` serve the same handlers for deployed apps. They add
+  `Deprecation: @1792022400` (2026-10-15) and
+  `Link: </attestation/v1/…>; rel="successor-version"`, are documented as
+  deprecated, still count in the `notes-import` rate-limit bucket, and log
+  `deprecated path: <old> -> <new>`. Remove them only after the minimum app
+  version uses the new paths and those Workers Logs lines stop.
+- New paths count in their own `attestation` per-IP bucket and keep 100%
+  Sentry trace sampling (status excepted), as they had under Notes Import.
+
+## Link pages
+
+Universal links (and their no-app fallback pages) use readable paths under
+their feature: `/contacts#<payload>`, `/buddies/invite#1…`,
+`/accounts/handoff#1…`. Older app versions shared the short `/c#…` (and
+`/c/<payload>`), `/b#1…`, and `/h#1…`. Those links live on in people's
+messages and screenshots, so **the short paths stay routed and in the AASA for
+good**; a redirect wouldn't do, because iOS decides from the AASA whether a
+tapped URL opens the app. Each page's `og:url` is the path it was served on
+(never a payload).
+
+The app must parse the readable paths (and Android's intent filters must list
+them) for at least one release before it starts generating them, or people on
+older builds get the web page instead of the app.
 
 ## Deploying to dev (one-time setup)
 
@@ -229,10 +278,12 @@ its existing sampling configuration.
 
 `POST /buddies/v1/{op}` is the Buddies relay, built to the wire contract in
 [`docs/buddies-protocol.md`](docs/buddies-protocol.md) (the witness-work repo
-holds the canonical copy). Code lives in `src/buddies/`. `GET /b` is the
-no-app fallback page for invite links (App Store and Google Play buttons), the
-AASA matches `/b#1…`, and `public/.well-known/assetlinks.json` verifies the
-whole host, `/b` included, for Android App Links. Clients are iOS and Android
+holds the canonical copy). Code lives in `src/buddies/`.
+`GET /buddies/invite` is the no-app fallback page for invite links (App Store
+and Google Play buttons), and the short `/b` serves it for invites already
+sent. The AASA matches `/buddies/invite#1…` and `/b#1…`, and
+`public/.well-known/assetlinks.json` verifies the whole host for Android App
+Links. Clients are iOS and Android
 (witness-work ADR 0020).
 
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
@@ -358,8 +409,8 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
 - **Not yet built** (required before any production rollout): App Attest on
   `inbox/register` and `invite/*` (`attest` is accepted and ignored; Android
   will use Play Integrity). `blob/put` isn't attested either; the plan is to
-  attest an inbox once per few days through a Notes Import purpose and have
-  `blob/put` require a recent one, rather than attesting each upload. The protocol's durable push outbox (retries for
+  attest an inbox once per few days through a Buddies purpose added to
+  `src/attestation/purposes.ts` and have `blob/put` require a recent one, rather than attesting each upload. The protocol's durable push outbox (retries for
   6 h, outcome history, deferred instead of dropped alerts inside the 60 s
   spacing, `apns-expiration`) is specified but not built either;
   today each push gets one immediate attempt plus one retry.
@@ -378,8 +429,8 @@ wrangler kv key put --binding NOTES_KV buddies:enabled true --env dev
 
 Production takes the same three secrets without `--env dev`, and the `v3`
 migration applies on the next `pnpm run deploy`. Buddies stays off there
-(`BUDDIES_ENABLED = "false"`) until the KV key flips it. The AASA `/b` entry
-only goes live with a prod deploy. iOS caches the AASA, so ship it at least one
+(`BUDDIES_ENABLED = "false"`) until the KV key flips it. AASA entries only go
+live with a prod deploy. iOS caches the AASA, so ship it at least one
 app version before the invite UI.
 
 Photo blobs need their R2 buckets **before the first deploy that carries the
@@ -497,11 +548,12 @@ Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
   counts against the Buddies photo-upload edge tier, the rest the read tier.
   `delete` without `slotId` deletes every slot. Suspended accounts can still
   back up. Without the bucket or `ACCOUNTS_DB`, every op is 503 `disabled`.
-- **`GET /h`** is the page a camera opens for a handoff QR code
-  (`/h#1<…>`): install or open WitnessWork on the new phone and scan from
-  inside the app. Localized like `/c` (`?lang=`, then `Accept-Language`;
-  strings in `src/accounts/handoffPageLocales.ts`), no script. The AASA
-  matches `/h#1…`; `assetlinks.json` already covers the whole host.
+- **`GET /accounts/handoff`** (and the short `/h`) is the page a camera
+  opens for a handoff QR code (`/accounts/handoff#1<…>`): install or open
+  WitnessWork on the new phone and scan from inside the app. Localized like
+  `/contacts` (`?lang=`, then `Accept-Language`; strings in
+  `src/accounts/handoffPageLocales.ts`), no script. The AASA matches both
+  paths with `#1…`; `assetlinks.json` already covers the whole host.
 - **Privacy**: handoff and backup log only the op name. Never log or report
   bodies, headers, keys, tokens, account ids, channel ids, or slot ids.
 
@@ -622,8 +674,8 @@ need the token).
 
 - `hono-openapi` builds the document from the routes themselves: each route
   carries a `describeRoute(...)` middleware, kept in an `openapi.ts` beside its
-  handlers (`src/notesImport/`, `src/buddies/`, `src/accounts/`,
-  `src/routePlanning/`; routes registered in `src/app.ts` use
+  handlers (`src/attestation/`, `src/notesImport/`, `src/buddies/`,
+  `src/accounts/`, `src/routePlanning/`; routes registered in `src/app.ts` use
   `src/openapi/coreDocs.ts`). Shared helpers and the error envelope are in
   `src/openapi/schemas.ts`; tags, servers, and the Scalar config in
   `src/openapi/route.ts`.

@@ -21,6 +21,11 @@ export const OPENAPI_TAGS = [
       'HERE Geocoding & Search proxy. The worker injects its own `apiKey` and forwards every other query parameter unchanged.',
   },
   {
+    name: 'Attestation',
+    description:
+      'Device attestation for the whole API: App Attest on iOS, Play Integrity on Android. Get a challenge, register an App Attest key, and prove the path with `verify`; each protected route then checks an assertion signed for its own `purpose`. These routes lived under `/notes-import/` until 2026-10; the old paths still work, marked deprecated.',
+  },
+  {
     name: 'Notes Import',
     description:
       'Turns pasted or photographed notes into contacts, visits, and time entries with a model. Every metered call is authenticated with App Attest (iOS) or Play Integrity (Android). Design: [docs/notes-import-streaming-durable-objects.md](' +
@@ -51,7 +56,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Links',
     description:
-      'Universal-link support: the AASA file and the no-app fallback pages for shared contacts and buddy invites.',
+      'Universal-link support: the AASA file and the no-app fallback pages for shared contacts (`/contacts`), buddy invites (`/buddies/invite`), and Set Up Another Device (`/accounts/handoff`). The short paths (`/c`, `/b`, `/h`) in links already shared are served for good.',
   },
   {
     name: 'Admin',
@@ -66,9 +71,9 @@ const DOCUMENTATION = {
     version: '1',
     description: `The backend for the [WitnessWork](https://github.com/leviFrosty/witness-work) app: a Cloudflare Worker built with Hono. Source: [ww-api](${REPO_URL}).
 
-**Errors.** Every JSON error uses one envelope: \`{ "ok": false, "error", "code", "retryAfter"? }\`. Read \`code\`; \`error\` repeats it, except on Notes Import and route planning, where it is a human-readable message. Every 429 and 503 sends \`Retry-After\`.
+**Errors.** Every JSON error uses one envelope: \`{ "ok": false, "error", "code", "retryAfter"? }\`. Read \`code\`; \`error\` repeats it, except on attestation, Notes Import, and route planning, where it is a human-readable message. Every 429 and 503 sends \`Retry-After\`.
 
-**Rate limits.** Places, Notes Import, route planning, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
+**Rate limits.** Places, Notes Import, attestation, route planning, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
     license: { name: 'See repository', url: REPO_URL },
   },
   servers: [

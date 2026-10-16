@@ -470,7 +470,7 @@ async function doctor() {
   }
 
   try {
-    const verify = await fetchJson(`${state.url}/notes-import/verify`, {
+    const verify = await fetchJson(`${state.url}/attestation/v1/verify`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',

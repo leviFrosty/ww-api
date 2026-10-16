@@ -7,8 +7,26 @@ import { handleBuddyInvitePage } from './invitePage'
 const app = new Hono<{ Bindings: Environment }>()
 app.get('/.well-known/apple-app-site-association', handleAasaRequest)
 app.get('/b', handleBuddyInvitePage)
+app.get('/buddies/invite', handleBuddyInvitePage)
 
 const env = { APPLE_TEAM_ID: 'TEAMID1234' } as Environment
+
+describe('GET /buddies/invite', () => {
+  it('serves the /b page under its own og:url', async () => {
+    const [short, readable] = await Promise.all(
+      ['/b', '/buddies/invite'].map(async (path) =>
+        (await app.request(path, {}, env)).text()
+      )
+    )
+    expect(readable).toContain(
+      'property="og:url" content="https://ww-proxy.leviwilkerson.com/buddies/invite"'
+    )
+    expect(short).toContain(
+      'property="og:url" content="https://ww-proxy.leviwilkerson.com/b"'
+    )
+    expect(readable.replace('/buddies/invite"', '/b"')).toBe(short)
+  })
+})
 
 describe('GET /b', () => {
   it('serves a static, generic, noindex page with the install steps and a copy button', async () => {
@@ -84,6 +102,9 @@ describe('apple-app-site-association', () => {
       'TEAMID1234.com.leviwilkerson.jwtimedev',
     ])
     expect(details.components).toEqual([
+      { '/': '/contacts', '#': '?*' },
+      { '/': '/buddies/invite', '#': '1?*' },
+      { '/': '/accounts/handoff', '#': '1?*' },
       { '/': '/c', '#': '?*' },
       { '/': '/c/*' },
       { '/': '/b', '#': '1?*' },

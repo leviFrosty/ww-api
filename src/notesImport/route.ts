@@ -2,7 +2,6 @@ import type { AppContext, ErrorResponse } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
 import { retryAfterHeaders } from '../errors'
-import { PLAY_INTEGRITY_CHALLENGE_TTL_SECONDS } from '../playIntegrity/protocol'
 import { sha256Hex, timingSafeEqual, randomToken } from '../crypto'
 import {
   getNotesImportConfig,
@@ -28,35 +27,30 @@ import {
   AppAttestError,
   NOTES_IMPORT_KICKOFF_PURPOSE,
   NOTES_IMPORT_TRANSCRIBE_PURPOSE,
-  NOTES_IMPORT_VERIFY_PURPOSE,
   type AppAttestAction,
   type AppAttestReason,
   type AppAttestAssertionPurpose,
 } from '../appAttest'
-import { appAttestHttpCode } from '../appAttest/errors'
 import {
   computeNotesImportRequestHash,
   computeNotesImportTranscribeRequestHash,
-  isAppAttestAssertionPurpose,
-  isAppAttestChallenge,
-  isAppAttestKeyId,
-  isAppAttestOperationId,
-  isAppAttestUuid,
-  type V2AssertionChallengeRequest,
-  type V2AssertionFinalRequest,
 } from '../appAttest/protocol'
-import {
-  PlayIntegrityError,
-  isPlayIntegrityRequest,
-  issuePlayIntegrityChallenge,
-  parsePlayIntegrityAssertionRequest,
-  parsePlayIntegrityChallengeRequest,
-  verifyPlayIntegrityAssertion,
-  type PlayIntegrityReason,
-} from '../playIntegrity'
+import { isPlayIntegrityRequest, type PlayIntegrityReason } from '../playIntegrity'
 import type { PlayIntegrityAction } from '../playIntegrity/errors'
+import {
+  appAttestFailureResponse,
+  asRecord,
+  asString,
+  attestationBadRequest as appAttestBadRequest,
+  isLowercaseSha256,
+  isValidAccountId,
+  parseV2AssertionFinalRequest,
+  requireAttestation,
+  verifyPlayIntegrityRecord,
+  verifyV2Assertion,
+} from '../attestation/http'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
-import { handleAdminResetRequest, isValidMeterId } from './admin'
+import { handleAdminResetRequest } from './admin'
 import {
   buildAllowanceDenial,
   type NotesImportKickoffResponse,
@@ -157,256 +151,6 @@ const errorDetail = (e: unknown): string => {
   }
 }
 
-const asString = (v: unknown): string | null =>
-  typeof v === 'string' && v.length > 0 ? v : null
-
-const asRecord = (value: unknown): Record<string, unknown> | null =>
-  value != null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null
-
-const appAttestBadRequest = (ctx: AppContext, message: string): Response =>
-  err(
-    ctx,
-    HTTP_STATUS.BAD_REQUEST,
-    message,
-    'bad_request',
-    undefined,
-    undefined,
-    'invalid_request',
-    'none'
-  )
-
-const appAttestFailureResponse = (
-  ctx: AppContext,
-  error: AppAttestError,
-  input: unknown
-): Response => {
-  // Stable reason only: request bodies may contain a recovery token.
-  console.warn('notes-import App Attest rejected:', error.reason)
-  if (error.reason === 'storage_unavailable') Sentry.captureException(error)
-
-  const version = appAttestProtocolVersion(input)
-  const status = version === 1 && error.status < 500 ? 401 : error.status
-  const code = appAttestHttpCode(version, error.reason)
-  return err(
-    ctx,
-    status,
-    error.message,
-    code,
-    undefined,
-    undefined,
-    error.reason,
-    error.action
-  )
-}
-
-const readOptionalJson = async (
-  ctx: AppContext
-): Promise<{ ok: true; value: unknown } | { ok: false }> => {
-  const text = await ctx.req.text()
-  if (!text.trim()) return { ok: true, value: undefined }
-  try {
-    return { ok: true, value: JSON.parse(text) as unknown }
-  } catch {
-    return { ok: false }
-  }
-}
-
-/**
- * Shape gate for the client-supplied shared account id (witness-work ADR
- * 0011). It becomes a Durable Object name, a RevenueCat app-user-id path
- * segment, and a `|`-delimited clientData field, so keep it to a bounded
- * uuid-ish alphabet. Install ids (the value it defaults to on-device) are
- * `Crypto.randomUUID()` strings, which this accepts with room to spare.
- */
-const isValidAccountId = isValidMeterId
-
-const isLowercaseSha256 = (value: string): boolean =>
-  /^[a-f0-9]{64}$/.test(value)
-
-const parseV2AssertionChallengeRequest = (
-  record: Record<string, unknown>
-): V2AssertionChallengeRequest | null => {
-  const operationId = asString(record.operationId)
-  const uuid = asString(record.uuid)
-  const keyId = asString(record.keyId)
-  const purpose = asString(record.purpose)
-  const contentHash = asString(record.contentHash)
-  const requestHash = asString(record.requestHash)
-  const accountId =
-    record.accountId == null ? undefined : asString(record.accountId)
-  if (
-    record.protocolVersion !== 2 ||
-    record.operation !== 'assert' ||
-    !operationId ||
-    !isAppAttestOperationId(operationId) ||
-    !uuid ||
-    !isAppAttestUuid(uuid) ||
-    !keyId ||
-    !isAppAttestKeyId(keyId) ||
-    !purpose ||
-    !isAppAttestAssertionPurpose(purpose) ||
-    (record.accountId != null &&
-      (!accountId || !isValidAccountId(accountId))) ||
-    !contentHash ||
-    !isLowercaseSha256(contentHash) ||
-    !requestHash ||
-    !isLowercaseSha256(requestHash)
-  ) {
-    return null
-  }
-  return {
-    protocolVersion: 2,
-    operation: 'assert',
-    operationId,
-    uuid,
-    keyId,
-    purpose,
-    ...(accountId ? { accountId } : {}),
-    contentHash,
-    requestHash,
-  }
-}
-
-const parseV2AssertionFinalRequest = (
-  record: Record<string, unknown>,
-  expectedPurpose: AppAttestAssertionPurpose
-): V2AssertionFinalRequest | null => {
-  const challengeRequest = parseV2AssertionChallengeRequest(record)
-  const challenge = asString(record.challenge)
-  const assertion = asString(record.assertion)
-  if (
-    !challengeRequest ||
-    challengeRequest.purpose !== expectedPurpose ||
-    !challenge ||
-    !isAppAttestChallenge(challenge) ||
-    !assertion ||
-    assertion.length > 65_536
-  ) {
-    return null
-  }
-  return { ...challengeRequest, challenge, assertion }
-}
-
-const storageUnavailable = (cause: unknown): AppAttestError =>
-  new AppAttestError('App Attest storage is temporarily unavailable', {
-    reason: 'storage_unavailable',
-    action: 'retry',
-    status: 503,
-    cause,
-  })
-
-const issueV2AssertionChallenge = async (
-  ctx: AppContext,
-  request: V2AssertionChallengeRequest
-) => {
-  try {
-    const id = ctx.env.APP_ATTEST_IDENTITY.idFromName(request.uuid)
-    const result = await ctx.env.APP_ATTEST_IDENTITY.get(id).issueChallenge(
-      request
-    )
-    if (!result.ok) throw AppAttestError.fromFailure(result.error)
-    return result.value
-  } catch (error) {
-    if (error instanceof AppAttestError) throw error
-    throw storageUnavailable(error)
-  }
-}
-
-const verifyV2Assertion = async (
-  ctx: AppContext,
-  request: V2AssertionFinalRequest
-) => {
-  try {
-    const id = ctx.env.APP_ATTEST_IDENTITY.idFromName(request.uuid)
-    const result = await ctx.env.APP_ATTEST_IDENTITY.get(id).verifyAssertion(
-      request
-    )
-    if (!result.ok) throw AppAttestError.fromFailure(result.error)
-    return result.value
-  } catch (error) {
-    if (error instanceof AppAttestError) throw error
-    throw storageUnavailable(error)
-  }
-}
-
-const playIntegrityFailureResponse = (
-  ctx: AppContext,
-  error: PlayIntegrityError
-): Response => {
-  // Stable reason and policy detail only; never the token or verdict payload.
-  console.warn(
-    'notes-import Play Integrity rejected:',
-    error.reason,
-    error.message
-  )
-  if (error.reason === 'storage_unavailable') Sentry.captureException(error)
-  return err(
-    ctx,
-    error.status,
-    error.message,
-    error.status >= 500 ? 'server_error' : 'attestation_failed',
-    undefined,
-    undefined,
-    error.reason,
-    error.action,
-    error.status === 429
-      ? PLAY_INTEGRITY_CHALLENGE_TTL_SECONDS
-      : error.status === 503
-        ? UNAVAILABLE_RETRY_AFTER_SECONDS
-        : undefined
-  )
-}
-
-const playIntegrityDependencies = {
-  fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
-  now: () => Date.now(),
-  report: (error: Error) => {
-    Sentry.captureException(error)
-  },
-}
-
-/** Android's protected-request check (ADR 0017); null when it passed. */
-const verifyPlayIntegrityRecord = async (
-  ctx: AppContext,
-  record: Record<string, unknown>,
-  purpose: AppAttestAssertionPurpose
-): Promise<Response | null> => {
-  const request = parsePlayIntegrityAssertionRequest(record, purpose)
-  if (!request) {
-    return err(
-      ctx,
-      HTTP_STATUS.BAD_REQUEST,
-      'Invalid Play Integrity request',
-      'bad_request',
-      undefined,
-      undefined,
-      'invalid_request',
-      'none'
-    )
-  }
-  try {
-    await verifyPlayIntegrityAssertion(
-      ctx.env,
-      request,
-      playIntegrityDependencies
-    )
-    return null
-  } catch (e) {
-    if (e instanceof PlayIntegrityError) {
-      return playIntegrityFailureResponse(ctx, e)
-    }
-    Sentry.captureException(e)
-    return err(
-      ctx,
-      HTTP_STATUS.INTERNAL_SERVER_ERROR,
-      'Auth error',
-      'server_error'
-    )
-  }
-}
-
 const subKey = (token: string) => `notes-import:sub:${token}`
 
 /**
@@ -418,253 +162,6 @@ export async function handleNotesImportStatusRequest(ctx: AppContext) {
   const status = await getPublicNotesImportStatus(ctx.env, waitUntilOf(ctx))
   // Keep intermediary/browser caches from adding another freshness window.
   return ctx.json(status, 200, { 'Cache-Control': 'no-store' })
-}
-
-/** POST /notes-import/challenge — issue an App Attest challenge (v1 or v2). */
-export async function handleChallengeRequest(ctx: AppContext) {
-  const parsed = await readOptionalJson(ctx)
-  if (!parsed.ok) return appAttestBadRequest(ctx, 'Invalid JSON')
-  if (parsed.value !== undefined && !asRecord(parsed.value)) {
-    return appAttestBadRequest(ctx, 'Invalid JSON body')
-  }
-  const record = asRecord(parsed.value)
-  if (record && isPlayIntegrityRequest(record)) {
-    const request = parsePlayIntegrityChallengeRequest(record)
-    if (!request) {
-      return appAttestBadRequest(ctx, 'Invalid Play Integrity challenge')
-    }
-    try {
-      return ctx.json(await issuePlayIntegrityChallenge(ctx.env, request))
-    } catch (e) {
-      if (e instanceof PlayIntegrityError) {
-        return playIntegrityFailureResponse(ctx, e)
-      }
-      Sentry.captureException(e)
-      return err(
-        ctx,
-        HTTP_STATUS.INTERNAL_SERVER_ERROR,
-        'Challenge error',
-        'server_error'
-      )
-    }
-  }
-  const isV2Assertion =
-    record?.protocolVersion === 2 && record.operation === 'assert'
-  const v2AssertionRequest = isV2Assertion
-    ? parseV2AssertionChallengeRequest(record)
-    : null
-  if (isV2Assertion && !v2AssertionRequest) {
-    return appAttestBadRequest(ctx, 'Invalid App Attest v2 assertion challenge')
-  }
-
-  try {
-    const response = v2AssertionRequest
-      ? await issueV2AssertionChallenge(ctx, v2AssertionRequest)
-      : await appAttestLifecycle(ctx.env).issueChallenge(parsed.value)
-    return ctx.json(response)
-  } catch (e) {
-    if (e instanceof AppAttestError) {
-      return appAttestFailureResponse(ctx, e, parsed.value)
-    }
-    Sentry.captureException(e)
-    return err(
-      ctx,
-      HTTP_STATUS.INTERNAL_SERVER_ERROR,
-      'Challenge error',
-      'server_error'
-    )
-  }
-}
-
-/** POST /notes-import/attest — bind a key or enroll v2 recovery. */
-export async function handleAttestRequest(ctx: AppContext) {
-  let parsed: unknown
-  try {
-    parsed = await ctx.req.json()
-  } catch {
-    return appAttestBadRequest(ctx, 'Invalid JSON')
-  }
-  const body = asRecord(parsed)
-  if (!body) return appAttestBadRequest(ctx, 'Invalid JSON body')
-  // Play Integrity has no key to register; every request carries a token.
-  if (isPlayIntegrityRequest(body)) {
-    return err(
-      ctx,
-      HTTP_STATUS.BAD_REQUEST,
-      'Play Integrity has no registration step',
-      'bad_request',
-      undefined,
-      undefined,
-      'unsupported_protocol',
-      'none'
-    )
-  }
-
-  // Keep the deployed v1 request gate and top-level error text unchanged.
-  if (appAttestProtocolVersion(body) === 1) {
-    const keyId = asString(body.keyId)
-    const attestation = asString(body.attestation)
-    const challenge = asString(body.challenge)
-    const uuid = asString(body.uuid)
-    if (!keyId || !attestation || !challenge || !uuid) {
-      return appAttestBadRequest(
-        ctx,
-        'Missing keyId, attestation, challenge, or uuid'
-      )
-    }
-  }
-
-  try {
-    const response = await appAttestLifecycle(ctx.env).register(body)
-    return ctx.json(response)
-  } catch (e) {
-    if (e instanceof AppAttestError) {
-      return appAttestFailureResponse(ctx, e, body)
-    }
-    Sentry.captureException(e)
-    return err(
-      ctx,
-      HTTP_STATUS.INTERNAL_SERVER_ERROR,
-      'Attestation error',
-      'server_error'
-    )
-  }
-}
-
-/**
- * POST /notes-import/verify — attested no-op for the app's dev-tools
- * diagnostics. Runs the exact verifyAssertion path the metered endpoints use
- * (challenge consumption and sign-count advance included) but touches no
- * credits and no inference, so the Tools screen can prove the full App Attest
- * boundary server-side. This no-payload probe requires `requestHash` to equal
- * its client-chosen `contentHash`; real kickoffs instead hash their canonical
- * Notes Import payload.
- */
-export async function handleNotesImportVerifyRequest(ctx: AppContext) {
-  let parsed: unknown
-  try {
-    parsed = await ctx.req.json()
-  } catch {
-    return appAttestBadRequest(ctx, 'Invalid JSON')
-  }
-  const body = asRecord(parsed)
-  if (!body) return appAttestBadRequest(ctx, 'Invalid JSON body')
-
-  const config = getNotesImportConfig(ctx.env)
-  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
-  const devBypass =
-    config.devBypassToken != null &&
-    timingSafeEqual(bypassHeader, config.devBypassToken)
-  if (devBypass) {
-    const version = appAttestProtocolVersion(body)
-    if (version === 2) {
-      const operationId = asString(body.operationId)
-      const contentHash = asString(body.contentHash)
-      const requestHash = asString(body.requestHash)
-      if (
-        !operationId ||
-        !isAppAttestOperationId(operationId) ||
-        body.operation !== 'assert' ||
-        body.purpose !== NOTES_IMPORT_VERIFY_PURPOSE ||
-        !contentHash ||
-        !isLowercaseSha256(contentHash) ||
-        requestHash !== contentHash
-      ) {
-        return appAttestBadRequest(ctx, 'Invalid App Attest v2 bypass probe')
-      }
-      return ctx.json({ ok: true, protocolVersion: 2, operationId })
-    }
-    return ctx.json({ ok: true })
-  }
-
-  if (isPlayIntegrityRequest(body)) {
-    // Same no-payload probe contract as App Attest v2 verify.
-    if (body.requestHash !== body.contentHash) {
-      return appAttestBadRequest(
-        ctx,
-        'requestHash must equal contentHash for Play Integrity verify'
-      )
-    }
-    const failure = await verifyPlayIntegrityRecord(
-      ctx,
-      body,
-      NOTES_IMPORT_VERIFY_PURPOSE
-    )
-    if (failure) return failure
-    return ctx.json({
-      ok: true,
-      attestationProvider: 'play-integrity',
-      protocolVersion: 1,
-      operationId: body.operationId,
-    })
-  }
-
-  const uuid = asString(body.uuid)
-  const keyId = asString(body.keyId)
-  const challenge = asString(body.challenge)
-  const assertion = asString(body.assertion)
-  const contentHash = asString(body.contentHash)
-  if (!uuid || !keyId || !challenge || !assertion || !contentHash) {
-    return appAttestBadRequest(
-      ctx,
-      'Missing uuid, keyId, challenge, assertion, or contentHash'
-    )
-  }
-  // Same shape gates as kickoff: both values end up in the `|`-delimited
-  // signed clientData, so keep them to their bounded alphabets.
-  const accountId = body.accountId != null ? asString(body.accountId) : null
-  if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
-    return appAttestBadRequest(ctx, 'Invalid accountId')
-  }
-  if (!/^[a-f0-9]{64}$/.test(contentHash)) {
-    return appAttestBadRequest(ctx, 'Invalid contentHash')
-  }
-
-  const version = appAttestProtocolVersion(body)
-  let v2Request: V2AssertionFinalRequest | null = null
-  if (version === 2) {
-    const requestHash = asString(body.requestHash)
-    if (
-      !requestHash ||
-      !isLowercaseSha256(requestHash) ||
-      requestHash !== contentHash
-    ) {
-      return appAttestBadRequest(
-        ctx,
-        'requestHash must equal contentHash for App Attest verify'
-      )
-    }
-    v2Request = parseV2AssertionFinalRequest(
-      body,
-      NOTES_IMPORT_VERIFY_PURPOSE
-    )
-    if (!v2Request) {
-      return appAttestBadRequest(ctx, 'Invalid App Attest v2 verify assertion')
-    }
-  }
-
-  try {
-    const response = v2Request
-      ? await verifyV2Assertion(ctx, v2Request)
-      : await appAttestLifecycle(ctx.env).verifyAssertion(body, {
-          uuid,
-          accountId: accountId ?? undefined,
-          contentHash,
-          purpose: NOTES_IMPORT_VERIFY_PURPOSE,
-        })
-    return ctx.json(response)
-  } catch (e) {
-    if (e instanceof AppAttestError) {
-      return appAttestFailureResponse(ctx, e, body)
-    }
-    Sentry.captureException(e)
-    return err(
-      ctx,
-      HTTP_STATUS.INTERNAL_SERVER_ERROR,
-      'Verify error',
-      'server_error'
-    )
-  }
 }
 
 interface NotesImportBody {
@@ -1591,44 +1088,14 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
   const devBypass =
     config.devBypassToken != null &&
     timingSafeEqual(bypassHeader, config.devBypassToken)
-  if (!devBypass && isPlayIntegrityRequest(record)) {
-    const failure = await verifyPlayIntegrityRecord(
+  if (!devBypass) {
+    const failure = await requireAttestation(
       ctx,
       record,
-      NOTES_IMPORT_TRANSCRIBE_PURPOSE
+      NOTES_IMPORT_TRANSCRIBE_PURPOSE,
+      'Page transcription requires App Attest v2 or Play Integrity'
     )
     if (failure) return failure
-  } else if (!devBypass) {
-    const v2Request =
-      appAttestProtocolVersion(record) === 2
-        ? parseV2AssertionFinalRequest(record, NOTES_IMPORT_TRANSCRIBE_PURPOSE)
-        : null
-    if (!v2Request) {
-      return err(
-        ctx,
-        HTTP_STATUS.BAD_REQUEST,
-        'Page transcription requires App Attest v2 or Play Integrity',
-        'bad_request',
-        undefined,
-        undefined,
-        'unsupported_protocol',
-        'none'
-      )
-    }
-    try {
-      await verifyV2Assertion(ctx, v2Request)
-    } catch (e) {
-      if (e instanceof AppAttestError) {
-        return appAttestFailureResponse(ctx, e, record)
-      }
-      Sentry.captureException(e)
-      return err(
-        ctx,
-        HTTP_STATUS.INTERNAL_SERVER_ERROR,
-        'Auth error',
-        'server_error'
-      )
-    }
   }
 
   // --- Entitlement, import allowance, and page limit --------------------

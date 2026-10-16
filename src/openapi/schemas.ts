@@ -35,7 +35,7 @@ export const apiErrorSchema = z
     ok: z.literal(false),
     error: z.string().meta({
       description:
-        'The same as `code`, except on Notes Import and route planning, where it is a human-readable message.',
+        'The same as `code`, except on attestation, Notes Import, and route planning, where it is a human-readable message.',
     }),
     code: z
       .string()

@@ -2,12 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { makeMemoryKv } from '../test/memoryKv'
 import { sha256Hex } from '../crypto'
 import type { AppContext, Environment } from '../types'
+import { handleNotesImportKickoffRequest } from './route'
 import {
-  handleAttestRequest,
-  handleChallengeRequest,
-  handleNotesImportKickoffRequest,
-  handleNotesImportVerifyRequest,
-} from './route'
+  handleAttestationChallengeRequest,
+  handleAttestationRegisterRequest,
+  handleAttestationVerifyRequest,
+} from '../attestation/route'
 
 const UUID = '65A8B00C-DA7A-4E0A-BA5C-8E3D1B8C5F1C'
 const CONTENT_HASH = 'a'.repeat(64)
@@ -121,10 +121,10 @@ describe('App Attest route compatibility', () => {
         NOTES_KV: kv,
       } as unknown as Environment
       const requests = [
-        () => handleChallengeRequest(context(environment, { body: invalidBody })),
-        () => handleAttestRequest(context(environment, { body: invalidBody })),
+        () => handleAttestationChallengeRequest(context(environment, { body: invalidBody })),
+        () => handleAttestationRegisterRequest(context(environment, { body: invalidBody })),
         () =>
-          handleNotesImportVerifyRequest(
+          handleAttestationVerifyRequest(
             context(environment, { body: invalidBody })
           ),
         () =>
@@ -149,7 +149,7 @@ describe('App Attest route compatibility', () => {
       NOTES_KV: kv,
     } as unknown as Environment
 
-    const response = await handleChallengeRequest(context(environment))
+    const response = await handleAttestationChallengeRequest(context(environment))
     const body = (await response.json()) as Record<string, unknown>
 
     expect(response.status).toBe(200)
@@ -187,7 +187,7 @@ describe('App Attest route compatibility', () => {
       requestHash: GOLDEN_REQUEST_HASH,
     }
 
-    const response = await handleChallengeRequest(
+    const response = await handleAttestationChallengeRequest(
       context(environment, { body })
     )
 
@@ -211,7 +211,7 @@ describe('App Attest route compatibility', () => {
       attestation: 'legacy-attestation',
     }
 
-    const response = await handleAttestRequest(context(environment, { body }))
+    const response = await handleAttestationRegisterRequest(context(environment, { body }))
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ ok: true })
@@ -246,7 +246,7 @@ describe('App Attest route compatibility', () => {
     }
     vi.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-    const response = await handleAttestRequest(context(environment, { body }))
+    const response = await handleAttestationRegisterRequest(context(environment, { body }))
 
     expect(response.status).toBe(401)
     await expect(response.json()).resolves.toEqual({
@@ -274,7 +274,7 @@ describe('App Attest route compatibility', () => {
       contentHash: CONTENT_HASH,
     }
 
-    const response = await handleNotesImportVerifyRequest(
+    const response = await handleAttestationVerifyRequest(
       context(environment, { body })
     )
 
@@ -326,7 +326,7 @@ describe('App Attest route compatibility', () => {
       }
       vi.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-      const response = await handleNotesImportVerifyRequest(
+      const response = await handleAttestationVerifyRequest(
         context(environment, { body })
       )
 
@@ -369,7 +369,7 @@ describe('App Attest route compatibility', () => {
       requestHash: CONTENT_HASH,
     }
 
-    const response = await handleNotesImportVerifyRequest(
+    const response = await handleAttestationVerifyRequest(
       context(environment, { body })
     )
 
@@ -391,7 +391,7 @@ describe('App Attest route compatibility', () => {
       requestHash: CONTENT_HASH,
     }
 
-    const response = await handleNotesImportVerifyRequest(
+    const response = await handleAttestationVerifyRequest(
       context(environment, {
         body,
         headers: { 'x-ww-dev-bypass': 'bypass-token' },
@@ -429,7 +429,7 @@ describe('App Attest route compatibility', () => {
       requestHash: 'b'.repeat(64),
     }
 
-    const response = await handleNotesImportVerifyRequest(
+    const response = await handleAttestationVerifyRequest(
       context(environment, { body })
     )
 
@@ -711,7 +711,7 @@ describe('App Attest route compatibility', () => {
       retryAfter: 60,
     })
 
-    const challenge = await handleChallengeRequest(
+    const challenge = await handleAttestationChallengeRequest(
       context(environment, {
         body: {
           protocolVersion: 2,
@@ -729,7 +729,7 @@ describe('App Attest route compatibility', () => {
     expect(challenge.status).toBe(200)
     expect(issueChallenge).toHaveBeenCalledTimes(1)
 
-    const attest = await handleAttestRequest(
+    const attest = await handleAttestationRegisterRequest(
       context(environment, {
         body: {
           protocolVersion: 2,
@@ -746,7 +746,7 @@ describe('App Attest route compatibility', () => {
     expect(attest.status).toBe(200)
     await expect(attest.json()).resolves.toMatchObject({ status: 'rotated' })
 
-    const verify = await handleNotesImportVerifyRequest(
+    const verify = await handleAttestationVerifyRequest(
       context(environment, {
         body: {
           protocolVersion: 2,
