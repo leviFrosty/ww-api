@@ -66,11 +66,11 @@ export class SigningKey {
 }
 
 export interface Envelope {
-  p: string
-  s?: string
+  payload: string
+  signature?: string
 }
 
-/** Builds `{p, s}` over exact payload bytes (optionally pre-serialized). */
+/** Builds `{payload, signature}` over exact payload bytes (optionally pre-serialized). */
 export const envelope = async (
   op: BuddiesSigningOp,
   payload: Record<string, unknown> | string,
@@ -79,39 +79,43 @@ export const envelope = async (
   const bytes = encoder.encode(
     typeof payload === 'string' ? payload : JSON.stringify(payload)
   )
-  return { p: b64u(bytes), s: b64u(await key.sign(signedMessage(op, bytes))) }
+  return {
+    payload: b64u(bytes),
+    signature: b64u(await key.sign(signedMessage(op, bytes))),
+  }
 }
 
 /**
- * Headers for the `inbox/live` upgrade: the signed envelope's `p` and `s`.
+ * Headers for the `inbox/live` upgrade: the signed envelope's `payload` and
+ * `signature`.
  * `payload` must hold `inboxId`, `ts`, and `nonce`.
  */
 export const liveHeaders = async (
   payload: Record<string, unknown> | string,
   key: SigningKey
 ): Promise<Record<string, string>> => {
-  const { p, s } = await envelope(BUDDIES_LIVE_OP, payload, key)
+  const signed = await envelope(BUDDIES_LIVE_OP, payload, key)
   return {
     upgrade: 'websocket',
-    [BUDDIES_LIVE_HEADERS.payload]: p,
-    [BUDDIES_LIVE_HEADERS.signature]: s ?? '',
+    [BUDDIES_LIVE_HEADERS.payload]: signed.payload,
+    [BUDDIES_LIVE_HEADERS.signature]: signed.signature ?? '',
   }
 }
 
 /**
- * Headers for `blob/put`: the signed envelope (op `blob/put`) as `x-buddies-p`
- * and `x-buddies-s`. `payload` must hold `inboxId`, `blobId`, `bytes`,
+ * Headers for `blob/put`: the signed envelope (op `blob/put`) as
+ * `x-buddies-payload` and `x-buddies-signature`. `payload` must hold `inboxId`, `blobId`, `bytes`,
  * `expiresAt`, `readTokenHash`, `ts`, and `nonce`.
  */
 export const blobPutHeaders = async (
   payload: Record<string, unknown> | string,
   key: SigningKey
 ): Promise<Record<string, string>> => {
-  const { p, s } = await envelope(BUDDIES_BLOB_PUT_OP, payload, key)
+  const signed = await envelope(BUDDIES_BLOB_PUT_OP, payload, key)
   return {
     'content-type': 'application/octet-stream',
-    [BUDDIES_ENVELOPE_HEADERS.payload]: p,
-    [BUDDIES_ENVELOPE_HEADERS.signature]: s ?? '',
+    [BUDDIES_ENVELOPE_HEADERS.payload]: signed.payload,
+    [BUDDIES_ENVELOPE_HEADERS.signature]: signed.signature ?? '',
   }
 }
 
@@ -145,7 +149,7 @@ export const photoBlob = async (size = 2_048): Promise<PhotoBlob> => {
 export const unsignedEnvelope = (
   payload: Record<string, unknown>
 ): Envelope => ({
-  p: b64u(encoder.encode(JSON.stringify(payload))),
+  payload: b64u(encoder.encode(JSON.stringify(payload))),
 })
 
 /** Random lowercase hex, `size` bytes (an APNs device token). */

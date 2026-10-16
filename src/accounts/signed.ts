@@ -9,7 +9,7 @@ import {
 } from '../buddies/contracts'
 import {
   type Envelope,
-  envelopeFromParts,
+  envelopeFromHeaders,
   parseEnvelope,
   readEnvelopeText,
   verifyEd25519,
@@ -27,6 +27,7 @@ import {
 import {
   ACCOUNT_ENVELOPE_HEADERS,
   ACCOUNT_FIELD_PARSERS,
+  LEGACY_ACCOUNT_ENVELOPE_HEADERS,
   type AccountFields,
   type AccountKeyPayload,
   type AccountsOp,
@@ -86,16 +87,17 @@ export const verifiedBody = async <K extends AccountsOp>(
   return verifyEnvelope(op, text == null ? null : parseEnvelope(text))
 }
 
-/** A self-signed op whose envelope rides in `x-ww-p` and `x-ww-s`. */
+/** A self-signed op whose envelope rides in `x-ww-payload` and `x-ww-signature`. */
 export const verifiedHeaders = <K extends AccountsOp>(
   c: AppContext,
   op: K
 ): Promise<Verified<K>> =>
   verifyEnvelope(
     op,
-    envelopeFromParts(
-      c.req.header(ACCOUNT_ENVELOPE_HEADERS.payload),
-      c.req.header(ACCOUNT_ENVELOPE_HEADERS.signature)
+    envelopeFromHeaders(
+      c.req.raw.headers,
+      ACCOUNT_ENVELOPE_HEADERS,
+      LEGACY_ACCOUNT_ENVELOPE_HEADERS
     )
   )
 

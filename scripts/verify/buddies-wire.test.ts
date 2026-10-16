@@ -33,11 +33,11 @@ it('knows every op', () => {
 it('signs exactly what the relay verifies', async () => {
   const key = await wire.signingKeyFromSeed(new Uint8Array(32).fill(7))
   const envelope = await wire.signedEnvelope('inbox/sync', { since: 0 }, key)
-  const payloadBytes = wire.fromB64u(envelope.p)
+  const payloadBytes = wire.fromB64u(envelope.payload)
   expect(wire.signedMessage('inbox/sync', payloadBytes)).toEqual(
     signedMessage('inbox/sync', payloadBytes)
   )
   expect(
-    await verifyBuddiesSignature(key.publicKey, 'inbox/sync', payloadBytes, wire.fromB64u(envelope.s))
+    await verifyBuddiesSignature(key.publicKey, 'inbox/sync', payloadBytes, wire.fromB64u(envelope.signature))
   ).toBe(true)
 })

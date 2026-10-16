@@ -374,7 +374,7 @@ const putBlob = async (owner, blob, { fields = {}, body = blob.bytes, key = owne
   return send({
     op: 'blob/put',
     body,
-    headers: { 'content-type': 'application/octet-stream', [ENVELOPE_HEADERS.payload]: envelope.p, [ENVELOPE_HEADERS.signature]: envelope.s },
+    headers: { 'content-type': 'application/octet-stream', [ENVELOPE_HEADERS.payload]: envelope.payload, [ENVELOPE_HEADERS.signature]: envelope.signature },
     expect,
     error,
     note: note ?? `blob/put ${body.length} bytes`,
@@ -401,7 +401,7 @@ const GENERATORS = {
   'tampered-signature': async (rng, canary) => {
     const op = rng.pick(CANARY_TARGET_OPS)
     const env = await signed(op, keyFor(op, canary), await validPayload(op, canary))
-    env.s = b64u(flipBit(fromB64u(env.s), rng))
+    env.signature = b64u(flipBit(fromB64u(env.signature), rng))
     await send({ op, body: env, expect: [401], error: 'bad_signature', note: `bit-flipped signature on ${op}` })
   },
 
@@ -413,7 +413,7 @@ const GENERATORS = {
     const forged = { ...payload, nonce: rid() }
     if ('since' in forged) forged.since = rng.int(1, 1_000)
     if ('blob' in forged) forged.blob = blob(64)
-    env.p = b64u(new TextEncoder().encode(JSON.stringify(forged)))
+    env.payload = b64u(new TextEncoder().encode(JSON.stringify(forged)))
     await send({ op, body: env, expect: [401], error: 'bad_signature', note: `payload swapped under ${op} signature` })
   },
 
@@ -511,28 +511,32 @@ const GENERATORS = {
   /** Envelope-level garbage: bad JSON, wrong shapes, bad base64, bad UTF-8. */
   'malformed-envelope': async (rng, canary) => {
     const op = rng.pick(ALL_OPS)
-    const goodP = (await signed('inbox/sync', canary.owner.key, await validPayload('inbox/sync', canary))).p
+    const goodPayload = (await signed('inbox/sync', canary.owner.key, await validPayload('inbox/sync', canary))).payload
     const cases = [
       ['raw', '{not json'],
       ['raw', ''],
       ['raw', 'null'],
       ['raw', '[]'],
       ['raw', '42'],
-      ['raw', '"p"'],
+      ['raw', '"payload"'],
+      ['raw', '{"payload":'],
       ['raw', '{"p":'],
       ['raw', '['.repeat(5_000) + ']'.repeat(5_000)],
-      ['raw', `{"p":"${'A'.repeat(100)}"${',"x":1'.repeat(2_000)}}`],
-      ['json', { p: 1 }],
+      ['raw', `{"payload":"${'A'.repeat(100)}"${',"x":1'.repeat(2_000)}}`],
+      ['json', { payload: 1 }],
+      ['json', { payload: '' }],
+      ['json', { payload: null, signature: 'x' }],
       ['json', { p: '' }],
       ['json', { p: null, s: 'x' }],
-      ['json', { p: 'not base64!' }],
-      ['json', { p: 'A' }],
-      ['json', { p: `${goodP}==` }],
-      ['json', { p: b64u(Buffer.from('not json')) }],
-      ['json', { p: b64u(Buffer.from('[1,2]')) }],
-      ['json', { p: b64u(Buffer.from('"str"')) }],
-      ['json', { p: b64u(Buffer.from([0xff, 0xfe, 0x7b, 0x7d])) }],
-      ['json', { p: b64u(Buffer.from([0xef, 0xbb, 0xbf, 0x7b, 0x7d])) }],
+      ['json', { payload: 'not base64!' }],
+      ['json', { payload: 'A' }],
+      ['json', { payload: `${goodPayload}==` }],
+      ['json', { p: `${goodPayload}==` }],
+      ['json', { payload: b64u(Buffer.from('not json')) }],
+      ['json', { payload: b64u(Buffer.from('[1,2]')) }],
+      ['json', { payload: b64u(Buffer.from('"str"')) }],
+      ['json', { payload: b64u(Buffer.from([0xff, 0xfe, 0x7b, 0x7d])) }],
+      ['json', { payload: b64u(Buffer.from([0xef, 0xbb, 0xbf, 0x7b, 0x7d])) }],
       ['bytes', Uint8Array.from([0xff, 0xfe, 0xfd])],
       ['bom', null],
     ]
@@ -560,12 +564,12 @@ const GENERATORS = {
     })
   },
 
-  /** Valid payload, malformed `s` (missing, wrong type, wrong length, bad alphabet). */
+  /** Valid payload, malformed `signature` (missing, wrong type, wrong length, bad alphabet). */
   'malformed-signature': async (rng, canary) => {
     const op = rng.pick(CANARY_TARGET_OPS)
     const env = await signed(op, keyFor(op, canary), await validPayload(op, canary))
-    const s = rng.pick([undefined, null, 7, '', env.s.slice(1), `${env.s}A`, `${env.s.slice(0, 85)}!`, `${env.s.slice(0, 84)}==`, 'A'.repeat(86), {}])
-    await send({ op, body: { p: env.p, s }, expect: [401], error: 'bad_signature', note: `s=${clip(JSON.stringify(s) ?? 'undefined', 40)}` })
+    const signature = rng.pick([undefined, null, 7, '', env.signature.slice(1), `${env.signature}A`, `${env.signature.slice(0, 85)}!`, `${env.signature.slice(0, 84)}==`, 'A'.repeat(86), {}])
+    await send({ op, body: { payload: env.payload, signature }, expect: [401], error: 'bad_signature', note: `signature=${clip(JSON.stringify(signature) ?? 'undefined', 40)}` })
   },
 
   /** Blobs at the decoded-size limit succeed; one byte over is rejected. */
@@ -607,7 +611,7 @@ const GENERATORS = {
   'oversized-envelope': async (rng, canary) => {
     const op = rng.pick(ALL_OPS)
     const bytes = L.requestBytes + rng.int(1, 64 * 1024)
-    const filler = `{"p":"${'A'.repeat(bytes)}"}`
+    const filler = `{"payload":"${'A'.repeat(bytes)}"}`
     if (rng.bool()) {
       await send({ op, body: filler, headers: { 'content-type': 'application/json' }, expect: [400], error: 'bad_request', note: `${filler.length}-byte envelope` })
     } else {

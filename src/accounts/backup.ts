@@ -104,7 +104,7 @@ const hex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 
 /**
- * `backup/put`: the envelope in `x-ww-p`/`x-ww-s`, the blob as the raw body.
+ * `backup/put`: the envelope in `x-ww-payload`/`x-ww-signature`, the blob as the raw body.
  * A declared `Content-Length` over the cap is refused before anything is
  * read; otherwise the body is read up to the signed `size` and checked
  * against `size` and `sha256` before it replaces the slot.

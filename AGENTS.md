@@ -266,8 +266,8 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   `slot/leave` work even when disabled.
 - **Photo blobs** (photos in Plan notes; contract in the protocol's "Photo
   blobs"): `POST /buddies/v1/blob/put` takes the raw sealed bytes as its body
-  with the owner-signed envelope (op `blob/put`) in `x-buddies-p` /
-  `x-buddies-s`; the Worker reads at most 1 MiB, recomputes
+  with the owner-signed envelope (op `blob/put`) in `x-buddies-payload` /
+  `x-buddies-signature`; the Worker reads at most 1 MiB, recomputes
   `blobId = b64u(SHA-256(body))`, and hands the bytes to the sender's inbox
   DO, which checks the signature, nonce, and caps and writes R2 object
   `v1/<inboxId>/<blobId>`. `blob/get` (unsigned; the read token is the
@@ -317,8 +317,8 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   added in place to older inboxes). Invitations and answers (`isImmediatePushKind` in `contracts.ts`)
   skip the 60 s per-slot spacing but still count toward the daily cap.
 - **Live socket**: `GET /buddies/v1/inbox/live` upgrades to a WebSocket. The
-  owner-signed envelope (op `inbox/live`) rides in the `x-buddies-p` and
-  `x-buddies-s` headers. The inbox DO accepts it with the Hibernation API
+  owner-signed envelope (op `inbox/live`) rides in the `x-buddies-payload`
+  and `x-buddies-signature` headers. The inbox DO accepts it with the Hibernation API
   (`ping` gets `pong` without waking it, at most 10 sockets per inbox) and
   sends `{"type":"changed","seq":…}` after each write that changes
   `inbox/sync`. Sentry events drop `x-buddies-*` headers. Under `wrangler
@@ -421,10 +421,10 @@ Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
 
 - **Handoff** (Set Up Another Device): `POST /accounts/v1/handoff/open|claim|
   status|send|receive|done|cancel`, code in `src/accounts/handoff.ts`. The old
-  phone's ops (`open`, `status`, `send`, and `cancel` with `p`/`s`) are signed
+  phone's ops (`open`, `status`, `send`, and `cancel` with `payload`/`signature`) are signed
   by the account key like `account/register` and need a registered account
   (`unknown_account` otherwise; a suspended one may still hand off). The new
-  phone's (`claim`, `receive`, `done`, and `cancel` without `p`) are plain JSON
+  phone's (`claim`, `receive`, `done`, and `cancel` without `payload`) are plain JSON
   carrying `claimToken`. One `AccountHandoff` SQLite DO per `channelId`
   (binding `ACCOUNT_HANDOFF`, migration `v7`, `src/accounts/handoffDO.ts`)
   holds the opening account, `verifier = b64u(SHA-256(claimToken))`, the new
@@ -442,7 +442,8 @@ Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
   tier.
 - **Backup**: `POST /accounts/v1/backup/put|list|get|delete`, code in
   `src/accounts/backup.ts`. All four are signed; `put` sends its envelope in
-  `x-ww-p`/`x-ww-s` (Sentry drops both) and the blob as the raw body. R2
+  `x-ww-payload`/`x-ww-signature` (Sentry drops both, and the legacy
+  `x-ww-p`/`x-ww-s`) and the blob as the raw body. R2
   bucket `ACCOUNT_BACKUPS` (`ww-account-backups` prod,
   `ww-account-backups-dev` dev), one object per device slot at
   `v1/<accountId>/<slotId>` with `customMetadata.uploadedAt` (epoch ms). `put`
@@ -583,8 +584,43 @@ need the token).
   route's `openapi.ts` in the same PR**.
 - `src/openapi/openapi.test.ts` fails on any route without docs, and on any
   operation without a tag, summary, or responses.
-- Signed Buddies/accounts ops document the envelope `{p, s}` and list the
-  decoded `p` fields as a table (`signedBody`).
+- Signed Buddies/accounts ops document the envelope `{payload, signature}`
+  and list the decoded `payload` fields as a table (`signedBody`).
+- The legacy short names `p`/`s` (and `x-buddies-p`/`-s`, `x-ww-p`/`-s`) are
+  accepted for shipped builds but appear in the docs only as a note; never
+  add a new short name.
+
+## API design: readable, standard REST
+
+This project is open source. Anyone can read this repo, the app's repo, the
+generated `/docs`, and `/openapi.json`, so hiding the API's shape buys no
+security. Short or cryptic names (`p`, `s`, single letters, unexplained
+abbreviations) only make the API harder to read, debug, and maintain.
+Security comes from signatures, attestation, capability secrets, rate limits,
+and end-to-end encryption, never from obscure names.
+
+When adding or changing an endpoint:
+
+- **Name things for a human reader.** Spell fields, headers, and query
+  parameters out in full camelCase (`signature`, not `s`; `payload`, not
+  `p`; `publicKey`, not `pub`). Abbreviate only where every developer knows
+  the term (`id`, `url`, `nonce`), and give every number its unit in the
+  name or its description (`durationSeconds`, `expiresAt` in epoch ms).
+  Some shipped names predate this (`ts`, `*Pub`, `seq`); don't copy them
+  into new routes.
+- **Follow REST and HTTP conventions.** Resource-oriented paths, the right
+  method and status code, `Content-Type` and `Retry-After` honoured, JSON
+  bodies, errors in the shared `{ ok, error, code }` envelope. Where a route
+  deliberately departs from REST (Buddies' and accounts' `POST /{op}` keeps
+  ids out of URLs, which production logs), document why in its `openapi.ts`.
+- **Document as you go.** Every field gets a description in the route's
+  `openapi.ts`; `/docs` should be enough to call the API without reading the
+  source.
+- **Renaming a shipped field:** accept both names on the server, document
+  only the new one (mention the old one as legacy), switch the app, and keep
+  the alias as long as supported builds send it. Inside signed payloads the
+  server verifies the exact bytes it got, so an alias there only needs the
+  parser to read either name.
 - The document is built once per isolate. Scalar's UI loads from jsDelivr.
 
 ## Checks before deploy

@@ -139,19 +139,31 @@ export const buddiesId = (description: string) =>
     .regex(/^[A-Za-z0-9_-]{22}$/)
     .meta({ description: `${description} (22-character base64url id)` })
 
+/** An envelope's `payload` field. */
+export const envelopePayload = () =>
+  b64u('The request’s fields as UTF-8 JSON, then base64url-encoded')
+
 /**
- * The signed envelope Buddies and accounts ops send: `p` is the payload JSON,
- * `s` an Ed25519 signature over the op's signing context, the op, and `p`'s
- * bytes.
+ * The signed envelope Buddies and accounts ops send: `payload` is the request
+ * JSON, `signature` an Ed25519 signature over the op's signing context, the
+ * op, and `payload`'s decoded bytes. Older app builds send them as `p` and
+ * `s`, which the server still accepts; they aren't documented as fields.
  */
 export const signedEnvelopeSchema = z
   .object({
-    p: b64u('The payload JSON, UTF-8 encoded'),
-    s: b64u(
-      'Ed25519 signature over `<context>\\n<op>\\n` followed by the decoded `p` bytes'
+    payload: envelopePayload(),
+    signature: b64u(
+      'Ed25519 signature over `<context>\\n<op>\\n` followed by the decoded `payload` bytes'
     ),
   })
   .strict()
+  .meta({ id: 'SignedEnvelope' })
+
+/** The envelope unsigned Buddies ops send: `payload` only. */
+export const unsignedEnvelopeSchema = z
+  .object({ payload: envelopePayload() })
+  .strict()
+  .meta({ id: 'UnsignedEnvelope' })
 
 type JsonSchema = {
   type?: string | string[]
@@ -209,12 +221,12 @@ export const fieldTable = (schema: Schema): string =>
   ].join('\n')
 
 /**
- * A signed envelope whose decoded `p` must match `payload`. The payload's
+ * A signed envelope whose decoded `payload` must match `payload`. Its
  * fields are listed as a table in the body's description, since the
  * envelope hides them inside base64.
  */
 export const signedBody = (payload: Schema, description: string) =>
   jsonBody(
     signedEnvelopeSchema,
-    `${description}\n\n**Decoded \`p\`:**\n\n${fieldTable(payload)}`
+    `${description}\n\n**Decoded \`payload\`:**\n\n${fieldTable(payload)}`
   )

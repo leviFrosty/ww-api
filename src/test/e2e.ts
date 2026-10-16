@@ -250,7 +250,7 @@ export const sendSigned = async (
 export const sendUnsigned = (op: string, payload: Record<string, unknown>) =>
   buddies(op, unsignedEnvelope(payload))
 
-/** `blob/get`: an unsigned `{p}` envelope; raw bytes back on 200. */
+/** `blob/get`: an unsigned `{payload}` envelope; raw bytes back on 200. */
 export const getBlob = (payload: Record<string, unknown>) =>
   httpBytes('/buddies/v1/blob/get', { json: unsignedEnvelope(payload) })
 

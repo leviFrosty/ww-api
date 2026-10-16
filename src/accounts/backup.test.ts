@@ -59,8 +59,8 @@ const envelope = async (
     })
   )
   return {
-    p: b64u(bytes),
-    s: b64u(await signer.sign(accountSignedMessage(op, bytes))),
+    payload: b64u(bytes),
+    signature: b64u(await signer.sign(accountSignedMessage(op, bytes))),
   }
 }
 
@@ -105,7 +105,7 @@ interface PutOptions {
 
 const put = async (key: SigningKey, options: PutOptions = {}) => {
   const bytes = options.bytes ?? randomBytes(4_096)
-  const { p, s } = await envelope(
+  const { payload, signature } = await envelope(
     'backup/put',
     key,
     {
@@ -119,8 +119,8 @@ const put = async (key: SigningKey, options: PutOptions = {}) => {
   const headers: Record<string, string> = {
     'content-type': 'application/octet-stream',
     'cf-connecting-ip': options.ip ?? freshIp(),
-    'x-ww-p': p,
-    'x-ww-s': s,
+    'x-ww-payload': payload,
+    'x-ww-signature': signature,
   }
   for (const [name, value] of Object.entries(options.headers ?? {})) {
     if (value == null) delete headers[name]
@@ -195,6 +195,27 @@ describe('backup', () => {
     // Idempotent.
     expect((await remove(key, slotId)).status).toBe(200)
     expect((await list(key)).body.slots).toEqual([])
+  })
+
+  it('still accepts the short x-ww-p / x-ww-s headers older builds send', async () => {
+    const { key } = await register()
+    const bytes = randomBytes(1_000)
+    const { payload, signature } = await envelope('backup/put', key, {
+      slotId: randomId(),
+      size: bytes.byteLength,
+      sha256: await sha256B64u(bytes),
+    })
+    expect(
+      await put(key, {
+        bytes,
+        headers: {
+          'x-ww-payload': null,
+          'x-ww-signature': null,
+          'x-ww-p': payload,
+          'x-ww-s': signature,
+        },
+      })
+    ).toMatchObject({ status: 200, body: { ok: true } })
   })
 
   it('keeps each account to its own slots', async () => {
@@ -287,7 +308,7 @@ describe('backup', () => {
     // A declared Content-Length is refused before the body or signature is read.
     expect(
       await put(key, {
-        headers: { 'content-length': String(20 * MIB + 1), 'x-ww-s': 'nope' },
+        headers: { 'content-length': String(20 * MIB + 1), 'x-ww-signature': 'nope' },
       })
     ).toMatchObject(tooLarge)
     // A signed size over the cap.
@@ -333,7 +354,7 @@ describe('backup', () => {
     expect(
       await put(key, { signer: await SigningKey.generate() })
     ).toMatchObject({ status: 401, body: { code: 'bad_signature' } })
-    expect(await put(key, { headers: { 'x-ww-p': null } })).toMatchObject({
+    expect(await put(key, { headers: { 'x-ww-payload': null } })).toMatchObject({
       status: 400,
       body: { code: 'bad_request' },
     })

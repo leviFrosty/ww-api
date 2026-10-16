@@ -28,7 +28,7 @@ const keySignedBody = (op: string) =>
       }),
       nonce: buddiesId('A fresh random nonce'),
     }),
-    `A signed envelope; \`s\` is the account key’s signature over \`ww-account/v1\\n${op}\\n\` followed by \`p\`’s bytes.`
+    `A signed envelope; \`signature\` is the account key’s signature over \`ww-account/v1\\n${op}\\n\` followed by the decoded \`payload\` bytes.`
   )
 
 const signatureErrors = {
@@ -427,14 +427,14 @@ const keyPayloadFields = (op: string, fields: z.ZodRawShape) =>
       nonce: buddiesId('A fresh random nonce'),
       ...fields,
     })
-  ) + `\n\nSigned over \`ww-account/v1\\n${op}\\n\` followed by \`p\`’s bytes.`
+  ) + `\n\nSigned over \`ww-account/v1\\n${op}\\n\` followed by the decoded \`payload\` bytes.`
 
 export const backupPutDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Upload a backup',
-  description: `Replaces this device’s slot with an end-to-end encrypted backup (\`0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305\`). The body is the raw blob, at most 20 MiB; the signed envelope (op \`backup/put\`) rides in the \`x-ww-p\` and \`x-ww-s\` headers.
+  description: `Replaces this device’s slot with an end-to-end encrypted backup (\`0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305\`). The body is the raw blob, at most 20 MiB; the signed envelope (op \`backup/put\`) rides in the \`x-ww-payload\` and \`x-ww-signature\` headers.
 
-**Decoded \`x-ww-p\`:**
+**Decoded \`x-ww-payload\`:**
 
 ${keyPayloadFields('backup/put', {
   slotId,
@@ -448,14 +448,14 @@ ${keyPayloadFields('backup/put', {
 Limits: 20 MiB a blob, 8 slots an account, one upload a slot a minute, and the Buddies photo-upload tier (60 a minute per caller IP). ${backupNotes}`,
   parameters: [
     {
-      name: 'x-ww-p',
+      name: 'x-ww-payload',
       in: 'header' as const,
       required: true,
       schema: { type: 'string' as const },
-      description: 'The payload JSON, UTF-8 encoded, base64url.',
+      description: 'The request’s fields as UTF-8 JSON, base64url.',
     },
     {
-      name: 'x-ww-s',
+      name: 'x-ww-signature',
       in: 'header' as const,
       required: true,
       schema: { type: 'string' as const },

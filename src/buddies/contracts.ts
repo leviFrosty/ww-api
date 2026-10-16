@@ -40,14 +40,19 @@ export const BUDDIES_UNSIGNED_OPS = ['invite/fetch', 'invite/claim'] as const
  */
 export const BUDDIES_LIVE_OP = 'inbox/live'
 /**
- * Request headers that carry a signed envelope's `p` and `s` when the body
- * can't: the live upgrade (no body) and `blob/put` (raw bytes).
+ * Request headers that carry a signed envelope's `payload` and `signature`
+ * when the body can't: the live upgrade (no body) and `blob/put` (raw bytes).
  */
 export const BUDDIES_ENVELOPE_HEADERS = {
+  payload: 'x-buddies-payload',
+  signature: 'x-buddies-signature',
+} as const
+/** The short header names older app builds send; still accepted. */
+export const LEGACY_BUDDIES_ENVELOPE_HEADERS = {
   payload: 'x-buddies-p',
   signature: 'x-buddies-s',
 } as const
-/** Request headers that carry the live upgrade's `p` and `s`. */
+/** Request headers that carry the live upgrade's `payload` and `signature`. */
 export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
 
 /**
@@ -719,7 +724,7 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
 
 /** The authenticated parts of a signed request, forwarded to the inbox DO. */
 export interface SignedCall {
-  /** Decoded bytes of the envelope's `p`, exactly as the client signed them. */
+  /** Decoded bytes of the envelope's `payload`, exactly as the client signed them. */
   payloadBytes: Uint8Array
   signature: Uint8Array
 }

@@ -24,13 +24,14 @@ Since the MVP: shared Plans and Follow-up invitations, requests to join, and bad
 ### Request envelope
 
 ```json
-{ "p": "<b64u(UTF-8 JSON payload)>", "s": "<b64u(Ed25519 signature)>" }
+{ "payload": "<b64u(UTF-8 JSON payload)>", "signature": "<b64u(Ed25519 signature)>" }
 ```
 
-- The signed message is `UTF-8("ww-buddies/v1\n" + op + "\n")` followed by the **decoded bytes of `p`**. The server verifies against those exact bytes; it never re-serializes JSON.
+- The signed message is `UTF-8("ww-buddies/v1\n" + op + "\n")` followed by the **decoded bytes of `payload`**. The server verifies against those exact bytes; it never re-serializes JSON.
 - `op` is the path segment after `/buddies/v1/`, e.g. `inbox/sync`.
 - Every signed payload carries `ts` (ms; a fractional value is accepted and floored) and `nonce` (`b64u` of 16 random bytes). The server rejects `|now − ts| > 300 000` with `stale`, and a nonce seen within the last 10 minutes for the same inbox with `replay`.
-- Unsigned ops (`invite/fetch`, `invite/claim`) send `{ "p": "…" }` only; `ts`/`nonce` are not required there.
+- Unsigned ops (`invite/fetch`, `invite/claim`) send `{ "payload": "…" }` only; `ts`/`nonce` are not required there.
+- **Legacy names:** builds before the rename send `p` and `s` (and the headers `x-buddies-p` / `x-buddies-s`). The relay accepts both spellings indefinitely; when both are present the long name wins. New clients send the long names.
 
 ### Which key verifies
 
@@ -116,7 +117,7 @@ Payload fields listed are **in addition** to `ts` and `nonce` for signed ops.
 
 While the app is in the foreground it keeps a WebSocket open to its own inbox, so a buddy's claim, confirmation, invitation, reply, or request to join shows up within a second instead of at the next foreground or push. The socket only says _that_ something changed; the app then runs `inbox/sync` as usual.
 
-- **Request:** `GET {BASE}/buddies/v1/inbox/live` with `Upgrade: websocket`. Owner-signed exactly like a POST owner op, with op `inbox/live` and payload `{ inboxId, ts, nonce }`, but the envelope travels in headers so no id reaches a URL: `x-buddies-p` (the `p` value) and `x-buddies-s` (the `s` value). Same stale and replay checks. Not a POST op (`POST /inbox/live` is 404).
+- **Request:** `GET {BASE}/buddies/v1/inbox/live` with `Upgrade: websocket`. Owner-signed exactly like a POST owner op, with op `inbox/live` and payload `{ inboxId, ts, nonce }`, but the envelope travels in headers so no id reaches a URL: `x-buddies-payload` (the `payload` value) and `x-buddies-signature` (the `signature` value). Same stale and replay checks. Not a POST op (`POST /inbox/live` is 404).
 - **Refusals (before upgrading):** kill switch off → `503 disabled`; too many requests from this caller → `429 rate_limited` (with `Retry-After`); not a WebSocket upgrade → `426 upgrade_required`; then the usual `bad_request`, `bad_signature`, `stale`, `replay`, `not_found`. A refused upgrade is retried with the usual reconnect backoff.
 - **Messages (server → app):** `{ "type": "hello", "seq": N }` right after the upgrade, where `N` is the inbox's current `seq` (what a full `inbox/sync` returns); then `{ "type": "changed", "seq": N }` after every committed write that changes what `inbox/sync` returns: `event/put` (new events only), `card/put`, `roster/put`, a delivered claim, and `slot/add`, `slot/remove`, `slot/leave` that changed a slot. No content, ever. Slot changes don't advance `seq`, so the app syncs on every `changed` and on a `hello` past its cursor.
 - **Keepalive:** the app sends `ping` about every 25 s; the relay answers `pong` without waking the inbox's Durable Object. No `pong` within 10 s means the connection is dead and the app reconnects. Anything else the app sends is ignored.
@@ -153,8 +154,8 @@ Plan notes can carry photos. A photo is far too big for an event (8 KB), so the 
 
 | Op            | Signed                | Request                                                                                       | Response                       |
 | ------------- | --------------------- | --------------------------------------------------------------------------------------------- | ------------------------------ |
-| `blob/put`    | Owner, in headers     | headers `x-buddies-p`, `x-buddies-s`; payload `inboxId`, `blobId`, `bytes`, `expiresAt`, `readTokenHash`; raw body | `{ ok, expiresAt }`            |
-| `blob/get`    | —                     | `{ "p": b64u(JSON { inboxId, blobId, token }) }`                                              | the raw bytes (200)            |
+| `blob/put`    | Owner, in headers     | headers `x-buddies-payload`, `x-buddies-signature`; payload `inboxId`, `blobId`, `bytes`, `expiresAt`, `readTokenHash`; raw body | `{ ok, expiresAt }`            |
+| `blob/get`    | —                     | `{ "payload": b64u(JSON { inboxId, blobId, token }) }`                                        | the raw bytes (200)            |
 | `blob/delete` | Owner                 | `inboxId`, `blobIds` (1–50)                                                                   | `{ ok }`                       |
 
 #### `blob/put`
@@ -163,14 +164,14 @@ Plan notes can carry photos. A photo is far too big for an event (8 KB), so the 
 POST {BASE}/buddies/v1/blob/put
 Content-Type: application/octet-stream
 Content-Length: <bytes>
-x-buddies-p: <b64u(UTF-8 JSON payload)>
-x-buddies-s: <b64u(Ed25519 signature)>
+x-buddies-payload: <b64u(UTF-8 JSON payload)>
+x-buddies-signature: <b64u(Ed25519 signature)>
 
 <the sealed bytes>
 ```
 
-- **Payload** (JSON, then UTF-8, then `b64u` into `x-buddies-p`): `{ "inboxId": "<22>", "blobId": "<43>", "bytes": <int>, "expiresAt": <ms>, "readTokenHash": "<43>", "ts": <ms>, "nonce": "<22>" }`. Field order doesn't matter; the relay verifies the bytes it got.
-- **Signature:** an owner op like any other, with op `blob/put`: Ed25519 by the owner key over the bytes `UTF-8("ww-buddies/v1\nblob/put\n") ‖ decoded(x-buddies-p)`, `b64u` into `x-buddies-s`. Same `ts` (±5 min, `stale`) and `nonce` (`replay`) rules. Because the signed `blobId` is the body's SHA-256, which the relay recomputes, the signature covers the bytes too. In the app this is `envelope('blob/put', ownerSeed, { inboxId, blobId, bytes, expiresAt, readTokenHash })`, sent as headers as `openLive` does.
+- **Payload** (JSON, then UTF-8, then `b64u` into `x-buddies-payload`): `{ "inboxId": "<22>", "blobId": "<43>", "bytes": <int>, "expiresAt": <ms>, "readTokenHash": "<43>", "ts": <ms>, "nonce": "<22>" }`. Field order doesn't matter; the relay verifies the bytes it got.
+- **Signature:** an owner op like any other, with op `blob/put`: Ed25519 by the owner key over the bytes `UTF-8("ww-buddies/v1\nblob/put\n") ‖ decoded(x-buddies-payload)`, `b64u` into `x-buddies-signature`. Same `ts` (±5 min, `stale`) and `nonce` (`replay`) rules. Because the signed `blobId` is the body's SHA-256, which the relay recomputes, the signature covers the bytes too. In the app this is `envelope('blob/put', ownerSeed, { inboxId, blobId, bytes, expiresAt, readTokenHash })`, sent as headers as `openLive` does.
 - **`bytes`:** the body's exact length, 1 to 1,048,576. Over that is `413 too_large` before the body is read. `Content-Length`, when sent, must equal `bytes` (over 1 MiB: `too_large`; otherwise different: `bad_request`). The relay stops reading one chunk past `bytes`: more than 1 MiB is `too_large`, any other length mismatch is `bad_request`.
 - **`expiresAt`:** integer ms with `now < expiresAt ≤ now + 90 days` (the relay's clock), else `bad_request`. The app keeps a photo until a month after its Plan ends, which covers a Plan 8 weeks out; for a later Plan it asks for 90 days and uploads the photo again as the Plan nears.
 - **Checks, in order:** `disabled`, `photos_disabled`, the per-caller limit (`rate_limited`), envelope and payload shape (`bad_request`), signature shape (`bad_signature`), `stale`, `too_large`, the body (`too_large`, `bad_request`), `SHA-256(body) ≠ blobId` (`bad_request`), then in the inbox: unknown inbox (`not_found`), signature (`bad_signature`), `replay`, no slots (`no_buddies`: a photo is for buddies to read, so an inbox with none can't store one), the caps (`rate_limited`).
@@ -183,10 +184,10 @@ x-buddies-s: <b64u(Ed25519 signature)>
 POST {BASE}/buddies/v1/blob/get
 Content-Type: application/json
 
-{ "p": "<b64u(UTF-8 JSON { "inboxId": "<sender's 22>", "blobId": "<43>", "token": "<readToken, 43>" })>" }
+{ "payload": "<b64u(UTF-8 JSON { "inboxId": "<sender's 22>", "blobId": "<43>", "token": "<readToken, 43>" })>" }
 ```
 
-- The same unsigned envelope as `invite/fetch` (no `s`, `ts`, or `nonce`).
+- The same unsigned envelope as `invite/fetch` (no `signature`, `ts`, or `nonce`).
 - **200:** the exact bytes put, with `Content-Type: application/octet-stream`, `Content-Length`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. The app may check `b64u(SHA-256(body)) = blobId` before opening it; the AEAD tag catches tampering either way.
 - **One `404 not_found`** for an unknown inbox or blob, a deleted or expired blob, one whose upload hasn't finished, and a wrong token: same status, same body. The relay compares token hashes in constant time.
 - Not owner activity, and it changes nothing in the inbox.

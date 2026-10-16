@@ -4,6 +4,7 @@ import {
   BUDDIES_LIMITS,
   BUDDIES_LIVE_OP,
   BUDDIES_PAYLOAD_PARSERS,
+  LEGACY_BUDDIES_ENVELOPE_HEADERS,
   decodeB64u,
   decodeSignature,
   fail,
@@ -16,22 +17,24 @@ import {
 } from './contracts'
 
 /**
- * Request envelope `{ "p": b64u(UTF-8 JSON payload), "s": b64u(Ed25519 sig) }`.
+ * Request envelope
+ * `{ "payload": b64u(UTF-8 JSON payload), "signature": b64u(Ed25519 sig) }`.
  * The live socket's upgrade and `blob/put` carry the same two values in
- * headers instead.
+ * headers instead. Older app builds send the short names `p` and `s` (and
+ * `x-buddies-p` / `x-buddies-s`); those are still accepted.
  *
- * The signature covers `UTF-8("ww-buddies/v1\n" + op + "\n") ‖ decoded(p)`: the
- * exact bytes the client sent, never a re-serialization of the parsed JSON.
+ * The signature covers `UTF-8("ww-buddies/v1\n" + op + "\n") ‖ decoded(payload)`:
+ * the exact bytes the client sent, never a re-serialization of the parsed JSON.
  */
 
 const SIGNING_CONTEXT = 'ww-buddies/v1\n'
 const encoder = new TextEncoder()
 
 export interface Envelope {
-  /** Decoded bytes of `p`, exactly as signed. */
+  /** Decoded bytes of `payload`, exactly as signed. */
   payloadBytes: Uint8Array
   payload: Record<string, unknown>
-  /** Raw `s`; unsigned ops ignore it. */
+  /** Raw `signature`; unsigned ops ignore it. */
   signature: unknown
 }
 
@@ -85,13 +88,25 @@ export const parseEnvelope = (text: string): Envelope | null => {
     // Never surface the parser message: V8 quotes the offending input.
     return null
   }
-  return isPlainObject(body) ? envelopeFromParts(body.p, body.s) : null
+  return isPlainObject(body)
+    ? envelopeFromParts(body.payload ?? body.p, body.signature ?? body.s)
+    : null
 }
 
-/** Decodes `p` and its JSON; `s` passes through. Null means `bad_request`. */
-export const envelopeFromParts = (p: unknown, s: unknown): Envelope | null => {
-  if (typeof p !== 'string' || !p) return null
-  const payloadBytes = decodeB64u(p)
+/** True when a JSON body is a signed envelope (either naming). */
+export const isEnvelopeBody = (body: Record<string, unknown>): boolean =>
+  'payload' in body || 'p' in body
+
+/**
+ * Decodes `payload` and its JSON; `signature` passes through. Null means
+ * `bad_request`.
+ */
+export const envelopeFromParts = (
+  encodedPayload: unknown,
+  signature: unknown
+): Envelope | null => {
+  if (typeof encodedPayload !== 'string' || !encodedPayload) return null
+  const payloadBytes = decodeB64u(encodedPayload)
   if (!payloadBytes) return null
 
   let payload: unknown
@@ -105,7 +120,7 @@ export const envelopeFromParts = (p: unknown, s: unknown): Envelope | null => {
     return null
   }
   if (!isPlainObject(payload)) return null
-  return { payloadBytes, payload, signature: s }
+  return { payloadBytes, payload, signature }
 }
 
 /**
@@ -129,9 +144,24 @@ export const isWebSocketUpgrade = (request: Request): boolean =>
   request.headers.get('upgrade')?.trim().toLowerCase() === 'websocket'
 
 /**
- * A signed call whose envelope rides in the `x-buddies-p` and `x-buddies-s`
- * headers (`inbox/live`, `blob/put`). Both the Worker (to route) and the inbox
- * DO (to verify) read it, so neither trusts the other's parse.
+ * Reads an envelope from request headers: the long names, else the legacy
+ * short ones older app builds send.
+ */
+export const envelopeFromHeaders = (
+  headers: Headers,
+  names: { payload: string; signature: string },
+  legacy: { payload: string; signature: string }
+): Envelope | null =>
+  envelopeFromParts(
+    headers.get(names.payload) ?? headers.get(legacy.payload),
+    headers.get(names.signature) ?? headers.get(legacy.signature)
+  )
+
+/**
+ * A signed call whose envelope rides in the `x-buddies-payload` and
+ * `x-buddies-signature` headers (`inbox/live`, `blob/put`). Both the Worker
+ * (to route) and the inbox DO (to verify) read it, so neither trusts the
+ * other's parse.
  */
 const readHeaderCall = <
   K extends typeof BUDDIES_LIVE_OP | typeof BUDDIES_BLOB_PUT_OP,
@@ -140,9 +170,10 @@ const readHeaderCall = <
   headers: Headers,
   now: number
 ): BuddiesResult<Signed<BuddiesPayloads[K]>> => {
-  const envelope = envelopeFromParts(
-    headers.get(BUDDIES_ENVELOPE_HEADERS.payload),
-    headers.get(BUDDIES_ENVELOPE_HEADERS.signature)
+  const envelope = envelopeFromHeaders(
+    headers,
+    BUDDIES_ENVELOPE_HEADERS,
+    LEGACY_BUDDIES_ENVELOPE_HEADERS
   )
   return envelope ? signedCall(op, envelope, now) : fail('bad_request')
 }

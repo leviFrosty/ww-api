@@ -5,6 +5,7 @@ import {
   apiErrorSchema,
   staleErrorSchema,
   b64u,
+  unsignedEnvelopeSchema,
   buddiesId,
   errorResponse,
   fieldTable,
@@ -104,7 +105,7 @@ const SIGNED_BY = {
     '**Signed by** the writer key registered for (`inboxId`, `slotId`) with `slot/add`.',
   self: '**Self-signed** by `ownerPub` in the payload (proof of possession).',
   unsigned:
-    '**Unsigned:** send `{ "p": … }` only, no `s`, `ts`, or `nonce`. Knowing the ids and secrets is the capability.',
+    '**Unsigned:** send `{ "payload": … }` only, no `signature`, `ts`, or `nonce`. Knowing the ids and secrets is the capability.',
 } as const
 
 const paragraphs = (...lines: string[]) => lines.join('\n\n')
@@ -312,7 +313,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
               'Links the inbox to an account. Absent from builds before accounts.',
           }),
       }),
-      'Self-signed: `s` verifies against the payload’s own `ownerPub`.'
+      'Self-signed: `signature` verifies against the payload’s own `ownerPub`.'
     ),
     responses: {
       200: jsonResponse(
@@ -724,10 +725,8 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       KILL_SWITCH_OFF
     ),
     requestBody: jsonBody(
-      z.object({
-        p: b64u('The payload JSON, UTF-8 encoded'),
-      }),
-      `Unsigned envelope.\n\n**Decoded \`p\`:**\n\n${fieldTable(
+      unsignedEnvelopeSchema,
+      `Unsigned envelope.\n\n**Decoded \`payload\`:**\n\n${fieldTable(
         z.object({ inviteId: buddiesId('The invite, from the link secret') })
       )}`
     ),
@@ -762,10 +761,8 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       'App Attest is not required yet.'
     ),
     requestBody: jsonBody(
-      z.object({
-        p: b64u('The payload JSON, UTF-8 encoded'),
-      }),
-      `Unsigned envelope.\n\n**Decoded \`p\`:**\n\n${fieldTable(
+      unsignedEnvelopeSchema,
+      `Unsigned envelope.\n\n**Decoded \`payload\`:**\n\n${fieldTable(
         z.object({
           inviteId: buddiesId('The invite'),
           claimSecret: bytes32('The claim secret derived from the link'),
@@ -793,18 +790,18 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
 
 const envelopeHeaders = (op: string, payload: z.ZodType) => [
   {
-    name: 'x-buddies-p',
+    name: 'x-buddies-payload',
     in: 'header' as const,
     required: true,
     schema: { type: 'string' as const },
-    description: `The envelope’s \`p\`: the payload JSON, UTF-8, base64url without padding.\n\n**Decoded:**\n\n${fieldTable(payload)}`,
+    description: `The envelope’s \`payload\`: the request’s fields as UTF-8 JSON, base64url without padding.\n\n**Decoded:**\n\n${fieldTable(payload)}`,
   },
   {
-    name: 'x-buddies-s',
+    name: 'x-buddies-signature',
     in: 'header' as const,
     required: true,
     schema: { type: 'string' as const },
-    description: `The envelope’s \`s\`: Ed25519 signature by the owner key over \`ww-buddies/v1\\n${op}\\n\` followed by the decoded \`x-buddies-p\` bytes (base64url, no padding).`,
+    description: `The envelope’s \`signature\`: Ed25519 signature by the owner key over \`ww-buddies/v1\\n${op}\\n\` followed by the decoded \`x-buddies-payload\` bytes (base64url, no padding).`,
   },
 ]
 
@@ -838,7 +835,7 @@ export const buddiesLiveDocs = describeRoute({
     101: { description: 'Switching protocols: the socket is open.' },
     ...refusals({
       ...ownerRefusals('read'),
-      bad_request: 'Missing or malformed `x-buddies-p`, or a bad payload.',
+      bad_request: 'Missing or malformed `x-buddies-payload`, or a bad payload.',
       upgrade_required: 'Not a WebSocket upgrade (`Upgrade: websocket`).',
     }),
   },
@@ -927,8 +924,8 @@ export const buddiesBlobGetDocs = describeRoute({
     PHOTOS_SWITCH
   ),
   requestBody: jsonBody(
-    z.object({ p: b64u('The payload JSON, UTF-8 encoded') }),
-    `Unsigned envelope.\n\n**Decoded \`p\`:**\n\n${fieldTable(
+    unsignedEnvelopeSchema,
+    `Unsigned envelope.\n\n**Decoded \`payload\`:**\n\n${fieldTable(
       z.object({
         inboxId: buddiesId('The sender’s inbox'),
         blobId: bytes32('The blob'),

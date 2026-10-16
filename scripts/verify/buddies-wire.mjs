@@ -33,7 +33,7 @@ export const WIRE_LIMITS = {
 }
 
 /** `blob/put` carries its signed envelope in these headers; the body is the blob. */
-export const ENVELOPE_HEADERS = { payload: 'x-buddies-p', signature: 'x-buddies-s' }
+export const ENVELOPE_HEADERS = { payload: 'x-buddies-payload', signature: 'x-buddies-signature' }
 
 /** Per-caller requests per minute by edge tier (BUDDIES_ABUSE_LIMITS.edge). */
 export const WIRE_EDGE_LIMITS = {
@@ -95,14 +95,14 @@ export const signingKeyFromSeed = async (seed) => {
   }
 }
 
-/** `{p, s}` over exact payload bytes (`payload` may be a pre-serialized string). */
+/** `{payload, signature}` over exact payload bytes (`payload` may be a pre-serialized string). */
 export const signedEnvelope = async (op, payload, key) => {
   const bytes = encoder.encode(typeof payload === 'string' ? payload : JSON.stringify(payload))
-  return { p: b64u(bytes), s: b64u(await key.sign(signedMessage(op, bytes))) }
+  return { payload: b64u(bytes), signature: b64u(await key.sign(signedMessage(op, bytes))) }
 }
 
 export const unsignedEnvelope = (payload) => ({
-  p: b64u(encoder.encode(typeof payload === 'string' ? payload : JSON.stringify(payload))),
+  payload: b64u(encoder.encode(typeof payload === 'string' ? payload : JSON.stringify(payload))),
 })
 
 export const sha256 = async (bytes) => new Uint8Array(await subtle.digest('SHA-256', bytes))

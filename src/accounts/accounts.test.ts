@@ -80,8 +80,8 @@ const accountEnvelope = async (
 ) => {
   const bytes = encoder.encode(JSON.stringify(payload))
   return {
-    p: b64u(bytes),
-    s: b64u(await key.sign(message(op, bytes))),
+    payload: b64u(bytes),
+    signature: b64u(await key.sign(message(op, bytes))),
   }
 }
 
