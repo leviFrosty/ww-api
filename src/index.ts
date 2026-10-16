@@ -1,6 +1,6 @@
 import type { Environment } from "./types";
 import { runRatingsSweepStep } from "./appStoreRatings/ratings";
-import { Sentry, createSentryConfig } from "./sentry";
+import { Sentry, captureFailure, createSentryConfig } from "./sentry";
 import { app } from "./app";
 import { accountsDb } from "./accounts/store";
 import { pruneEndedSessions } from "./accounts/sessionStore";
@@ -12,7 +12,7 @@ async function pruneAccountSessions(environment: Environment): Promise<void> {
     await pruneEndedSessions(accountsDb(environment.ACCOUNTS_DB));
   } catch (error) {
     console.error("accounts: pruning ended sessions failed");
-    Sentry.captureException(error);
+    captureFailure(error, "session prune");
   }
 }
 

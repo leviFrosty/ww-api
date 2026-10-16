@@ -1,10 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type {
   Breadcrumb,
   CloudflareOptions,
   ErrorEvent,
 } from '@sentry/cloudflare'
-import { createSentryConfig, redactContactLinkPayloads } from './sentry'
+import { DrizzleQueryError } from 'drizzle-orm'
+import {
+  DatabaseError,
+  Sentry,
+  captureFailure,
+  createSentryConfig,
+  isDatabaseError,
+  redactContactLinkPayloads,
+  redactDatabaseErrors,
+  reportableError,
+} from './sentry'
+import { recordSentryEvents, type SentryRecorder } from './test/sentry'
 import type { Environment } from './types'
 
 type TransactionEvent = Parameters<
@@ -243,5 +254,135 @@ describe('trace sampling', () => {
     expect(config.sampleRate).toBeUndefined()
     expect(config.beforeSend).toBeTypeOf('function')
     expect(config.beforeSendTransaction).toBeTypeOf('function')
+  })
+})
+
+describe('database errors', () => {
+  // What Drizzle puts in a failed query's message: ids, token hashes.
+  const ACCOUNT_ID = 'AcctAcctAcctAcctAcct0w'
+  const TOKEN_HASH = 'HashHashHashHashHashHashHashHashHashHashHa0'
+  const QUERY =
+    'select "id", "account_id" from "account_sessions" where "account_sessions"."refresh_hash" = ? and "account_sessions"."account_id" = ?'
+  const queryError = () =>
+    new DrizzleQueryError(
+      QUERY,
+      [TOKEN_HASH, ACCOUNT_ID],
+      new Error(`D1_TYPE_ERROR: Type 'object' not supported for value '${ACCOUNT_ID}'`)
+    )
+
+  let recorder: SentryRecorder
+  beforeEach(() => {
+    recorder = recordSentryEvents()
+  })
+  afterEach(() => recorder.stop())
+
+  const leaks = (value: unknown) => {
+    const text = JSON.stringify(value)
+    return text.includes(ACCOUNT_ID) || text.includes(TOKEN_HASH)
+  }
+
+  it('reports a database error, or one it caused, as the operation alone', () => {
+    const error = queryError()
+    expect(isDatabaseError(error)).toBe(true)
+    const reported = reportableError(error, 'session/refresh') as Error
+    expect(reported).toBeInstanceOf(DatabaseError)
+    expect(reported.name).toBe('DatabaseError')
+    expect(reported.message).toBe('database query failed: session/refresh')
+    expect(reported.cause).toBeUndefined()
+    expect(Object.keys(reported)).toEqual(['name'])
+    // The stack keeps the frames and nothing from the query.
+    expect(reported.stack).toMatch(
+      /^DatabaseError: database query failed: session\/refresh\n\s+at /
+    )
+    expect(reported.stack).not.toContain('Failed query')
+    expect(leaks(reported.stack)).toBe(false)
+
+    const wrapped = new Error('kickoff failed', { cause: queryError() })
+    expect(reportableError(wrapped, 'kickoff')).toBeInstanceOf(DatabaseError)
+    const d1 = new Error(`D1_ERROR: no such column: ${ACCOUNT_ID}`)
+    expect(reportableError(d1, 'account status')).toBeInstanceOf(DatabaseError)
+  })
+
+  it('reports anything else unchanged', () => {
+    const plain = new Error('RPC reply lost', { cause: new Error('socket') })
+    expect(isDatabaseError(plain)).toBe(false)
+    expect(reportableError(plain, 'inbox/sync')).toBe(plain)
+    expect(reportableError('text', 'inbox/sync')).toBe('text')
+    const loop = new Error('loop') as Error & { cause?: unknown }
+    loop.cause = loop
+    expect(reportableError(loop, 'inbox/sync')).toBe(loop)
+  })
+
+  it('captureFailure sends the operation, never the query', async () => {
+    captureFailure(queryError(), 'session/refresh')
+    const events = await recorder.events()
+    expect(events).toHaveLength(1)
+    expect(events[0].exception?.values).toEqual([
+      expect.objectContaining({
+        type: 'DatabaseError',
+        value: 'database query failed: session/refresh',
+      }),
+    ])
+    expect(leaks(events)).toBe(false)
+  })
+
+  it('beforeSend redacts a raw query error and drops its cause chain', async () => {
+    Sentry.captureException(queryError())
+    const [event] = await recorder.events()
+    expect(event.exception?.values).toEqual([
+      expect.objectContaining({ type: 'Error', value: '[redacted database query]' }),
+    ])
+    expect(leaks(event)).toBe(false)
+  })
+
+  it('beforeSend keeps the errors above one and drops only those below', async () => {
+    const deeper = queryError()
+    ;(deeper.cause as Error).cause = new Error(`D1 detail ${ACCOUNT_ID}`)
+    Sentry.captureException(new Error('settling failed', { cause: deeper }))
+    const [event] = await recorder.events()
+    expect(event.exception?.values?.map((value) => value.value)).toEqual([
+      '[redacted database query]',
+      'settling failed',
+    ])
+    expect(leaks(event)).toBe(false)
+
+    // Chains without a database error keep every cause.
+    Sentry.captureException(
+      new Error('outer', { cause: new Error('middle', { cause: new Error('inner') }) })
+    )
+    const [, plain] = await recorder.events()
+    expect(plain.exception?.values?.map((value) => value.value)).toEqual([
+      'inner',
+      'middle',
+      'outer',
+    ])
+  })
+
+  it('redacts query text in messages, extras, and breadcrumbs', async () => {
+    const text = queryError().message
+    Sentry.captureMessage(`accounts: ${text}`)
+    const [event] = await recorder.events()
+    expect(event.message).toBe('accounts: [redacted database query]')
+
+    const scrubbed = config.beforeSend!(
+      { type: undefined, extra: { detail: { reason: text } } },
+      {}
+    ) as ErrorEvent
+    expect(scrubbed.extra).toEqual({
+      detail: { reason: '[redacted database query]' },
+    })
+    expect(
+      config.beforeBreadcrumb!({ message: `failed: ${text}` }, {})
+    ).toEqual({ message: 'failed: [redacted database query]' })
+    // Truncated before `params:`, the query alone still goes.
+    expect(redactDatabaseErrors(`Failed query: ${QUERY.slice(0, 40)}…`)).toBe(
+      '[redacted database query]'
+    )
+    expect(redactDatabaseErrors(`x\nparams: ${ACCOUNT_ID}`)).toBe(
+      'x[redacted database query]'
+    )
+    expect(redactDatabaseErrors('No query here; params are fine')).toBe(
+      'No query here; params are fine'
+    )
   })
 })

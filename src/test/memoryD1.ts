@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import { vi } from 'vitest'
 
 /**
  * A D1 test double backed by a real in-memory SQLite database, with the
@@ -92,3 +93,25 @@ export class MemoryD1 {
 
 export const makeMemoryD1 = (): MemoryD1 & D1Database =>
   new MemoryD1() as MemoryD1 & D1Database
+
+/**
+ * Makes statements whose SQL matches `pattern` fail when they run, the way
+ * D1 does (so Drizzle wraps the error, with the query's parameters, in a
+ * `DrizzleQueryError`). Restore it with `mockRestore()`.
+ */
+export const failQueries = (
+  d1: MemoryD1,
+  pattern: RegExp,
+  message = 'D1_ERROR: database is locked: SQLITE_BUSY'
+) => {
+  const prepare = d1.prepare.bind(d1)
+  const fail = async () => {
+    throw new Error(message)
+  }
+  const failing = { run: fail, all: fail, raw: fail, first: fail, rows: fail }
+  return vi.spyOn(d1, 'prepare').mockImplementation((query: string) =>
+    pattern.test(query)
+      ? ({ ...failing, bind: () => failing } as unknown as MemoryD1Statement)
+      : prepare(query)
+  )
+}

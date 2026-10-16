@@ -1,6 +1,6 @@
 import type { MiddlewareHandler } from 'hono'
 import type { AppContext, AppEnv, Environment } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { readEnvelopeText } from '../buddies/envelope'
 import {
   buddiesErrorResponse,
@@ -124,7 +124,7 @@ export const authenticateAccount = async (
       status = await accountStatus(c.env, account.accountId, Date.now())
     } catch (error) {
       console.error('accounts: status read failed')
-      Sentry.captureException(error)
+      captureFailure(error, 'account status')
       return refuse('internal')
     }
     if (status == null) return refuse('unauthorized')

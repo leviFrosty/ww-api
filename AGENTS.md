@@ -669,7 +669,13 @@ Building a route on accounts (`src/accounts/auth.ts`):
   sends any method.
 
 **Privacy**: never log or report access or refresh tokens, account ids,
-session ids, or device labels. Sentry drops `Authorization`.
+session ids, or device labels. Sentry drops `Authorization`. Drizzle's
+query errors quote the query's parameters (ids, token hashes), so report a
+caught error with `captureFailure(error, operation)` (`src/sentry.ts`),
+never `Sentry.captureException`: a database error, or one it caused, goes
+out as a `DatabaseError` naming the operation only. As a backstop,
+`beforeSend` cuts `Failed query:`, `params:`, and `D1_…:` text from every
+string and drops the exceptions chained under it.
 
 ### Updates and the legacy switch
 

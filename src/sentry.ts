@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/cloudflare';
 import type { Breadcrumb, CloudflareOptions, Event } from '@sentry/cloudflare';
+import { DrizzleQueryError } from 'drizzle-orm';
 import type { Context } from 'hono';
 import { routePath } from 'hono/route';
 import type { Environment } from './types';
@@ -20,11 +21,73 @@ export function redactContactLinkPayloads(value: string): string {
 }
 
 /**
+ * Drizzle's query errors carry the SQL and its bound parameters (account ids,
+ * session ids, refresh token hashes, inbox ids) in their message, as
+ * `Failed query: <sql>\nparams: <values>`, and D1's own error in `cause`. D1's
+ * messages (`D1_ERROR: …`, `D1_TYPE_ERROR: …`) can quote a value too.
+ */
+const DATABASE_ERROR_TEXT = /Failed query:|\nparams:|\bD1_[A-Z_]+:/;
+const REDACTED_DATABASE_ERROR = '[redacted database query]';
+
+/** Cuts everything from a database error's text onwards. */
+export function redactDatabaseErrors(value: string): string {
+  const match = DATABASE_ERROR_TEXT.exec(value);
+  return match
+    ? `${value.slice(0, match.index)}${REDACTED_DATABASE_ERROR}`
+    : value;
+}
+
+const isDatabaseErrorItself = (error: unknown): boolean =>
+  error instanceof DrizzleQueryError ||
+  (error instanceof Error && DATABASE_ERROR_TEXT.test(error.message));
+
+/** A database error, or an error caused (at any depth) by one. */
+export function isDatabaseError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let at = error; at != null && !seen.has(at); ) {
+    if (isDatabaseErrorItself(at)) return true;
+    seen.add(at);
+    at = (at as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** A database failure as it's reported: which operation, nothing from the query. */
+export class DatabaseError extends Error {
+  override name = 'DatabaseError';
+}
+
+/**
+ * What to report for `error`, caught around `operation` (an op name or a
+ * fixed label, never a value). A database error, or one caused by it,
+ * becomes a `DatabaseError` naming only the operation: the original's stack
+ * frames, but no message, query, parameters, or cause. Anything else is
+ * reported as is.
+ */
+export function reportableError(error: unknown, operation: string): unknown {
+  if (!isDatabaseError(error)) return error;
+  const reported = new DatabaseError(`database query failed: ${operation}`);
+  const stack = error instanceof Error ? (error.stack ?? '') : '';
+  const frames = stack.split('\n').filter((line) => /^\s+at /.test(line));
+  reported.stack = [`${reported.name}: ${reported.message}`, ...frames].join(
+    '\n'
+  );
+  return reported;
+}
+
+/** `Sentry.captureException` for a failure caught around `operation`. */
+export function captureFailure(error: unknown, operation: string): void {
+  Sentry.captureException(reportableError(error, operation));
+}
+
+/**
  * Rewrites strings in place through plain objects and arrays. Anything else
  * (SDK class instances such as scopes) is left alone.
  */
 function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (typeof value === 'string') return redactContactLinkPayloads(value);
+  if (typeof value === 'string') {
+    return redactDatabaseErrors(redactContactLinkPayloads(value));
+  }
   if (typeof value !== 'object' || value === null || seen.has(value)) {
     return value;
   }
@@ -68,9 +131,47 @@ function dropSecretHeaders(event: Event): void {
   }
 }
 
+/**
+ * Drops every exception chained under a redacted database error (its
+ * `cause`, which for Drizzle is D1's own error, and so on down). The
+ * linked-errors integration lists each cause as another exception whose
+ * `mechanism.parent_id` names the one it caused.
+ */
+function dropDatabaseErrorCauses(event: Event): void {
+  const values = event.exception?.values;
+  if (!values) return;
+  const redacted = new Set<number>();
+  for (const value of values) {
+    const id = value.mechanism?.exception_id;
+    if (id != null && value.value?.includes(REDACTED_DATABASE_ERROR)) {
+      redacted.add(id);
+    }
+  }
+  if (redacted.size === 0) return;
+  const below = new Set<number>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const value of values) {
+      const { exception_id: id, parent_id: parent } = value.mechanism ?? {};
+      if (id == null || parent == null || below.has(id)) continue;
+      if (redacted.has(parent) || below.has(parent)) {
+        below.add(id);
+        grew = true;
+      }
+    }
+  }
+  event.exception!.values = values.filter((value) => {
+    const id = value.mechanism?.exception_id;
+    return id == null || !below.has(id);
+  });
+}
+
 function scrubEvent<T extends Event>(event: T): T {
   dropSecretHeaders(event);
-  return scrubStrings(event) as T;
+  const scrubbed = scrubStrings(event) as T;
+  dropDatabaseErrorCauses(scrubbed);
+  return scrubbed;
 }
 
 function scrubBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb {

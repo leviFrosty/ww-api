@@ -1,5 +1,5 @@
 import type { AppContext, Environment } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_LIMITS,
@@ -215,7 +215,7 @@ export const refuseOverDailyQuota = async (
     })
   } catch (error) {
     console.warn('accounts: quota unavailable; allowing', { op })
-    Sentry.captureException(error)
+    captureFailure(error, op)
     return null
   }
 }
@@ -234,7 +234,9 @@ export const replyWith = <T extends object>(
 /**
  * Runs an accounts handler, turning a throw into a bare 500.
  *
- * Privacy: the log names the op only, never the body, keys, or ids.
+ * Privacy: the log names the op only, never the body, keys, or ids, and a
+ * database error reaches Sentry as the op alone (`captureFailure`), since its
+ * message quotes the query's parameters.
  */
 export const guarded =
   (op: string, handler: (c: AppContext) => Promise<Response>) =>
@@ -243,7 +245,7 @@ export const guarded =
       return await handler(c)
     } catch (error) {
       console.error('accounts: request failed', { op })
-      Sentry.captureException(error)
+      captureFailure(error, op)
       return buddiesInternalError()
     }
   }

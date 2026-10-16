@@ -1,5 +1,5 @@
 import type { AppContext } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { isPlainObject } from '../buddies/contracts'
 import {
   buddiesErrorResponse,
@@ -52,7 +52,7 @@ const refusal = (reason: Reason, action: Action, cause?: unknown): Response => {
         extras,
       })
     case 'storage_unavailable':
-      Sentry.captureException(cause)
+      captureFailure(cause, 'session/open attestation')
       return buddiesInternalError()
     default:
       return buddiesErrorResponse('attestation_failed', { extras })

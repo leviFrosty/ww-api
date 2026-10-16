@@ -3,6 +3,7 @@
  * with Sentry and the cron handler, and re-exports the Durable Objects.
  */
 import { Hono } from "hono";
+import { routePath } from "hono/route";
 import type { AppEnv, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { apiError, dateHeader } from "./errors";
@@ -53,7 +54,7 @@ import {
 } from "./attestation/openapi";
 import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
 import { handleAppConfigRequest } from "./appConfig";
-import { Sentry } from "./sentry";
+import { Sentry, reportableError } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { createAccountsRoutes } from "./accounts/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
@@ -114,9 +115,17 @@ function handleNotFound() {
   return apiError(HTTP_STATUS.NOT_FOUND, "not_found");
 }
 
-function handleApplicationError(error: Error) {
-  Sentry.captureException(error);
-  console.error("Application error:", error);
+/**
+ * A route that threw. A database error is reported and logged as the route
+ * alone (`reportableError`), since its message quotes the query's parameters.
+ */
+function handleApplicationError(error: Error, context: AppContext) {
+  const reported = reportableError(
+    error,
+    `${context.req.method} ${routePath(context)}`
+  );
+  Sentry.captureException(reported);
+  console.error("Application error:", reported);
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 

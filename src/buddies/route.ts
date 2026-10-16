@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { AppContext, AppEnv, Environment } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_ALWAYS_ALLOWED_OPS,
@@ -277,7 +277,7 @@ const registerInbox = async (
     } catch (error) {
       if (account) throw error
       console.warn('buddies: accounts database unavailable; registering unlinked')
-      Sentry.captureException(error)
+      captureFailure(error, 'inbox/register')
     }
   }
   if (!check.ok) return check
@@ -291,7 +291,7 @@ const registerInbox = async (
     } catch (error) {
       if (account) throw error
       console.warn('buddies: linking an inbox failed')
-      Sentry.captureException(error)
+      captureFailure(error, 'inbox/register')
       return ok({ body: {} })
     }
     await stub.confirmAccount(owner.id, owner.status === 'suspended')
@@ -411,7 +411,7 @@ const admitRegistration = async (
     admission = await quota.get(quota.idFromName(name)).admit(Date.now())
   } catch (error) {
     console.warn('buddies: registration quota unavailable; allowing')
-    Sentry.captureException(error)
+    captureFailure(error, 'inbox/register')
     return null
   }
   if (admission.ok) return null
@@ -521,7 +521,7 @@ const handleBuddiesOp = async (
   } catch (error) {
     // Report the failure, never the request: bodies hold ids, keys, and blobs.
     console.error('buddies: request failed', { op })
-    Sentry.captureException(error)
+    captureFailure(error, op)
     return buddiesInternalError()
   }
 }
@@ -573,7 +573,7 @@ const handleLive = async (c: AppContext): Promise<Response> => {
     )
   } catch (error) {
     console.error('buddies: request failed', { op: BUDDIES_LIVE_OP })
-    Sentry.captureException(error)
+    captureFailure(error, BUDDIES_LIVE_OP)
     return buddiesInternalError()
   }
 }
@@ -648,7 +648,7 @@ const handleBlobPut = async (c: AppContext): Promise<Response> => {
     return c.json({ ok: true, expiresAt: result.value.expiresAt })
   } catch (error) {
     console.error('buddies: request failed', { op: BUDDIES_BLOB_PUT_OP })
-    Sentry.captureException(error)
+    captureFailure(error, BUDDIES_BLOB_PUT_OP)
     return buddiesInternalError()
   }
 }
@@ -690,7 +690,7 @@ const handleBlobGet = async (c: AppContext): Promise<Response> => {
     })
   } catch (error) {
     console.error('buddies: request failed', { op: BUDDIES_BLOB_GET_OP })
-    Sentry.captureException(error)
+    captureFailure(error, BUDDIES_BLOB_GET_OP)
     return buddiesInternalError()
   }
 }
