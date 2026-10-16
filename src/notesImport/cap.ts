@@ -16,6 +16,20 @@ export const decideAcquire = (
   cap: number
 ): boolean => alreadyHeld || activeCount < cap
 
+/** Prefix of a synchronous `POST /notes-import` slot (a run's is `imp_`). */
+export const SYNC_SLOT_PREFIX = 'legacy:'
+
+/**
+ * How long a synchronous import's slot counts before it's taken as
+ * abandoned. The synchronous path releases its slot in a `finally`, which
+ * may never run if the client disconnects mid-run (the runtime can cancel
+ * the request) or the isolate goes away, and each invocation holds a slot of
+ * its own, so without an age limit every such request would leak one for
+ * good. Far beyond any real model run (about a minute); past it, a run still
+ * going at worst lets one more start.
+ */
+export const SYNC_SLOT_MAX_AGE_MS = 15 * 60 * 1000
+
 /**
  * What a re-kick of an existing run DO resolves to, from its persisted status.
  * Split out (like {@link decideAcquire}) so the leak-relevant decision is pure
