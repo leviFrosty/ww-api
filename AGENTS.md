@@ -76,8 +76,9 @@ take the unchanged App Attest paths. Challenges live in the
 binding, `PLAY_RECOGNIZED`, and `MEETS_DEVICE_INTEGRITY`. Licensing is not
 required.
 
-Android stays off until all three are set per environment; only then does
-`GET /notes-import/status` advertise `capabilities.playIntegrity`:
+Both environments are configured. Android is on only while all three
+required settings are present; only then does `GET /notes-import/status`
+advertise `capabilities.playIntegrity`:
 
 | Setting | Kind | Value |
 | --- | --- | --- |
@@ -87,23 +88,11 @@ Android stays off until all three are set per environment; only then does
 | `ANDROID_CERT_SHA256_DIGESTS` | var, optional | base64url SHA-256 of the Play app-signing certificate |
 | `PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT` | var, optional | `MEETS_DEVICE_INTEGRITY` (default), `MEETS_BASIC_INTEGRITY`, `MEETS_STRONG_INTEGRITY` |
 
-One-time setup:
-
-1. Google Cloud: enable **Google Play Integrity API** in a project and note
-   its project number.
-2. Play Console → WitnessWork → **Protected with Play** → Play Integrity API →
-   **Link Cloud project** (that project). The default responses already
-   include `MEETS_DEVICE_INTEGRITY`; basic/strong need an opt-in under Change
-   responses.
-3. Same project: IAM & Admin → Service Accounts → create one (no role needed)
-   → Keys → Add key → JSON.
-4. `wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON < key.json` (and
-   `--env dev`), then delete the downloaded key.
-5. Uncomment and fill the two vars in `wrangler.toml` under `[vars]` and
-   `[env.dev.vars]`. Optionally pin the certificate from Play Console → App
-   integrity → App signing:
-   `echo "<SHA-256 with colons>" | tr -d ':' | xxd -r -p | base64 | tr '+/' '-_' | tr -d '='`.
-6. `pnpm run deploy:dev`, then `pnpm run deploy` (applies `v4`).
+To rotate the key, create a new JSON key for the service account in the
+linked Cloud project, `wrangler secret put PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON
+< key.json` (and `--env dev`), then delete the downloaded file. Basic/strong
+verdicts need an opt-in in Play Console under Play Integrity API → Change
+responses.
 
 Development builds (`com.leviwilkerson.jwtimedev`) aren't on Play and
 emulators fail device integrity, so exercise real tokens with a
@@ -114,30 +103,16 @@ stable `reason`: `device_integrity_failed`, `app_not_recognized`,
 quota; reported to Sentry), or a challenge reason. The default quota is 10,000
 decodes per day; request more through Google's quota form before it matters.
 
-## Deploying to dev (one-time setup)
-
-```bash
-# 1. Create a dedicated dev KV namespace, then paste the printed id into
-#    wrangler.toml under [[env.dev.kv_namespaces]] (replacing REPLACE_WITH_DEV_NOTES_KV_ID).
-wrangler kv namespace create NOTES_KV --env dev
-
-# 2. Set the dev worker's secrets (the --env dev flag keeps them off prod).
-wrangler secret put OPENROUTER_API_KEY --env dev
-wrangler secret put REVENUECAT_API_KEY --env dev
-wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN --env dev   # dev only
-wrangler secret put ADMIN_API_TOKEN --env dev  # unique dev reset token
-# Plus any other secrets prod uses that dev needs (HERE_API_KEY, SENTRY_DSN, ...).
-# Production uses a different token: wrangler secret put ADMIN_API_TOKEN
-
-# 3. Deploy.
-wrangler deploy --env dev
-```
-
-After setup, redeploying dev is just:
+## Deploying to dev
 
 ```bash
 pnpm run deploy:dev
 ```
+
+Secrets are per environment: add `--env dev` to `wrangler secret put` to keep
+them off prod (the full list is at the bottom of `wrangler.toml`).
+`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN` differs
+between the two workers.
 
 ## Local iteration (no deploy)
 
@@ -364,36 +339,18 @@ whole host, `/b` included, for Android App Links. Clients are iOS and Android
   spacing, `apns-expiration`) is specified but not built either;
   today each push gets one immediate attempt plus one retry.
 
-Dev deploy (first time):
+Secrets: `APNS_KEY_ID`, `APNS_PRIVATE_KEY` (`< AuthKey_XXXXXXXXXX.p8`), and
+`FCM_SERVICE_ACCOUNT_JSON` (`jq -c . buddies-fcm-sender.json | wrangler secret
+put FCM_SERVICE_ACCOUNT_JSON`), each with `--env dev` for dev. Buddies stays
+off in prod (`BUDDIES_ENABLED = "false"`) until the KV key flips it.
 
-```bash
-wrangler secret put APNS_KEY_ID --env dev
-wrangler secret put APNS_PRIVATE_KEY --env dev < AuthKey_XXXXXXXXXX.p8
-# Android (FCM): one line of JSON from the 1Password item above.
-jq -c . buddies-fcm-sender.json | wrangler secret put FCM_SERVICE_ACCOUNT_JSON --env dev
-pnpm run deploy:dev   # applies the v3 migration to ww-proxy-dev
-# Optional; dev is already on via BUDDIES_ENABLED:
-wrangler kv key put --binding NOTES_KV buddies:enabled true --env dev
-```
-
-Production takes the same three secrets without `--env dev`, and the `v3`
-migration applies on the next `pnpm run deploy`. Buddies stays off there
-(`BUDDIES_ENABLED = "false"`) until the KV key flips it. The AASA `/b` entry
-only goes live with a prod deploy. iOS caches the AASA, so ship it at least one
-app version before the invite UI.
-
-Photo blobs need their R2 buckets **before the first deploy that carries the
-`BUDDY_BLOBS` binding** (a deploy naming a missing bucket fails), plus a
-lifecycle rule as a backstop (blobs are deleted by the inbox at `expiresAt`;
-the rule only catches objects the relay lost track of). Every deploy runs
-`scripts/r2-lifecycle.mjs` first, which creates the bucket if it's missing and
-sets its rules (`v1/` objects deleted 91 days after their last write); the
-GitHub deploy's `CLOUDFLARE_API_TOKEN` needs **Workers R2 Storage: Edit**.
+Every deploy runs `scripts/r2-lifecycle.mjs` first, which creates the photo
+bucket if it's missing (a deploy naming a missing bucket fails) and sets its
+rules (`v1/` objects deleted 91 days after their last write); the GitHub
+deploy's `CLOUDFLARE_API_TOKEN` needs **Workers R2 Storage: Edit**.
 `node scripts/r2-lifecycle.mjs <bucket> --check` only reads.
 
 ```bash
-pnpm run deploy:dev   # photos are on in dev through BUDDIES_PHOTOS = "on"
-pnpm run deploy       # or push a v* tag (GitHub deploy)
 # Production photos stay off until:
 wrangler kv key put --binding NOTES_KV buddies:photos on
 # Off again (stored blobs stay until they expire):
@@ -505,8 +462,7 @@ Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
 - **Privacy**: handoff and backup log only the op name. Never log or report
   bodies, headers, keys, tokens, account ids, channel ids, or slot ids.
 
-The buckets need to exist **before the first deploy that carries the
-`ACCOUNT_BACKUPS` binding**. Every deploy (`pnpm run deploy`, `deploy:dev`,
+Every deploy (`pnpm run deploy`, `deploy:dev`,
 and the tag deploy) runs `scripts/r2-lifecycle.mjs` for both buckets first,
 which creates a missing bucket and sets its rules: `v1/` objects deleted 400
 days after their last upload (each `put` rewrites the object, restarting its
@@ -520,9 +476,6 @@ node scripts/r2-lifecycle.mjs ww-account-backups --check      # read-only
 wrangler r2 bucket create ww-account-backups
 wrangler r2 bucket lifecycle add ww-account-backups account-backups-expiry v1/ --expire-days 400
 ```
-
-The `v7` migration (`AccountHandoff`) applies on the next deploy of each
-worker.
 
 ## App Store ratings (paywall social proof)
 
@@ -611,8 +564,6 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   URL) and the HERE key stay out of trace spans. Nothing logs bodies,
   coordinates, or account ids.
 
-The first deploy applies the `v5` migration (prod and `--env dev`).
-
 ## API docs (OpenAPI + Scalar)
 
 `GET /docs` is the Scalar API reference and `GET /openapi.json` its OpenAPI
@@ -682,32 +633,18 @@ repo secret. Never commit it.
 `[env.dev]`), so Cloudflare's own dashboard/tail stack traces are mapped even
 on raw `wrangler deploy`.
 
-## Backlog
+## Notes Import streaming
 
-- **Notes Import streaming / Durable Objects migration** — DONE (2026-06-23).
-  The model run now streams from two SQLite Durable Objects (`NotesImportRun`
-  per import, `NotesImportIndex` per user for the concurrency cap), via AI SDK
-  v6 `streamText` + `Output.object`. Attested kickoff (`POST
-  /notes-import/kickoff`) → SSE progress stream (`GET /notes-import/:id/events`)
-  → result snapshot (`/result`); the legacy `POST /notes-import` remains as a
-  fallback. First deploy applies the `v1` DO migration automatically (prod +
-  `--env dev`). Reasoning is ON by default at `low`
-  (`NOTES_IMPORT_REASONING_EFFORT`). V4.1 Flash supports `low`, `high`, and
-  `max`; legacy `xhigh` overrides normalize to `max` for this model. Both
-  environments use `openai/gpt-6-luna`
-  with the existing Fireworks/DigitalOcean ZDR allowlist. Fixed instructions
-  precede user context and tagged notes; refinements preserve the notes prefix.
-  Strict structured output is validated locally against the same JSON schema.
-  The 32,000-token default includes reasoning and JSON; historical multi-contact
-  imports exhausted 16,000 before producing the object. Date rules prioritize
-  month/day over a conflicting weekday and resolve each ambiguity once. A
-  conflicting house number prevents fuzzy-name deduplication, and people
-  identified by address retain their visits even when their names are unknown.
-  A buggy host parser can misroute JSON into reasoning; recovery requires a
-  completed blank response and valid nested records. Reasoning-only exhaustion
-  gets one retry with thinking explicitly off; nonblank invalid/truncated JSON
-  never retries, cancellation prevents a retry, and usage includes both attempts.
-  Logs include model, host,
-  finish reason, and token/cache counts, never content. Architecture + resolved
-  decisions:
-  [`docs/notes-import-streaming-durable-objects.md`](docs/notes-import-streaming-durable-objects.md).
+Each import runs in a `NotesImportRun` SQLite Durable Object (`NotesImportIndex`
+per user holds the concurrency cap) via AI SDK v6 `streamText` +
+`Output.object`: attested kickoff (`POST /notes-import/kickoff`) → SSE progress
+(`GET /notes-import/:id/events`) → result snapshot (`/result`). The legacy
+`POST /notes-import` remains as a fallback. Model, providers, reasoning effort,
+and the output-token budget are `NOTES_IMPORT_*` vars in `wrangler.toml`
+(defaults in `src/notesImport/config.ts`); the budget includes reasoning and
+JSON. Strict structured output is validated locally against the same JSON
+schema. Reasoning-only exhaustion gets one retry with thinking off; nonblank
+invalid or truncated JSON never retries, cancellation prevents a retry, and
+usage includes both attempts. Logs include model, host, finish reason, and
+token/cache counts, never content. Architecture and decisions:
+[`docs/notes-import-streaming-durable-objects.md`](docs/notes-import-streaming-durable-objects.md).
