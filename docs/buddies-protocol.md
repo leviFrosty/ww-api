@@ -44,6 +44,8 @@ Since the MVP: shared Plans and Follow-up invitations, requests to join, and bad
 
 Ed25519 public keys are 32 raw bytes, `b64u`-encoded (43 chars).
 
+`inbox/register`, `invite/create`, and `blob/put` will also need `Authorization: Bearer` from an attested account session whose account is the one the inbox is linked to (or, for `inbox/register`, the one its `account` proof names), on top of the signature above ([ADR 0027](https://github.com/leviFrosty/witness-work/blob/main/docs/adr/0027-account-sessions-attest-once-then-bearer-tokens.md), [Sessions](https://github.com/leviFrosty/witness-work/blob/main/docs/accounts-protocol.md#sessions)). Writer ops, invites, and `blob/get` never carry a token: it would tell the relay which account writes into which inbox.
+
 ### Responses
 
 Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "ok": false, "error": "<code>", "code": "<code>" }` (`code` repeats `error`; older relays sent `error` alone) with:
