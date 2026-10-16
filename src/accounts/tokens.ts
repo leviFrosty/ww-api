@@ -17,10 +17,14 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  * Rotation: the header's `kid` is derived from the secret that signed it, so
  * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
  * valid until they expire. Without it, they fail once and the app refreshes.
+ * Refresh tokens issued under the old secret refresh only while it's there,
+ * since their MAC is checked under it; once it's gone, their sessions open
+ * anew.
  *
- * Each secret also yields the key refresh tokens rotate under
- * (`rotationKey`, src/accounts/sessionStore.ts), kept apart from the signing
- * key by its own derivation.
+ * Each secret also yields the two refresh token keys
+ * (src/accounts/sessionStore.ts): the one each token's MAC is signed under
+ * (`macKey`), and the one the next token is derived under (`rotationKey`),
+ * each kept apart from the signing key and the other by its own derivation.
  *
  * The issuer names the environment (`APP_ATTEST_ENVIRONMENT`) and each
  * environment has its own secret, so a development token never passes on
@@ -54,11 +58,20 @@ export interface AccessTokenClaims {
   expiresAt: number
 }
 
-interface TokenKey {
+/**
+ * The HMAC-SHA256 keys one secret yields for refresh tokens, each the
+ * SHA-256 of its own label and the secret.
+ */
+export interface RefreshKeys {
+  /** Signs every refresh token's MAC. */
+  macKey: CryptoKey
+  /** Derives the token that replaces a refresh token. */
+  rotationKey: CryptoKey
+}
+
+interface TokenKey extends RefreshKeys {
   kid: string
   key: CryptoKey
-  /** HMAC-SHA256 key for deriving refresh tokens: SHA-256 of a label and the secret. */
-  rotationKey: CryptoKey
 }
 
 export interface AccessTokenKeys {
@@ -94,13 +107,19 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
           false,
           ['sign', 'verify']
         )
-      const [key, rotationKey] = await Promise.all([
+      const derived = (label: string) =>
+        sha256Bytes(encoder.encode(`${label}\n${secret}`)).then(hmac)
+      const [key, macKey, rotationKey] = await Promise.all([
         hmac(encoder.encode(secret)),
-        sha256Bytes(
-          encoder.encode(`ww-account/v1/refresh-rotation\n${secret}`)
-        ).then(hmac),
+        derived('ww-account/v1/refresh-mac'),
+        derived('ww-account/v1/refresh-rotation'),
       ])
-      return { kid: bytesToBase64Url(digest).slice(0, 16), key, rotationKey }
+      return {
+        kid: bytesToBase64Url(digest).slice(0, 16),
+        key,
+        macKey,
+        rotationKey,
+      }
     })()
     cached.catch(() => keyCache.delete(secret))
     keyCache.set(secret, cached)
@@ -144,11 +163,11 @@ export const accessTokenKeys = async (
   return { issuer, current, previous }
 }
 
-/** The keys refresh tokens rotate under: the current one first. */
-export const rotationKeys = (keys: AccessTokenKeys): CryptoKey[] =>
-  keys.previous
-    ? [keys.current.rotationKey, keys.previous.rotationKey]
-    : [keys.current.rotationKey]
+/** Each secret's refresh token keys: the current secret's first. */
+export const refreshKeys = (keys: AccessTokenKeys): RefreshKeys[] =>
+  (keys.previous ? [keys.current, keys.previous] : [keys.current]).map(
+    ({ macKey, rotationKey }) => ({ macKey, rotationKey })
+  )
 
 const encodeJson = (value: unknown): string =>
   bytesToBase64Url(encoder.encode(JSON.stringify(value)))

@@ -817,13 +817,13 @@ const sessionAttestationErrorSchema = apiErrorSchema
       'The accounts error envelope (`error` repeats `code`) plus the attestation’s `reason` and `action`.',
   })
 
-/** Refresh tokens: `<sessionId>.<secret>`, b64u of 16 and 32 bytes. */
+/** Refresh tokens: `<sessionId>.<secret>.<mac>`, b64u of 16, 32, 32 bytes. */
 const refreshTokenSchema = (description: string) =>
   z
     .string()
-    .regex(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/)
+    .regex(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/)
     .meta({
-      description: `${description}. Opaque to the app: the session’s id and a secret, \`<sessionId>.<secret>\` (base64url, 16 and 32 bytes); store and send it as is`,
+      description: `${description}. Opaque to the app: the session’s id, a secret, and the server’s MAC over both, \`<sessionId>.<secret>.<mac>\` (base64url, 16, 32, and 32 bytes); store and send it as is`,
     })
 
 const tokenPair = {
@@ -937,7 +937,7 @@ ${readTier}`,
     ),
     400: errorResponse('Malformed JSON, or no `refreshToken`.', ['bad_request']),
     401: errorResponse(
-      'Malformed, unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session.',
+      'Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does.',
       ['unauthorized']
     ),
     429: errorResponse('Over the per-caller rate.', ['rate_limited']),

@@ -607,16 +607,21 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
   counted before the attestation.
 - **Refresh**: plain JSON `{ refreshToken }`. A refresh token is
-  `<sessionId>.<secret>` (b64u, 16 and 32 bytes; opaque to the app), so the
-  session is found by id, and a malformed one is 401 before any D1 read.
-  Each refresh replaces the token with one derived from it (HMAC under a key
-  from `ACCOUNT_TOKEN_SECRET`), with a compare-and-swap on the hash it read,
-  so the row rotates once and every refresh presenting the same token gets
-  the same next one. The one just replaced gets it again for 60 seconds
-  from its rotation (a lost response, or two refreshes at once; retries
-  don't extend it and write nothing), so a device's double refresh can't
-  strand it with a dead token. Presenting it later, or any older token of a
-  live session (or one it never issued), ends the session. An unknown,
+  `<sessionId>.<secret>.<mac>` (b64u, 16, 32, and 32 bytes; opaque to the
+  app), so the session is found by id. The MAC is HMAC-SHA256 over
+  `<sessionId>.<secret>` under its own key from `ACCOUNT_TOKEN_SECRET` (or
+  the previous secret), proving the worker issued it: the session id is no
+  secret (every access token's `sid`), so a made-up token for it must not
+  end the session. A malformed token, or one whose MAC doesn't verify
+  (two-part tokens from before the MAC included), is 401 before any D1
+  read and ends nothing. Each refresh replaces the token with one derived
+  from it (HMAC under another key from the secret), with a compare-and-swap
+  on the hash it read, so the row rotates once and every refresh presenting
+  the same token gets the same next one. The one just replaced gets it
+  again for 60 seconds from its rotation (a lost response, or two refreshes
+  at once; retries don't extend it and write nothing), so a device's double
+  refresh can't strand it with a dead token. Presenting it later, or any older token of a
+  live session that carries a valid MAC, ends the session. An unknown,
   ended, or expired session is 401 `unauthorized`; a refresh that lost its
   rotation race to a session that has since moved on again is 401 without
   ending it. Sessions last 90 days from opening and refreshing never
@@ -650,13 +655,20 @@ openssl rand -base64 32 | wrangler secret put ACCOUNT_TOKEN_SECRET   # add --env
 # one. Its kid is derived from the secret, so old tokens keep verifying.
 wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS   # the old value
 openssl rand -base64 32 | wrangler secret put ACCOUNT_TOKEN_SECRET
-# After 15 minutes:
+# Routine rotation: after 90 days (the longest a session lasts). After a
+# leak: at once.
 wrangler secret delete ACCOUNT_TOKEN_SECRET_PREVIOUS
 ```
 
-Skipping the previous slot only costs each device one extra refresh, and
-a refresh retried within the minute after the rotation (a lost response)
-gets 401, so that device opens a new session. Local
+The previous slot keeps access tokens verifying for their 15 minutes and,
+because refresh tokens carry a MAC under the secret, keeps refresh tokens
+issued under the old secret refreshing; each refresh signs its replacement
+under the new one. Once the slot is gone, a device still holding an old
+refresh token gets 401 and opens a new session (attesting again), so
+deleting it before 90 days sends every device that hasn't refreshed since
+the rotation through a new session, and skipping it sends every device.
+After a leak that's what you want: the old secret could mint access tokens
+and MACs. Local
 `wrangler dev` reads `ACCOUNT_TOKEN_SECRET` from `.dev.vars`
 (`.dev.vars.example`); the verify launcher and the test harness set their
 own.

@@ -269,7 +269,9 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
       accountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
-      refreshToken: expect.stringMatching(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/),
+      refreshToken: expect.stringMatching(
+        /^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/
+      ),
     })
     expect(session.sessionExpiresAt - session.accessExpiresAt).toBeGreaterThan(89 * 24 * 3_600_000)
 

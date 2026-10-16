@@ -184,7 +184,8 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
   new pair; each refresh token works once (plus a 60-second grace for a lost
   response, which gets the same new refresh token again), and presenting an
   older one ends the session. Refresh tokens are opaque strings
-  (`<sessionId>.<secret>`).
+  (`<sessionId>.<secret>.<mac>`); one the worker didn't issue is 401 and
+  never ends a session.
 - **`DELETE /accounts/v1/sessions/current`** ends the token's session.
 - **`GET /accounts/v1/account`** reads the token's account.
 - Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
