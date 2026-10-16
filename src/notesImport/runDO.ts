@@ -123,19 +123,12 @@ export class NotesImportRun extends DurableObject<Environment> {
    */
   #settlement: Promise<void> | null = null
 
-  constructor(ctx: DurableObjectState, env: Environment) {
-    super(ctx, env)
-    ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`
-    )
-    ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS events (
-         seq  INTEGER PRIMARY KEY AUTOINCREMENT,
-         type TEXT NOT NULL,
-         data TEXT NOT NULL
-       )`
-    )
-  }
+  /**
+   * The tables exist. They're created on the first write, not in the
+   * constructor, so a read of an unknown import stores nothing, and reset
+   * after `deleteAll()`, which drops them.
+   */
+  #schemaReady = false
 
   // --- RPC surface --------------------------------------------------------
 
@@ -160,6 +153,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     // Fresh, or retrying a prior failure → reset and schedule the run. Awaiting
     // setAlarm means the kickoff's `await start()` guarantees the run is durably
     // scheduled before it mints the subscribe token and replies.
+    this.#ensureSchema()
     this.ctx.storage.sql.exec('DELETE FROM events')
     this.#metaSet('input', JSON.stringify(input))
     this.#metaDel('result')
@@ -261,7 +255,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     for (const s of this.#subscribers) s.close()
     this.#subscribers.clear()
     this.#stopHeartbeat()
-    await this.ctx.storage.deleteAll()
+    await this.#deleteAll()
   }
 
   // --- Background execution ----------------------------------------------
@@ -271,7 +265,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     if (status === null) return
     if (status === 'done' || status === 'error' || status === 'cancelled') {
       // Retention window elapsed → evict all state.
-      await this.ctx.storage.deleteAll()
+      await this.#deleteAll()
       return
     }
     if (status !== 'queued') {
@@ -586,12 +580,14 @@ export class NotesImportRun extends DurableObject<Environment> {
         // Replay everything since the client's cursor (lossless resume). Guarded
         // because the client may disconnect mid-replay.
         try {
-          const rows = this.ctx.storage.sql
-            .exec<{ seq: number; data: string }>(
-              'SELECT seq, data FROM events WHERE seq > ? ORDER BY seq',
-              cursor
-            )
-            .toArray()
+          const rows = this.#hasSchema()
+            ? this.ctx.storage.sql
+                .exec<{ seq: number; data: string }>(
+                  'SELECT seq, data FROM events WHERE seq > ? ORDER BY seq',
+                  cursor
+                )
+                .toArray()
+            : []
           for (const r of rows) {
             const ev = { ...JSON.parse(r.data), seq: r.seq } as ImportEvent
             sub.send(encoder.encode(formatSSE(ev)))
@@ -634,6 +630,7 @@ export class NotesImportRun extends DurableObject<Environment> {
 
   /** Persist an event to the replay log, then broadcast it with its resume seq. */
   #emit(ev: UnsequencedEvent): void {
+    this.#ensureSchema()
     const row = this.ctx.storage.sql
       .exec<{ seq: number }>(
         'INSERT INTO events (type, data) VALUES (?, ?) RETURNING seq',
@@ -688,6 +685,39 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#heartbeatTimer = null
   }
 
+  // --- storage helpers ----------------------------------------------------
+
+  #ensureSchema(): void {
+    if (this.#schemaReady) return
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`
+    )
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS events (
+         seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+         type TEXT NOT NULL,
+         data TEXT NOT NULL
+       )`
+    )
+    this.#schemaReady = true
+  }
+
+  /** Whether the tables exist, without creating them. */
+  #hasSchema(): boolean {
+    if (this.#schemaReady) return true
+    const tables = this.ctx.storage.sql.exec(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'`
+    )
+    this.#schemaReady = tables.toArray().length > 0
+    return this.#schemaReady
+  }
+
+  /** Wipes all state, tables included; the next write recreates them. */
+  async #deleteAll(): Promise<void> {
+    await this.ctx.storage.deleteAll()
+    this.#schemaReady = false
+  }
+
   // --- tiny meta helpers --------------------------------------------------
 
   #status(): ImportStatus | null {
@@ -699,6 +729,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaGet(k: string): string | null {
+    if (!this.#hasSchema()) return null
     const rows = this.ctx.storage.sql
       .exec<{ v: string }>('SELECT v FROM meta WHERE k = ?', k)
       .toArray()
@@ -706,6 +737,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaSet(k: string, v: string): void {
+    this.#ensureSchema()
     this.ctx.storage.sql.exec(
       'INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)',
       k,
@@ -714,6 +746,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaDel(k: string): void {
+    if (!this.#hasSchema()) return
     this.ctx.storage.sql.exec('DELETE FROM meta WHERE k = ?', k)
   }
 }
