@@ -84,23 +84,21 @@ export const findInboxAccount = async (
 /**
  * Links the inbox to the account unless it's already linked. Returns the
  * account the inbox belongs to afterwards, which differs from `accountId` only
- * when another account linked it first.
+ * when another account linked it first, with its status as read after the
+ * link was written.
  */
 export const linkInbox = async (
   db: AccountsDb,
   inboxId: string,
   accountId: string
-): Promise<string> => {
+): Promise<AccountRecord> => {
   await db
     .insert(accountInboxes)
     .values({ inboxId, accountId })
     .onConflictDoNothing({ target: accountInboxes.inboxId })
-  const row = await db
-    .select({ accountId: accountInboxes.accountId })
-    .from(accountInboxes)
-    .where(eq(accountInboxes.inboxId, inboxId))
-    .get()
-  return row?.accountId ?? accountId
+  const owner = await findInboxAccount(db, inboxId)
+  if (!owner) throw new Error('accounts: linked inbox is missing')
+  return owner
 }
 
 export const accountInboxIds = async (

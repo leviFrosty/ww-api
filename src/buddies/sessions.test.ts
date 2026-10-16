@@ -518,6 +518,243 @@ describe('bearer owner ops', () => {
   })
 })
 
+/** The inbox's `owner_account` row, straight from its storage. */
+const ownerAccountRow = (inboxId: string) =>
+  h.inboxes
+    .storage(inboxId)
+    .query(
+      'SELECT account_id AS accountId, suspended, confirmed FROM owner_account'
+    )
+
+const lookupInbox = async (inboxId: string) => {
+  const response = await adminApp.request(
+    '/lookup',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-ww-admin-token': ADMIN_TOKEN,
+      },
+      body: JSON.stringify({ inboxId }),
+    },
+    h.env
+  )
+  return { status: response.status, body: await response.json() }
+}
+
+/** Makes the accounts database refuse writes to `account_inboxes`. */
+const failInboxLinks = () => {
+  const db = h.accountsDb!
+  const prepare = db.prepare.bind(db)
+  return vi.spyOn(db, 'prepare').mockImplementation((query: string) => {
+    if (/^insert into "account_inboxes"/i.test(query))
+      throw new Error('D1 down')
+    return prepare(query)
+  })
+}
+
+describe('confirmed inbox links', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  })
+
+  it('keeps an inbox the accounts database never linked not_linked, until registering again links it', async () => {
+    const owner = await BearerOwner.create(false)
+    const failing = failInboxLinks()
+    expect(await owner.register()).toEqual({
+      status: 500,
+      body: { ok: false, error: 'internal', code: 'internal' },
+    })
+    failing.mockRestore()
+
+    // The inbox accepted the registration, but moderation can't find it, so
+    // no token may act as its owner.
+    expect(await lookupInbox(owner.inboxId)).toMatchObject({ status: 404 })
+    expect(h.inboxes.storage(owner.inboxId).tables()).not.toContain(
+      'owner_account'
+    )
+    expect(await owner.sync()).toEqual({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+    expect((await owner.connect()).status).toBe(409)
+    expect(await owner.putBlob(await photoBlob())).toEqual({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+
+    // The app's relink is the same registration again.
+    expect(await owner.register()).toEqual({
+      status: 200,
+      body: { ok: true, accountId: owner.session.accountId },
+    })
+    expect(await owner.register()).toEqual({
+      status: 200,
+      body: { ok: true, accountId: owner.session.accountId },
+    })
+    expect((await owner.sync()).status).toBe(200)
+
+    // Moderation reaches it now.
+    await setStatus(owner.session.accountId, 'suspended')
+    expect(await owner.sync()).toEqual({
+      status: 403,
+      body: relayError('suspended'),
+    })
+  })
+
+  it('leaves a link the inbox never confirmed to moderation and the next registration', async () => {
+    const owner = await BearerOwner.create(false)
+    const object = h.inboxes.object(owner.inboxId)
+    vi.spyOn(object, 'confirmAccount').mockRejectedValueOnce(
+      new Error('RPC reply lost')
+    )
+    expect((await owner.register()).status).toBe(500)
+    // The accounts database holds the link; the inbox doesn't trust it yet.
+    expect((await lookupInbox(owner.inboxId)).body.account.id).toBe(
+      owner.session.accountId
+    )
+    expect(await owner.sync()).toEqual({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+
+    // A suspension finds the inbox through the database and confirms it.
+    await setStatus(owner.session.accountId, 'suspended')
+    expect(ownerAccountRow(owner.inboxId)).toEqual([
+      { accountId: owner.session.accountId, suspended: 1, confirmed: 1 },
+    ])
+    expect(await owner.sync()).toEqual({
+      status: 403,
+      body: relayError('suspended'),
+    })
+    expect(await owner.register()).toEqual({
+      status: 403,
+      body: relayError('suspended'),
+    })
+    expect((await owner.op('slot/remove', { slotId: randomId() })).status).toBe(
+      200
+    )
+  })
+
+  it('names the database’s winner when two accounts claim an inbox at once', async () => {
+    // One person with the inbox's owner key and two accounts.
+    const first = await BearerOwner.create(false)
+    const second = await BearerOwner.create(false)
+    Object.assign(second, { inboxId: first.inboxId, key: first.key })
+    const object = h.inboxes.object(first.inboxId)
+    const register = object.register.bind(object)
+    let secondChecked!: () => void
+    const bothChecked = new Promise<void>((resolve) => (secondChecked = resolve))
+    let releaseSecond!: () => void
+    const secondMayRegister = new Promise<void>(
+      (resolve) => (releaseSecond = resolve)
+    )
+    // Both pass the database check before either links; the first finishes
+    // before the second's registration reaches the inbox (the order that
+    // used to leave the inbox naming the loser).
+    vi.spyOn(object, 'register').mockImplementation(async (call, linked) => {
+      if (call.account?.accountId === second.session.accountId) {
+        secondChecked()
+        await secondMayRegister
+      } else {
+        await bothChecked
+      }
+      return register(call, linked)
+    })
+
+    const firstReply = first.register()
+    const secondReply = second.register()
+    expect(await firstReply).toEqual({
+      status: 200,
+      body: { ok: true, accountId: first.session.accountId },
+    })
+    releaseSecond()
+    expect(await secondReply).toEqual({
+      status: 409,
+      body: relayError('conflict'),
+    })
+
+    expect((await lookupInbox(first.inboxId)).body.account.id).toBe(
+      first.session.accountId
+    )
+    expect(ownerAccountRow(first.inboxId)).toEqual([
+      { accountId: first.session.accountId, suspended: 0, confirmed: 1 },
+    ])
+    expect((await first.sync()).status).toBe(200)
+    expect(await second.sync()).toEqual({
+      status: 403,
+      body: relayError('forbidden'),
+    })
+  })
+
+  it('carries a suspension that lands while the link is written', async () => {
+    const owner = await BearerOwner.create(false)
+    const object = h.inboxes.object(owner.inboxId)
+    const register = object.register.bind(object)
+    // Suspended after the registration's check, while no link exists for
+    // the admin to find.
+    vi.spyOn(object, 'register').mockImplementationOnce(async (call, linked) => {
+      await setStatus(owner.session.accountId, 'suspended')
+      return register(call, linked)
+    })
+    expect((await owner.register()).status).toBe(200)
+    expect(ownerAccountRow(owner.inboxId)).toEqual([
+      { accountId: owner.session.accountId, suspended: 1, confirmed: 1 },
+    ])
+    expect(await owner.sync()).toEqual({
+      status: 403,
+      body: relayError('suspended'),
+    })
+  })
+
+  it('treats a link from before confirmation as none until the app links it again', async () => {
+    const owner = await BearerOwner.create()
+    const loser = await session()
+    // A row as the inbox stored it before confirmation, naming an account
+    // the accounts database doesn't link (a lost concurrent claim).
+    const storage = h.inboxes.storage(owner.inboxId)
+    storage.query('UPDATE owner_account SET account_id = ?', loser.accountId)
+    storage.query('ALTER TABLE owner_account DROP COLUMN confirmed')
+    h.inboxes.restart(owner.inboxId)
+
+    expect(await owner.sync(bearer(loser.accessToken))).toEqual({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+    expect(await owner.sync()).toEqual({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+    expect(ownerAccountRow(owner.inboxId)).toEqual([
+      { accountId: loser.accountId, suspended: 0, confirmed: 0 },
+    ])
+
+    expect(await owner.register()).toEqual({
+      status: 200,
+      body: { ok: true, accountId: owner.session.accountId },
+    })
+    expect(ownerAccountRow(owner.inboxId)).toEqual([
+      { accountId: owner.session.accountId, suspended: 0, confirmed: 1 },
+    ])
+    expect((await owner.sync()).status).toBe(200)
+    expect((await owner.sync(bearer(loser.accessToken))).status).toBe(403)
+  })
+
+  it('keeps an old row’s suspension while it waits to be confirmed', async () => {
+    const owner = await BearerOwner.create()
+    await setStatus(owner.session.accountId, 'suspended')
+    const storage = h.inboxes.storage(owner.inboxId)
+    storage.query('ALTER TABLE owner_account DROP COLUMN confirmed')
+    h.inboxes.restart(owner.inboxId)
+    const legacy = await Owner.create(h, false)
+    Object.assign(legacy, { inboxId: owner.inboxId, key: owner.key })
+    expect(await legacy.sync()).toMatchObject({
+      status: 403,
+      body: relayError('suspended'),
+    })
+  })
+})
+
 describe('bearer writer and capability ops', () => {
   it('takes the token plus the writer envelope, never comparing the token’s account', async () => {
     const owner = await BearerOwner.create()
