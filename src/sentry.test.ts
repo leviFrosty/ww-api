@@ -13,6 +13,7 @@ import {
   isDatabaseError,
   redactContactLinkPayloads,
   redactDatabaseErrors,
+  redactSecretQueryParameters,
   reportableError,
 } from './sentry'
 import { recordSentryEvents, type SentryRecorder } from './test/sentry'
@@ -56,6 +57,39 @@ describe('redactContactLinkPayloads', () => {
     'https://geocode.search.hereapi.com/v1/geocode?q=1',
   ])('leaves %s alone', (input) => {
     expect(redactContactLinkPayloads(input)).toBe(input)
+  })
+})
+
+describe('redactSecretQueryParameters', () => {
+  const EVENTS = 'https://ww-proxy.test/notes-import/imp_0123/events'
+  it.each([
+    [`${EVENTS}?token=s3cr3t`, `${EVENTS}?token=[redacted]`],
+    [
+      `${EVENTS}?lastEventId=3&token=s3cr3t&x=1`,
+      `${EVENTS}?lastEventId=3&token=[redacted]&x=1`,
+    ],
+    [`${EVENTS}?token=s3cr3t#top`, `${EVENTS}?token=[redacted]#top`],
+    [`${EVENTS}?TOKEN=s3cr3t`, `${EVENTS}?TOKEN=[redacted]`],
+    [`GET ${EVENTS}?token=s3cr3t 200`, `GET ${EVENTS}?token=[redacted] 200`],
+    [`"${EVENTS}?token=s3cr3t"`, `"${EVENTS}?token=[redacted]"`],
+    // The SDK's `query_string` and `url.query` drop the `?`.
+    ['token=s3cr3t&lastEventId=3', 'token=[redacted]&lastEventId=3'],
+    [
+      'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=k3y',
+      'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=[redacted]',
+    ],
+  ])('redacts %s', (input, expected) => {
+    expect(redactSecretQueryParameters(input)).toBe(expected)
+  })
+
+  it.each([
+    `${EVENTS}?lastEventId=3`,
+    'GET /notes-import/:importId/events',
+    'https://ww-proxy.test/autocomplete?q=token',
+    'https://ww-proxy.test/geocode?q=a%3Dtoken%3D1',
+    'a token=s3cr3t in prose',
+  ])('leaves %s alone', (input) => {
+    expect(redactSecretQueryParameters(input)).toBe(input)
   })
 })
 
@@ -219,6 +253,99 @@ describe('Sentry scrubbers', () => {
     expect(
       (config.beforeSendTransaction!(transaction, {}) as TransactionEvent).request?.headers
     ).toEqual(kept)
+  })
+
+  it('cuts subscribe tokens from URLs, query strings, spans, and breadcrumbs', () => {
+    const SECRET = 'legacy-subscribe-token-0123456789'
+    const url = `https://ww-proxy.test/notes-import/imp_0123/events?token=${SECRET}&lastEventId=3`
+    const redactedUrl =
+      'https://ww-proxy.test/notes-import/imp_0123/events?token=[redacted]&lastEventId=3'
+    const request = (queryString: unknown) =>
+      ({
+        url,
+        query_string: queryString,
+        headers: { referer: url, accept: 'text/event-stream' },
+      }) as ErrorEvent['request']
+    const trace = {
+      trace_id: 't',
+      span_id: 's',
+      data: { 'url.full': url, 'url.query': `token=${SECRET}&lastEventId=3` },
+    }
+
+    const error = config.beforeSend!(
+      {
+        type: undefined,
+        message: `stream failed for ${url}`,
+        request: request(`token=${SECRET}&lastEventId=3`),
+        breadcrumbs: [{ category: 'fetch', data: { url } }],
+        contexts: { trace },
+      },
+      {}
+    ) as ErrorEvent
+    expect(JSON.stringify(error)).not.toContain(SECRET)
+    expect(error.request).toEqual({
+      url: redactedUrl,
+      query_string: 'token=[redacted]&lastEventId=3',
+      headers: { referer: redactedUrl, accept: 'text/event-stream' },
+    })
+    expect(error.contexts?.trace?.data).toEqual({
+      'url.full': redactedUrl,
+      'url.query': 'token=[redacted]&lastEventId=3',
+    })
+
+    // The event format also allows the query as an object or pairs.
+    for (const [queryString, expected] of [
+      [
+        { token: SECRET, lastEventId: '3' },
+        { token: '[redacted]', lastEventId: '3' },
+      ],
+      [
+        [['Token', SECRET], ['lastEventId', '3']],
+        [['Token', '[redacted]'], ['lastEventId', '3']],
+      ],
+    ]) {
+      const scrubbed = config.beforeSend!(
+        { type: undefined, request: request(queryString) },
+        {}
+      ) as ErrorEvent
+      expect(scrubbed.request?.query_string).toEqual(expected)
+    }
+
+    const transaction = config.beforeSendTransaction!(
+      {
+        type: 'transaction',
+        transaction: 'GET /notes-import/imp_0123/events',
+        request: request(`token=${SECRET}`),
+        contexts: { trace },
+        spans: [
+          {
+            span_id: 'c',
+            trace_id: 't',
+            start_timestamp: 0,
+            description: `GET ${url}`,
+            data: { 'url.full': url, 'http.query': `?token=${SECRET}` },
+          },
+        ],
+      },
+      {}
+    ) as TransactionEvent
+    expect(JSON.stringify(transaction)).not.toContain(SECRET)
+    expect(transaction.spans?.[0]).toMatchObject({
+      description: `GET ${redactedUrl}`,
+      data: { 'url.full': redactedUrl, 'http.query': '?token=[redacted]' },
+    })
+
+    expect(
+      config.beforeBreadcrumb!({
+        category: 'fetch',
+        message: `GET ${url}`,
+        data: { url, status_code: 200 },
+      })
+    ).toEqual({
+      category: 'fetch',
+      message: `GET ${redactedUrl}`,
+      data: { url: redactedUrl, status_code: 200 },
+    })
   })
 
   it('leaves events without contact links untouched', () => {

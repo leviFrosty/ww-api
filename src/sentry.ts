@@ -21,6 +21,30 @@ export function redactContactLinkPayloads(value: string): string {
 }
 
 /**
+ * Query parameters that carry a credential: Notes Import's legacy run routes
+ * (`/notes-import/:importId/events|result|cancel|destroy`) take their
+ * subscribe token as `?token=`, and the HERE proxy drops a client-sent
+ * `apiKey` for its own. The SDK records the request URL whole
+ * (`event.request.url` and `query_string`, `url.full` span data, the Referer
+ * header, breadcrumbs), and Notes Import traces at 100%, so their values are
+ * cut from every string in an event, like contact links. Names are lowercase
+ * and match without regard to case.
+ */
+const SECRET_QUERY_PARAMETERS = ['token', 'apikey'];
+const SECRET_QUERY_PARAMETER = new RegExp(
+  `((?:^|[?&])(?:${SECRET_QUERY_PARAMETERS.join('|')})=)[^&#\\s"'<>]*`,
+  'gi'
+);
+const REDACTED_QUERY_VALUE = '[redacted]';
+
+export function redactSecretQueryParameters(value: string): string {
+  return value.replace(SECRET_QUERY_PARAMETER, `$1${REDACTED_QUERY_VALUE}`);
+}
+
+const isSecretQueryParameter = (name: string): boolean =>
+  SECRET_QUERY_PARAMETERS.includes(name.toLowerCase());
+
+/**
  * Drizzle's query errors carry the SQL and its bound parameters (account ids,
  * session ids, refresh token hashes, inbox ids) in their message, as
  * `Failed query: <sql>\nparams: <values>`, and D1's own error in `cause`. D1's
@@ -86,7 +110,9 @@ export function captureFailure(error: unknown, operation: string): void {
  */
 function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
   if (typeof value === 'string') {
-    return redactDatabaseErrors(redactContactLinkPayloads(value));
+    return redactDatabaseErrors(
+      redactSecretQueryParameters(redactContactLinkPayloads(value))
+    );
   }
   if (typeof value !== 'object' || value === null || seen.has(value)) {
     return value;
@@ -132,6 +158,27 @@ function dropSecretHeaders(event: Event): void {
 }
 
 /**
+ * `event.request.query_string` is a string from this SDK, which
+ * `scrubStrings` covers, but the event format also allows an object or a
+ * list of pairs, whose values only their keys name.
+ */
+function redactQueryStringPairs(event: Event): void {
+  const request = event.request;
+  const query = request?.query_string;
+  if (!request || query == null || typeof query === 'string') return;
+  if (Array.isArray(query)) {
+    request.query_string = query.map(([name, value]) => [
+      name,
+      isSecretQueryParameter(name) ? REDACTED_QUERY_VALUE : value,
+    ]);
+    return;
+  }
+  for (const name of Object.keys(query)) {
+    if (isSecretQueryParameter(name)) query[name] = REDACTED_QUERY_VALUE;
+  }
+}
+
+/**
  * Drops every exception chained under a redacted database error (its
  * `cause`, which for Drizzle is D1's own error, and so on down). The
  * linked-errors integration lists each cause as another exception whose
@@ -169,6 +216,7 @@ function dropDatabaseErrorCauses(event: Event): void {
 
 function scrubEvent<T extends Event>(event: T): T {
   dropSecretHeaders(event);
+  redactQueryStringPairs(event);
   const scrubbed = scrubStrings(event) as T;
   dropDatabaseErrorCauses(scrubbed);
   return scrubbed;

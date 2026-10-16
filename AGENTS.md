@@ -294,6 +294,14 @@ Production status, HERE proxy, health, contact-link and other routine routes use
 capture and contact-data redaction remain unchanged; Cloudflare logging retains
 its existing sampling configuration.
 
+Because those traces record request URLs whole, `src/sentry.ts` cuts the value
+of every `token` query parameter (legacy run routes' subscribe token, `?token=`)
+and `apiKey` (a client-sent HERE key) from every string in an event,
+transaction, span, and breadcrumb (`token=[redacted]`), and from an object or
+pair-list `request.query_string`. A new route that takes a credential in its
+query string adds its name to `SECRET_QUERY_PARAMETERS` (better: take it in a
+header).
+
 ## Buddies
 
 `POST /buddies/v1/{op}` is the Buddies relay, built to the wire contract in
