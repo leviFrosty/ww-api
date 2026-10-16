@@ -920,7 +920,7 @@ ${fieldTable(playIntegritySessionAttestation)}`
 export const sessionRefreshDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Refresh a session',
-  description: `Plain JSON, no envelope: a new access token and a new refresh token, which replaces this one. Sending the refresh token just replaced again within 60 seconds (a lost response) gets a new pair; sending it later, or any older one, ends the session. An ended or expired session is \`unauthorized\`: open a new one, attesting again, without asking the User.
+  description: `Plain JSON, no envelope: a new access token and a new refresh token, which replaces this one. Sending the refresh token just replaced again within 60 seconds (a lost response, or two refreshes at once) gets a new access token and the same new refresh token; sending it later, or any older one, ends the session. An ended or expired session is \`unauthorized\`: open a new one, attesting again, without asking the User.
 
 A \`POST\` on the \`sessions\` collection rather than the session itself, since the refresh token, not an id in the URL, names the session.
 
