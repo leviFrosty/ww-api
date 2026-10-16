@@ -13,7 +13,8 @@ import {
 /**
  * Notes Import on account sessions: a dev-bypass session's bearer token runs
  * kickoff → SSE events → result → destroy, another account gets 404 for that
- * import, and legacy requests get 426 once the legacy switch is off.
+ * import, empty notes are a 400, and legacy requests get 426 once the legacy
+ * switch is off.
  *
  * The lifecycle runs only against the local launcher without an OpenRouter
  * key, where the run fails at the model call (free) and still walks every
@@ -92,6 +93,30 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Notes Import with a bearer token', () => {
     expect(res.body).toMatchObject({ ok: false, code: 'unauthorized' })
     expect(typeof res.body.error).toBe('string')
     expect(res.headers.get('www-authenticate')).toBe('Bearer error="invalid_token"')
+  })
+
+  it('refuses empty or whitespace-only notes with 400 bad_request, bearer and legacy', async () => {
+    const session = await openSession()
+    for (const notesText of ['', ' \n\t ']) {
+      const refused = [
+        await http('POST', '/notes-import/kickoff', {
+          headers: bearer(session),
+          body: { notesText, context: CONTEXT },
+        }),
+        await http('POST', '/notes-import', {
+          headers: bearer(session),
+          body: { notesText, context: CONTEXT },
+        }),
+        await http('POST', '/notes-import/kickoff', {
+          headers: { 'x-ww-dev-bypass': DEV_BYPASS_TOKEN ?? '' },
+          body: { uuid: 'A7B8C9D0-0000-4000-8000-000000000006', notesText, context: CONTEXT },
+        }),
+      ]
+      for (const res of refused) {
+        expect(res.status).toBe(400)
+        expect(res.body).toEqual({ ok: false, error: 'notesText is empty', code: 'bad_request' })
+      }
+    }
   })
 
   it('answers an unknown import with 404 not_found', async () => {
