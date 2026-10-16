@@ -25,10 +25,24 @@ export const SYNC_SLOT_PREFIX = 'legacy:'
  * may never run if the client disconnects mid-run (the runtime can cancel
  * the request) or the isolate goes away, and each invocation holds a slot of
  * its own, so without an age limit every such request would leak one for
- * good. Far beyond any real model run (about a minute); past it, a run still
- * going at worst lets one more start.
+ * good.
+ *
+ * A request still running when its slot ages out would let one more import
+ * past the cap, so the model call it waits on ends first, at
+ * `SYNC_IMPORT_DEADLINE_MS`. Change the two together: the deadline stays
+ * minutes short of this age, which leaves room for the work after the model
+ * (settlement, the response) and the release.
  */
 export const SYNC_SLOT_MAX_AGE_MS = 15 * 60 * 1000
+
+/**
+ * How long the synchronous `POST /notes-import` waits on the model before it
+ * aborts the call, answers `model_error`, and releases its slot. Far beyond
+ * any real model run (about a minute), and well short of
+ * `SYNC_SLOT_MAX_AGE_MS`, the slot's lifetime, so a slow call can't outlast
+ * its slot.
+ */
+export const SYNC_IMPORT_DEADLINE_MS = 10 * 60 * 1000
 
 /**
  * What a re-kick of an existing run DO resolves to, from its persisted status.

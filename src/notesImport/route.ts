@@ -12,7 +12,12 @@ import {
 } from './config'
 import { isSupporter, RevenueCatError } from '../revenuecat'
 import type { CreditDecision, CreditsSnapshot } from '../credits'
-import { runNotesImportModel } from './llm'
+import {
+  runNotesImportModel,
+  type RunModelArgs,
+  type RunModelOutput,
+} from './llm'
+import { SYNC_IMPORT_DEADLINE_MS } from './cap'
 import {
   base64DecodedBytes,
   isTranscribeMimeType,
@@ -1111,6 +1116,41 @@ export function handleNotesImportAdminResetRequest(ctx: AppContext) {
   })
 }
 
+/** The synchronous path's model call ran past `SYNC_IMPORT_DEADLINE_MS`. */
+export class ModelDeadlineError extends Error {
+  override name = 'ModelDeadlineError'
+}
+
+/**
+ * The synchronous path's model call, under `SYNC_IMPORT_DEADLINE_MS`. At the
+ * deadline it aborts the call (ending the upstream request) and rejects with
+ * a `ModelDeadlineError` at once, whether or not the call honours the
+ * signal, so the request answers and releases its slot before the slot can
+ * age out.
+ */
+async function runModelBeforeDeadline(
+  args: Omit<RunModelArgs, 'abortSignal'>
+): Promise<RunModelOutput> {
+  const aborter = new AbortController()
+  let passDeadline!: (error: ModelDeadlineError) => void
+  const deadline = new Promise<never>((_, reject) => (passDeadline = reject))
+  const timer = setTimeout(() => {
+    const error = new ModelDeadlineError(
+      `model call passed its ${SYNC_IMPORT_DEADLINE_MS / 1000}s deadline`
+    )
+    aborter.abort(error)
+    passDeadline(error)
+  }, SYNC_IMPORT_DEADLINE_MS)
+  const model = runNotesImportModel({ ...args, abortSignal: aborter.signal })
+  // Past the deadline nothing waits on the call, so its own rejection is moot.
+  model.catch(() => undefined)
+  try {
+    return await Promise.race([model, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * POST /notes-import — LEGACY synchronous path. Held open for the full model run
  * and returns the result in one response. Kept as a fallback during the
@@ -1141,7 +1181,9 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   // with a streaming run's importId, which a run DO releases by. Charging is
   // per content hash in recordUsage, so identical requests still charge once.
   // A plain try/finally release (no run DO to hand the slot off to); a
-  // disconnected client's slot ages out instead (SYNC_SLOT_MAX_AGE_MS).
+  // disconnected client's slot ages out instead (SYNC_SLOT_MAX_AGE_MS). The
+  // model call ends at SYNC_IMPORT_DEADLINE_MS, before that, so a request
+  // still running never loses its slot to the age limit.
   const cap = supporterConcurrency
     ? config.activeImportCapSupporter
     : config.activeImportCap
@@ -1172,7 +1214,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
   try {
     let output
     try {
-      output = await runNotesImportModel({
+      output = await runModelBeforeDeadline({
         apiKey: ctx.env.OPENROUTER_API_KEY,
         config,
         notesText,
@@ -1180,6 +1222,8 @@ export async function handleNotesImportRequest(ctx: AppContext) {
         refinement: body.refinement,
       })
     } catch (e) {
+      // A call past its deadline is a model error like any other: nothing
+      // is charged, and the slot is released below.
       Sentry.captureException(e)
       console.error('notes-import model_error', errorDetail(e))
       track(

@@ -15,11 +15,11 @@ import { accountsDb, setAccountStatus } from '../accounts/store'
 import { accessTokenKeys, signAccessToken } from '../accounts/tokens'
 import { analyticsDistinctId } from '../analytics'
 import { app } from '../app'
-import { SYNC_SLOT_MAX_AGE_MS } from './cap'
+import { SYNC_IMPORT_DEADLINE_MS, SYNC_SLOT_MAX_AGE_MS } from './cap'
 import { getNotesImportConfig } from './config'
 import { NotesImportIndex } from './indexDO'
 import { NotesImportRun } from './runDO'
-import { importOwnerKey } from './route'
+import { ModelDeadlineError, importOwnerKey } from './route'
 
 /**
  * Notes Import on account sessions (witness-work ADR 0027): bearer requests
@@ -632,6 +632,81 @@ describe('synchronous imports and the concurrency cap', () => {
     expect(slots(session.accountId)).toEqual([
       { importId: started.body.importId },
     ])
+  })
+
+  it('ends a model call at its deadline with model_error, freeing its slot before it could age out', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(START)
+    const session = await devSession()
+    const token = await iosToken(session)
+    const send = () =>
+      call('POST', '/notes-import', {
+        headers: bearer(token),
+        body: { notesText: 'Field service 1 hour', context: CONTEXT },
+      })
+    // A model that never answers and ignores its abort signal, in every
+    // slot of the cap. (Not `vi.waitFor`, which advances fake timers.)
+    const cap = getNotesImportConfig(h.env).activeImportCap
+    let allStarted!: () => void
+    const started = new Promise<void>((resolve) => (allStarted = resolve))
+    mocks.runModel.mockImplementation(() => {
+      if (mocks.runModel.mock.calls.length === cap) allStarted()
+      return new Promise(() => undefined)
+    })
+    const settled: Reply[] = []
+    const hung = Array.from({ length: cap }, () =>
+      send().then((reply) => (settled.push(reply), reply))
+    )
+    await started
+    expect(Date.now()).toBe(START)
+    const signals = mocks.runModel.mock.calls.map(
+      ([args]) => (args as { abortSignal: AbortSignal }).abortSignal
+    )
+
+    // Up to the deadline the calls run and hold the cap.
+    await vi.advanceTimersByTimeAsync(SYNC_IMPORT_DEADLINE_MS - 1)
+    expect(settled).toEqual([])
+    expect(slots(session.accountId)).toHaveLength(cap)
+    for (const signal of signals) expect(signal.aborted).toBe(false)
+    expect((await send()).status).toBe(429)
+
+    await vi.advanceTimersByTimeAsync(1)
+    for (const reply of await Promise.all(hung)) {
+      expect(reply.status).toBe(502)
+      expect(reply.body).toMatchObject({
+        error: 'The import model could not process these notes',
+        code: 'model_error',
+      })
+    }
+    // The upstream request is aborted, and each slot released by its own
+    // request (an age-out would take SYNC_SLOT_MAX_AGE_MS and another
+    // acquire).
+    for (const signal of signals) {
+      expect(signal.aborted).toBe(true)
+      expect(signal.reason).toBeInstanceOf(ModelDeadlineError)
+    }
+    expect(Date.now() - START).toBeLessThan(SYNC_SLOT_MAX_AGE_MS)
+    expect(slots(session.accountId)).toEqual([])
+    // Charged nothing, like any other model error.
+    expect(
+      indexes.storage(session.accountId).query('SELECT hash FROM hash_record')
+    ).toEqual([])
+    await flush()
+    const finished = mocks.capture.mock.calls
+      .map(
+        (args) =>
+          (args as unknown[])[1] as {
+            event: string
+            properties: Record<string, unknown>
+          }
+      )
+      .filter((event) => event.event === 'api_notes_import_finished')
+    expect(finished.map((event) => event.properties.outcome)).toEqual(
+      Array(cap).fill('model_error')
+    )
+
+    mocks.runModel.mockResolvedValue(MODEL_OUTPUT)
+    expect((await send()).status).toBe(200)
   })
 })
 
