@@ -121,12 +121,17 @@ Device attestation is API-wide, under `/attestation/v1/` (code in
   `ATTESTATION_PURPOSES` in `src/attestation/purposes.ts`. Installed apps sign
   these strings, so **never rename a shipped purpose**. `attestation-verify`
   is verify's purpose; `notes-import-verify` (what deployed apps sign) is
-  accepted on verify too.
+  accepted on verify too. `account-session` opens an account session
+  ([Sessions](#sessions-and-bearer-tokens)).
 - **Protecting a new route**: add a purpose, have the route recompute its
   `contentHash`/`requestHash` from the payload and reject a mismatch, then
   call `requireAttestation(ctx, body, purpose)` (`src/attestation/http.ts`;
-  App Attest v2 or Play Integrity, never v1). Notes Import kickoff keeps its
-  own gate because it still accepts v1.
+  App Attest v2 or Play Integrity, never v1). A route with its own error
+  format calls `verifyAttestation` instead, which resolves with the platform
+  (`ios`, `android`) or throws the provider's error with its `reason`.
+  Notes Import kickoff keeps its own gate because it still accepts v1. A
+  user-scoped route shouldn't attest at all: it takes the session's bearer
+  token (see Accounts).
 - **Old paths**: `POST /notes-import/challenge`, `/notes-import/attest`, and
   `/notes-import/verify` serve the same handlers for deployed apps. They add
   `Deprecation: @1792022400` (2026-10-15) and
@@ -160,8 +165,8 @@ pnpm run deploy:dev
 
 Secrets are per environment: add `--env dev` to `wrangler secret put` to keep
 them off prod (the full list is at the bottom of `wrangler.toml`).
-`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN` differs
-between the two workers.
+`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN` and
+`ACCOUNT_TOKEN_SECRET` differ between the two workers.
 
 ## Local iteration (no deploy)
 
@@ -423,22 +428,26 @@ attested session's bearer token, through the `requireAccount()` middleware,
 and keys its authorization, metering, limits, and audit records on that id.
 Don't add a route that trusts a client-sent install id, RevenueCat id, or
 inbox id to say who the User is, or that builds its own signed envelope or
-per-request attestation: attestation happens once, when a session opens (`POST
-/accounts/v1/sessions`). Feature ids (inboxes, backup slots, imports) belong
-to an account. The RevenueCat identity is being linked to the account so
-Supporter status is kept in step from RevenueCat webhooks and answered from
+per-request attestation: attestation happens once, when a session opens
+(`POST /accounts/v1/sessions`). Feature ids (inboxes, backup slots, imports)
+belong to an account. The RevenueCat identity is being linked to the account
+so Supporter status is kept in step from RevenueCat webhooks and answered from
 the account, not from an id the app sends. The pre-session ways of
 authenticating survive only behind the legacy switch (`auth:legacy`), for app
 versions from before sessions.
 
-- `POST /accounts/v1/account/register`: self-signed under the
+- `GET /accounts/v1/account`: Bearer, read-only. Returns the token's
+  account (`accountId`, `accountPub`, `status`, `createdAt`, `inboxIds`, and
+  `statusChanges` without their reasons) for Settings → Account and the
+  developer tools. Counts against the Buddies read edge tier.
+- `POST /accounts/v1/account/register` (legacy): self-signed under the
   `ww-account/v1` context; idempotent per key. Counts against the Buddies
-  register edge tier and the per-caller daily quota.
-- `POST /accounts/v1/account/info`: the same self-signed envelope (op
-  `account/info`), read-only. Returns the key's own account (`accountId`,
-  `accountPub`, `status`, `createdAt`, `inboxIds`, and `statusChanges`
-  without their reasons) for the app's developer tools; an unregistered key
-  is 404 `unknown_account`. Counts against the Buddies read edge tier.
+  register edge tier and the per-caller daily quota. Replaced by opening a
+  session; 426 `upgrade_required` once the legacy switch is off.
+- `POST /accounts/v1/account/info` (legacy): `GET /account`'s answer for
+  builds before it. A bearer request with no body reads the token's account;
+  while the legacy switch is on it also takes the old self-signed envelope
+  (op `account/info`), where an unregistered key is 404 `unknown_account`.
 - `inbox/register` takes an optional `account: { accountId, signature }`,
   the account key's signature over the inbox id and owner key. The link
   (`account_inboxes`) is written only after the inbox accepted the
@@ -448,7 +457,7 @@ versions from before sessions.
   4003. The database is the authority (registration checks it); each inbox
   keeps a copy so its hot path never reads D1.
 
-Without the `ACCOUNTS_DB` binding, accounts are off: `account/register`
+Without the `ACCOUNTS_DB` binding, accounts are off: every accounts route
 answers `disabled` and proofs are ignored. Prod uses `ww-accounts`, dev
 `ww-accounts-dev`.
 
@@ -476,21 +485,170 @@ curl -sX POST "$BASE/admin/accounts/status" -H "x-ww-admin-token: $TOKEN" \
 
 `/status` records every change in `account_status_events` and updates each
 of the account's inboxes. If `inboxesFailed` is above 0, send the same
-request again.
+request again. Routes that refuse suspended accounts through
+`requireAccount({ requireActive: true })` see the change within 30 seconds
+(per-isolate cache).
+
+### Sessions and bearer tokens
+
+Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
+`docs/accounts-protocol.md`). Code in `src/accounts/session.ts` (handlers),
+`attestation.ts`, `tokens.ts`, `sessionStore.ts`, and `auth.ts`.
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201 |
+| `POST /accounts/v1/sessions/refresh` | `{ refreshToken }` → new token pair |
+| `DELETE /accounts/v1/sessions/current` | Bearer; end the token's session |
+| `GET /accounts/v1/account` | Bearer; the token's account |
+
+- **Attesting**: `POST /attestation/v1/challenge` with purpose
+  `account-session`, App Attest v2 `assert` (the install's key, bound
+  through `/attestation/v1/register`) or Play Integrity v1, with
+  `contentHash` = `requestHash` = `hex(SHA-256(UTF-8("ww-account/v1/session\n"
+  + accountPub)))`. The answer rides in the open request's `attestation`.
+- **Open**: an envelope (`{ payload, signature }`, op `session/open`)
+  self-signed by the account key like `account/register`, carrying that
+  attestation. Its hashes must name the envelope's own key and purpose (400
+  `bad_request` otherwise); `verifyAttestation` checks the rest. Creates the
+  account if needed, stores a session, and answers 201 with `Location:
+  /accounts/v1/sessions/current` and `{ ok, accountId, status, sessionId,
+  accessToken, accessExpiresAt, refreshToken, sessionExpiresAt }`. A refused
+  attestation is 403 `attestation_failed` with the attestation routes'
+  `reason` and `action`. Optional sealed `device` label (≤ 512 chars, else
+  `too_large`), stored opaque. An eleventh live session ends the account's
+  oldest. Limits: the register edge tier, and 20 a rolling day per account
+  key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
+  counted before the attestation.
+- **Refresh**: plain JSON `{ refreshToken }`. Each refresh replaces the
+  token. The one just replaced still works for 60 seconds from its rotation
+  (a lost response; retries don't extend it). Presenting it later ends the
+  session. An unknown, ended, or expired token is 401 `unauthorized`.
+  Sessions last 90 days from opening and refreshing never extends them.
+  Read edge tier.
+- **Close**: `DELETE /sessions/current`, Bearer, no body; ends the token's
+  own session, idempotent. Read tier. Session ids never go in URLs.
+- **Storage**: D1 `account_sessions` (migration
+  `migrations/accounts/0001_account-sessions.sql`): id, account, platform
+  (`ios`, `android`, `dev`), sealed device label, SHA-256 of the current
+  and previous refresh token, and times. No install id, App Attest key,
+  `accountPub`, or IP. The hourly cron deletes sessions a week after they
+  were revoked or expired.
+- **Access tokens**: HS256 JWTs, 15 minutes (never past the session's end),
+  claims `sub` (account), `sid` (session), `platform`, `iss`
+  `ww-api/<APP_ATTEST_ENVIRONMENT>`, `aud` `ww-account`, `iat`, `exp`.
+  Nothing is stored; a token is valid until it expires, so closing a
+  session stops its refresh token at once and its access token within 15
+  minutes. Without a usable `ACCOUNT_TOKEN_SECRET` (at least 32 characters)
+  the session routes are 503 `disabled` and no bearer token passes.
+- **Dev bypass**: on the dev worker, `x-ww-dev-bypass` with
+  `NOTES_IMPORT_DEV_BYPASS_TOKEN` stands in for the attestation (platform
+  `dev`; `src/devBypass.ts`). Production ignores it (and fails loudly if the
+  token is set there), and a `dev` token never verifies there.
+
+`ACCOUNT_TOKEN_SECRET` takes a different value per worker; keep a copy in
+1Password's Agents vault, since a rotation needs the old value:
+
+```bash
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TOKEN_SECRET   # add --env dev for dev
+# Rotation: move the current value to the verify-only slot, then set a new
+# one. Its kid is derived from the secret, so old tokens keep verifying.
+wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS   # the old value
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TOKEN_SECRET
+# After 15 minutes:
+wrangler secret delete ACCOUNT_TOKEN_SECRET_PREVIOUS
+```
+
+Skipping the previous slot only costs each device one extra refresh. Local
+`wrangler dev` reads `ACCOUNT_TOKEN_SECRET` from `.dev.vars`
+(`.dev.vars.example`); the verify launcher and the test harness set their
+own.
+
+Building a route on accounts (`src/accounts/auth.ts`):
+
+- `requireAccount(options?)`: Hono middleware for bearer-only routes. Sets
+  `c.var.account = { accountId, sessionId, platform }` (read it with
+  `accountOf(c)`). `{ requireActive: true }` also refuses a suspended
+  account with 403 `suspended` (one D1 read, cached 30 s per isolate).
+- `authenticateAccount(c, options?)`: the same check as a call, for routes
+  that order their own gates (`GET /account` counts its edge tier first).
+  Returns `{ ok: true, account }` or `{ ok: false, error, response }`
+  (`unauthorized`, `suspended`, `disabled`, `internal`), so routes with
+  their own error format can map `error`.
+- `bearerOrLegacy(c, { bearer, legacy }, options?)`: for converted routes.
+  A request with an `Authorization` header is a bearer request, always (a
+  bad token is 401, never a fallback to the envelope). Without one, `legacy`
+  runs while the legacy switch is on, else 426.
+- `isLegacyAuthEnabled(env)` and `refuseLegacyAuth(env)`
+  (`src/accounts/legacySwitch.ts`) for legacy-only paths.
+- `unauthorized` (401, always with `WWW-Authenticate: Bearer
+  error="invalid_token"`), `upgrade_required` (426, no `Retry-After`), and
+  `attestation_failed` (403) are in the shared Buddies codes
+  (`buddiesErrorResponse`).
+- Name new routes as resources (REST), with ids out of URLs; document the
+  bearer requirement with `security: [{ bearerAuth: [] }]` in the route's
+  `openapi.ts`.
+- Tests: `createHarness()` turns sessions on by default, `openTestSession()`
+  in `src/test/accounts.ts` opens one with the bypass, and `requestJson()`
+  sends any method.
+
+**Privacy**: never log or report access or refresh tokens, account ids,
+session ids, or device labels. Sentry drops `Authorization`.
+
+### Updates and the legacy switch
+
+`GET /app/v1/config` (no auth, `src/appConfig.ts`) returns `{ ok,
+minAppVersion? }`. The value comes from KV `app:min-version`
+(`{"minVersion":"x.y.z"}`), then the `APP_MIN_VERSION` var, else it's
+absent. Invalid values are logged and ignored, and the KV read is
+edge-cached for 60 seconds. It has its own per-IP bucket (`app`). App
+versions from sessions on read it at launch and on returning to the
+foreground, and show Update Required below it.
+
+KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
+var, then on; edge-cached 60 s). While it's on, converted routes also take
+the way they authenticated before sessions. Off, those requests get 426
+`upgrade_required`, `account/register` included.
+
+#### Turning off backward compatibility
+
+Do these in order. Each step takes up to 60 seconds to reach every colo.
+
+```bash
+# 1. Raise the app-wide floor to the first version that opens sessions, so
+#    current apps show Update Required before anything is refused.
+wrangler kv key put --binding NOTES_KV app:min-version '{"minVersion":"X.Y.Z"}'
+# 2. Raise Notes Import's floor too: versions before sessions never read
+#    app:min-version, but their composer honors this one.
+wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"X.Y.Z"}'
+# 3. Refuse the old ways of authenticating (426 upgrade_required).
+wrangler kv key put --binding NOTES_KV auth:legacy off
+```
+
+Add `--env dev` to each for the dev worker. To undo, take them back in
+reverse: `wrangler kv key delete --binding NOTES_KV auth:legacy` (back to
+`AUTH_LEGACY`, on), then put the previous floors back, or delete
+`app:min-version` and `notes-import:min-version` to remove them.
 
 ### Handoff and backup
 
 Moving the account to another phone and backing it up (witness-work ADR 0026;
 "Handoff", "Backup", and "Recovery key" in its `docs/accounts-protocol.md`).
-Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
+Shared helpers for the self-signed ops, and `accountCall` (bearer or legacy
+envelope, then the account), are in `src/accounts/signed.ts`. Both stay
+`POST /accounts/v1/{op}` like Buddies, so channel and slot ids travel in
+bodies and headers, never URLs.
 
 - **Handoff** (Set Up Another Device): `POST /accounts/v1/handoff/open|claim|
   status|send|receive|done|cancel`, code in `src/accounts/handoff.ts`. The old
-  phone's ops (`open`, `status`, `send`, and `cancel` with `payload`/`signature`) are signed
-  by the account key like `account/register` and need a registered account
-  (`unknown_account` otherwise; a suspended one may still hand off). The new
-  phone's (`claim`, `receive`, `done`, and `cancel` without `payload`) are plain JSON
-  carrying `claimToken`. One `AccountHandoff` SQLite DO per `channelId`
+  phone's ops (`open`, `status`, `send`, and `cancel` without `claimToken`)
+  are Bearer with their fields as plain JSON; while the legacy switch is on
+  they also take envelopes (`payload`/`signature`) signed by the account key
+  like `account/register`, which need a registered account
+  (`unknown_account` otherwise). A suspended account may still hand off. The
+  new phone's (`claim`, `receive`, `done`, and `cancel` with `claimToken`)
+  are plain JSON carrying `claimToken`, with or without an `Authorization`
+  header. One `AccountHandoff` SQLite DO per `channelId`
   (binding `ACCOUNT_HANDOFF`, migration `v7`, `src/accounts/handoffDO.ts`)
   holds the opening account, `verifier = b64u(SHA-256(claimToken))`, the new
   phone's temporary key, and the sealed hello (≤ 2,048 chars) and key
@@ -506,9 +664,14 @@ Shared helpers for the self-signed ops are in `src/accounts/signed.ts`.
   `handoff-open` name; `admit` takes the limit), and every other op the read
   tier.
 - **Backup**: `POST /accounts/v1/backup/put|list|get|delete`, code in
-  `src/accounts/backup.ts`. All four are signed; `put` sends its envelope in
-  `x-ww-payload`/`x-ww-signature` (Sentry drops both, and the legacy
-  `x-ww-p`/`x-ww-s`) and the blob as the raw body. R2
+  `src/accounts/backup.ts`. `put`, `list`, and `get` are Bearer. `put`
+  sends the blob as the raw body, with `x-ww-slot-id`, `x-ww-sha256`, and
+  `Content-Length` as its size. `delete` is Bearer **and** the account key's
+  envelope; its key must be the token's account (403 `forbidden`), so a
+  leaked token can't delete backups. While the legacy switch is on, all four
+  also take the envelope alone; the old `put` sends it in
+  `x-ww-payload`/`x-ww-signature` (or the short `x-ww-p`/`x-ww-s`). Sentry
+  drops all four envelope headers and `x-ww-slot-id`. R2
   bucket `ACCOUNT_BACKUPS` (`ww-account-backups` prod,
   `ww-account-backups-dev` dev), one object per device slot at
   `v1/<accountId>/<slotId>` with `customMetadata.uploadedAt` (epoch ms). `put`
