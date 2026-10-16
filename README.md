@@ -459,7 +459,8 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
 bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
-`attestation`, `route-planning`, `admin` (`src/rateLimit.ts`). The old
+`attestation`, `route-planning`, `admin`, `app` (`/app/v1/*`)
+(`src/rateLimit.ts`). The old
 `/notes-import/*` attestation paths still count in `notes-import`. Refusals are 429
 `rate_limited` with `Retry-After: 60`.
 

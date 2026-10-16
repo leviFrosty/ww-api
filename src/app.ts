@@ -52,6 +52,7 @@ import {
   verifyDocs as attestationVerifyDocs,
 } from "./attestation/openapi";
 import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
+import { handleAppConfigRequest } from "./appConfig";
 import { Sentry } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { createAccountsRoutes } from "./accounts/route";
@@ -62,6 +63,7 @@ import { createRoutePlanningRoutes } from "./routePlanning/route";
 import { mountApiDocs } from "./openapi/route";
 import {
   aasaDocs,
+  appConfigDocs,
   appStoreRatingsDocs,
   autocompleteDocs,
   buddyInvitePageDocs,
@@ -126,10 +128,13 @@ app.use("/notes-import/*", rateLimit("notes-import"));
 app.use("/attestation/*", rateLimit("attestation"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
+app.use("/app/v1/*", rateLimit("app"));
 
 app.get("/geocode", geocodeDocs, handleGeocodeRequest);
 app.get("/autocomplete", autocompleteDocs, handleAutocompleteRequest);
 app.get("/health", healthDocs, handleHealthCheckRequest);
+// The app's minimum version (Update Required), read at launch and foreground.
+app.get("/app/v1/config", appConfigDocs, handleAppConfigRequest);
 // Paywall social proof (App Store ratings), edge-cached; refreshed by cron.
 app.get(
   "/app-store/ratings",

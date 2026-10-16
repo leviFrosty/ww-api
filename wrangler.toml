@@ -72,6 +72,9 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 BUDDIES_ENABLED = "true"
 # Buddies photo blobs fallback when KV `buddies:photos` is absent. On in dev.
 BUDDIES_PHOTOS = "on"
+# App-wide minimum version fallback when KV `app:min-version` is absent
+# (GET /app/v1/config). Unset = no floor.
+# APP_MIN_VERSION = "1.42.0"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -291,6 +294,9 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 BUDDIES_ENABLED = "false"
 # Buddies photo blobs stay off in prod unless KV `buddies:photos` is "on"
 # (no BUDDIES_PHOTOS fallback here). Not inherited by [env.dev].
+# App-wide minimum version fallback when KV `app:min-version` is absent
+# (GET /app/v1/config). Unset = no floor. Repeated under [env.dev.vars].
+# APP_MIN_VERSION = "1.42.0"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -357,6 +363,12 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 #   wrangler kv key put --binding NOTES_KV buddies:photos on      # on
 #   wrangler kv key put --binding NOTES_KV buddies:photos off     # off
 #   wrangler kv key delete --binding NOTES_KV buddies:photos      # use the var
+# (add `--env dev` for the dev worker).
+#
+# App-wide minimum version (GET /app/v1/config, cacheTtl 60; KV >
+# APP_MIN_VERSION var > unset). Below it the app shows Update Required.
+#   wrangler kv key put --binding NOTES_KV app:min-version '{"minVersion":"1.42.0"}'
+#   wrangler kv key delete --binding NOTES_KV app:min-version   # remove the floor
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
