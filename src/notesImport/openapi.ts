@@ -255,7 +255,8 @@ const importBaseFields = {
   uuid: installId,
   accountId,
   notesText: z.string().meta({
-    description: 'The notes to import, at most 100,000 characters by default.',
+    description:
+      'The notes to import, at most 100,000 characters by default. Empty or whitespace-only text is a 400 `bad_request`.',
   }),
   context: contextSchema,
   refinement: refinementSchema,
@@ -339,10 +340,10 @@ const successSchema = z
 
 const importGateErrors = (legacy: boolean) => ({
   400: niError(
-    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, or an invalid \`revenueCatAppUserId\`. Legacy: ${
+    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, empty or whitespace-only \`notesText\`, or an invalid \`revenueCatAppUserId\`. Legacy: ${
       legacy
-        ? 'invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
-        : 'invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).'
+        ? 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
+        : 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).'
     }`,
     ['bad_request', 'attestation_failed']
   ),

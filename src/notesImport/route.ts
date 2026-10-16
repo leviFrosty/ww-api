@@ -465,6 +465,9 @@ async function authenticateAndGate(
     }
   }
 
+  // Nothing to import: refuse before any attestation, credit, or model work.
+  if (notesText.trim() === '') return badRequest('notesText is empty')
+
   if (notesText.length > config.maxChars) {
     return {
       ok: false,

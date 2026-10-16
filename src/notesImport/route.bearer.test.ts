@@ -349,6 +349,39 @@ describe('bearer kickoff', () => {
   })
 })
 
+describe('empty notes', () => {
+  it('refuses empty or whitespace-only notesText before any credit or model work, bearer and legacy', async () => {
+    const session = await devSession()
+    const token = await iosToken(session)
+    const metered = vi.spyOn(indexes.namespace, 'idFromName')
+    const requests = (notesText: string) => [
+      ['/notes-import/kickoff', bearer(token), { notesText, context: CONTEXT, revenueCatAppUserId: RC_ID }],
+      ['/notes-import', bearer(token), { notesText, context: CONTEXT, revenueCatAppUserId: RC_ID }],
+      ['/notes-import/kickoff', legacyHeaders, legacyBody({ notesText })],
+      ['/notes-import', legacyHeaders, legacyBody({ notesText })],
+    ] as const
+
+    for (const notesText of ['', ' ', '\n\t \r\n', '  ﻿']) {
+      for (const [path, headers, body] of requests(notesText)) {
+        const response = await call('POST', path, { headers, body })
+        expect(response.status, `${path} ${JSON.stringify(notesText)}`).toBe(400)
+        expect(response.body).toEqual({
+          ok: false,
+          error: 'notesText is empty',
+          code: 'bad_request',
+        })
+      }
+    }
+    expect(metered).not.toHaveBeenCalled()
+    expect(revenueCatIds()).toEqual([])
+    expect(mocks.runModel).not.toHaveBeenCalled()
+    expect(mocks.capture).not.toHaveBeenCalled()
+
+    // Text around the whitespace is still an import.
+    expect((await kickoff(token, { notesText: '  1 hour  ' })).status).toBe(200)
+  })
+})
+
 describe('Supporter status through revenueCatAppUserId', () => {
   it('checks the named RevenueCat id at kickoff and again at settlement', async () => {
     fetchMock.mockImplementation(async () => Response.json(LIFETIME))
