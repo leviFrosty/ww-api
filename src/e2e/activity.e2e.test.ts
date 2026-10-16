@@ -3,15 +3,18 @@ import { accountSignedMessage, type AccountsOp } from '../accounts/contracts'
 import {
   SigningKey,
   b64u,
+  envelope,
   randomBytes,
   randomId,
   sha256B64u,
 } from '../test/buddiesClient'
 import {
   ADMIN_TOKEN,
+  BearerRelayOwner,
   DEV_BYPASS_TOKEN,
   http,
   httpBytes,
+  openSession as openE2ESession,
   writeTranscript,
 } from '../test/e2e'
 
@@ -171,5 +174,42 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('account activity and devices (dev bypass)', 
       'account.suspended',
     ])
     expect(JSON.stringify(read.body)).not.toContain('report')
+  })
+
+  it('logs a Buddies inbox linked and deleted, and nothing for a buddy writing', async () => {
+    const session = await openE2ESession()
+    const owner = await BearerRelayOwner.create(session)
+    const buddy = await openE2ESession()
+    const writer = await owner.addWriter()
+    const put = await http('POST', '/buddies/v1/card/put', {
+      headers: { authorization: `Bearer ${buddy.accessToken}` },
+      body: await envelope(
+        'card/put',
+        {
+          inboxId: writer.inboxId,
+          slotId: writer.slotId,
+          blob: b64u(randomBytes(64)),
+          ts: Date.now(),
+          nonce: randomId(),
+        },
+        writer.key
+      ),
+    })
+    expect(put.status).toBe(200)
+    expect((await owner.op('inbox/delete')).status).toBe(200)
+
+    const kinds = async (accessToken: string) =>
+      (
+        await http('GET', '/accounts/v1/activity', {
+          headers: { authorization: `Bearer ${accessToken}` },
+        })
+      ).body.activity.map((e: { kind: string }) => e.kind)
+    expect(await kinds(session.accessToken)).toEqual([
+      'buddies.deleted',
+      'buddies.inbox_linked',
+      'session.opened',
+      'account.created',
+    ])
+    expect(await kinds(buddy.accessToken)).toEqual(['session.opened', 'account.created'])
   })
 })

@@ -1228,3 +1228,71 @@ describe('per-account limits', () => {
     expect(bearerA).not.toContain(owner.session.accountId)
   })
 })
+
+describe('the account activity log (witness-work ADR 0028)', () => {
+  const activityOf = async (s: TestSession) => {
+    const response = await accountsApp.request(
+      '/activity?limit=100',
+      { headers: bearer(s.accessToken) },
+      h.env
+    )
+    expect(response.status).toBe(200)
+    return ((await response.json()) as {
+      activity: { kind: string; session?: { sessionId: string } }[]
+    }).activity
+  }
+  const buddiesEntries = async (s: TestSession) =>
+    (await activityOf(s)).filter((entry) => entry.kind.startsWith('buddies.'))
+
+  it('logs linking an inbox and deleting Buddies once each, with the session', async () => {
+    const owner = await BearerOwner.create()
+    expect((await owner.register()).status).toBe(200)
+    expect((await owner.op('inbox/delete')).status).toBe(200)
+    expect((await owner.op('inbox/delete')).status).not.toBe(200)
+
+    expect(await buddiesEntries(owner.session)).toEqual([
+      expect.objectContaining({
+        kind: 'buddies.deleted',
+        session: expect.objectContaining({ sessionId: owner.session.sessionId }),
+      }),
+      expect.objectContaining({
+        kind: 'buddies.inbox_linked',
+        session: expect.objectContaining({ sessionId: owner.session.sessionId }),
+      }),
+    ])
+  })
+
+  it('logs a legacy delete of a linked inbox on its account, without a session', async () => {
+    const legacy = await Owner.create(h)
+    const owner = await BearerOwner.create(false)
+    Object.assign(owner, { inboxId: legacy.inboxId, key: legacy.key })
+    expect((await owner.register()).status).toBe(200)
+    expect((await legacy.send('inbox/delete')).status).toBe(200)
+
+    const [deleted] = await buddiesEntries(owner.session)
+    expect(deleted).toEqual(expect.objectContaining({ kind: 'buddies.deleted' }))
+    expect(deleted.session).toBeUndefined()
+  })
+
+  it('logs nothing for writer ops, on either account', async () => {
+    const owner = await BearerOwner.create()
+    const buddy = await session()
+    const writer = await owner.addWriter()
+    for (const [op, fields] of [
+      ['event/put', { eventId: randomId(), kind: 'plan.joined', blob: blobOfSize(48), push: false }],
+      ['card/put', { blob: blobOfSize(64) }],
+      ['slot/leave', {}],
+    ] as const)
+      expect(
+        (await writerSend(writer, op, fields, bearer(buddy.accessToken))).status
+      ).toBe(200)
+
+    expect((await activityOf(buddy)).map((entry) => entry.kind)).toEqual([
+      'session.opened',
+      'account.created',
+    ])
+    expect((await buddiesEntries(owner.session)).map((entry) => entry.kind)).toEqual([
+      'buddies.inbox_linked',
+    ])
+  })
+})

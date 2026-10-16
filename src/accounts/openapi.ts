@@ -1087,8 +1087,10 @@ export const activityListDocs = describeRoute({
 | \`backup.downloaded\` | A backup slot was downloaded (once per slot, session, and day) | The downloading one | — |
 | \`account.suspended\` | The account was suspended | — | — |
 | \`account.reinstated\` | The account was reinstated | — | — |
+| \`buddies.inbox_linked\` | A Buddies inbox was linked to the account | The linking one | — |
+| \`buddies.deleted\` | The account's Buddies inbox was deleted (Delete My Buddies Data) | The deleting one | — |
 
-\`session\` is absent on handoff and backup entries made with an envelope before sessions.
+\`session\` is absent on handoff, backup, and Buddies entries made with an envelope before sessions. Buddies entries never name a buddy or another account's inbox: only the owner's own link and deletion are logged, never writer ops.
 
 Works for a suspended account. ${readTier}`,
   security: [{ bearerAuth: [] }],

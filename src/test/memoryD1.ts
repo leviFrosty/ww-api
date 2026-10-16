@@ -108,7 +108,16 @@ export const failQueries = (
   const fail = async () => {
     throw new Error(message)
   }
-  const failing = { run: fail, all: fail, raw: fail, first: fail, rows: fail }
+  // `batch` reads `rows()` synchronously, so it throws there.
+  const failing = {
+    run: fail,
+    all: fail,
+    raw: fail,
+    first: fail,
+    rows: () => {
+      throw new Error(message)
+    },
+  }
   return vi.spyOn(d1, 'prepare').mockImplementation((query: string) =>
     pattern.test(query)
       ? ({ ...failing, bind: () => failing } as unknown as MemoryD1Statement)

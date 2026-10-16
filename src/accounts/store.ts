@@ -97,16 +97,31 @@ export const findInboxAccount = async (
  * account the inbox belongs to afterwards, which differs from `accountId` only
  * when another account linked it first, with its status as read after the
  * link was written.
+ *
+ * A new link goes in the account's activity (`buddies.inbox_linked`, naming
+ * `sessionId` when a bearer session linked it) in the same batch; the batch
+ * is atomic, so an account that loses a race logs nothing.
  */
 export const linkInbox = async (
   db: AccountsDb,
   inboxId: string,
-  accountId: string
+  accountId: string,
+  sessionId: string | null = null
 ): Promise<AccountRecord> => {
-  await db
-    .insert(accountInboxes)
-    .values({ inboxId, accountId })
-    .onConflictDoNothing({ target: accountInboxes.inboxId })
+  await db.batch([
+    activityInsert(
+      db,
+      { accountId, kind: 'buddies.inbox_linked', sessionId },
+      {
+        onlyIf: sql`NOT EXISTS (SELECT 1 FROM ${accountInboxes}
+          WHERE ${accountInboxes.inboxId} = ${inboxId})`,
+      }
+    ),
+    db
+      .insert(accountInboxes)
+      .values({ inboxId, accountId })
+      .onConflictDoNothing({ target: accountInboxes.inboxId }),
+  ])
   const owner = await findInboxAccount(db, inboxId)
   if (!owner) throw new Error('accounts: linked inbox is missing')
   return owner
