@@ -1,4 +1,5 @@
 import type { AppContext, Environment } from '../types'
+import { captureFailure } from '../sentry'
 import { isPlainObject } from '../buddies/contracts'
 import {
   isEnvelopeBody,
@@ -24,6 +25,8 @@ import {
   replyWith,
   verifyEnvelope,
 } from './signed'
+import { recordActivity } from './activity'
+import { accountsDb } from './store'
 
 /**
  * Set Up Another Device (witness-work `docs/accounts-protocol.md`, "Handoff"):
@@ -37,6 +40,9 @@ import {
  *
  * `handoff/open` counts against the register edge tier and 20 opens per
  * account a rolling day; every other op against the read tier.
+ *
+ * `handoff/send` goes in the account's activity (`handoff.sent`, ADR 0028)
+ * once the channel accepted the key.
  *
  * Privacy: nothing here logs or reports bodies, keys, tokens, account ids, or
  * channel ids.
@@ -115,16 +121,24 @@ const handleSend = guarded('handoff/send', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
   const text = await readEnvelopeText(c.req.raw)
-  return oldPhone(c, 'handoff/send', text, async (accountId, fields) =>
-    replyWith(
-      c,
-      await channel(c.env, fields.channelId).send(
-        fields.channelId,
-        accountId,
-        fields.key
-      )
+  return oldPhone(c, 'handoff/send', text, async (accountId, fields) => {
+    const result = await channel(c.env, fields.channelId).send(
+      fields.channelId,
+      accountId,
+      fields.key
     )
-  )
+    // The key has left: a failed entry is reported, never the send's answer.
+    if (result.ok)
+      await recordActivity(accountsDb(c.env.ACCOUNTS_DB!), {
+        accountId,
+        kind: 'handoff.sent',
+        sessionId: c.get('account')?.sessionId ?? null,
+      }).catch((error: unknown) => {
+        console.error('accounts: activity write failed', { op: 'handoff/send' })
+        captureFailure(error, 'handoff/send')
+      })
+    return replyWith(c, result)
+  })
 })
 
 const handleClaim = guarded('handoff/claim', async (c) => {
