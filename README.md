@@ -182,7 +182,8 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
   /accounts/v1/sessions/current`. Sessions last 90 days.
 - **`POST /accounts/v1/sessions/refresh`** trades `{ refreshToken }` for a
   new pair; each refresh token works once (plus a 60-second grace for a lost
-  response).
+  response), and presenting an older one ends the session. Refresh tokens are opaque strings
+  (`<sessionId>.<secret>`).
 - **`DELETE /accounts/v1/sessions/current`** ends the token's session.
 - **`GET /accounts/v1/account`** reads the token's account.
 - Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)

@@ -269,7 +269,7 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
       accountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
-      refreshToken: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      refreshToken: expect.stringMatching(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/),
     })
     expect(session.sessionExpiresAt - session.accessExpiresAt).toBeGreaterThan(89 * 24 * 3_600_000)
 
@@ -314,6 +314,26 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
     expect(after.status).toBe(401)
     expect(after.body.code).toBe('unauthorized')
     expect(after.headers.get('www-authenticate')).toBe('Bearer error="invalid_token"')
+  })
+
+  it('ends the session when an older refresh token comes back', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const first = await refresh(session.refreshToken)
+    expect(first.status).toBe(200)
+    const second = await refresh(first.body.refreshToken as string)
+    expect(second.status).toBe(200)
+
+    // Two tokens old: refused, and the session ends with it.
+    const reused = await refresh(session.refreshToken)
+    expect(reused.status).toBe(401)
+    expect(reused.body.code).toBe('unauthorized')
+    expect((await refresh(second.body.refreshToken as string)).status).toBe(401)
+
+    // Malformed tokens are refused alike.
+    for (const token of ['', 'not-a-token', b64u(randomBytes(32))])
+      expect((await refresh(token)).status).toBe(401)
   })
 
   it('refuses a bad bearer token without trying the envelope', async () => {

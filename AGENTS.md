@@ -596,12 +596,15 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   oldest. Limits: the register edge tier, and 20 a rolling day per account
   key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
   counted before the attestation.
-- **Refresh**: plain JSON `{ refreshToken }`. Each refresh replaces the
-  token. The one just replaced still works for 60 seconds from its rotation
-  (a lost response; retries don't extend it). Presenting it later ends the
-  session. An unknown, ended, or expired token is 401 `unauthorized`.
-  Sessions last 90 days from opening and refreshing never extends them.
-  Read edge tier.
+- **Refresh**: plain JSON `{ refreshToken }`. A refresh token is
+  `<sessionId>.<secret>` (b64u, 16 and 32 bytes; opaque to the app), so the
+  session is found by id, and a malformed one is 401 before any D1 read.
+  Each refresh replaces the token. The one just replaced still works for 60
+  seconds from its rotation (a lost response; retries don't extend it).
+  Presenting it later, or any older token of a live session (or one it
+  never issued), ends the session. An unknown, ended, or expired session
+  is 401 `unauthorized`. Sessions last 90 days from opening and refreshing
+  never extends them. Read edge tier.
 - **Close**: `DELETE /sessions/current`, Bearer, no body; ends the token's
   own session, idempotent. Read tier. Session ids never go in URLs.
 - **Storage**: D1 `account_sessions` (migration

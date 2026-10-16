@@ -329,11 +329,29 @@ export const sessionDeviceTooLarge = (payload: unknown): boolean =>
 export const sessionAttestationHash = (accountPub: string): Promise<string> =>
   sha256Hex(`ww-account/v1/session\n${accountPub}`)
 
-/** A refresh token: b64u of 32 random bytes, in its canonical spelling. */
-export const parseRefreshToken = (value: unknown): Uint8Array | null => {
-  if (typeof value !== 'string') return null
+/** A refresh token as presented: the session it names, and the whole token. */
+export interface RefreshToken {
+  sessionId: string
+  token: string
+}
+
+/** b64u of exactly `size` bytes, in its canonical spelling. */
+const isCanonicalB64u = (value: string, size: number): boolean => {
   const bytes = decodeB64u(value)
-  return bytes && bytes.length === 32 && bytesToBase64Url(bytes) === value
-    ? bytes
+  return bytes != null && bytes.length === size && bytesToBase64Url(bytes) === value
+}
+
+/**
+ * A refresh token, opaque to the app: `<sessionId>.<secret>`, the session's
+ * id (b64u, 16 bytes) and b64u of 32 bytes, each in its canonical spelling.
+ * Null for anything else.
+ */
+export const parseRefreshToken = (value: unknown): RefreshToken | null => {
+  if (typeof value !== 'string') return null
+  const parts = value.split('.')
+  if (parts.length !== 2) return null
+  const [sessionId, secret] = parts
+  return isCanonicalB64u(sessionId, 16) && isCanonicalB64u(secret, 32)
+    ? { sessionId, token: value }
     : null
 }
