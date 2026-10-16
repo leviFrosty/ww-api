@@ -358,6 +358,9 @@ same handlers for deployed apps.
   for Supporters); over it → 429 `transcribe_limit` with `Retry-After`.
   `GET /notes-import/status` advertises `capabilities.transcribe`.
 - **`POST /notes-import`** is the synchronous fallback under identical rules.
+- Both import routes refuse empty or whitespace-only `notesText` with 400
+  `bad_request`, bearer and legacy alike, before attestation, the allowance,
+  or the model.
 - **`GET /notes-import/status`** is public and supplies a fresh allowance
   schedule only when availability is confirmed.
 
