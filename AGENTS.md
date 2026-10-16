@@ -266,6 +266,27 @@ sent. The AASA matches `/buddies/invite#1…` and `/b#1…`, and
 Links. Clients are iOS and Android
 (witness-work ADR 0020).
 
+- **Authentication** (witness-work ADR 0027; "Authentication (sessions)" in
+  the protocol): a request with an `Authorization` header is a bearer
+  request, and its access token must verify (401 `unauthorized`, never a
+  fallback). `inbox/register` sends the token plus its self-signed
+  envelope, whose `account` proof is then required (400) and must name the
+  token's account (403 `forbidden`). Owner ops send their fields as plain
+  JSON, no envelope, `ts`, or `nonce` (`inbox/live` and `blob/put` in
+  `x-buddies-payload`, no signature header); the inbox DO compares the
+  token's account with its `owner_account` row: another account is 403
+  `forbidden`, none 409 `not_linked` (an inbox registered before accounts;
+  the app links it with `inbox/register` and retries). Writer ops send the
+  token plus the writer-signed envelope, still the slot's capability; the
+  token's account is never compared with the slot or stored. Invite and
+  blob reads send the token plus today's body. Without the header it's a
+  legacy request, served byte for byte as before while `auth:legacy` is on,
+  and 426 `upgrade_required` once it's off, leaving ops included. The live
+  upgrade reaches the inbox DO with the token's account in the internal
+  `x-buddies-session-account` header, which the Worker always strips from
+  client requests (the DO trusts it). Suspension and both switches work as
+  before in both forms; `owner_account` needs no migration (created in
+  place at registration).
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
@@ -277,8 +298,11 @@ Links. Clients are iOS and Android
   each with its sizing rationale. They only stop scripted abuse; size them
   from the heaviest real use with at least 10× headroom. Hits log
   `buddies: limit hit {op, limit}` (nothing else), so tune from Workers Logs.
-  - Per caller, in the Worker before any DO wakes: the client IP (IPv6 by
-    /64), never the target inbox. `BUDDIES_RATE_LIMITER` 120/min for
+  - Per caller, in the Worker before any DO wakes: for a bearer request the
+    session's account (`account:` + a SHA-256 of its id, so the limiter never
+    sees the id and people behind one NAT stop sharing a budget), else the
+    client IP (IPv6 by /64); never the target inbox. The budgets were sized
+    per IP, so one account gets the same. `BUDDIES_RATE_LIMITER` 120/min for
     `invite/fetch` + `invite/claim`, `BUDDIES_REGISTER_LIMITER` 60/min for
     `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync` +
     `inbox/live`, `BUDDIES_BLOB_PUT_LIMITER` 60/min for `blob/put`,
@@ -292,8 +316,9 @@ Links. Clients are iOS and Android
     the Durable Objects, and `stale` carries `serverTime` and `Date`. The Worker also refuses stale `ts` and badly
     signed `inbox/register` before any DO. A limiter outage lets requests
     through.
-  - `inbox/register`: 2,000 validly signed calls per caller per rolling day
-    (`BuddyRegistrationQuota`, hourly counts under a hashed caller key).
+  - `inbox/register`: 2,000 validly signed calls per caller (account or IP,
+    as above) per rolling day (`BuddyRegistrationQuota`, hourly counts under
+    a hashed caller key).
   - Per inbox, after the signature check: stored events per slot (10,000,
     16 MiB) and per inbox (128 MiB). `event/put` past them is 429
     `rate_limited`; nothing stored is dropped. `slot_usage` keeps the running
@@ -382,15 +407,16 @@ Links. Clients are iOS and Android
   the frame itself arrives at once.
 - **Privacy**: every id travels in the body (for the live socket, in headers;
   never the URL). Never log or report bodies, headers, blobs,
-  ids, or tokens. APNs and FCM requests use the `fetch` captured before
+  ids, account ids, or tokens (access tokens included; Sentry drops
+  `Authorization` and `x-buddies-*`). APNs and FCM requests use the `fetch` captured before
   Sentry wraps the global, so device tokens in APNs URLs stay out of Sentry
   spans (FCM tokens travel only in request bodies). The dev worker's 100%
   Workers traces do record subrequest URLs, APNs included.
-- **Not yet built** (required before any production rollout): App Attest on
-  `inbox/register` and `invite/*` (`attest` is accepted and ignored; Android
-  will use Play Integrity). `blob/put` isn't attested either; the plan is to
-  attest an inbox once per few days through a Buddies purpose added to
-  `src/attestation/purposes.ts` and have `blob/put` require a recent one, rather than attesting each upload. The protocol's durable push outbox (retries for
+- **Not yet built** (required before any production rollout): bearer
+  requests are attested once, when their session opens (App Attest or Play
+  Integrity), so nothing per request is needed for them; legacy requests
+  stay unattested until the legacy switch is off (`attest` is accepted and
+  ignored), which is the remaining step before production. The protocol's durable push outbox (retries for
   6 h, outcome history, deferred instead of dropped alerts inside the 60 s
   spacing, `apns-expiration`) is specified but not built either;
   today each push gets one immediate attempt plus one retry.
@@ -448,8 +474,9 @@ versions from before sessions.
   builds before it. A bearer request with no body reads the token's account;
   while the legacy switch is on it also takes the old self-signed envelope
   (op `account/info`), where an unregistered key is 404 `unknown_account`.
-- `inbox/register` takes an optional `account: { accountId, signature }`,
-  the account key's signature over the inbox id and owner key. The link
+- `inbox/register` takes an optional `account: { accountId, signature }`
+  (required in a bearer request, for the token's account), the account
+  key's signature over the inbox id and owner key. The link
   (`account_inboxes`) is written only after the inbox accepted the
   owner-signed registration, so it takes both keys (Option A in the ADR).
 - A suspended account's inboxes refuse every owner op except `inbox/delete`
