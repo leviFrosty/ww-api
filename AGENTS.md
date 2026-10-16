@@ -589,6 +589,7 @@ need the token).
 - The legacy short names `p`/`s` (and `x-buddies-p`/`-s`, `x-ww-p`/`-s`) are
   accepted for shipped builds but appear in the docs only as a note; never
   add a new short name.
+- The document is built once per isolate. Scalar's UI loads from jsDelivr.
 
 ## API design: readable, standard REST
 
@@ -621,7 +622,6 @@ When adding or changing an endpoint:
   the alias as long as supported builds send it. Inside signed payloads the
   server verifies the exact bytes it got, so an alias there only needs the
   parser to read either name.
-- The document is built once per isolate. Scalar's UI loads from jsDelivr.
 
 ## Checks before deploy
 
