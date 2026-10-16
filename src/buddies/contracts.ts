@@ -54,6 +54,12 @@ export const LEGACY_BUDDIES_ENVELOPE_HEADERS = {
 } as const
 /** Request headers that carry the live upgrade's `payload` and `signature`. */
 export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
+/**
+ * The account a bearer `inbox/live` upgrade's token named, set by the Worker
+ * on the request it hands the inbox DO. Never read from a client: the Worker
+ * deletes any copy a client sends before forwarding.
+ */
+export const BUDDIES_LIVE_ACCOUNT_HEADER = 'x-buddies-session-account'
 
 /**
  * Photo blobs (encrypted note photos, too big for an event). `blob/put` is
@@ -134,8 +140,9 @@ export const BUDDIES_ERROR_STATUS = {
   disabled: 503,
   /**
    * `inbox/live` without a WebSocket upgrade, and any request authenticated
-   * the way it was before sessions once the legacy switch (`auth:legacy`) is
-   * off. Never carries `Retry-After`: updating the app is the fix.
+   * the way it was before sessions (no `Authorization` header) once the
+   * legacy switch (`auth:legacy`) is off. Never carries `Retry-After`:
+   * updating the app is the fix.
    */
   upgrade_required: 426,
   /** A `blob/put` body (declared or streamed) over `blobBytes`. */
@@ -149,10 +156,17 @@ export const BUDDIES_ERROR_STATUS = {
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,
   /**
-   * A handoff channel another account opened, or a `backup/delete` signed by
-   * another account than the bearer token's.
+   * A handoff channel another account opened, a `backup/delete` signed by
+   * another account than the bearer token's, a bearer Buddies owner request
+   * for an inbox linked to another account, or a bearer `inbox/register`
+   * whose `account` proof names another account than the token's.
    */
   forbidden: 403,
+  /**
+   * A bearer Buddies owner request for an inbox registered before accounts
+   * (linked to none). The app links it with `inbox/register` and retries.
+   */
+  not_linked: 409,
   /**
    * A missing, expired, or invalid access token, or an ended session's
    * refresh token. Sent with `WWW-Authenticate: Bearer error="invalid_token"`.
@@ -412,6 +426,9 @@ export interface SignedFields {
   nonce: string
 }
 
+/** A payload without its signed `ts` and `nonce`: a bearer request's fields. */
+export type Unsigned<T> = Omit<T, keyof SignedFields>
+
 export interface InboxFields extends SignedFields {
   inboxId: string
 }
@@ -592,14 +609,10 @@ const timestamp = (value: unknown): number | null => {
   return isSafeInteger(ms) ? ms : null
 }
 
-const inboxFields = (p: Fields): InboxFields | null => {
-  const ts = timestamp(p.ts)
-  return ts != null && isId(p.nonce) && isId(p.inboxId)
-    ? { ts, nonce: p.nonce, inboxId: p.inboxId }
-    : null
-}
+const inboxFields = (p: Fields): Unsigned<InboxFields> | null =>
+  isId(p.inboxId) ? { inboxId: p.inboxId } : null
 
-const slotFields = (p: Fields): SlotPayload | null => {
+const slotFields = (p: Fields): Unsigned<SlotPayload> | null => {
   const base = inboxFields(p)
   return base && isId(p.slotId) ? { ...base, slotId: p.slotId } : null
 }
@@ -613,6 +626,13 @@ const withBlob = <T extends object>(
   return base && b ? { ...base, blob: b } : null
 }
 
+/** An op's fields without `ts` and `nonce` (unsigned ops have none anyway). */
+export type BuddiesFields<K extends BuddiesRouteOp> = Unsigned<BuddiesPayloads[K]>
+
+type FieldParsers = {
+  [K in BuddiesRouteOp]: (payload: Fields, now: number) => BuddiesFields<K> | null
+}
+
 type PayloadParsers = {
   [K in BuddiesRouteOp]: (
     payload: Fields,
@@ -621,11 +641,14 @@ type PayloadParsers = {
 }
 
 /**
- * Validates a decoded payload for one op and returns only the contract fields
- * (unknown fields, including the reserved `attest`, are dropped). Keys and the
- * claim verifier come back canonically encoded. Null means `bad_request`.
+ * Validates an op's fields and returns only the contract's (unknown fields,
+ * including the reserved `attest`, `ts`, and `nonce`, are dropped). Keys and
+ * the claim verifier come back canonically encoded. Null means
+ * `bad_request`. A bearer request's plain JSON body (or `x-buddies-payload`)
+ * goes through these alone; a signed payload through
+ * `BUDDIES_PAYLOAD_PARSERS`, which also takes its `ts` and `nonce`.
  */
-export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
+export const BUDDIES_FIELD_PARSERS: FieldParsers = {
   'inbox/register': (p) => {
     const base = inboxFields(p)
     const ownerPub = fixedBytes(p.ownerPub, 32)
@@ -734,6 +757,29 @@ export const BUDDIES_PAYLOAD_PARSERS: PayloadParsers = {
   },
 }
 
+/** Ops whose payload is never signed, so it has no `ts` or `nonce`. */
+const UNSIGNED_PAYLOAD_OPS: ReadonlySet<BuddiesRouteOp> = new Set([
+  ...BUDDIES_UNSIGNED_OPS,
+  BUDDIES_BLOB_GET_OP,
+])
+
+/**
+ * Validates a decoded envelope payload for one op: its fields
+ * (`BUDDIES_FIELD_PARSERS`), plus `ts` and `nonce` for every signed op.
+ * Null means `bad_request`.
+ */
+export const BUDDIES_PAYLOAD_PARSERS = Object.fromEntries(
+  (Object.keys(BUDDIES_FIELD_PARSERS) as BuddiesRouteOp[]).map((op) => [
+    op,
+    (p: Fields, now: number) => {
+      const fields = BUDDIES_FIELD_PARSERS[op](p, now)
+      if (!fields || UNSIGNED_PAYLOAD_OPS.has(op)) return fields
+      const ts = timestamp(p.ts)
+      return ts != null && isId(p.nonce) ? { ...fields, ts, nonce: p.nonce } : null
+    },
+  ])
+) as PayloadParsers
+
 // --- Durable Object call shapes -------------------------------------------
 
 /** The authenticated parts of a signed request, forwarded to the inbox DO. */
@@ -744,6 +790,21 @@ export interface SignedCall {
 }
 
 export type Signed<T> = T & SignedCall
+
+/**
+ * An owner request authorized by an account session instead of the owner
+ * key (a bearer request): the Worker verified the access token, and the
+ * inbox DO compares `accountId` with the account the inbox is linked to.
+ * No `ts` or `nonce`: the token, not a signature, authenticates it.
+ */
+export type AccountCall<T> = Unsigned<T> & { accountId: string }
+
+/** An owner request as the inbox DO takes it: signed (legacy) or by account. */
+export type OwnerCall<T> = Signed<T> | AccountCall<T>
+
+export const isAccountCall = <T>(
+  call: Signed<T> | AccountCall<T>
+): call is AccountCall<T> => !('signature' in call)
 
 export type SyncSlot = {
   slotId: string
