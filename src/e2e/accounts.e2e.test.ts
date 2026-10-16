@@ -7,11 +7,22 @@ import {
   randomId,
   sha256B64u,
 } from '../test/buddiesClient'
-import { ADMIN_TOKEN, http, httpBytes, writeTranscript } from '../test/e2e'
+import {
+  ADMIN_TOKEN,
+  DEV_BYPASS_TOKEN,
+  LOCAL_LAUNCHER,
+  http,
+  httpBytes,
+  localKv,
+  writeTranscript,
+} from '../test/e2e'
 
 /**
- * Anonymous accounts: register, read the account back with account/info, move
- * the key through a handoff channel, and back up to R2.
+ * Anonymous accounts: open an attested session (the dev bypass), read the
+ * account with GET /account, refresh, and close it; register and read the
+ * account back with the legacy account/info, move the key through a handoff
+ * channel, and back up to R2, both ways; and the legacy switch refusing the
+ * envelope forms with 426.
  */
 
 afterAll(() => {
@@ -49,6 +60,31 @@ const send = async (
   http('POST', `/accounts/v1/${op}`, {
     body: await signedEnvelope(op, key, fields, signer),
   })
+
+interface Session {
+  key: SigningKey
+  accountId: string
+  sessionId: string
+  accessToken: string
+  refreshToken: string
+  accessExpiresAt: number
+  sessionExpiresAt: number
+}
+
+const openSession = async (key?: SigningKey): Promise<Session> => {
+  const signingKey = key ?? (await SigningKey.generate())
+  const res = await http('POST', '/accounts/v1/sessions', {
+    headers: { 'x-ww-dev-bypass': DEV_BYPASS_TOKEN ?? '' },
+    body: await signedEnvelope('session/open', signingKey),
+  })
+  expect(res.status).toBe(201)
+  expect(res.headers.get('location')).toBe('/accounts/v1/sessions/current')
+  return { key: signingKey, ...(res.body as Omit<Session, 'key'>) }
+}
+
+const bearer = (session: Session) => ({
+  authorization: `Bearer ${session.accessToken}`,
+})
 
 const registered = async () => {
   const key = await SigningKey.generate()
@@ -226,9 +262,241 @@ describe('POST /accounts/v1/backup/*', () => {
   })
 })
 
-describe('GET /h', () => {
-  it('serves the scan-from-the-app page', async () => {
-    const res = await http('GET', '/h')
+describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
+  it('opens a session, reads the account with it, refreshes, and closes', async () => {
+    const session = await openSession()
+    expect(session).toMatchObject({
+      accountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
+      refreshToken: expect.stringMatching(
+        /^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/
+      ),
+    })
+    expect(session.sessionExpiresAt - session.accessExpiresAt).toBeGreaterThan(89 * 24 * 3_600_000)
+
+    const info = await http('GET', '/accounts/v1/account', { headers: bearer(session) })
+    expect(info.status).toBe(200)
+    expect(info.body).toMatchObject({
+      ok: true,
+      accountId: session.accountId,
+      accountPub: session.key.publicKey,
+      status: 'active',
+    })
+    // The legacy path answers bearer requests the same way.
+    const legacyInfo = await http('POST', '/accounts/v1/account/info', {
+      headers: bearer(session),
+    })
+    expect(legacyInfo.body).toEqual(info.body)
+
+    const refreshed = await http('POST', '/accounts/v1/sessions/refresh', {
+      body: { refreshToken: session.refreshToken },
+    })
+    expect(refreshed.status).toBe(200)
+    expect(refreshed.body).toMatchObject({
+      ok: true,
+      sessionExpiresAt: session.sessionExpiresAt,
+    })
+    expect(refreshed.body.refreshToken).not.toBe(session.refreshToken)
+    const next = { ...session, ...(refreshed.body as Partial<Session>) }
+    expect(
+      (await http('GET', '/accounts/v1/account', { headers: bearer(next) })).body.accountId
+    ).toBe(session.accountId)
+
+    const closed = await http('DELETE', '/accounts/v1/sessions/current', { headers: bearer(next) })
+    expect(closed.status).toBe(200)
+    expect(closed.body).toEqual({ ok: true })
+    // Idempotent while the access token lives.
+    expect(
+      (await http('DELETE', '/accounts/v1/sessions/current', { headers: bearer(next) })).status
+    ).toBe(200)
+    const after = await http('POST', '/accounts/v1/sessions/refresh', {
+      body: { refreshToken: next.refreshToken },
+    })
+    expect(after.status).toBe(401)
+    expect(after.body.code).toBe('unauthorized')
+    expect(after.headers.get('www-authenticate')).toBe('Bearer error="invalid_token"')
+  })
+
+  it('ends the session when an older refresh token comes back', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const first = await refresh(session.refreshToken)
+    expect(first.status).toBe(200)
+    const second = await refresh(first.body.refreshToken as string)
+    expect(second.status).toBe(200)
+
+    // Two tokens old: refused, and the session ends with it.
+    const reused = await refresh(session.refreshToken)
+    expect(reused.status).toBe(401)
+    expect(reused.body.code).toBe('unauthorized')
+    expect((await refresh(second.body.refreshToken as string)).status).toBe(401)
+
+    // Malformed tokens are refused alike.
+    for (const token of ['', 'not-a-token', b64u(randomBytes(32))])
+      expect((await refresh(token)).status).toBe(401)
+  })
+
+  it('never ends a session for a refresh token it didn’t issue', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const [sessionId, secret, mac] = session.refreshToken.split('.')
+    // The session id is no secret (every access token's `sid`); without the
+    // worker's MAC, a token naming it is refused and the session lives.
+    for (const token of [
+      `${sessionId}.${b64u(randomBytes(32))}.${b64u(randomBytes(32))}`,
+      `${sessionId}.${b64u(randomBytes(32))}.${mac}`,
+      // Two-part tokens from before the MAC.
+      `${sessionId}.${secret}`,
+      `${sessionId}.${b64u(randomBytes(32))}`,
+    ]) {
+      const refused = await refresh(token)
+      expect(refused.status).toBe(401)
+      expect(refused.body.code).toBe('unauthorized')
+    }
+    const next = await refresh(session.refreshToken)
+    expect(next.status).toBe(200)
+    expect((await refresh(next.body.refreshToken as string)).status).toBe(200)
+  })
+
+  it('gives a double refresh and a lost-response retry the same token', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const [one, two] = await Promise.all([
+      refresh(session.refreshToken),
+      refresh(session.refreshToken),
+    ])
+    expect(one.status).toBe(200)
+    expect(two.status).toBe(200)
+    expect(two.body.refreshToken).toBe(one.body.refreshToken)
+    // A retry within the minute, as after a lost response, gets it again.
+    const retried = await refresh(session.refreshToken)
+    expect(retried.body.refreshToken).toBe(one.body.refreshToken)
+
+    // Whichever answer the device kept, the session goes on.
+    const next = await refresh(one.body.refreshToken as string)
+    expect(next.status).toBe(200)
+    const info = await http('GET', '/accounts/v1/account', {
+      headers: { authorization: `Bearer ${next.body.accessToken}` },
+    })
+    expect(info.body.accountId).toBe(session.accountId)
+  })
+
+  it('refuses a bad bearer token without trying the envelope', async () => {
+    const key = await registered()
+    const res = await http('POST', '/accounts/v1/account/info', {
+      headers: { authorization: 'Bearer not.a.token' },
+      body: await signedEnvelope('account/info', key),
+    })
+    expect(res.status).toBe(401)
+    expect(res.body.code).toBe('unauthorized')
+  })
+
+  it('backs up and hands off with a bearer token', async () => {
+    const session = await openSession()
+    const slotId = randomId()
+    const bytes = randomBytes(8 * 1_024)
+    const stored = await httpBytes('/accounts/v1/backup/put', {
+      bytes,
+      headers: {
+        ...bearer(session),
+        'x-ww-slot-id': slotId,
+        'x-ww-sha256': await sha256B64u(bytes),
+      },
+    })
+    expect(stored.status).toBe(200)
+    const got = await httpBytes('/accounts/v1/backup/get', {
+      json: { slotId },
+      headers: bearer(session),
+    })
+    expect(got.bytes).toEqual(bytes)
+    // A token alone can't delete; the account key signs it too.
+    expect(
+      (await http('POST', '/accounts/v1/backup/delete', { headers: bearer(session), body: { slotId } }))
+        .status
+    ).toBe(400)
+    const deleted = await http('POST', '/accounts/v1/backup/delete', {
+      headers: bearer(session),
+      body: await signedEnvelope('backup/delete', session.key, { slotId }),
+    })
+    expect(deleted.status).toBe(200)
+    const listed = await http('POST', '/accounts/v1/backup/list', { headers: bearer(session) })
+    expect(listed.body).toEqual({ ok: true, slots: [] })
+
+    const token = randomBytes(16)
+    const channelId = randomId()
+    const opened = await http('POST', '/accounts/v1/handoff/open', {
+      headers: bearer(session),
+      body: { channelId, verifier: await sha256B64u(token) },
+    })
+    expect(opened.status).toBe(200)
+    const status = await http('POST', '/accounts/v1/handoff/status', {
+      headers: bearer(session),
+      body: { channelId },
+    })
+    expect(status.body).toMatchObject({ ok: true, status: 'open' })
+    const cancelled = await http('POST', '/accounts/v1/handoff/cancel', {
+      headers: bearer(session),
+      body: { channelId },
+    })
+    expect(cancelled.status).toBe(200)
+  })
+})
+
+describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch (local KV)', () => {
+  it('refuses envelope-authenticated requests with 426 while bearer ones work', async () => {
+    const key = await registered()
+    const session = await openSession(key)
+    try {
+      localKv('put', 'auth:legacy', 'off')
+      const info = await send('account/info', key)
+      expect(info.status).toBe(426)
+      expect(info.body).toEqual({ ok: false, error: 'upgrade_required', code: 'upgrade_required' })
+      expect(info.headers.get('retry-after')).toBeNull()
+      expect((await send('account/register', await SigningKey.generate())).status).toBe(426)
+      expect((await send('backup/list', key)).status).toBe(426)
+
+      const viaToken = await http('GET', '/accounts/v1/account', { headers: bearer(session) })
+      expect(viaToken.status).toBe(200)
+      expect(viaToken.body.accountId).toBe(session.accountId)
+      const legacyPath = await http('POST', '/accounts/v1/account/info', {
+        headers: bearer(session),
+      })
+      expect(legacyPath.status).toBe(200)
+      // Sessions still open (they replace account/register).
+      await openSession()
+    } finally {
+      localKv('delete', 'auth:legacy')
+    }
+    expect((await send('account/info', key)).status).toBe(200)
+  })
+})
+
+describe('GET /app/v1/config', () => {
+  it('answers without authentication', async () => {
+    const res = await http('GET', '/app/v1/config')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.body.ok).toBe(true)
+  })
+
+  it.skipIf(!LOCAL_LAUNCHER)('serves KV app:min-version', async () => {
+    try {
+      localKv('put', 'app:min-version', '{"minVersion":"9.8.7"}')
+      expect((await http('GET', '/app/v1/config')).body).toEqual({ ok: true, minAppVersion: '9.8.7' })
+    } finally {
+      localKv('delete', 'app:min-version')
+    }
+    expect((await http('GET', '/app/v1/config')).body).toEqual({ ok: true })
+  })
+})
+
+describe('GET /accounts/handoff', () => {
+  it.each(['/accounts/handoff', '/h'])('%s serves the scan-from-the-app page', async (path) => {
+    const res = await http('GET', path)
     expect(res.status).toBe(200)
     expect(res.text).toContain('Scan this code in WitnessWork')
   })

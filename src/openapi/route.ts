@@ -1,7 +1,7 @@
 import type { Hono } from 'hono'
 import { Scalar } from '@scalar/hono-api-reference'
 import { describeRoute, generateSpecs } from 'hono-openapi'
-import type { Environment } from '../types'
+import type { AppEnv } from '../types'
 import { componentSchemaObjects } from './schemas'
 
 export const OPENAPI_PATH = '/openapi.json'
@@ -13,12 +13,18 @@ const REPO_URL = 'https://github.com/leviFrosty/ww-api'
 export const OPENAPI_TAGS = [
   {
     name: 'Service',
-    description: 'Liveness, the server clock, and these docs.',
+    description:
+      'Liveness, the server clock, the app’s minimum version, and these docs.',
   },
   {
     name: 'Places',
     description:
       'HERE Geocoding & Search proxy. The worker injects its own `apiKey` and forwards every other query parameter unchanged.',
+  },
+  {
+    name: 'Attestation',
+    description:
+      'Device attestation for the whole API: App Attest on iOS, Play Integrity on Android. Get a challenge, register an App Attest key, and prove the path with `verify`; each protected route then checks an assertion signed for its own `purpose`. These routes lived under `/notes-import/` until 2026-10; the old paths still work, marked deprecated.',
   },
   {
     name: 'Notes Import',
@@ -37,7 +43,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Accounts',
     description:
-      'Anonymous accounts: a random id and a public key, nothing else. Signed like Buddies ops under the `ww-account/v1` context.',
+      'Anonymous accounts: a random id and a public key, nothing else. An attested session (`POST /accounts/v1/sessions`) gives bearer tokens; before sessions, ops were signed like Buddies ops under the `ww-account/v1` context, which still works while the legacy switch is on.',
   },
   {
     name: 'Route planning',
@@ -51,7 +57,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Links',
     description:
-      'Universal-link support: the AASA file and the no-app fallback pages for shared contacts and buddy invites.',
+      'Universal-link support: the AASA file and the no-app fallback pages for shared contacts (`/contacts`), buddy invites (`/buddies/invite`), and Set Up Another Device (`/accounts/handoff`). The short paths (`/c`, `/b`, `/h`) in links already shared are served for good.',
   },
   {
     name: 'Admin',
@@ -66,11 +72,11 @@ const DOCUMENTATION = {
     version: '1',
     description: `The backend for the [WitnessWork](https://github.com/leviFrosty/witness-work) app: a Cloudflare Worker built with Hono. Source: [ww-api](${REPO_URL}).
 
-**Errors.** Every JSON error uses one envelope: \`{ "ok": false, "error", "code", "retryAfter"? }\`. Read \`code\`; \`error\` repeats it, except on Notes Import and route planning, where it is a human-readable message. Every 429 and 503 sends \`Retry-After\`.
+**Errors.** Every JSON error uses one envelope: \`{ "ok": false, "error", "code", "retryAfter"? }\`. Read \`code\`; \`error\` repeats it, except on attestation, Notes Import, and route planning, where it is a human-readable message. Every 429 and 503 sends \`Retry-After\`.
 
 **Signed requests.** Buddies and accounts ops send \`{ "payload", "signature" }\`: \`payload\` is the request’s fields as base64url-encoded UTF-8 JSON, and \`signature\` is an Ed25519 signature over the op’s context line followed by those exact bytes. Each op lists its decoded \`payload\` fields. Older app builds send the same values as \`p\` and \`s\` (headers \`x-buddies-p\`/\`x-buddies-s\`, \`x-ww-p\`/\`x-ww-s\`), which are still accepted.
 
-**Rate limits.** Places, Notes Import, route planning, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
+**Rate limits.** Places, Notes Import, attestation, route planning, app config, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
     license: { name: 'See repository', url: REPO_URL },
   },
   servers: [
@@ -89,11 +95,18 @@ const DOCUMENTATION = {
         name: 'x-ww-admin-token',
         description: 'The environment’s `ADMIN_API_TOKEN` secret.',
       },
+      bearerAuth: {
+        type: 'http' as const,
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+        description:
+          'An access token from `POST /accounts/v1/sessions` or `POST /accounts/v1/sessions/refresh` (a JWT, 15 minutes). A missing, expired, or invalid one is 401 `unauthorized` with `WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry.',
+      },
     },
   },
 }
 
-type App = Hono<{ Bindings: Environment }>
+type App = Hono<AppEnv>
 
 /** The OpenAPI document for `app`. */
 /**

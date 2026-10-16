@@ -4,6 +4,7 @@ import { acceptedBundleIds } from '../appAttest/appId'
 import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import {
   BUDDIES_LIMITS as LIMITS,
+  BUDDIES_LIVE_ACCOUNT_HEADER,
   BUDDIES_LIVE_CLOSE,
   BUDDIES_LIVE_OP,
   INVITE_CLAIMED_KIND,
@@ -11,9 +12,11 @@ import {
   buddyBlobKey,
   decodeB64u,
   fail,
+  isAccountCall,
   isImmediatePushKind,
   isPlainObject,
   ok,
+  type AccountCall,
   type BuddiesErrorCode,
   type BuddiesFailure,
   type BuddiesResult,
@@ -27,6 +30,7 @@ import {
   type InboxFields,
   type InviteCreatePayload,
   type InviteDeletePayload,
+  type OwnerCall,
   type PushAddress,
   type PushJob,
   type PushTarget,
@@ -44,6 +48,7 @@ import {
 } from './contracts'
 import {
   isWebSocketUpgrade,
+  readHeaderFields,
   readLiveCall,
   verifyBuddiesSignature,
 } from './envelope'
@@ -103,7 +108,9 @@ const pushAddressOf = (row: DeviceRow): PushAddress | null => {
 }
 
 type KeyRef = 'owner' | 'writer'
-type KeyedCall = InboxFields & { slotId?: string }
+type KeyedCall = { inboxId: string; slotId?: string }
+/** A writer op, or an owner op either way (`OwnerCall`). */
+type AuthCall = Signed<KeyedCall & SignedFields> | AccountCall<KeyedCall>
 
 /** Who signed, for `SignerBudget`: the owner, or a writer by its slot id. */
 const signerOf = (call: KeyedCall, ref: KeyRef): string =>
@@ -312,12 +319,23 @@ const TOMBSTONE_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_tombstone (
  * The account that owns this inbox, and whether it's suspended (witness-work
  * ADR 0024). Not in `SCHEMA`: an inbox registered without an account doesn't
  * have it. A wipe deletes it; the accounts database keeps the link, and the
- * Worker passes it back on the next registration.
+ * Worker passes it back on the next registration. Bearer owner requests
+ * (witness-work ADR 0027) are authorized against `account_id` once
+ * `confirmed`: another account is `forbidden`, and an inbox without a
+ * confirmed link is `not_linked`.
+ *
+ * `confirmed` means the accounts database holds the same link. The Worker
+ * only writes the row with the account that database names (an existing
+ * link, a new one once written, or a status change), so moderation, which
+ * finds an account's inboxes there, reaches every inbox its tokens can act
+ * for. Rows from before the column count as unconfirmed until the app links
+ * the inbox again.
  */
 const OWNER_ACCOUNT_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_account (
    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
    account_id TEXT NOT NULL,
-   suspended  INTEGER NOT NULL DEFAULT 0
+   suspended  INTEGER NOT NULL DEFAULT 0,
+   confirmed  INTEGER NOT NULL DEFAULT 0
  )`
 
 /**
@@ -366,10 +384,16 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   // --- Owner ops ----------------------------------------------------------
+  //
+  // Each takes an `OwnerCall`: signed by the owner key (a legacy request),
+  // or an `AccountCall` the Worker authenticated with a bearer token, which
+  // `#authenticate` checks against the inbox's account and which has no
+  // `ts` or `nonce` to check or record.
 
   /**
-   * `accountId` is the account that owns the inbox, once the Worker has checked
-   * the link (null for registrations without one). It never clears a
+   * `accountId` is the account the accounts database already links the inbox
+   * to (null when it links none), taken as confirmed. A new link is confirmed
+   * with `confirmAccount` once that database has it. It never clears a
    * suspension: only `setAccountStatus` does.
    */
   async register(
@@ -410,10 +434,11 @@ export class BuddyInbox extends DurableObject<Environment> {
           )
         }
         if (accountId) {
-          this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+          this.#ensureOwnerAccount()
           this.#sql.exec(
-            `INSERT INTO owner_account (singleton, account_id) VALUES (1, ?)
-             ON CONFLICT (singleton) DO UPDATE SET account_id = excluded.account_id`,
+            `INSERT INTO owner_account (singleton, account_id, confirmed) VALUES (1, ?, 1)
+             ON CONFLICT (singleton) DO UPDATE
+             SET account_id = excluded.account_id, confirmed = 1`,
             accountId
           )
         }
@@ -424,15 +449,28 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
-  async sync(call: Signed<SyncPayload>): Promise<BuddiesResult<SyncResponse>> {
-    const auth = await this.#authenticate('inbox/sync', call, 'owner')
+  /**
+   * `linkedOnly`: a legacy (owner-signed) sync the Worker admitted after the
+   * legacy switch went off, from the iOS Notification Service Extension.
+   * Checked as ever, and served only while this inbox has a confirmed account
+   * link (its owner moved to sessions), else `upgrade_required`.
+   */
+  async sync(
+    call: OwnerCall<SyncPayload>,
+    { linkedOnly = false }: { linkedOnly?: boolean } = {}
+  ): Promise<BuddiesResult<SyncResponse>> {
+    const auth = await this.#authenticate('inbox/sync', call, 'owner', {
+      linkedOnly,
+    })
     if (!auth.ok) return auth
     return this.#commit(call, 'owner', auth.value, (now) =>
       ok(this.#snapshot(call.since, now))
     )
   }
 
-  async deleteInbox(call: Signed<InboxFields>): Promise<BuddiesResult<Empty>> {
+  async deleteInbox(
+    call: OwnerCall<InboxFields>
+  ): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('inbox/delete', call, 'owner')
     if (!auth.ok) return auth
     // Hash before the commit, so no other await sits between it and the wipe.
@@ -444,7 +482,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async registerDevice(
-    call: Signed<DeviceRegisterPayload>
+    call: OwnerCall<DeviceRegisterPayload>
   ): Promise<BuddiesResult<Empty>> {
     const { push } = call
     // Only topics this worker can sign for; absent means `IOS_BUNDLE_ID`.
@@ -504,7 +542,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async unregisterDevice(
-    call: Signed<DeviceUnregisterPayload>
+    call: OwnerCall<DeviceUnregisterPayload>
   ): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('device/unregister', call, 'owner')
     if (!auth.ok) return auth
@@ -517,7 +555,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     })
   }
 
-  async addSlot(call: Signed<SlotAddPayload>): Promise<BuddiesResult<Empty>> {
+  async addSlot(call: OwnerCall<SlotAddPayload>): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('slot/add', call, 'owner')
     if (!auth.ok) return auth
     let added = false
@@ -544,7 +582,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
-  async removeSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
+  async removeSlot(call: OwnerCall<SlotPayload>): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('slot/remove', call, 'owner')
     if (!auth.ok) return auth
     let removed = false
@@ -557,7 +595,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async putRoster(
-    call: Signed<RosterPutPayload>
+    call: OwnerCall<RosterPutPayload>
   ): Promise<BuddiesResult<{ seq: number }>> {
     const auth = await this.#authenticate('roster/put', call, 'owner')
     if (!auth.ok) return auth
@@ -576,7 +614,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async createInvite(
-    call: Signed<InviteCreatePayload>
+    call: OwnerCall<InviteCreatePayload>
   ): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('invite/create', call, 'owner')
     if (!auth.ok) return auth
@@ -666,7 +704,7 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   async deleteInvite(
-    call: Signed<InviteDeletePayload>
+    call: OwnerCall<InviteDeletePayload>
   ): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('invite/delete', call, 'owner')
     if (!auth.ok) return auth
@@ -795,7 +833,7 @@ export class BuddyInbox extends DurableObject<Environment> {
    * uploads.
    */
   async putBlob(
-    call: Signed<BlobPutPayload>,
+    call: OwnerCall<BlobPutPayload>,
     body: Uint8Array
   ): Promise<BuddiesResult<{ expiresAt: number }>> {
     const bucket = this.env.BUDDY_BLOBS
@@ -914,7 +952,7 @@ export class BuddyInbox extends DurableObject<Environment> {
    * in case one outlived its row. R2 failures are retried from the alarm.
    */
   async deleteBlobs(
-    call: Signed<BlobDeletePayload>
+    call: OwnerCall<BlobDeletePayload>
   ): Promise<BuddiesResult<Empty>> {
     const auth = await this.#authenticate('blob/delete', call, 'owner')
     if (!auth.ok) return auth
@@ -939,13 +977,15 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * `GET inbox/live`, forwarded by the Worker. Verifies the owner's signed
-   * headers (stale and replay checks included), accepts the socket with the
-   * Hibernation API, and greets it with the current `seq`. Opening a socket is
+   * headers (stale and replay checks included), or, for a bearer upgrade,
+   * the account the Worker verified (`BUDDIES_LIVE_ACCOUNT_HEADER`, which it
+   * sets only from a valid token), then accepts the socket with the
+   * Hibernation API and greets it with the current `seq`. Opening a socket is
    * not owner activity for the 180-day retention.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return liveError(fail('upgrade_required'))
-    const call = readLiveCall(request.headers, Date.now())
+    const call = this.#liveCall(request.headers, Date.now())
     if (!call.ok) return liveError(call)
     const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
     if (!auth.ok) return liveError(auth)
@@ -972,6 +1012,17 @@ export class BuddyInbox extends DurableObject<Environment> {
       closeQuietly(ws, code, reason)
     this.#signal(server, { type: 'hello', seq: admitted.value })
     return new Response(null, { status: 101, webSocket: client })
+  }
+
+  /** The upgrade's owner call: by account (bearer) or signed (legacy). */
+  #liveCall(
+    headers: Headers,
+    now: number
+  ): BuddiesResult<OwnerCall<InboxFields>> {
+    const accountId = headers.get(BUDDIES_LIVE_ACCOUNT_HEADER)
+    if (accountId == null) return readLiveCall(headers, now)
+    const fields = readHeaderFields(BUDDIES_LIVE_OP, headers, now)
+    return fields.ok ? ok({ ...fields.value, accountId }) : fields
   }
 
   /** Sockets only listen; anything but the auto-answered `ping` is ignored. */
@@ -1078,19 +1129,48 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
+   * The accounts database linked this inbox to `accountId`, after this inbox
+   * accepted the owner-signed registration: from now on that account's
+   * bearer requests act as the owner. It's the database's winner, so when
+   * two accounts claimed the inbox at once, the inbox names the same one.
+   * `suspended` is the account's status as read after the link was written,
+   * so a suspension that listed the account's inboxes just before still
+   * applies. Never clears a suspension. Idempotent; a no-op for an inbox
+   * that isn't registered.
+   */
+  async confirmAccount(accountId: string, suspended: boolean): Promise<void> {
+    if (!this.#ready() || !this.#meta()) return
+    this.ctx.storage.transactionSync(() => {
+      this.#ensureOwnerAccount()
+      this.#sql.exec(
+        `INSERT INTO owner_account (singleton, account_id, suspended, confirmed) VALUES (1, ?, ?, 1)
+         ON CONFLICT (singleton) DO UPDATE
+         SET account_id = excluded.account_id, confirmed = 1,
+             suspended = MAX(suspended, excluded.suspended)`,
+        accountId,
+        suspended ? 1 : 0
+      )
+    })
+    if (suspended) this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.suspended)
+  }
+
+  /**
    * The accounts admin suspended or reinstated this inbox's account. Owner ops
    * other than leaving answer `suspended` until it's reinstated, and live
-   * sockets close. An inbox that isn't registered keeps nothing: the Worker
-   * checks the accounts database before it registers again.
+   * sockets close. The admin found this inbox among the account's in the
+   * accounts database, so the link is confirmed too. An inbox that isn't
+   * registered keeps nothing: the Worker checks the accounts database before
+   * it registers again.
    */
   async setAccountStatus(accountId: string, suspended: boolean): Promise<void> {
     if (!this.#ready() || !this.#meta()) return
     this.ctx.storage.transactionSync(() => {
-      this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+      this.#ensureOwnerAccount()
       this.#sql.exec(
-        `INSERT INTO owner_account (singleton, account_id, suspended) VALUES (1, ?, ?)
+        `INSERT INTO owner_account (singleton, account_id, suspended, confirmed) VALUES (1, ?, ?, 1)
          ON CONFLICT (singleton) DO UPDATE
-         SET account_id = excluded.account_id, suspended = excluded.suspended`,
+         SET account_id = excluded.account_id, suspended = excluded.suspended,
+             confirmed = 1`,
         accountId,
         suspended ? 1 : 0
       )
@@ -1141,24 +1221,39 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
-   * Verifies the signature, then checks the signer's budget of requests that
-   * take effect (`#commit` spends it). Both are about the authenticated
-   * signer, so nobody else can use up an inbox's budget.
+   * Verifies the signature (or, for an account call, that the inbox is
+   * linked to that account), then checks the signer's budget of requests
+   * that take effect (`#commit` spends it). Both are about the authenticated
+   * signer, so nobody else can use up an inbox's budget. An owner's budget is
+   * shared by both ways of authenticating.
+   *
+   * `linkedOnly` (a signed call admitted after the legacy switch went off):
+   * once the signature holds, an inbox without a confirmed account link is
+   * `upgrade_required`. Nothing un-confirms a link (a wipe drops the inbox
+   * too), so the check holds through `#commit`.
    */
   async #authenticate(
     op: BuddiesSigningOp,
-    call: Signed<KeyedCall>,
-    ref: KeyRef
+    call: AuthCall,
+    ref: KeyRef,
+    { linkedOnly = false }: { linkedOnly?: boolean } = {}
   ): Promise<BuddiesResult<string>> {
     const key = this.#key(call, ref)
     if (!key.ok) return key
-    const valid = await verifyBuddiesSignature(
-      key.value,
-      op,
-      call.payloadBytes,
-      call.signature
-    )
-    if (!valid) return fail('bad_signature')
+    if (isAccountCall(call)) {
+      const refused = this.#refuseAccount(call.accountId)
+      if (refused) return refused
+    } else {
+      const valid = await verifyBuddiesSignature(
+        key.value,
+        op,
+        call.payloadBytes,
+        call.signature
+      )
+      if (!valid) return fail('bad_signature')
+      if (linkedOnly && this.#confirmedAccountId() == null)
+        return fail('upgrade_required')
+    }
     if (ref === 'owner' && !SUSPENDED_ALLOWED_OPS.has(op) && this.#suspended())
       return fail('suspended')
     const [budget, limit] =
@@ -1179,18 +1274,20 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * After the signature check: the verifying key must be unchanged, `ts`
-   * fresh, and the nonce unseen, then `work` runs in the same transaction.
-   * Owner ops also count as owner activity for the 180-day retention unless
-   * `activity` is false (the live socket).
+   * fresh, and the nonce unseen (an account call: the inbox still linked to
+   * its account), then `work` runs in the same transaction. Owner ops also
+   * count as owner activity for the 180-day retention unless `activity` is
+   * false (the live socket).
    *
    * Only a request that took effect keeps its nonce (and spends its signer's
    * budget), so refused ones (caps, rate limits, conflicts) add no rows.
    * Replay protection is unchanged: the check and the record share this
    * synchronous transaction, so each signed request still takes effect at
-   * most once, and only within ±5 minutes.
+   * most once, and only within ±5 minutes. Account calls carry no nonce and
+   * record none.
    */
   #commit<T>(
-    call: KeyedCall & SignedFields,
+    call: AuthCall,
     ref: KeyRef,
     verifiedKey: string,
     work: (now: number) => BuddiesResult<T>,
@@ -1201,16 +1298,30 @@ export class BuddyInbox extends DurableObject<Environment> {
       const key = this.#key(call, ref)
       if (!key.ok) return key
       if (key.value !== verifiedKey) return fail('bad_signature')
-      const denied = this.#admit(call, now)
+      const denied = isAccountCall(call)
+        ? this.#refuseAccount(call.accountId)?.error
+        : this.#admit(call, now)
       if (denied) return fail(denied)
       if (activity) this.#touch(now)
       const result = work(now)
       if (result.ok) {
-        this.#recordNonce(call, now)
+        if (!isAccountCall(call)) this.#recordNonce(call, now)
         this.#signers.spend(signerOf(call, ref), now)
       }
       return result
     })
+  }
+
+  /**
+   * Whether an account call may act for this inbox: only the account it's
+   * confirmed to be linked to. An inbox registered before accounts, or whose
+   * link the accounts database hasn't confirmed, has none to compare
+   * (`not_linked`); the app links it with `inbox/register` and retries.
+   */
+  #refuseAccount(accountId: string): BuddiesFailure | null {
+    const linked = this.#confirmedAccountId()
+    if (linked == null) return fail('not_linked')
+    return linked === accountId ? null : fail('forbidden')
   }
 
   #admit(call: SignedFields, now: number): BuddiesErrorCode | null {
@@ -1281,8 +1392,22 @@ export class BuddyInbox extends DurableObject<Environment> {
         )
       }
       if (this.#hasTable('device')) this.#migrateDevices()
+      if (this.#hasTable('owner_account')) this.#ensureOwnerAccount()
     }
     return exists
+  }
+
+  /**
+   * `owner_account`, with `confirmed` added in place to a table from before
+   * it (as 0: those links were never checked against the accounts database).
+   */
+  #ensureOwnerAccount(): void {
+    this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+    if (!this.#hasColumn('owner_account', 'confirmed')) {
+      this.#sql.exec(
+        'ALTER TABLE owner_account ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0'
+      )
+    }
   }
 
   /**
@@ -1339,6 +1464,20 @@ export class BuddyInbox extends DurableObject<Environment> {
     return meta && now - meta.lastActiveAt >= LIMITS.inboxInactivityMs
       ? meta.ownerPub
       : null
+  }
+
+  /** The account this inbox is confirmed to be linked to, or null. */
+  #confirmedAccountId(): string | null {
+    if (!this.#hasTable('owner_account')) return null
+    return (
+      this.#sql
+        .exec<{
+          accountId: string
+        }>(
+          'SELECT account_id AS accountId FROM owner_account WHERE singleton = 1 AND confirmed = 1'
+        )
+        .toArray()[0]?.accountId ?? null
+    )
   }
 
   /** Whether this inbox's account is suspended. */

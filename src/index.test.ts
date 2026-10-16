@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Environment } from './types'
 import { RATE_LIMIT_PERIOD_SECONDS, rateLimitKey } from './rateLimit'
+import { makeMemoryD1 } from './test/memoryD1'
+import { makeMemoryKv } from './test/memoryKv'
 
 vi.mock('cloudflare:workers', () => ({ DurableObject: class {} }))
 
@@ -132,5 +134,36 @@ describe('per-IP rate limits', () => {
     expect(rateLimitKey('route-planning', '2001:db8::1')).toBe(
       'route-planning:2001:db8::1'
     )
+  })
+})
+
+describe('the hourly cron', () => {
+  it('deletes account sessions that ended over a week ago', async () => {
+    here.fetch = vi.fn(async () => new Response(null, { status: 404 }))
+    const db = makeMemoryD1()
+    db.db.exec(`INSERT INTO accounts (id, account_pub, status, created_at)
+                VALUES ('account', 'pub', 'active', 0)`)
+    const insert = db.db.prepare(
+      `INSERT INTO account_sessions
+         (id, account_id, platform, refresh_hash, created_at, expires_at, revoked_at)
+       VALUES (?, 'account', 'ios', ?, 0, ?, ?)`
+    )
+    const week = 7 * 24 * 60 * 60 * 1000
+    insert.run('live', 'h1', NOW + week, null)
+    insert.run('revoked', 'h2', NOW + week, NOW - week)
+    insert.run('expired', 'h3', NOW - week, null)
+    insert.run('recently-ended', 'h4', NOW + week, NOW - 1)
+    const pending: Promise<unknown>[] = []
+    await worker.scheduled!(
+      { scheduledTime: NOW, cron: '17 * * * *', noRetry: () => {} } as ScheduledController,
+      { ...makeEnv(), NOTES_KV: makeMemoryKv(), ACCOUNTS_DB: db } as never,
+      { waitUntil: (promise: Promise<unknown>) => pending.push(promise) } as never
+    )
+    await Promise.all(pending)
+    const ids = db.db
+      .prepare('SELECT id FROM account_sessions ORDER BY id')
+      .all()
+      .map((row) => row.id)
+    expect(ids).toEqual(['live', 'recently-ended'])
   })
 })

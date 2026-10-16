@@ -1,14 +1,27 @@
 import { z } from 'zod'
 import { describeRoute } from 'hono-openapi'
 import {
-  apiErrorSchema,
   errorResponse,
-  json,
   jsonBody,
   jsonResponse,
   rateLimitedResponse,
 } from '../openapi/schemas'
+import {
+  accountId,
+  appAttestV2AssertionFields,
+  ATTESTATION_NOTE,
+  attestationErrorSchema,
+  attestationProvidersShape,
+  attestationResponses,
+  devBypassHeader,
+  installId,
+  playIntegrityFields,
+  sha256Hex,
+  storageUnavailable,
+  V1_CODES,
+} from '../attestation/openapi'
 import { notesImportResultValidator } from './schema'
+import { SYNC_IMPORT_DEADLINE_MS } from './cap'
 
 /**
  * OpenAPI descriptions for the Notes Import routes (`src/notesImport/route.ts`).
@@ -18,82 +31,8 @@ import { notesImportResultValidator } from './schema'
 
 const TAG = 'Notes Import'
 
-// --- Shared fields -------------------------------------------------------
-
-const sha256Hex = (description: string) =>
-  z
-    .string()
-    .regex(/^[a-f0-9]{64}$/)
-    .meta({ description: `${description} (lowercase hex SHA-256)` })
-
-const installId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,64}$/)
-  .meta({
-    description:
-      'The install id (`uuid`). App Attest keys are pinned to it; usage is metered on it when no `accountId` is sent.',
-  })
-
-const accountId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,64}$/)
-  .optional()
-  .meta({
-    description:
-      'Optional shared account id. When present, Supporter status, allowances, the concurrency cap, and replay all key on it instead of `uuid`. A malformed value is a 400, never ignored.',
-  })
-
-const operationId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,128}$/)
-  .meta({
-    description:
-      'Client-chosen id for one challenge → request round trip. Reusing it with different data is `operation_conflict`.',
-  })
-
-const keyId = z
-  .string()
-  .regex(/^[A-Za-z0-9+/]{43}=$/)
-  .meta({
-    description: 'The App Attest key id (standard base64 of 32 bytes).',
-  })
-
-const challenge = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/)
-  .meta({
-    description:
-      'The one-time server challenge from `POST /notes-import/challenge` (43-character base64url). Consumed on use.',
-  })
-
-const purpose = z
-  .enum([
-    'notes-import-kickoff',
-    'notes-import-verify',
-    'notes-import-transcribe',
-  ])
-  .meta({
-    description:
-      'Which protected request the challenge is for. It must match the route that consumes it.',
-  })
-
-const expiresAt = z.number().int().meta({
-  description: 'When the challenge expires (epoch ms; 5 minutes after issue).',
-})
-
-const playIntegrityProvider = z.literal('play-integrity').meta({
-  description:
-    'Opts the request into the Android Play Integrity path. Bodies without it take the App Attest path.',
-})
-
-const devBypassHeader = {
-  name: 'x-ww-dev-bypass',
-  in: 'header' as const,
-  required: false,
-  schema: { type: 'string' as const },
-  description:
-    'Development worker only: the `NOTES_IMPORT_DEV_BYPASS_TOKEN` secret. A match skips attestation and the RevenueCat check and uses the Supporter allowances. Production never sets the token, so the header is ignored there.',
-}
+/** How long the synchronous path waits on the model. */
+const SYNC_DEADLINE_MINUTES = SYNC_IMPORT_DEADLINE_MS / 60_000
 
 // --- Shared bodies and responses ----------------------------------------
 
@@ -130,31 +69,12 @@ const creditsSchema = z
       'Usage snapshot, shared by kickoff, `done`, the legacy response, and allowance denials.',
   })
 
-const notesImportErrorSchema = apiErrorSchema
+const notesImportErrorSchema = attestationErrorSchema
   .extend({
     detail: z.string().optional().meta({
       description:
         'On `unavailable`, why (`disabled`, `no_provider`, or an operator message). On the development worker, a debug detail for `server_error` and `model_error`.',
     }),
-    reason: z.string().optional().meta({
-      description:
-        'Stable App Attest or Play Integrity reason, on attestation failures: `invalid_request`, `unsupported_protocol`, `operation_conflict`, `too_many_challenges`, `challenge_not_found`, `challenge_expired`, `identity_not_bound`, `key_not_active`, `recovery_not_enrolled`, `recovery_token_mismatch`, `attestation_invalid`, `assertion_invalid`, `counter_not_increasing`, `storage_unavailable`; Android adds `integrity_unavailable`, `integrity_token_invalid`, `app_not_recognized`, `device_integrity_failed`.',
-    }),
-    action: z
-      .enum([
-        'none',
-        'retry',
-        'request_challenge',
-        'start_new_operation',
-        'bind',
-        'enroll_recovery',
-        'use_active_key',
-      ])
-      .optional()
-      .meta({
-        description:
-          'What the client should do next, beside `reason`. Transient failures never ask for key rotation.',
-      }),
     credits: creditsSchema.optional().meta({
       description: 'On `limit_reached` and `refinement_limit`.',
     }),
@@ -168,66 +88,36 @@ const notesImportErrorSchema = apiErrorSchema
 const niError = (description: string, codes: readonly string[]) =>
   errorResponse(description, codes, notesImportErrorSchema)
 
-const V1_CODES = [
-  'device_verification_failed',
-  'assertion_failed',
-  'challenge_expired',
-  'counter_conflict',
-] as const
-
-const ATTESTATION_NOTE =
-  'App Attest v1 (legacy) failures are always 401 with `device_verification_failed`, `assertion_failed`, `challenge_expired`, or `counter_conflict`, which never ask the client to rotate its key. App Attest v2 and Play Integrity failures are `attestation_failed` at the reason’s own status; branch on `reason`/`action`.'
-
 const killSwitchUnavailable =
   '`unavailable`: the kill switch is off or no allowlisted model host is healthy (`detail` says which; `Retry-After: 60`). '
 
-const storageUnavailable =
-  '`server_error`: attestation storage or Google’s decode service is unavailable (`Retry-After: 30`).'
+// --- Bearer tokens and the legacy switch -----------------------------------
 
-const attestationResponses = {
-  401: niError(
-    `Attestation failed: an unknown, consumed, or expired challenge, an invalid assertion or token, or an identity whose key isn’t bound or active. ${ATTESTATION_NOTE}`,
-    ['attestation_failed', ...V1_CODES]
-  ),
-  403: niError(
-    'Play Integrity only: the app isn’t the Play-distributed build (`app_not_recognized`) or the device fails the required integrity verdict (`device_integrity_failed`).',
-    ['attestation_failed']
-  ),
-  409: niError(
-    'App Attest v2 / Play Integrity: `operationId` was used with different data (`operation_conflict`), or the assertion’s sign count didn’t increase (`counter_not_increasing`). Start a new operation.',
-    ['attestation_failed']
-  ),
-}
+/** A bearer token, or (while the legacy switch is on) none: the legacy form. */
+const bearerOrLegacy: Record<string, string[]>[] = [{ bearerAuth: [] }, {}]
 
-// --- Attested request fields --------------------------------------------
+const BEARER_FORM =
+  '**Bearer** (`Authorization: Bearer <accessToken>`, from `POST /accounts/v1/sessions`): the session attested once, so the body carries no attestation fields and no hashes, and usage is metered by the token’s account (a fresh allowance: usage under an install id or shared account id doesn’t carry over). A request with an `Authorization` header is always a bearer request: a bad token is 401 `unauthorized`, never a fallback to the legacy form.'
 
-/** App Attest v2 assertion fields shared by verify, kickoff, and transcribe. */
-const appAttestV2AssertionFields = (forPurpose: string) => ({
-  protocolVersion: z.literal(2),
-  operation: z.literal('assert'),
-  operationId,
-  keyId,
-  purpose: z.literal(forPurpose),
-  challenge,
-  assertion: z.string().max(65_536).meta({
+const LEGACY_FORM =
+  '**Legacy** (no `Authorization` header; app versions before sessions): the attested forms, metered by `accountId` or `uuid`. They work while the legacy switch (KV `auth:legacy`) is on and are 426 `upgrade_required` once it’s off.'
+
+const revenueCatAppUserId = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{8,64}$/)
+  .optional()
+  .meta({
     description:
-      'App Attest assertion (base64) over SHA-256 of the client data `witnesswork.app-attest|2|assert|<purpose>|<operationId>|<challenge>|<uuid>|<accountId or empty>|<contentHash>|<requestHash>`.',
-  }),
-})
+      'Bearer only: the app’s RevenueCat app user id, checked with RevenueCat for Supporter status. Absent: not a Supporter. Temporary, until RevenueCat is linked to the account; a malformed value is a 400.',
+  })
 
-/** Play Integrity fields shared by verify, kickoff, and transcribe. */
-const playIntegrityFields = (forPurpose: string) => ({
-  attestationProvider: playIntegrityProvider,
-  protocolVersion: z.literal(1),
-  operation: z.literal('assert'),
-  operationId,
-  purpose: z.literal(forPurpose),
-  challenge,
-  integrityToken: z.string().max(32_768).meta({
-    description:
-      'A Play Integrity standard-request token whose `requestHash` is the lowercase hex SHA-256 of `witnesswork.play-integrity|1|assert|<purpose>|<operationId>|<challenge>|<uuid>|<accountId or empty>|<contentHash>|<requestHash>`. Never send `keyId` or `assertion` with it.',
-  }),
-})
+const upgradeRequired = niError(
+  'A legacy request (no `Authorization` header) after the legacy switch was turned off. No `Retry-After`: only updating the app helps.',
+  ['upgrade_required']
+)
+
+const accountsDisabled =
+  '`disabled`: account sessions are off on this worker (`Retry-After: 60`). '
 
 // --- GET /notes-import/status --------------------------------------------
 
@@ -237,26 +127,8 @@ const allowancePair = z.object({
 })
 
 const capabilitiesSchema = z.object({
-  appAttest: z.object({
-    protocolVersions: z.array(z.number().int()).meta({
-      description: 'App Attest protocol versions accepted: `[1, 2]`.',
-    }),
-  }),
-  playIntegrity: z
-    .object({
-      protocolVersions: z.array(z.number().int()).meta({
-        description: 'Play Integrity protocol versions accepted: `[1]`.',
-      }),
-      cloudProjectNumber: z.string().meta({
-        description:
-          'The Google Cloud project number the app passes to the Play Integrity standard-request provider.',
-      }),
-    })
-    .optional()
-    .meta({
-      description:
-        'Present only when this worker can verify Android requests. Android keeps Notes Import closed while it is absent.',
-    }),
+  // The same as GET /attestation/v1/status `providers`.
+  ...attestationProvidersShape,
   transcribe: z
     .object({
       maxPages: z
@@ -315,328 +187,10 @@ export const statusDocs = describeRoute({
 
 Availability checks the KV kill switch (\`notes-import:enabled\`) first, then whether any allowlisted model host is healthy on OpenRouter (a free metadata call, cached 60 seconds). Fails open: if the probe itself errors, the response says available without \`limits\`.
 
-Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`.`,
+Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`. Public and the same for everyone: it ignores \`Authorization\` and never reports one account’s allowance (kickoff’s \`credits\` does).`,
   responses: {
     200: jsonResponse('The current status.', statusSchema),
     ...rateLimitedResponse,
-  },
-})
-
-// --- POST /notes-import/challenge ------------------------------------------
-
-const challengeRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-    })
-    .meta({
-      title: 'App Attest v1 (legacy)',
-      description:
-        'An empty body, `{}`, or `{ "protocolVersion": 1 }`. Returns a bare challenge for a v1 attestation or assertion.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.enum(['bind', 'enroll']),
-      operationId,
-      uuid: installId,
-      keyId,
-    })
-    .meta({
-      title: 'App Attest v2 bind / enroll',
-      description:
-        'A challenge for `POST /notes-import/attest`: `bind` attests a new key, `enroll` adds a recovery token with the active key. No assertion fields allowed.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('assert'),
-      operationId,
-      uuid: installId,
-      keyId,
-      purpose,
-      accountId,
-      contentHash: sha256Hex(
-        'The content hash the protected request will carry'
-      ),
-      requestHash: sha256Hex(
-        'The request hash the protected request will carry'
-      ),
-    })
-    .meta({
-      title: 'App Attest v2 assert',
-      description:
-        'A challenge bound to one protected request (verify, kickoff, or transcribe). The later request must repeat these values exactly.',
-    }),
-  z
-    .object({
-      attestationProvider: playIntegrityProvider,
-      protocolVersion: z.literal(1),
-      operation: z.literal('assert'),
-      operationId,
-      uuid: installId,
-      accountId,
-      purpose,
-      contentHash: sha256Hex(
-        'The content hash the protected request will carry'
-      ),
-      requestHash: sha256Hex(
-        'The request hash the protected request will carry'
-      ),
-    })
-    .meta({
-      title: 'Play Integrity',
-      description:
-        'Android. Same binding as the App Attest v2 assert challenge, without `keyId`.',
-    }),
-])
-
-const challengeResponseSchema = z.union([
-  z.object({ challenge: z.string() }).meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.enum(['bind', 'enroll', 'assert']),
-      operationId,
-      challenge,
-      expiresAt,
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      attestationProvider: z.literal('play-integrity'),
-      protocolVersion: z.literal(1),
-      operation: z.literal('assert'),
-      operationId,
-      challenge,
-      expiresAt,
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-export const challengeDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Issue an attestation challenge',
-  description: `Step one of every attested call. Returns a one-time challenge (5-minute lifetime) for App Attest v1, App Attest v2 (\`bind\`, \`enroll\`, or \`assert\`), or Play Integrity.
-
-v2 and Play Integrity challenges are bound to their request: the descriptor (operation, \`operationId\`, \`uuid\`, \`keyId\`, purpose, \`accountId\`, and both hashes) is stored, and the consuming request must match it. Re-requesting the same \`operationId\` with the same data returns the outstanding challenge. At most 32 unexpired challenges per install.
-
-**Hashes.** \`contentHash\` is SHA-256 of \`notesText\` (kickoff), of the base64 \`image\` string as sent (transcribe), or any value the client picks (verify). \`requestHash\` is SHA-256 of the sorted-key canonical JSON \`{"context","notesText","refinement"}\` (kickoff; \`refinement\` is \`null\` when absent), of \`{"imageHash","mimeType"}\` (transcribe), or equal to \`contentHash\` (verify).`,
-  requestBody: {
-    required: false,
-    description: 'Optional; an empty body asks for a v1 challenge.',
-    content: json(challengeRequestSchema),
-  },
-  responses: {
-    200: jsonResponse('A challenge.', challengeResponseSchema),
-    400: niError(
-      'Invalid JSON, an invalid challenge request (`reason: invalid_request`), or an unsupported `protocolVersion` (`reason: unsupported_protocol`). v2 requests the lifecycle rejects answer `attestation_failed`.',
-      ['bad_request', 'attestation_failed']
-    ),
-    409: niError(
-      '`operationId` was already used with different data (`operation_conflict`).',
-      ['attestation_failed']
-    ),
-    429: niError(
-      'Too many requests from this IP (`rate_limited`, `Retry-After: 60`), or 32 unexpired challenges for this install (`attestation_failed`, `reason: too_many_challenges`; Play Integrity sends `Retry-After: 300`).',
-      ['rate_limited', 'attestation_failed']
-    ),
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError(
-      'Challenge storage is unavailable, or Play Integrity isn’t configured on this worker (`reason: integrity_unavailable`). `Retry-After: 30`.',
-      ['server_error']
-    ),
-  },
-})
-
-// --- POST /notes-import/attest ---------------------------------------------
-
-const recoveryToken = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/)
-  .meta({
-    description:
-      'A 256-bit secret the app keeps (43-character base64url). Only a verifier is stored; it lets a reinstall or a new key take over the install id later.',
-  })
-
-const attestRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-      keyId: z.string(),
-      attestation: z.string().meta({
-        description: 'App Attest attestation object (base64).',
-      }),
-      challenge: z.string(),
-      uuid: z.string(),
-    })
-    .meta({
-      title: 'App Attest v1 (legacy)',
-      description: 'Binds a key to the install id.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('bind'),
-      operationId,
-      uuid: installId,
-      keyId,
-      challenge,
-      attestation: z.string().meta({
-        description:
-          'App Attest attestation object (base64) whose client data hash is SHA-256 of `witnesswork.app-attest|2|bind|<operationId>|<challenge>|<uuid>|<tokenHash>`, where `tokenHash` is base64url SHA-256 of the decoded recovery token.',
-      }),
-      recoveryToken,
-    })
-    .meta({
-      title: 'App Attest v2 bind',
-      description:
-        'Attests a key for the install id with a recovery token. Rebinding the same install to a new key requires the recovery token enrolled earlier.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('enroll'),
-      operationId,
-      uuid: installId,
-      keyId,
-      challenge,
-      assertion: z.string().max(65_536).meta({
-        description:
-          'Assertion by the active key over SHA-256 of `witnesswork.app-attest|2|enroll|<operationId>|<challenge>|<uuid>|<keyId>|<tokenHash>`.',
-      }),
-      recoveryToken,
-    })
-    .meta({
-      title: 'App Attest v2 enroll',
-      description:
-        'Adds a recovery token to an install already bound by a legacy key.',
-    }),
-])
-
-const attestResponseSchema = z.union([
-  z.object({ ok: z.literal(true) }).meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      ok: z.literal(true),
-      protocolVersion: z.literal(2),
-      operationId,
-      status: z
-        .enum(['bound', 'already_bound', 'rotated', 'recovery_enrolled'])
-        .meta({
-          description:
-            '`bound`: first key; `already_bound`: this key was already active; `rotated`: a new key replaced the old one with the recovery token; `recovery_enrolled`: enroll succeeded.',
-        }),
-      recoveryEnrolled: z.boolean(),
-    })
-    .meta({ title: 'App Attest v2' }),
-])
-
-export const attestDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Register an App Attest key',
-  description: `iOS only. Binds a Secure Enclave key to the install id (v1 or v2 \`bind\`), or enrolls a v2 recovery token with the active key (\`enroll\`), using a challenge from \`POST /notes-import/challenge\`.
-
-The attested App ID must be \`<team id>.<bundle id>\` for an accepted bundle id (the App Store app, plus the TestFlight Beta app on production); the key stays bound to the one it matched. Play Integrity has no registration step: a body with \`attestationProvider: "play-integrity"\` is a 400 with \`reason: unsupported_protocol\`.`,
-  requestBody: jsonBody(attestRequestSchema),
-  responses: {
-    200: jsonResponse('Registered.', attestResponseSchema),
-    400: niError(
-      'Invalid JSON, missing fields, a Play Integrity body, or (v2) an invalid field or recovery token. Route-level checks answer `bad_request`; v2 checks in the lifecycle answer `attestation_failed` with `reason: invalid_request` or `unsupported_protocol`.',
-      ['bad_request', 'attestation_failed']
-    ),
-    401: niError(
-      `The challenge, attestation, or recovery token didn’t verify: \`challenge_not_found\`, \`challenge_expired\`, \`attestation_invalid\`, \`recovery_not_enrolled\` (\`action: enroll_recovery\`), \`recovery_token_mismatch\`, \`identity_not_bound\`. ${ATTESTATION_NOTE}`,
-      ['attestation_failed', ...V1_CODES]
-    ),
-    409: niError(
-      '`operationId` was already used with different data (`operation_conflict`).',
-      ['attestation_failed']
-    ),
-    ...rateLimitedResponse,
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError('App Attest storage is unavailable. `Retry-After: 30`.', [
-      'server_error',
-    ]),
-  },
-})
-
-// --- POST /notes-import/verify ---------------------------------------------
-
-const verifyRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-      uuid: z.string(),
-      accountId,
-      keyId: z.string(),
-      challenge: z.string(),
-      assertion: z.string().meta({
-        description:
-          'Assertion over SHA-256 of `<challenge>|<uuid>|<contentHash>`, or `<challenge>|<uuid>|<accountId>|<contentHash>` when `accountId` is sent.',
-      }),
-      contentHash: sha256Hex('Any value the client picks'),
-    })
-    .meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      uuid: installId,
-      accountId,
-      ...appAttestV2AssertionFields('notes-import-verify'),
-      contentHash: sha256Hex('Any value the client picks'),
-      requestHash: sha256Hex('Must equal `contentHash`'),
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      uuid: installId,
-      accountId,
-      ...playIntegrityFields('notes-import-verify'),
-      contentHash: sha256Hex('Any value the client picks'),
-      requestHash: sha256Hex('Must equal `contentHash`'),
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-const verifyResponseSchema = z.union([
-  z
-    .object({ ok: z.literal(true) })
-    .meta({ title: 'App Attest v1 (or dev bypass)' }),
-  z
-    .object({
-      ok: z.literal(true),
-      protocolVersion: z.literal(2),
-      operationId,
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      ok: z.literal(true),
-      attestationProvider: z.literal('play-integrity'),
-      protocolVersion: z.literal(1),
-      operationId,
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-export const verifyDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Verify attestation (diagnostic)',
-  description: `An attested no-op for the app’s developer tools. Runs the same verification as the metered routes, consuming the challenge and advancing the sign count, but touches no allowance and runs no model.
-
-There is no payload, so \`requestHash\` must equal \`contentHash\` (v2 and Play Integrity), with purpose \`notes-import-verify\`. Not gated by the kill switch.`,
-  parameters: [devBypassHeader],
-  requestBody: jsonBody(verifyRequestSchema),
-  responses: {
-    200: jsonResponse('The attestation verified.', verifyResponseSchema),
-    400: niError(
-      'Invalid JSON, missing or malformed fields, `requestHash` ≠ `contentHash`, or an invalid v2 / Play Integrity request (`reason: invalid_request`).',
-      ['bad_request', 'attestation_failed']
-    ),
-    ...attestationResponses,
-    ...rateLimitedResponse,
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError(storageUnavailable, ['server_error']),
   },
 })
 
@@ -705,7 +259,8 @@ const importBaseFields = {
   uuid: installId,
   accountId,
   notesText: z.string().meta({
-    description: 'The notes to import, at most 100,000 characters by default.',
+    description:
+      'The notes to import, at most 100,000 characters by default. Empty or whitespace-only text is a 400 `bad_request`.',
   }),
   context: contextSchema,
   refinement: refinementSchema,
@@ -730,7 +285,19 @@ const v1ImportFields = {
   contentHash: notesContentHash.optional(),
 }
 
+const bearerImportFields = {
+  notesText: importBaseFields.notesText,
+  context: contextSchema,
+  refinement: refinementSchema,
+  revenueCatAppUserId,
+}
+
+const bearerImportSchema = z
+  .object(bearerImportFields)
+  .meta({ title: 'Bearer' })
+
 const kickoffRequestSchema = z.union([
+  bearerImportSchema,
   z
     .object({ ...importBaseFields, ...v1ImportFields })
     .meta({ title: 'App Attest v1 (legacy)' }),
@@ -741,7 +308,7 @@ const kickoffRequestSchema = z.union([
       contentHash: notesContentHash,
       requestHash: notesRequestHash,
     })
-    .meta({ title: 'App Attest v2' }),
+    .meta({ title: 'App Attest v2 (legacy)' }),
   z
     .object({
       ...importBaseFields,
@@ -749,7 +316,7 @@ const kickoffRequestSchema = z.union([
       contentHash: notesContentHash,
       requestHash: notesRequestHash,
     })
-    .meta({ title: 'Play Integrity' }),
+    .meta({ title: 'Play Integrity (legacy)' }),
 ])
 
 const successSchema = z
@@ -777,44 +344,53 @@ const successSchema = z
 
 const importGateErrors = (legacy: boolean) => ({
   400: niError(
-    legacy
-      ? 'Invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
-      : 'Invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).',
+    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, empty or whitespace-only \`notesText\`, or an invalid \`revenueCatAppUserId\`. Legacy: ${
+      legacy
+        ? 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
+        : 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).'
+    }`,
     ['bad_request', 'attestation_failed']
   ),
   401: niError(
-    `No App Attest credentials (\`attestation_required\`, \`action: bind\`), or attestation failed. ${ATTESTATION_NOTE}`,
-    ['attestation_required', 'attestation_failed', ...V1_CODES]
+    `Bearer: the access token is missing, expired, or invalid (\`unauthorized\`, with \`WWW-Authenticate: Bearer error="invalid_token"\`; refresh once and retry). Legacy: no App Attest credentials (\`attestation_required\`, \`action: bind\`), or attestation failed. ${ATTESTATION_NOTE}`,
+    ['unauthorized', 'attestation_required', 'attestation_failed', ...V1_CODES]
   ),
   402: niError(
     'The import allowance for this window is used up. `credits` says when it resets; no `Retry-After`. Replays of already-imported content are free and never get this.',
     ['limit_reached']
   ),
-  ...(legacy
-    ? {}
-    : {
-        403: attestationResponses[403],
-        409: attestationResponses[409],
-      }),
+  403: niError(
+    legacy
+      ? 'Bearer: the account is suspended.'
+      : 'Bearer: the account is suspended (`suspended`). Legacy, Play Integrity only: the app isn’t the Play-distributed build (`app_not_recognized`) or the device fails the required integrity verdict (`device_integrity_failed`).',
+    legacy ? ['suspended'] : ['suspended', 'attestation_failed']
+  ),
+  ...(legacy ? {} : { 409: attestationResponses[409] }),
   413: niError('`notesText` is over the character limit.', ['too_large']),
   429: niError(
     'Too many requests from this IP (`rate_limited`, `Retry-After: 60`); this content’s refinement allowance is used up (`refinement_limit`, with `credits`, no `Retry-After`; it never resets); or this user already has the maximum imports running (`active_cap`, 2 free / 5 Supporter by default, `Retry-After: 15`).',
     ['rate_limited', 'refinement_limit', 'active_cap']
   ),
+  426: upgradeRequired,
 })
 
-const GATE_DESCRIPTION = `**Gate**, in order: the kill switch and provider health (503 \`unavailable\`), body checks, the content and request hashes, attestation (or the dev bypass), Supporter status from RevenueCat on \`accountId\` or \`uuid\` (an outage counts as free), then the allowance. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.`
+const GATE_DESCRIPTION = `**Gate**, in order: the access token and account (bearer) or the legacy switch (legacy), the kill switch and provider health (503 \`unavailable\`), body checks, then for legacy requests the content and request hashes and attestation (or the dev bypass), Supporter status from RevenueCat (an outage counts as free), then the allowance. Bearer requests ask RevenueCat about \`revenueCatAppUserId\` (none: free); legacy requests about \`accountId\` or \`uuid\`. A bearer \`dev\` session (dev worker only) gets the dev bypass’s unlimited allowances. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.
+
+${BEARER_FORM}
+
+${LEGACY_FORM}`
 
 export const kickoffDocs = describeRoute({
   tags: [TAG],
   summary: 'Start a streaming import',
-  description: `The attested, metered entry point. Starts the model run in a per-import Durable Object and returns at once with an \`importId\` and a \`subscribeToken\` for \`GET /notes-import/{importId}/events\`, \`/result\`, \`/cancel\`, and \`/destroy\`.
+  description: `The authenticated, metered entry point. Starts the model run in a per-import Durable Object and returns at once with an \`importId\` for \`GET /notes-import/{importId}/events\`, \`/result\`, \`/cancel\`, and \`/destroy\`. A bearer request calls those with the same access token; a legacy request gets a \`subscribeToken\` for them.
 
 ${GATE_DESCRIPTION}
 
-The \`importId\` is derived from the user and the content (plus the refinement instruction), so kicking off the same notes again reconnects to the same run instead of starting another; a run that failed restarts. The subscribe token lasts 1 hour, and a finished result is kept for 1 hour.
+The \`importId\` is derived from the user (the account, on bearer requests) and the content (plus the refinement instruction), so kicking off the same notes again reconnects to the same run instead of starting another; a run that failed restarts. The subscribe token lasts 1 hour, and a finished result is kept for 1 hour.
 
 \`credits\` is a point-in-time preview and may differ from the terminal snapshot on \`done\`.`,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(kickoffRequestSchema),
   responses: {
@@ -827,9 +403,9 @@ The \`importId\` is derived from the user and the content (plus the refinement i
           .meta({
             description: 'The run’s id, stable per user and content.',
           }),
-        subscribeToken: z.string().meta({
+        subscribeToken: z.string().optional().meta({
           description:
-            'Capability for this import’s stream, result, cancel, and destroy routes (`?token=`). Expires after 1 hour.',
+            'Legacy requests only: the capability for this import’s stream, result, cancel, and destroy routes (`?token=`). Expires after 1 hour. A bearer response has none; those routes take the access token.',
         }),
         refinement: z.boolean(),
         credits: creditsSchema,
@@ -837,37 +413,42 @@ The \`importId\` is derived from the user and the content (plus the refinement i
     ),
     ...importGateErrors(false),
     500: niError('The run could not be started.', ['server_error']),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
 export const legacyImportDocs = describeRoute({
   tags: [TAG],
   summary: 'Import notes synchronously (legacy)',
-  description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
+  description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. Bearer requests take the same body as kickoff’s. Legacy requests are App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
 
-${GATE_DESCRIPTION} The same concurrency cap as kickoff applies.`,
+${GATE_DESCRIPTION} The same concurrency cap as kickoff applies, and each request holds a slot of its own while it runs, identical ones included (they still charge once). A model run that hasn't finished within ${SYNC_DEADLINE_MINUTES} minutes is stopped and answered \`502\` \`model_error\`, charging nothing.`,
   deprecated: true,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(
-    z
-      .object({ ...importBaseFields, ...v1ImportFields })
-      .meta({ title: 'App Attest v1' })
+    z.union([
+      bearerImportSchema,
+      z
+        .object({ ...importBaseFields, ...v1ImportFields })
+        .meta({ title: 'App Attest v1 (legacy)' }),
+    ])
   ),
   responses: {
     200: jsonResponse('The finished import.', successSchema),
     ...importGateErrors(true),
     500: niError('Unexpected failure.', ['server_error']),
-    502: niError('The model failed or returned an invalid result.', [
-      'model_error',
-    ]),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    502: niError(
+      `The model failed, returned an invalid result, or didn’t finish within ${SYNC_DEADLINE_MINUTES} minutes.`,
+      ['model_error']
+    ),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
@@ -892,22 +473,34 @@ export const transcribeDocs = describeRoute({
   summary: 'Read a photographed page',
   description: `Import from Paper: reads one page image into plain text with a vision model on the zero-data-retention allowlist. Nothing is stored. The app shows the text for editing, then imports it through \`POST /notes-import/kickoff\`, which is where an import is used.
 
-App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.`,
+Bearer requests send just \`image\`, \`mimeType\`, and optionally \`revenueCatAppUserId\`, and are metered by the token’s account. Legacy requests take App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.
+
+${BEARER_FORM}
+
+${LEGACY_FORM}`,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(
     z.union([
       z
         .object({
+          image: transcribeBaseFields.image,
+          mimeType: transcribeBaseFields.mimeType,
+          revenueCatAppUserId,
+        })
+        .meta({ title: 'Bearer' }),
+      z
+        .object({
           ...transcribeBaseFields,
           ...appAttestV2AssertionFields('notes-import-transcribe'),
         })
-        .meta({ title: 'App Attest v2' }),
+        .meta({ title: 'App Attest v2 (legacy)' }),
       z
         .object({
           ...transcribeBaseFields,
           ...playIntegrityFields('notes-import-transcribe'),
         })
-        .meta({ title: 'Play Integrity' }),
+        .meta({ title: 'Play Integrity (legacy)' }),
     ])
   ),
   responses: {
@@ -925,33 +518,38 @@ App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 i
       })
     ),
     400: niError(
-      'Invalid JSON; missing `uuid` or `image`; an unsupported `mimeType`; an invalid `accountId`; an image that isn’t base64 of the declared type; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
+      'Invalid JSON; missing `image`; an unsupported `mimeType`; an image that isn’t base64 of the declared type. Bearer: an invalid `revenueCatAppUserId`. Legacy: missing `uuid`; an invalid `accountId`; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
       ['bad_request', 'attestation_failed']
     ),
-    401: niError(`Attestation failed. ${ATTESTATION_NOTE}`, [
-      'attestation_failed',
-    ]),
+    401: niError(
+      `Bearer: the access token is missing, expired, or invalid (\`unauthorized\`, with \`WWW-Authenticate\`). Legacy: attestation failed. ${ATTESTATION_NOTE}`,
+      ['unauthorized', 'attestation_failed']
+    ),
     402: niError(
       'A free user with no imports left in this window (with `credits`).',
       ['limit_reached']
     ),
-    403: attestationResponses[403],
+    403: niError(
+      'Bearer: the account is suspended (`suspended`). Legacy, Play Integrity only: the app isn’t the Play-distributed build or the device fails the required integrity verdict.',
+      ['suspended', 'attestation_failed']
+    ),
     409: attestationResponses[409],
     413: niError('The decoded image is over the byte limit.', ['too_large']),
     429: niError(
       'Too many requests from this IP (`rate_limited`, `Retry-After: 60`), or the daily page limit is reached (`transcribe_limit`, `Retry-After` until the oldest page ages out).',
       ['rate_limited', 'transcribe_limit']
     ),
+    426: upgradeRequired,
     500: niError('Unexpected failure.', ['server_error']),
     502: niError('The vision model couldn’t read the page.', ['model_error']),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
-// --- Run routes (subscribe-token capability) ---------------------------------
+// --- Run routes (bearer token, or the legacy subscribe token) ---------------
 
 const importIdParameter = {
   name: 'importId',
@@ -964,23 +562,29 @@ const importIdParameter = {
 const tokenParameter = {
   name: 'token',
   in: 'query' as const,
-  required: true,
+  required: false,
   schema: { type: 'string' as const },
   description:
-    'The `subscribeToken` from kickoff. It must have been issued for this `importId`; it expires after 1 hour.',
+    'Legacy requests only (required there): the `subscribeToken` from kickoff. It must have been issued for this `importId`; it expires after 1 hour. A bearer request never reads it.',
 }
 
 const runAuthErrors = {
-  400: niError('Missing `token`.', ['bad_request']),
+  400: niError('Legacy: missing `token`.', ['bad_request']),
   401: niError(
-    'The token is unknown, expired, or for another import. Kick off again for a fresh one.',
-    ['attestation_required']
+    'Bearer: the access token is missing, expired, or invalid (`unauthorized`, with `WWW-Authenticate`; refresh once and retry). Legacy: the subscribe token is unknown, expired, or for another import (`attestation_required`); kick off again for a fresh one.',
+    ['unauthorized', 'attestation_required']
   ),
+  404: niError(
+    'Bearer: no import with this id belongs to the token’s account. Another account’s import, an unknown id, and one deleted or past its 1-hour retention all get this same answer. Kick off again to run the notes anew.',
+    ['not_found']
+  ),
+  426: upgradeRequired,
   ...rateLimitedResponse,
+  503: niError(accountsDisabled, ['disabled']),
 }
 
 const RUN_AUTH =
-  'Authorized by the kickoff’s `subscribeToken` instead of attestation: this route can’t spend inference.'
+  'This route can’t spend inference, so it needs no attestation. **Bearer:** the access token of the account that kicked the import off (a suspended account still may). **Legacy:** the kickoff’s `subscribeToken` as `?token=`, while the legacy switch is on.'
 
 const importStatus = z
   .enum([
@@ -1037,6 +641,7 @@ Each frame has an \`event:\` line naming the type and a \`data:\` line with the 
 | \`cancelled\` | \`{ "type": "cancelled" }\` (never charged) | yes, terminal |
 
 The stream is for showing progress; the result is read only from \`done\` or \`GET /notes-import/{importId}/result\`.`,
+  security: bearerOrLegacy,
   parameters: [
     importIdParameter,
     tokenParameter,
@@ -1076,6 +681,7 @@ export const resultDocs = describeRoute({
   tags: [TAG],
   summary: 'Get an import’s result',
   description: `The run’s current state and, once finished, its result, for a client that reconnects after the stream closed or missed the terminal event. ${RUN_AUTH} Results are kept for 1 hour after the run ends.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('The run’s snapshot.', snapshotSchema),
@@ -1089,6 +695,7 @@ export const cancelDocs = describeRoute({
   description: `Stops a queued or running import: aborts the model call, frees the concurrency slot, and ends the stream with \`cancelled\`. A cancelled run is never charged. ${RUN_AUTH}
 
 No-op once the run has ended. If the run is already settling its result, cancel waits and returns \`done\` instead. Used by the app’s “edit & resend” flow.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('The run’s snapshot after the cancel.', snapshotSchema),
@@ -1099,7 +706,8 @@ No-op once the run has ended. If the run is already settling its result, cancel 
 export const destroyDocs = describeRoute({
   tags: [TAG],
   summary: 'Delete an import',
-  description: `Forgets a run now instead of after its retention: aborts any model call (uncharged), frees the concurrency slot, closes the stream, and deletes all stored state, the result included. Idempotent. ${RUN_AUTH} Backs the history view’s delete.`,
+  description: `Forgets a run now instead of after its retention: aborts any model call (uncharged), frees the concurrency slot, closes the stream, and deletes all stored state, the result included. Idempotent for legacy requests; a bearer request for an import already deleted is 404 \`not_found\`, which means the same thing. ${RUN_AUTH} Backs the history view’s delete.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('Deleted.', z.object({ ok: z.literal(true) })),

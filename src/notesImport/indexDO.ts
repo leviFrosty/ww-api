@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import { decideAcquire } from './cap'
+import { SYNC_SLOT_MAX_AGE_MS, SYNC_SLOT_PREFIX, decideAcquire } from './cap'
 import {
   allowanceDeniedEvent,
   emitNotesImportOperationalEvent,
@@ -30,6 +30,10 @@ export interface AcquireResult {
   ok: boolean
   active: number
 }
+
+export type AcquireSyncResult =
+  | { ok: true; active: number; slot: string }
+  | { ok: false; active: number }
 
 export interface CheckCreditArgs {
   hash: string
@@ -132,6 +136,33 @@ export class NotesImportIndex extends DurableObject<Environment> {
       )
     }
     return { ok: true, active: held ? active : active + 1 }
+  }
+
+  /**
+   * A slot for one synchronous import (`POST /notes-import`), under a key of
+   * its own: unlike a run, the synchronous path has nothing to share a model
+   * run with, so identical requests at once each run the model and each
+   * count against `cap`. Synchronous slots older than
+   * `SYNC_SLOT_MAX_AGE_MS` are dropped first, since a cancelled request
+   * never releases its own. `release(slot)` frees it.
+   */
+  acquireSync(cap: number): AcquireSyncResult {
+    this.ctx.storage.sql.exec(
+      'DELETE FROM active WHERE substr(importId, 1, ?) = ? AND startedAt <= ?',
+      SYNC_SLOT_PREFIX.length,
+      SYNC_SLOT_PREFIX,
+      Date.now() - SYNC_SLOT_MAX_AGE_MS
+    )
+    const active = this.#activeCount()
+    if (!decideAcquire(active, false, cap)) return { ok: false, active }
+    const slot = `${SYNC_SLOT_PREFIX}${crypto.randomUUID()}`
+    this.ctx.storage.sql.exec(
+      'INSERT INTO active (importId, status, startedAt) VALUES (?, ?, ?)',
+      slot,
+      'running',
+      Date.now()
+    )
+    return { ok: true, active: active + 1, slot }
   }
 
   release(importId: string): void {

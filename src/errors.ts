@@ -6,9 +6,9 @@
  * ```
  *
  * - `code` is always the stable, machine-readable code. Clients read it first.
- * - `error` is the same code on every route except Notes Import and route
- *   planning, where shipped app builds already read `code` and `error` keeps
- *   its human-readable message.
+ * - `error` is the same code on every route except attestation, Notes Import,
+ *   and route planning, where shipped app builds already read `code` and
+ *   `error` keeps its human-readable message.
  * - `retryAfter` (seconds) repeats the `Retry-After` header. Every 429 and 503
  *   sends both, except quotas that a wait can't free (documented per route).
  *

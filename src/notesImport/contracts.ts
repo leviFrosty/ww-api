@@ -7,6 +7,15 @@ export interface NotesImportKickoffResponse {
   credits: CreditsSnapshot
 }
 
+/**
+ * A bearer kickoff's answer: no subscribe token, because the run routes take
+ * the access token and check the run belongs to its account.
+ */
+export type NotesImportAccountKickoffResponse = Omit<
+  NotesImportKickoffResponse,
+  'subscribeToken'
+>
+
 export interface AllowanceDenialResponse {
   status: 402 | 429
   body: {

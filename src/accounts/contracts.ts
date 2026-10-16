@@ -1,4 +1,4 @@
-import { bytesToBase64Url } from '../crypto'
+import { bytesToBase64Url, sha256Hex } from '../crypto'
 import {
   BUDDIES_ID_PATTERN,
   decodeB64u,
@@ -27,6 +27,7 @@ export const ACCOUNTS_OPS = [
   'backup/list',
   'backup/get',
   'backup/delete',
+  'session/open',
 ] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
@@ -64,6 +65,20 @@ export const ACCOUNT_LIMITS = {
   backupSlots: 8,
   /** One `backup/put` per slot this often. */
   backupPutIntervalMs: MINUTE_MS,
+  /** An access token lives this long. */
+  accessTokenMs: 15 * MINUTE_MS,
+  /** A session lives this long from opening; refreshing never extends it. */
+  sessionMs: 90 * DAY_MS,
+  /** The refresh token just replaced still works this long (a lost response). */
+  refreshGraceMs: MINUTE_MS,
+  /** Live sessions per account; opening another ends the oldest. */
+  sessionsPerAccount: 10,
+  /** Sessions opened per account key per rolling day. */
+  sessionOpensPerDay: 20,
+  /** The sealed device label, b64u characters. */
+  sessionDeviceChars: 512,
+  /** Ended sessions (revoked or expired) are deleted after this long. */
+  endedSessionRetentionMs: 7 * DAY_MS,
 } as const
 
 /** A slot's R2 object key; `v1/<accountId>/` lists an account's slots. */
@@ -184,6 +199,17 @@ export interface BackupDeleteFields {
   slotId: string | null
 }
 
+export interface SessionOpenFields {
+  /**
+   * The answer to a `POST /attestation/v1/challenge` challenge for purpose
+   * `account-session`; checked by `src/accounts/attestation.ts`. Null only
+   * when the request leaves it out (the development bypass).
+   */
+  attestation: Record<string, unknown> | null
+  /** The sealed device label, stored opaque. */
+  device: string | null
+}
+
 type Fields = Record<string, unknown>
 
 /**
@@ -231,6 +257,14 @@ export const ACCOUNT_FIELD_PARSERS = {
     const slotId = id16(p.slotId)
     return slotId ? { slotId } : null
   },
+  'session/open': (p: Fields): SessionOpenFields | null => {
+    const attestation = p.attestation ?? null
+    if (attestation !== null && !isPlainObject(attestation)) return null
+    if (p.device === undefined || p.device === null)
+      return { attestation, device: null }
+    const device = sealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
+    return device ? { attestation, device } : null
+  },
 } satisfies Record<AccountsOp, (payload: Fields) => object | null>
 
 export type AccountFields<K extends AccountsOp> = NonNullable<
@@ -267,13 +301,69 @@ export const parseHandoffClaimRequest = (
   return claimPub && hello ? { ...base, claimPub, hello } : null
 }
 
+const over = (value: unknown, max: number) =>
+  typeof value === 'string' && value.length > max
+
 /** A sealed blob's cap broken, for `too_large` instead of `bad_request`. */
 export const handoffBlobTooLarge = (body: unknown): boolean => {
   if (!isPlainObject(body)) return false
-  const over = (value: unknown, max: number) =>
-    typeof value === 'string' && value.length > max
   return (
     over(body.hello, ACCOUNT_LIMITS.handoffHelloChars) ||
     over(body.key, ACCOUNT_LIMITS.handoffKeyChars)
   )
+}
+
+/** The session's sealed device label over its cap (`too_large`). */
+export const sessionDeviceTooLarge = (payload: unknown): boolean =>
+  isPlainObject(payload) &&
+  over(payload.device, ACCOUNT_LIMITS.sessionDeviceChars)
+
+// --- Sessions ----------------------------------------------------------------
+
+/**
+ * What an `account-session` attestation's `contentHash` and `requestHash`
+ * must both be (on `POST /attestation/v1/challenge` and in the session's
+ * `attestation`), so it covers the account key: lowercase hex
+ * `SHA-256(UTF-8("ww-account/v1/session\n" + accountPub))`.
+ */
+export const sessionAttestationHash = (accountPub: string): Promise<string> =>
+  sha256Hex(`ww-account/v1/session\n${accountPub}`)
+
+/** A refresh token as presented, in its parts. */
+export interface RefreshToken {
+  /** The session it names. */
+  sessionId: string
+  /** `<sessionId>.<secret>`, what its MAC covers. */
+  body: string
+  /** The MAC's 32 bytes. */
+  mac: Uint8Array
+  /** The whole token. */
+  token: string
+}
+
+/** The bytes of b64u for exactly `size` bytes, in its canonical spelling. */
+const canonicalB64u = (value: string, size: number): Uint8Array | null => {
+  const bytes = decodeB64u(value)
+  return bytes != null &&
+    bytes.length === size &&
+    bytesToBase64Url(bytes) === value
+    ? bytes
+    : null
+}
+
+/**
+ * A refresh token, opaque to the app: `<sessionId>.<secret>.<mac>`, the
+ * session's id (b64u, 16 bytes), then b64u of 32 bytes twice, each in its
+ * canonical spelling. Null for anything else, including the two-part
+ * `<sessionId>.<secret>` tokens from before the MAC.
+ */
+export const parseRefreshToken = (value: unknown): RefreshToken | null => {
+  if (typeof value !== 'string') return null
+  const parts = value.split('.')
+  if (parts.length !== 3) return null
+  const [sessionId, secret, mac] = parts
+  const macBytes = canonicalB64u(mac, 32)
+  return canonicalB64u(sessionId, 16) && canonicalB64u(secret, 32) && macBytes
+    ? { sessionId, body: `${sessionId}.${secret}`, mac: macBytes, token: value }
+    : null
 }

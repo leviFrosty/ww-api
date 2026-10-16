@@ -18,9 +18,11 @@ import { apiError } from './errors'
  * Address search and geocoding stay in one `places` bucket because both spend
  * HERE transactions. Behind each family sit stronger, identity-keyed limits
  * (Notes Import: App Attest or Play Integrity, allowances, the concurrency
- * cap; route planning: the per-account quota), which a client-supplied install
- * or account id can't replace here: before those checks it is unauthenticated,
- * so keying on it would let one caller mint fresh buckets at will.
+ * cap; attestation: the per-install challenge cap; route planning: the
+ * per-account quota), which a client-supplied install or account id can't
+ * replace here: before those checks it is unauthenticated, so keying on it
+ * would let one caller mint fresh buckets at will. The attestation routes'
+ * old `/notes-import/*` paths still count in `notes-import`.
  */
 
 /** The binding's window (`[ratelimits.simple] period`), so the longest wait. */
@@ -29,8 +31,10 @@ export const RATE_LIMIT_PERIOD_SECONDS = 60
 export type RateLimitFamily =
   | 'places'
   | 'notes-import'
+  | 'attestation'
   | 'route-planning'
   | 'admin'
+  | 'app'
 
 /** The bucket key for one family and caller. */
 export const rateLimitKey = (

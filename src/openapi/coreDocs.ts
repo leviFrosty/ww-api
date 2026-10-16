@@ -52,6 +52,30 @@ export const healthDocs = describeRoute({
   },
 })
 
+export const appConfigDocs = describeRoute({
+  tags: ['Service'],
+  summary: 'App configuration',
+  description:
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. No authentication.',
+  responses: {
+    200: jsonResponse(
+      'The configuration.',
+      z.object({
+        ok: z.literal(true),
+        minAppVersion: z
+          .string()
+          .regex(/^\d+\.\d+\.\d+$/)
+          .optional()
+          .meta({
+            description:
+              'The oldest app version (`major.minor.patch`) the API still supports. Absent without a floor.',
+          }),
+      })
+    ),
+    ...rateLimitedResponse,
+  },
+})
+
 const hereQuery = (extra: string) => [
   {
     name: 'q',
@@ -128,7 +152,7 @@ export const aasaDocs = describeRoute({
   tags: ['Links'],
   summary: 'Apple App Site Association',
   description:
-    'Tells iOS which paths open the app: `/c#…` (shared contacts), `/c/…` (contacts from older builds), and `/b#1…` (buddy invites), for the App Store, Beta, and development bundle ids.',
+    'Tells iOS which paths open the app, for the App Store, Beta, and development bundle ids: `/contacts#…` (shared contacts), `/buddies/invite#1…` (buddy invites), and `/accounts/handoff#1…` (Set Up Another Device), plus the short paths in links already shared (`/c#…`, `/c/…`, `/b#1…`, `/h#1…`), which stay for good.',
   responses: {
     200: {
       description: 'The AASA document.',
@@ -141,9 +165,13 @@ export const aasaDocs = describeRoute({
                 {
                   appIDs: ['TEAMID.com.leviwilkerson.jwtime'],
                   components: [
+                    { '/': '/contacts', '#': '?*' },
+                    { '/': '/buddies/invite', '#': '1?*' },
+                    { '/': '/accounts/handoff', '#': '1?*' },
                     { '/': '/c', '#': '?*' },
                     { '/': '/c/*' },
                     { '/': '/b', '#': '1?*' },
+                    { '/': '/h', '#': '1?*' },
                   ],
                 },
               ],
@@ -164,20 +192,51 @@ const langParameter = {
   description: 'Page language. Falls back to `Accept-Language`, then English.',
 }
 
+/**
+ * A link page's short path (`/c`, `/b`, `/h`): the same page, in links people
+ * already sent. Served for good; new links use the readable path.
+ */
+const shortPathDocs = (
+  path: string,
+  summary: string,
+  description: string,
+  response: string,
+  parameters: (typeof langParameter)[] = []
+) =>
+  describeRoute({
+    tags: ['Links'],
+    summary: `${summary} (short path)`,
+    description: `The same page as \`${path}\`, at the short path older app versions put in links. Those links are already in people’s messages, so this path is served for good; new links use \`${path}\`.\n\n${description}`,
+    deprecated: true,
+    parameters,
+    responses: { 200: html(response) },
+  })
+
+const CONTACT_LINK_DESCRIPTION =
+  'Shown when someone opens a shared-contact link without the app. The contact rides in the URL fragment (`/contacts#<payload>`), which never reaches the worker; the page’s script turns it into an “Open app” link.'
+
 export const contactLinkDocs = describeRoute({
   tags: ['Links'],
   summary: 'Shared contact fallback page',
-  description:
-    'Shown when someone opens a shared-contact link without the app. The contact rides in the URL fragment (`/c#<payload>`), which never reaches the worker; the page’s script turns it into an “Open app” link.',
+  description: CONTACT_LINK_DESCRIPTION,
   parameters: [langParameter],
   responses: { 200: html('A localized landing page.') },
 })
+
+export const shortContactLinkDocs = shortPathDocs(
+  '/contacts',
+  'Shared contact fallback page',
+  CONTACT_LINK_DESCRIPTION,
+  'A localized landing page.',
+  [langParameter]
+)
 
 export const legacyContactLinkDocs = describeRoute({
   tags: ['Links'],
   summary: 'Shared contact fallback page (legacy)',
   description:
-    'The same page for links shared by older app versions, which put the payload in the path. The payload only ever goes into the “Open app” link, never into meta tags.',
+    'The same page for links shared by the oldest app versions, which put the payload in the path. Served for good, like `/c`. The payload only ever goes into the “Open app” link, never into meta tags.',
+  deprecated: true,
   parameters: [
     {
       name: 'payload',
@@ -191,21 +250,41 @@ export const legacyContactLinkDocs = describeRoute({
   responses: { 200: html('A localized landing page.') },
 })
 
+const BUDDY_INVITE_DESCRIPTION =
+  'Shown when someone opens a buddy invite (`/buddies/invite#1<secret>`) without the app, with App Store and Google Play buttons. The invite secret stays in the fragment and never reaches the worker.'
+
 export const buddyInvitePageDocs = describeRoute({
   tags: ['Links'],
   summary: 'Buddy invite fallback page',
-  description:
-    'Shown when someone opens a buddy invite (`/b#1<secret>`) without the app, with App Store and Google Play buttons. The invite secret stays in the fragment and never reaches the worker.',
+  description: BUDDY_INVITE_DESCRIPTION,
   responses: { 200: html('The invite landing page.') },
 })
+
+export const shortBuddyInvitePageDocs = shortPathDocs(
+  '/buddies/invite',
+  'Buddy invite fallback page',
+  BUDDY_INVITE_DESCRIPTION,
+  'The invite landing page.'
+)
+
+const HANDOFF_DESCRIPTION =
+  'Shown when a phone’s camera opens a Set Up Another Device QR code (`/accounts/handoff#1<…>`) instead of WitnessWork: install or open the app on the new phone and scan the code from inside it, with App Store and Google Play buttons. Localized like `/contacts` (`?lang=`, then `Accept-Language`). The handoff secret stays in the fragment and never reaches the worker.'
 
 export const handoffPageDocs = describeRoute({
   tags: ['Links'],
   summary: 'Set Up Another Device fallback page',
-  description:
-    'Shown when a phone’s camera opens a Set Up Another Device QR code (`/h#1<…>`) instead of WitnessWork: install or open the app on the new phone and scan the code from inside it, with App Store and Google Play buttons. Localized like `/c` (`?lang=`, then `Accept-Language`). The handoff secret stays in the fragment and never reaches the worker.',
+  description: HANDOFF_DESCRIPTION,
+  parameters: [langParameter],
   responses: { 200: html('The handoff landing page.') },
 })
+
+export const shortHandoffPageDocs = shortPathDocs(
+  '/accounts/handoff',
+  'Set Up Another Device fallback page',
+  HANDOFF_DESCRIPTION,
+  'The handoff landing page.',
+  [langParameter]
+)
 
 export const notesImportAdminResetDocs = describeRoute({
   tags: ['Admin'],

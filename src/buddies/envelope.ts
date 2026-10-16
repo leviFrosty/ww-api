@@ -1,6 +1,7 @@
 import {
   BUDDIES_BLOB_PUT_OP,
   BUDDIES_ENVELOPE_HEADERS,
+  BUDDIES_FIELD_PARSERS,
   BUDDIES_LIMITS,
   BUDDIES_LIVE_OP,
   BUDDIES_PAYLOAD_PARSERS,
@@ -10,6 +11,7 @@ import {
   fail,
   isPlainObject,
   ok,
+  type BuddiesFields,
   type BuddiesPayloads,
   type BuddiesResult,
   type BuddiesSigningOp,
@@ -191,6 +193,33 @@ export const readBlobPutCall = (
   now: number
 ): BuddiesResult<Signed<BuddiesPayloads[typeof BUDDIES_BLOB_PUT_OP]>> =>
   readHeaderCall(BUDDIES_BLOB_PUT_OP, headers, now)
+
+/**
+ * A bearer request's fields for `inbox/live` or `blob/put`: b64u(UTF-8 JSON)
+ * in `x-buddies-payload`, without `ts` or `nonce`. The token authenticates
+ * it, so a signature header (either naming) is `bad_request`, as is the short
+ * `x-buddies-p`, which only shipped legacy builds send.
+ */
+export const readHeaderFields = <
+  K extends typeof BUDDIES_LIVE_OP | typeof BUDDIES_BLOB_PUT_OP,
+>(
+  op: K,
+  headers: Headers,
+  now: number
+): BuddiesResult<BuddiesFields<K>> => {
+  if (
+    headers.has(BUDDIES_ENVELOPE_HEADERS.signature) ||
+    headers.has(LEGACY_BUDDIES_ENVELOPE_HEADERS.signature)
+  ) {
+    return fail('bad_request')
+  }
+  const envelope = envelopeFromParts(
+    headers.get(BUDDIES_ENVELOPE_HEADERS.payload),
+    undefined
+  )
+  const fields = envelope ? BUDDIES_FIELD_PARSERS[op](envelope.payload, now) : null
+  return fields ? ok(fields) : fail('bad_request')
+}
 
 /**
  * Reads a `blob/put` body of exactly `expected` bytes (the signed `bytes`,

@@ -7,8 +7,10 @@ import type { Socket } from 'node:net'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { BuddiesSignedOp } from '../buddies/contracts'
+import { accountSignedMessage, inboxLinkMessage } from '../accounts/contracts'
 import {
   SigningKey,
+  b64u,
   blobPutHeaders,
   envelope,
   liveHeaders,
@@ -250,9 +252,15 @@ export const sendSigned = async (
 export const sendUnsigned = (op: string, payload: Record<string, unknown>) =>
   buddies(op, unsignedEnvelope(payload))
 
-/** `blob/get`: an unsigned `{payload}` envelope; raw bytes back on 200. */
-export const getBlob = (payload: Record<string, unknown>) =>
-  httpBytes('/buddies/v1/blob/get', { json: unsignedEnvelope(payload) })
+/** `blob/get`: an unsigned `{payload}` envelope (plus `headers`, e.g. a token); raw bytes back on 200. */
+export const getBlob = (
+  payload: Record<string, unknown>,
+  headers: Record<string, string> = {}
+) =>
+  httpBytes('/buddies/v1/blob/get', {
+    json: unsignedEnvelope(payload),
+    headers,
+  })
 
 /** One synthetic person: an inbox and the owner key that signs for it. */
 export class RelayOwner {
@@ -346,6 +354,211 @@ export class RelayWriter {
     })
   }
 }
+
+// --- Account sessions (bearer requests) --------------------------------------
+
+const encoder = new TextEncoder()
+
+export interface E2ESession {
+  key: SigningKey
+  accountId: string
+  sessionId: string
+  accessToken: string
+  refreshToken: string
+  accessExpiresAt: number
+  sessionExpiresAt: number
+}
+
+/**
+ * Opens an account session with the dev bypass standing in for attestation
+ * (`POST /accounts/v1/sessions`). Needs `DEV_BYPASS_TOKEN`.
+ */
+export const openSession = async (key?: SigningKey): Promise<E2ESession> => {
+  const signingKey = key ?? (await SigningKey.generate())
+  const bytes = encoder.encode(
+    JSON.stringify({
+      accountPub: signingKey.publicKey,
+      ts: Date.now(),
+      nonce: randomId(),
+    })
+  )
+  const response = await http('POST', '/accounts/v1/sessions', {
+    headers: { 'x-ww-dev-bypass': DEV_BYPASS_TOKEN ?? '' },
+    body: {
+      payload: b64u(bytes),
+      signature: b64u(
+        await signingKey.sign(accountSignedMessage('session/open', bytes))
+      ),
+    },
+  })
+  if (response.status !== 201)
+    throw new Error(`session open ${response.status} ${response.text}`)
+  return { key: signingKey, ...(response.body as Omit<E2ESession, 'key'>) }
+}
+
+export const bearerHeaders = (session: E2ESession): Record<string, string> => ({
+  authorization: `Bearer ${session.accessToken}`,
+})
+
+/** A bearer `inbox/live` or `blob/put`'s fields, for `x-buddies-payload`. */
+export const fieldsHeader = (fields: Record<string, unknown>): string =>
+  b64u(encoder.encode(JSON.stringify(fields)))
+
+/**
+ * One synthetic person on an account session: an inbox registered with a
+ * bearer token and linked to the session's account, and owner ops sent as
+ * bearer requests (plain JSON fields).
+ */
+export class BearerRelayOwner {
+  readonly inboxId = randomId()
+  private constructor(
+    readonly session: E2ESession,
+    readonly key: SigningKey
+  ) {}
+
+  /** A fresh owner key on `session` (a new session by default), registered unless `register` is false. */
+  static async create(
+    session?: E2ESession,
+    register = true
+  ): Promise<BearerRelayOwner> {
+    const owner = new BearerRelayOwner(
+      session ?? (await openSession()),
+      await SigningKey.generate()
+    )
+    if (register) {
+      const response = await owner.register()
+      if (response.status !== 200)
+        throw new Error(`inbox/register ${response.status} ${response.text}`)
+    }
+    return owner
+  }
+
+  /** Reuses an inbox and owner key registered the legacy way. */
+  static adopt(
+    legacy: RelayOwner,
+    session: E2ESession
+  ): BearerRelayOwner {
+    return Object.assign(new BearerRelayOwner(session, legacy.key), {
+      inboxId: legacy.inboxId,
+    })
+  }
+
+  get auth(): Record<string, string> {
+    return bearerHeaders(this.session)
+  }
+
+  /** `inbox/register`'s `account` proof for `account` (this session's by default). */
+  async proof(account: E2ESession = this.session) {
+    return {
+      accountId: account.accountId,
+      signature: b64u(
+        await account.key.sign(
+          inboxLinkMessage(account.accountId, this.inboxId, this.key.publicKey)
+        )
+      ),
+    }
+  }
+
+  /** A bearer `inbox/register`: the token plus the self-signed envelope with a proof. */
+  async register(
+    fields: Record<string, unknown> = {},
+    headers = this.auth
+  ): Promise<Exchange> {
+    const payload = {
+      inboxId: this.inboxId,
+      ownerPub: this.key.publicKey,
+      account: await this.proof(),
+      ts: Date.now(),
+      nonce: randomId(),
+      ...fields,
+    }
+    return http('POST', '/buddies/v1/inbox/register', {
+      headers,
+      body: await envelope('inbox/register', payload, this.key),
+    })
+  }
+
+  /** A bearer owner op: plain JSON fields, no envelope. */
+  op(
+    op: BuddiesSignedOp,
+    fields: Record<string, unknown> = {},
+    headers = this.auth
+  ): Promise<Exchange> {
+    return http('POST', `/buddies/v1/${op}`, {
+      headers,
+      body: { inboxId: this.inboxId, ...fields },
+    })
+  }
+
+  sync(since = 0, headers = this.auth) {
+    return this.op('inbox/sync', { since }, headers)
+  }
+
+  /** Adds a buddy's slot (bearer); the writer signs its own ops. */
+  async addWriter(slotId = randomId()): Promise<RelayWriter> {
+    const key = await SigningKey.generate()
+    const response = await this.op('slot/add', {
+      slotId,
+      writerPub: key.publicKey,
+    })
+    if (response.status !== 200)
+      throw new Error(`slot/add ${response.status} ${response.text}`)
+    return new RelayWriter(this.inboxId, slotId, key)
+  }
+
+  /** A bearer `blob/put`: the fields in `x-buddies-payload`, the bytes raw. */
+  putBlob(
+    blob: PhotoBlob,
+    headers = this.auth,
+    fields: Record<string, unknown> = {}
+  ) {
+    return httpBytes('/buddies/v1/blob/put', {
+      bytes: blob.bytes,
+      headers: {
+        'x-buddies-payload': fieldsHeader({
+          inboxId: this.inboxId,
+          blobId: blob.blobId,
+          bytes: blob.bytes.byteLength,
+          expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+          readTokenHash: blob.readTokenHash,
+          ...fields,
+        }),
+        ...headers,
+      },
+    })
+  }
+
+  /** Bearer `inbox/live` upgrade headers. */
+  liveHeaders(headers = this.auth): Record<string, string> {
+    return {
+      upgrade: 'websocket',
+      'x-buddies-payload': fieldsHeader({ inboxId: this.inboxId }),
+      ...headers,
+    }
+  }
+}
+
+/** A writer op as a bearer request: the writer-signed envelope plus a token. */
+export const sendWriter = async (
+  writer: RelayWriter,
+  op: BuddiesSignedOp,
+  fields: Record<string, unknown>,
+  headers: Record<string, string>
+) =>
+  http('POST', `/buddies/v1/${op}`, {
+    headers,
+    body: await envelope(
+      op,
+      {
+        inboxId: writer.inboxId,
+        slotId: writer.slotId,
+        ts: Date.now(),
+        nonce: randomId(),
+        ...fields,
+      },
+      writer.key
+    ),
+  })
 
 // --- Buddies live socket ----------------------------------------------------
 

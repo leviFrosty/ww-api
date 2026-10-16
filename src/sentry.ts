@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/cloudflare';
 import type { Breadcrumb, CloudflareOptions, Event } from '@sentry/cloudflare';
+import { DrizzleQueryError } from 'drizzle-orm';
 import type { Context } from 'hono';
 import { routePath } from 'hono/route';
 import type { Environment } from './types';
@@ -20,11 +21,134 @@ export function redactContactLinkPayloads(value: string): string {
 }
 
 /**
+ * Query parameters that carry a credential: Notes Import's legacy run routes
+ * (`/notes-import/:importId/events|result|cancel|destroy`) take their
+ * subscribe token as `?token=`, and the HERE proxy drops a client-sent
+ * `apiKey` for its own. The SDK records the request URL whole
+ * (`event.request.url` and `query_string`, `url.full` span data, the Referer
+ * header, breadcrumbs), and Notes Import traces at 100%, so their values are
+ * cut from every string in an event, like contact links. Names are lowercase
+ * and match without regard to case.
+ *
+ * A name is compared as the worker reads it: Hono and `URLSearchParams`
+ * decode percent-escapes (and `+`) in names, so `?to%6Ben=` is a `token`
+ * too. The raw name stays in the string; only the value is cut.
+ */
+const SECRET_QUERY_PARAMETERS = ['token', 'apikey'];
+/**
+ * A query parameter's `name=` at the start of a string or after `?` or `&`.
+ * It matches only up to the `=`, so a parameter inside another one's value
+ * (`?next=/x?token=…`) is found as well.
+ */
+const QUERY_PARAMETER_NAME = /(?:^|[?&])([^&#=?\s"'<>]*)=/g;
+/**
+ * A value runs to the next `&` or the fragment, or to whatever ends the URL
+ * in the string (whitespace, a quote, an angle bracket, the string's end).
+ */
+const QUERY_PARAMETER_VALUE = /[^&#\s"'<>]*/y;
+const REDACTED_QUERY_VALUE = '[redacted]';
+
+/**
+ * A raw query parameter name decoded as `URLSearchParams` decodes it: `+` is
+ * a space, and percent-escapes are decoded, a malformed one left as it is
+ * (never an error).
+ */
+function decodeQueryParameterName(name: string): string {
+  if (!/[%+]/.test(name)) return name;
+  for (const [decoded] of new URLSearchParams(`${name}=`)) return decoded;
+  return name;
+}
+
+const isSecretQueryParameter = (name: string): boolean =>
+  SECRET_QUERY_PARAMETERS.includes(
+    decodeQueryParameterName(name).toLowerCase()
+  );
+
+export function redactSecretQueryParameters(value: string): string {
+  let redacted = '';
+  let copied = 0;
+  for (const match of value.matchAll(QUERY_PARAMETER_NAME)) {
+    // A name inside a value that was just cut is gone with it.
+    if (match.index < copied || !isSecretQueryParameter(match[1])) continue;
+    const valueStart = match.index + match[0].length;
+    QUERY_PARAMETER_VALUE.lastIndex = valueStart;
+    QUERY_PARAMETER_VALUE.exec(value);
+    redacted += value.slice(copied, valueStart) + REDACTED_QUERY_VALUE;
+    copied = QUERY_PARAMETER_VALUE.lastIndex;
+  }
+  return copied === 0 ? value : redacted + value.slice(copied);
+}
+
+/**
+ * Drizzle's query errors carry the SQL and its bound parameters (account ids,
+ * session ids, refresh token hashes, inbox ids) in their message, as
+ * `Failed query: <sql>\nparams: <values>`, and D1's own error in `cause`. D1's
+ * messages (`D1_ERROR: …`, `D1_TYPE_ERROR: …`) can quote a value too.
+ */
+const DATABASE_ERROR_TEXT = /Failed query:|\nparams:|\bD1_[A-Z_]+:/;
+const REDACTED_DATABASE_ERROR = '[redacted database query]';
+
+/** Cuts everything from a database error's text onwards. */
+export function redactDatabaseErrors(value: string): string {
+  const match = DATABASE_ERROR_TEXT.exec(value);
+  return match
+    ? `${value.slice(0, match.index)}${REDACTED_DATABASE_ERROR}`
+    : value;
+}
+
+const isDatabaseErrorItself = (error: unknown): boolean =>
+  error instanceof DrizzleQueryError ||
+  (error instanceof Error && DATABASE_ERROR_TEXT.test(error.message));
+
+/** A database error, or an error caused (at any depth) by one. */
+export function isDatabaseError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let at = error; at != null && !seen.has(at); ) {
+    if (isDatabaseErrorItself(at)) return true;
+    seen.add(at);
+    at = (at as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** A database failure as it's reported: which operation, nothing from the query. */
+export class DatabaseError extends Error {
+  override name = 'DatabaseError';
+}
+
+/**
+ * What to report for `error`, caught around `operation` (an op name or a
+ * fixed label, never a value). A database error, or one caused by it,
+ * becomes a `DatabaseError` naming only the operation: the original's stack
+ * frames, but no message, query, parameters, or cause. Anything else is
+ * reported as is.
+ */
+export function reportableError(error: unknown, operation: string): unknown {
+  if (!isDatabaseError(error)) return error;
+  const reported = new DatabaseError(`database query failed: ${operation}`);
+  const stack = error instanceof Error ? (error.stack ?? '') : '';
+  const frames = stack.split('\n').filter((line) => /^\s+at /.test(line));
+  reported.stack = [`${reported.name}: ${reported.message}`, ...frames].join(
+    '\n'
+  );
+  return reported;
+}
+
+/** `Sentry.captureException` for a failure caught around `operation`. */
+export function captureFailure(error: unknown, operation: string): void {
+  Sentry.captureException(reportableError(error, operation));
+}
+
+/**
  * Rewrites strings in place through plain objects and arrays. Anything else
  * (SDK class instances such as scopes) is left alone.
  */
 function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (typeof value === 'string') return redactContactLinkPayloads(value);
+  if (typeof value === 'string') {
+    return redactDatabaseErrors(
+      redactSecretQueryParameters(redactContactLinkPayloads(value))
+    );
+  }
   if (typeof value !== 'object' || value === null || seen.has(value)) {
     return value;
   }
@@ -46,25 +170,91 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
 }
 
 /**
- * The Buddies live socket sends its signed envelope (which holds the inbox
- * id) in `x-buddies-*` request headers, and accounts' `backup/put` sends its
- * envelope (account key and slot id) in `x-ww-payload`/`x-ww-signature` (or
- * the legacy `x-ww-p`/`x-ww-s`). The SDK copies request headers into events,
- * so drop them outright.
+ * The SDK copies request headers into events (with `sendDefaultPii: false`
+ * it leaves out only cookies), so drop every header that carries a
+ * credential or an id outright:
+ * - `authorization`: bearer tokens.
+ * - `x-ww-admin-token` and `x-ww-dev-bypass`: the admin and dev bypass tokens.
+ * - `x-buddies-*`: the Buddies live socket's signed envelope (holds the inbox
+ *   id).
+ * - `x-ww-payload`/`x-ww-signature` (or the legacy `x-ww-p`/`x-ww-s`):
+ *   accounts' legacy `backup/put` envelope (account key and slot id).
+ * - `x-ww-slot-id`: the bearer `backup/put`'s slot id.
  */
-const BUDDIES_HEADER = /^(x-buddies-|x-ww-(p|s|payload|signature)$)/i;
+const SECRET_HEADER =
+  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id)$)/i;
 
-function dropBuddiesHeaders(event: Event): void {
+function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;
   if (!headers) return;
   for (const name of Object.keys(headers)) {
-    if (BUDDIES_HEADER.test(name)) delete headers[name];
+    if (SECRET_HEADER.test(name)) delete headers[name];
   }
 }
 
+/**
+ * `event.request.query_string` is a string from this SDK, which
+ * `scrubStrings` covers, but the event format also allows an object or a
+ * list of pairs, whose values only their keys name.
+ */
+function redactQueryStringPairs(event: Event): void {
+  const request = event.request;
+  const query = request?.query_string;
+  if (!request || query == null || typeof query === 'string') return;
+  if (Array.isArray(query)) {
+    request.query_string = query.map(([name, value]) => [
+      name,
+      isSecretQueryParameter(name) ? REDACTED_QUERY_VALUE : value,
+    ]);
+    return;
+  }
+  for (const name of Object.keys(query)) {
+    if (isSecretQueryParameter(name)) query[name] = REDACTED_QUERY_VALUE;
+  }
+}
+
+/**
+ * Drops every exception chained under a redacted database error (its
+ * `cause`, which for Drizzle is D1's own error, and so on down). The
+ * linked-errors integration lists each cause as another exception whose
+ * `mechanism.parent_id` names the one it caused.
+ */
+function dropDatabaseErrorCauses(event: Event): void {
+  const values = event.exception?.values;
+  if (!values) return;
+  const redacted = new Set<number>();
+  for (const value of values) {
+    const id = value.mechanism?.exception_id;
+    if (id != null && value.value?.includes(REDACTED_DATABASE_ERROR)) {
+      redacted.add(id);
+    }
+  }
+  if (redacted.size === 0) return;
+  const below = new Set<number>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const value of values) {
+      const { exception_id: id, parent_id: parent } = value.mechanism ?? {};
+      if (id == null || parent == null || below.has(id)) continue;
+      if (redacted.has(parent) || below.has(parent)) {
+        below.add(id);
+        grew = true;
+      }
+    }
+  }
+  event.exception!.values = values.filter((value) => {
+    const id = value.mechanism?.exception_id;
+    return id == null || !below.has(id);
+  });
+}
+
 function scrubEvent<T extends Event>(event: T): T {
-  dropBuddiesHeaders(event);
-  return scrubStrings(event) as T;
+  dropSecretHeaders(event);
+  redactQueryStringPairs(event);
+  const scrubbed = scrubStrings(event) as T;
+  dropDatabaseErrorCauses(scrubbed);
+  return scrubbed;
 }
 
 function scrubBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb {
@@ -101,7 +291,11 @@ export function createSentryConfig(environment: Environment): CloudflareOptions 
       const isImportOperation =
         path === '/notes-import' ||
         (path?.startsWith('/notes-import/') && path !== '/notes-import/status');
-      return isImportOperation ? 1 : 0.1;
+      // Attestation was part of Notes Import's operation traffic; it stays at
+      // 100% under its own paths.
+      const isAttestationOperation =
+        path?.startsWith('/attestation/') && path !== '/attestation/v1/status';
+      return isImportOperation || isAttestationOperation ? 1 : 0.1;
     },
     sendDefaultPii: false,
     beforeSend: scrubEvent,

@@ -1,9 +1,10 @@
 import type { AppContext, Environment } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
   BUDDIES_LIMITS,
   decodeSignature,
+  isPlainObject,
   type BuddiesResult,
   type BuddiesRouteOp,
 } from '../buddies/contracts'
@@ -34,8 +35,10 @@ import {
   accountSignedMessage,
   handoffBlobTooLarge,
   parseAccountKeyPayload,
+  sessionDeviceTooLarge,
 } from './contracts'
 import { accountsDb, findAccountByPub, type AccountRecord } from './store'
+import { bearerOrLegacy, type AccountAuth } from './auth'
 
 /** A self-signed account op whose envelope, signature, and `ts` check out. */
 export interface VerifiedCall<K extends AccountsOp> {
@@ -49,7 +52,8 @@ export type Verified<K extends AccountsOp> =
 
 /**
  * Checks a parsed envelope for `op`: the key payload and the op's own fields
- * (`bad_request`, or `too_large` for `handoff/send`'s oversized key), the signature
+ * (`bad_request`, or `too_large` for `handoff/send`'s oversized key and
+ * `session/open`'s oversized device label), the signature
  * by the named key (`bad_signature`), and the timestamp (`stale`).
  */
 export const verifyEnvelope = async <K extends AccountsOp>(
@@ -57,6 +61,8 @@ export const verifyEnvelope = async <K extends AccountsOp>(
   envelope: Envelope | null
 ): Promise<Verified<K>> => {
   if (op === 'handoff/send' && envelope && handoffBlobTooLarge(envelope.payload))
+    return { refusal: buddiesErrorResponse('too_large') }
+  if (op === 'session/open' && envelope && sessionDeviceTooLarge(envelope.payload))
     return { refusal: buddiesErrorResponse('too_large') }
   const payload = envelope ? parseAccountKeyPayload(envelope.payload) : null
   const fields = envelope
@@ -114,6 +120,56 @@ export const accountForKey = async (
     : { refusal: buddiesErrorResponse('unknown_account') }
 }
 
+/** A bearer request's fields for `op`, or its refusal. */
+export type BearerFields<K extends AccountsOp> =
+  | { fields: AccountFields<K> }
+  | { refusal: Response }
+
+/** How a converted op reads its fields, each way it can authenticate. */
+export interface AccountCallRead<K extends AccountsOp> {
+  bearer: (account: AccountAuth) => Promise<BearerFields<K>>
+  legacy: () => Promise<Verified<K>>
+}
+
+/**
+ * Runs an account op converted to bearer tokens (`bearerOrLegacy`). A bearer
+ * request is the token's account, with the fields `read.bearer` takes from
+ * the request (or its refusal). A legacy request, while the legacy switch is
+ * on, is the envelope `read.legacy` verifies, whose key must belong to a
+ * registered account (`unknown_account`), exactly as before sessions.
+ */
+export const accountCall = <K extends AccountsOp>(
+  c: AppContext,
+  read: AccountCallRead<K>,
+  run: (accountId: string, fields: AccountFields<K>) => Promise<Response>
+): Promise<Response> =>
+  bearerOrLegacy(c, {
+    bearer: async (account) => {
+      const bearer = await read.bearer(account)
+      return 'refusal' in bearer
+        ? bearer.refusal
+        : run(account.accountId, bearer.fields)
+    },
+    legacy: async () => {
+      const verified = await read.legacy()
+      if ('refusal' in verified) return verified.refusal
+      const found = await accountForKey(c.env, verified.payload.accountPub)
+      if ('refusal' in found) return found.refusal
+      return run(found.account.id, verified.fields)
+    },
+  })
+
+/** A bearer request's fields for `op` from its JSON body, or `bad_request`. */
+export const plainFields = <K extends AccountsOp>(
+  op: K,
+  body: unknown
+): BearerFields<K> => {
+  const fields = isPlainObject(body)
+    ? (ACCOUNT_FIELD_PARSERS[op](body) as AccountFields<K> | null)
+    : null
+  return fields ? { fields } : { refusal: buddiesErrorResponse('bad_request') }
+}
+
 /**
  * Counts the request against the Buddies edge tier `as` (named by a Buddies
  * op of that tier). Null admits.
@@ -159,7 +215,7 @@ export const refuseOverDailyQuota = async (
     })
   } catch (error) {
     console.warn('accounts: quota unavailable; allowing', { op })
-    Sentry.captureException(error)
+    captureFailure(error, op)
     return null
   }
 }
@@ -178,7 +234,9 @@ export const replyWith = <T extends object>(
 /**
  * Runs an accounts handler, turning a throw into a bare 500.
  *
- * Privacy: the log names the op only, never the body, keys, or ids.
+ * Privacy: the log names the op only, never the body, keys, or ids, and a
+ * database error reaches Sentry as the op alone (`captureFailure`), since its
+ * message quotes the query's parameters.
  */
 export const guarded =
   (op: string, handler: (c: AppContext) => Promise<Response>) =>
@@ -187,7 +245,7 @@ export const guarded =
       return await handler(c)
     } catch (error) {
       console.error('accounts: request failed', { op })
-      Sentry.captureException(error)
+      captureFailure(error, op)
       return buddiesInternalError()
     }
   }

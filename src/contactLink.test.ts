@@ -7,6 +7,7 @@ import worker from './index'
 
 const ORIGIN = 'https://ww-proxy.leviwilkerson.com'
 const CANONICAL_URL = `${ORIGIN}/c`
+const CONTACTS_URL = `${ORIGIN}/contacts`
 // gzip + base64url contact JSON, exactly as the app encodes it.
 const PAYLOAD =
   'H4sIAAAAAAAAE42MMQvCMBQG_0r4VpPyUohgNsHJ2ckttA8MYl5IglVK_7tEcBduvLsVTy41SoKHHQga7Z0ZHktsiWtdpNzNJKmFqUGDX1lK4_nY4DHSuDd0MGQvRP7LQERXaPwKvyLO8JgsNFJ49PM5JFYn4a4VDn_c8k1SL3dWOecUWSJs2wdjV8GKuwAAAA'
@@ -67,6 +68,9 @@ describe('apple-app-site-association', () => {
               'TEAM123456.com.leviwilkerson.jwtimedev',
             ],
             components: [
+              { '/': '/contacts', '#': '?*' },
+              { '/': '/buddies/invite', '#': '1?*' },
+              { '/': '/accounts/handoff', '#': '1?*' },
               { '/': '/c', '#': '?*' },
               { '/': '/c/*' },
               { '/': '/b', '#': '1?*' },
@@ -109,6 +113,25 @@ describe('GET /c', () => {
     ]) {
       expect(openAppLinkAt(page, hash)).toEqual({ href: '', hidden: true })
     }
+  })
+})
+
+describe('GET /contacts', () => {
+  it('serves the /c page under its own og:url and never reflects a payload', async () => {
+    for (const path of ['/contacts', `/contacts?${PAYLOAD}`]) {
+      const page = await html(path)
+      expect(page).not.toContain(PAYLOAD)
+      expect(ogUrl(page)).toBe(CONTACTS_URL)
+      expect(page).toContain('<a class="secondary" id="open-app" hidden>')
+    }
+    expect(openAppLinkAt(await html('/contacts'), `#${PAYLOAD}`)).toEqual({
+      href: `witnesswork://import-contact/${PAYLOAD}`,
+      hidden: false,
+    })
+  })
+
+  it('has no path-payload form', async () => {
+    expect((await request(`/contacts/${PAYLOAD}`)).status).toBe(404)
   })
 })
 

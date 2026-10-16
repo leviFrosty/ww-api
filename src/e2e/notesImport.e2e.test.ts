@@ -3,8 +3,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { DEV_BYPASS_TOKEN, configured, http, writeTranscript } from '../test/e2e'
 
 /**
- * Notes Import without inference: the dev-bypass verify probe, the App Attest
- * challenge, and kickoff's auth gate. A real kickoff calls OpenRouter (paid),
+ * Notes Import without inference: the attestation verify probe (dev bypass),
+ * the App Attest challenge, their old /notes-import paths, and kickoff's auth
+ * gate. A real kickoff calls OpenRouter (paid),
  * so it only runs with WW_API_E2E_ALLOW_PAID=1 plus a dev bypass. Local
  * workers also need OPENROUTER_API_KEY; deployed workers use their own secret.
  */
@@ -21,9 +22,9 @@ const bypass = (token = DEV_BYPASS_TOKEN ?? '') => ({
 })
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex')
 
-describe.skipIf(!DEV_BYPASS_TOKEN)('POST /notes-import/verify with the dev bypass', () => {
+describe.skipIf(!DEV_BYPASS_TOKEN)('POST /attestation/v1/verify with the dev bypass', () => {
   it('accepts a v1 probe', async () => {
-    const res = await http('POST', '/notes-import/verify', {
+    const res = await http('POST', '/attestation/v1/verify', {
       body: {},
       headers: bypass(),
     })
@@ -32,6 +33,48 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('POST /notes-import/verify with the dev bypas
   })
 
   it('echoes a valid v2 probe operationId', async () => {
+    const hash = sha256('verify-probe')
+    const operationId = `op_${randomUUID().replaceAll('-', '')}`
+    const res = await http('POST', '/attestation/v1/verify', {
+      headers: bypass(),
+      body: {
+        protocolVersion: 2,
+        operation: 'assert',
+        operationId,
+        purpose: 'attestation-verify',
+        contentHash: hash,
+        requestHash: hash,
+      },
+    })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, protocolVersion: 2, operationId })
+  })
+
+  it('rejects a v2 probe whose requestHash differs', async () => {
+    const res = await http('POST', '/attestation/v1/verify', {
+      headers: bypass(),
+      body: {
+        protocolVersion: 2,
+        operation: 'assert',
+        operationId: 'op_mismatch01',
+        purpose: 'attestation-verify',
+        contentHash: sha256('a'),
+        requestHash: sha256('b'),
+      },
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('treats a wrong bypass token as an unattested request', async () => {
+    const res = await http('POST', '/attestation/v1/verify', {
+      body: {},
+      headers: bypass('not-the-token'),
+    })
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('Missing uuid')
+  })
+
+  it('keeps the old path and purpose working, marked deprecated', async () => {
     const hash = sha256('verify-probe')
     const operationId = `op_${randomUUID().replaceAll('-', '')}`
     const res = await http('POST', '/notes-import/verify', {
@@ -47,34 +90,12 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('POST /notes-import/verify with the dev bypas
     })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ ok: true, protocolVersion: 2, operationId })
-  })
-
-  it('rejects a v2 probe whose requestHash differs', async () => {
-    const res = await http('POST', '/notes-import/verify', {
-      headers: bypass(),
-      body: {
-        protocolVersion: 2,
-        operation: 'assert',
-        operationId: 'op_mismatch01',
-        purpose: 'notes-import-verify',
-        contentHash: sha256('a'),
-        requestHash: sha256('b'),
-      },
-    })
-    expect(res.status).toBe(400)
-  })
-
-  it('treats a wrong bypass token as an unattested request', async () => {
-    const res = await http('POST', '/notes-import/verify', {
-      body: {},
-      headers: bypass('not-the-token'),
-    })
-    expect(res.status).toBe(400)
-    expect(res.text).toContain('Missing uuid')
+    expect(res.headers.get('deprecation')).toMatch(/^@\d+$/)
+    expect(res.headers.get('link')).toBe('</attestation/v1/verify>; rel="successor-version"')
   })
 
   it('rejects malformed JSON', async () => {
-    const res = await http('POST', '/notes-import/verify', {
+    const res = await http('POST', '/attestation/v1/verify', {
       raw: '{not json',
       headers: bypass(),
     })
@@ -83,11 +104,26 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('POST /notes-import/verify with the dev bypas
 })
 
 describe('App Attest handshake (no inference)', () => {
-  it('POST /notes-import/challenge issues a challenge', async () => {
-    const res = await http('POST', '/notes-import/challenge', { body: {} })
+  it('POST /attestation/v1/challenge issues a challenge', async () => {
+    const res = await http('POST', '/attestation/v1/challenge', { body: {} })
     expect(res.status).toBe(200)
     expect(typeof res.body.challenge).toBe('string')
     expect(res.body.challenge.length).toBeGreaterThan(16)
+    expect(res.headers.get('deprecation')).toBeNull()
+  })
+
+  it('POST /notes-import/challenge still issues one, marked deprecated', async () => {
+    const res = await http('POST', '/notes-import/challenge', { body: {} })
+    expect(res.status).toBe(200)
+    expect(typeof res.body.challenge).toBe('string')
+    expect(res.headers.get('deprecation')).toMatch(/^@\d+$/)
+    expect(res.headers.get('link')).toBe('</attestation/v1/challenge>; rel="successor-version"')
+  })
+
+  it('GET /attestation/v1/status lists App Attest', async () => {
+    const res = await http('GET', '/attestation/v1/status')
+    expect(res.status).toBe(200)
+    expect(res.body.providers.appAttest.protocolVersions).toEqual([1, 2])
   })
 
   it('kickoff without credentials is refused before any model call', async () => {

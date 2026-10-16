@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { decideAcquire, decideStartOutcome } from './cap'
+import {
+  SYNC_IMPORT_DEADLINE_MS,
+  SYNC_SLOT_MAX_AGE_MS,
+  decideAcquire,
+  decideStartOutcome,
+} from './cap'
 import type { ImportStatus } from './events'
 
 describe('decideAcquire', () => {
@@ -65,5 +70,17 @@ describe('decideStartOutcome', () => {
       (s) => decideStartOutcome(s) === 'terminal'
     )
     expect(releasable).toEqual(['done', 'cancelled'])
+  })
+})
+
+describe('synchronous slot lifetime and model deadline', () => {
+  it('ends the model call minutes before its slot could age out', () => {
+    expect(SYNC_IMPORT_DEADLINE_MS).toBeLessThan(SYNC_SLOT_MAX_AGE_MS)
+    // Room for settlement and the response after a call that ran to the end.
+    expect(SYNC_SLOT_MAX_AGE_MS - SYNC_IMPORT_DEADLINE_MS).toBeGreaterThanOrEqual(
+      5 * 60 * 1000
+    )
+    // Still far beyond a real model run (about a minute).
+    expect(SYNC_IMPORT_DEADLINE_MS).toBeGreaterThanOrEqual(5 * 60 * 1000)
   })
 })

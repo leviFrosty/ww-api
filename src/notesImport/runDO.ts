@@ -38,10 +38,11 @@ import {
 export interface StartImportInput {
   importId: string
   /**
-   * The METER identity, not necessarily the device's install uuid: the shared
-   * account id when the client sent one (ADR 0011), else the install uuid.
-   * Only ever used to name the per-user index DO (slot release + credit
-   * commit), so it must match whatever identity the kickoff acquired under.
+   * The METER identity, not necessarily the device's install uuid: the
+   * session's account id on a bearer run, else the shared account id when the
+   * client sent one (ADR 0011), else the install uuid. Names the per-user
+   * index DO (slot release + credit commit), so it must match whatever
+   * identity the kickoff acquired under.
    */
   uuid: string
   contentHash: string
@@ -55,6 +56,16 @@ export interface StartImportInput {
   decision: CreditDecision
   /** Usage-event context; absent on runs kicked off before analytics shipped. */
   analytics?: NotesImportAnalyticsContext
+  /**
+   * Set on runs started with an account session's bearer token; absent on
+   * legacy runs. `uuid` is then the account id.
+   */
+  account?: {
+    /** `importOwnerKey(accountId)`, kept as the run's owner until it's deleted. */
+    ownerKey: string
+    /** The RevenueCat app user id the kickoff named, or null (not a Supporter). */
+    revenueCatAppUserId: string | null
+  }
 }
 
 export interface RunResultSnapshot {
@@ -123,19 +134,12 @@ export class NotesImportRun extends DurableObject<Environment> {
    */
   #settlement: Promise<void> | null = null
 
-  constructor(ctx: DurableObjectState, env: Environment) {
-    super(ctx, env)
-    ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`
-    )
-    ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS events (
-         seq  INTEGER PRIMARY KEY AUTOINCREMENT,
-         type TEXT NOT NULL,
-         data TEXT NOT NULL
-       )`
-    )
-  }
+  /**
+   * The tables exist. They're created on the first write, not in the
+   * constructor, so a read of an unknown import stores nothing, and reset
+   * after `deleteAll()`, which drops them.
+   */
+  #schemaReady = false
 
   // --- RPC surface --------------------------------------------------------
 
@@ -160,13 +164,28 @@ export class NotesImportRun extends DurableObject<Environment> {
     // Fresh, or retrying a prior failure → reset and schedule the run. Awaiting
     // setAlarm means the kickoff's `await start()` guarantees the run is durably
     // scheduled before it mints the subscribe token and replies.
+    this.#ensureSchema()
     this.ctx.storage.sql.exec('DELETE FROM events')
     this.#metaSet('input', JSON.stringify(input))
+    // The owner outlives `input` (dropped once terminal): bearer routes check
+    // it for as long as the result is kept.
+    if (input.account) this.#metaSet('owner', input.account.ownerKey)
+    else this.#metaDel('owner')
     this.#metaDel('result')
     this.#metaDel('error')
     this.#setStatus('queued')
     await this.ctx.storage.setAlarm(Date.now())
     return 'started'
+  }
+
+  /**
+   * Whether a bearer request for `ownerKey`'s account may use this import:
+   * only a run that account started, until the run is deleted. A read, so
+   * asking about an unknown import stores nothing.
+   */
+  isOwnedBy(ownerKey: string): boolean {
+    const owner = this.#metaGet('owner')
+    return owner != null && owner === ownerKey
   }
 
   /** Snapshot for a client that reconnects after the live stream has closed. */
@@ -261,7 +280,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     for (const s of this.#subscribers) s.close()
     this.#subscribers.clear()
     this.#stopHeartbeat()
-    await this.ctx.storage.deleteAll()
+    await this.#deleteAll()
   }
 
   // --- Background execution ----------------------------------------------
@@ -271,7 +290,7 @@ export class NotesImportRun extends DurableObject<Environment> {
     if (status === null) return
     if (status === 'done' || status === 'error' || status === 'cancelled') {
       // Retention window elapsed → evict all state.
-      await this.ctx.storage.deleteAll()
+      await this.#deleteAll()
       return
     }
     if (status !== 'queued') {
@@ -345,6 +364,10 @@ export class NotesImportRun extends DurableObject<Environment> {
         apiKey: this.env.REVENUECAT_API_KEY,
         appUserId: input.uuid,
         entitlementId: config.entitlementId,
+        account: input.account && {
+          accountId: input.uuid,
+          revenueCatAppUserId: input.account.revenueCatAppUserId,
+        },
       })
       const limits = await resolveNotesImportLimits(this.env, this.env.NOTES_KV)
       const allowances = selectEffectiveAllowances(
@@ -586,12 +609,14 @@ export class NotesImportRun extends DurableObject<Environment> {
         // Replay everything since the client's cursor (lossless resume). Guarded
         // because the client may disconnect mid-replay.
         try {
-          const rows = this.ctx.storage.sql
-            .exec<{ seq: number; data: string }>(
-              'SELECT seq, data FROM events WHERE seq > ? ORDER BY seq',
-              cursor
-            )
-            .toArray()
+          const rows = this.#hasSchema()
+            ? this.ctx.storage.sql
+                .exec<{ seq: number; data: string }>(
+                  'SELECT seq, data FROM events WHERE seq > ? ORDER BY seq',
+                  cursor
+                )
+                .toArray()
+            : []
           for (const r of rows) {
             const ev = { ...JSON.parse(r.data), seq: r.seq } as ImportEvent
             sub.send(encoder.encode(formatSSE(ev)))
@@ -634,6 +659,7 @@ export class NotesImportRun extends DurableObject<Environment> {
 
   /** Persist an event to the replay log, then broadcast it with its resume seq. */
   #emit(ev: UnsequencedEvent): void {
+    this.#ensureSchema()
     const row = this.ctx.storage.sql
       .exec<{ seq: number }>(
         'INSERT INTO events (type, data) VALUES (?, ?) RETURNING seq',
@@ -688,6 +714,39 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#heartbeatTimer = null
   }
 
+  // --- storage helpers ----------------------------------------------------
+
+  #ensureSchema(): void {
+    if (this.#schemaReady) return
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`
+    )
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS events (
+         seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+         type TEXT NOT NULL,
+         data TEXT NOT NULL
+       )`
+    )
+    this.#schemaReady = true
+  }
+
+  /** Whether the tables exist, without creating them. */
+  #hasSchema(): boolean {
+    if (this.#schemaReady) return true
+    const tables = this.ctx.storage.sql.exec(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'`
+    )
+    this.#schemaReady = tables.toArray().length > 0
+    return this.#schemaReady
+  }
+
+  /** Wipes all state, tables included; the next write recreates them. */
+  async #deleteAll(): Promise<void> {
+    await this.ctx.storage.deleteAll()
+    this.#schemaReady = false
+  }
+
   // --- tiny meta helpers --------------------------------------------------
 
   #status(): ImportStatus | null {
@@ -699,6 +758,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaGet(k: string): string | null {
+    if (!this.#hasSchema()) return null
     const rows = this.ctx.storage.sql
       .exec<{ v: string }>('SELECT v FROM meta WHERE k = ?', k)
       .toArray()
@@ -706,6 +766,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaSet(k: string, v: string): void {
+    this.#ensureSchema()
     this.ctx.storage.sql.exec(
       'INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)',
       k,
@@ -714,6 +775,7 @@ export class NotesImportRun extends DurableObject<Environment> {
   }
 
   #metaDel(k: string): void {
+    if (!this.#hasSchema()) return
     this.ctx.storage.sql.exec('DELETE FROM meta WHERE k = ?', k)
   }
 }
