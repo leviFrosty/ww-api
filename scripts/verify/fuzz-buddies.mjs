@@ -11,6 +11,13 @@
  * status (e.g. tampered signature -> 401). After all cases a canary identity's
  * full `inbox/sync` must equal its pre-fuzz snapshot. Writes a JSON report to
  * .verify/artifacts/fuzz-<timestamp>.json and exits 1 on any failure.
+ *
+ * Both ways to authenticate are fuzzed: legacy requests (signed envelopes, no
+ * `Authorization` header) and bearer requests on account sessions opened
+ * with the dev bypass (`WW_API_DEV_BYPASS_TOKEN`, else the token
+ * `dev.mjs up` recorded). A second canary, registered and synced by bearer
+ * request, must come through intact too. Without a bypass token the bearer
+ * generators are skipped (and counted as such). Tokens never reach the report.
  */
 
 import { createHash, randomBytes } from 'node:crypto'
@@ -20,11 +27,15 @@ import { fileURLToPath } from 'node:url'
 import {
   ALL_OPS,
   ENVELOPE_HEADERS,
+  OWNER_OPS,
   SIGNED_OPS,
   WIRE_EDGE_LIMITS,
   WIRE_LIMITS as L,
+  accountEnvelope,
   b64u,
+  fieldsHeader,
   fromB64u,
+  inboxLinkMessage,
   sha256,
   signedEnvelope,
   signingKeyFromSeed,
@@ -43,11 +54,13 @@ const flag = (name, fallback) => {
   const inline = argv.find((arg) => arg.startsWith(`--${name}=`))
   return inline ? inline.split('=')[1] : fallback
 }
-const stateUrl = () => {
+const readState = () => {
   const path = join(ROOT, '.verify', 'state.json')
-  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).url : undefined
+  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
 }
-const BASE = String(flag('url', process.env.WW_API_URL ?? stateUrl() ?? '')).replace(/\/$/, '')
+const BASE = String(flag('url', process.env.WW_API_URL ?? readState().url ?? '')).replace(/\/$/, '')
+/** Opens account sessions without attestation; bearer generators skip without it. */
+const DEV_BYPASS = process.env.WW_API_DEV_BYPASS_TOKEN ?? (process.env.WW_API_URL ? undefined : readState().tokens?.devBypass)
 const RUNS = Number(flag('runs', process.env.WW_FUZZ_RUNS ?? 300))
 const SEED = Number(flag('seed', process.env.WW_FUZZ_SEED ?? randomBytes(4).readUInt32BE(0))) >>> 0
 const ONLY = flag('case', undefined)
@@ -106,6 +119,7 @@ class FuzzFailure extends Error {
 
 const stats = {
   requests: 0,
+  sessionsOpened: 0,
   devProxyRetries: 0,
   statuses: {},
   latencies: [],
@@ -121,6 +135,11 @@ const describeBody = (body) => {
   if (body instanceof Uint8Array) return `<${body.length} raw bytes, sha256 ${createHash('sha256').update(body).digest('hex').slice(0, 16)}>`
   return '<stream>'
 }
+
+/** Tokens (bearer, dev bypass) are recorded by name only. */
+const SECRET_HEADERS = new Set(['authorization', 'x-ww-dev-bypass'])
+const redact = (headers) =>
+  Object.fromEntries(Object.entries(headers).map(([name, value]) => [name, SECRET_HEADERS.has(name.toLowerCase()) ? '<redacted>' : value]))
 
 const clip = (text, max) =>
   text && text.length > max
@@ -141,7 +160,7 @@ const send = async ({ op, path, method = 'POST', body, headers = {}, expect, err
   }
   const exchange = {
     note,
-    request: { method, url: url.slice(BASE.length), headers: finalHeaders, body: describeBody(payload) },
+    request: { method, url: url.slice(BASE.length), headers: redact(finalHeaders), body: describeBody(payload) },
   }
   caseLog.push(exchange)
   const started = performance.now()
@@ -385,6 +404,110 @@ const getBlob = (inboxId, blob, token = blob.token, expect = [200], error) =>
   send({ op: 'blob/get', body: unsignedEnvelope({ inboxId, blobId: blob.blobId, token }), raw: true, expect, error, note: 'blob/get' })
 
 const sameBytes = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i])
+
+// --- Account sessions (bearer requests) -----------------------------------------
+
+/** A generator's answer when it can't run here (no dev bypass token). */
+const SKIPPED = Symbol('skipped')
+/** Access tokens last 15 minutes; reopen well before that. */
+const SESSION_REFRESH_MS = 10 * 60_000
+
+/** Opens a session for `key` (a fresh one by default) with the dev bypass. */
+const openSession = async (key) => {
+  const signingKey = key ?? (await newKey())
+  const response = await send({
+    path: '/accounts/v1/sessions',
+    body: await accountEnvelope('session/open', signingKey),
+    headers: { 'x-ww-dev-bypass': DEV_BYPASS },
+    expect: [201],
+    note: 'open a session (dev bypass)',
+  })
+  stats.sessionsOpened++
+  const { accountId, accessToken, refreshToken } = response.json
+  return {
+    key: signingKey,
+    accountId,
+    accessToken,
+    refreshToken,
+    openedAt: Date.now(),
+    auth: { authorization: `Bearer ${accessToken}` },
+  }
+}
+
+/** Reopens a long-lived session (same key, so the same account) before its token expires. */
+const keepFresh = async (session) => {
+  if (Date.now() - session.openedAt < SESSION_REFRESH_MS) return
+  Object.assign(session, await openSession(session.key))
+}
+
+const linkProof = async (account, inboxId, ownerPub) => ({
+  accountId: account.accountId,
+  signature: b64u(await account.key.sign(inboxLinkMessage(account.accountId, inboxId, ownerPub))),
+})
+
+/**
+ * An inbox on a session: registered by bearer request (token plus the
+ * self-signed envelope with its `account` proof), owner ops sent as plain JSON.
+ */
+const newBearerOwner = async (session) => {
+  const account = session ?? (await openSession())
+  const key = await newKey()
+  const owner = { key, inboxId: rid(), account }
+  owner.register = async (fields = {}, expect = [200], error, headers = account.auth, note) =>
+    send({
+      op: 'inbox/register',
+      body: await signed('inbox/register', key, {
+        inboxId: owner.inboxId,
+        ownerPub: key.publicKey,
+        account: await linkProof(account, owner.inboxId, key.publicKey),
+        ...fields,
+      }),
+      headers,
+      expect,
+      error,
+      note: note ?? 'bearer inbox/register',
+    })
+  owner.send = (op, fields = {}, expect = [200], error, headers = account.auth, note) =>
+    send({ op, body: { inboxId: owner.inboxId, ...fields }, headers, expect, error, note: note ?? `bearer ${op}` })
+  await owner.register()
+  return owner
+}
+
+/** `blob/put` as a bearer request: the fields in `x-buddies-payload`, no signature. */
+const putBlobBearer = (owner, blob, { fields = {}, body = blob.bytes, headers = owner.account.auth, expect = [200], error, note } = {}) =>
+  send({
+    op: 'blob/put',
+    body,
+    headers: {
+      'content-type': 'application/octet-stream',
+      [ENVELOPE_HEADERS.payload]: fieldsHeader({
+        inboxId: owner.inboxId,
+        blobId: blob.blobId,
+        bytes: blob.bytes.length,
+        expiresAt: Date.now() + 86_400_000,
+        readTokenHash: blob.readTokenHash,
+        ...fields,
+      }),
+      ...headers,
+    },
+    expect,
+    error,
+    note: note ?? `bearer blob/put ${body.length} bytes`,
+  })
+
+/** A writer op as a bearer request: the writer-signed envelope plus a token. */
+const sendWriterBearer = async (writer, op, fields, headers, { key = writer.key, expect = [200], error, note } = {}) =>
+  send({
+    op,
+    body: await signed(op, key, { inboxId: writer.inboxId, slotId: writer.slotId, ...fields }),
+    headers,
+    expect,
+    error,
+    note: note ?? `bearer ${op}`,
+  })
+
+/** Fields a bearer request ignores (it has no signature to bind them). */
+const BEARER_IGNORED = new Set(['ts', 'nonce'])
 
 // --- Generators -----------------------------------------------------------------
 // Each receives (rng, canary) and throws FuzzFailure on an oracle violation.
@@ -843,6 +966,292 @@ const GENERATORS = {
     const stored = sync.json.events.filter((event) => event.eventId === eventId)
     if (stored.length !== 1) throw new FuzzFailure(`dedupe: sync shows ${stored.length} copies of the event`, caseLog.at(-1))
   },
+
+  // --- Bearer requests (account sessions) ---------------------------------------
+
+  /**
+   * A bad `Authorization` header on any route class: always 401 `unauthorized`
+   * with the bearer challenge, never a fallback to the envelope (a valid
+   * legacy envelope rides along in some cases).
+   */
+  'bearer-bad-token': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.owner.account)
+    const token = bearer.owner.account.accessToken
+    const [head, claims, signature] = token.split('.')
+    const forgedClaims = b64u(Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(claims, 'base64url').toString('utf8')), sub: rid() })))
+    const flip = signature.at(-2) === 'A' ? 'B' : 'A'
+    const [variant, header] = rng.pick([
+      ['flipped signature', `Bearer ${head}.${claims}.${signature.slice(0, -2)}${flip}${signature.at(-1)}`],
+      ['no signature', `Bearer ${head}.${claims}`],
+      ['forged sub', `Bearer ${head}.${forgedClaims}.${signature}`],
+      ['alg none', `Bearer ${b64u(Buffer.from('{"alg":"none","typ":"JWT"}'))}.${claims}.`],
+      ['refresh token', `Bearer ${bearer.owner.account.refreshToken}`],
+      ['basic scheme', `Basic ${token}`],
+      ['no scheme', token],
+      ['empty bearer', 'Bearer'],
+      ['trailing junk', `Bearer ${token} x`],
+      ['random', `Bearer ${b64u(randomBytes(rng.int(1, 300)))}`],
+    ])
+    const target = rng.pick(['owner', 'owner-envelope', 'writer', 'unsigned', 'register', 'blob/get'])
+    let request
+    if (target === 'owner') {
+      const op = rng.pick(OWNER_OPS)
+      request = { op, body: await validPayload(op, bearer) }
+    } else if (target === 'owner-envelope') {
+      const op = rng.pick(OWNER_OPS)
+      request = { op, body: await signed(op, bearer.owner.key, await validPayload(op, bearer)) }
+    } else if (target === 'writer') {
+      const op = rng.pick(['card/put', 'event/put', 'slot/leave'])
+      request = { op, body: await signed(op, bearer.writer.key, await validPayload(op, bearer)) }
+    } else if (target === 'unsigned') {
+      const op = rng.pick(['invite/fetch', 'invite/claim'])
+      request = { op, body: unsignedEnvelope(await validPayload(op, bearer)) }
+    } else if (target === 'register') {
+      request = { op: 'inbox/register', body: await signed('inbox/register', bearer.owner.key, await validPayload('inbox/register', bearer)) }
+    } else {
+      request = { op: 'blob/get', body: unsignedEnvelope({ inboxId: bearer.owner.inboxId, blobId: b64u(randomBytes(32)), token: b64u(randomBytes(32)) }) }
+    }
+    const response = await send({ ...request, headers: { authorization: header }, expect: [401], error: 'unauthorized', note: `${variant} on ${target} ${request.op}` })
+    if (response.headers.get('www-authenticate') !== 'Bearer error="invalid_token"')
+      throw new FuzzFailure('unauthorized without WWW-Authenticate: Bearer error="invalid_token"', caseLog.at(-1))
+  },
+
+  /** Another account's valid token on the bearer canary: 403 `forbidden`, nothing lands. */
+  'bearer-cross-account': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    if (rng.pick(['op', 'op', 'op', 'blob']) === 'blob') {
+      await putBlobBearer(bearer.owner, await photo(64), { headers: bearer.stranger.auth, expect: [403], error: 'forbidden', note: "bearer blob/put into another account's inbox" })
+      return
+    }
+    const op = rng.pick(OWNER_OPS)
+    await bearer.owner.send(op, await validPayload(op, bearer), [403], 'forbidden', bearer.stranger.auth, `bearer ${op} with another account's token`)
+  },
+
+  /** A bearer owner op on the legacy canary, which no account owns: 409 `not_linked`. */
+  'bearer-not-linked': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    const op = rng.pick(OWNER_OPS)
+    await send({
+      op,
+      body: await validPayload(op, canary),
+      headers: bearer.stranger.auth,
+      expect: [409],
+      error: 'not_linked',
+      note: `bearer ${op} on an inbox registered before accounts`,
+    })
+  },
+
+  /**
+   * Bearer owner bodies that aren't the op's plain fields: one field invalid
+   * or missing, an envelope, or not a JSON object. All 400 on the bearer
+   * canary, which must not change.
+   */
+  'bearer-bad-fields': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.owner.account)
+    const op = rng.pick(OWNER_OPS)
+    const fields = await validPayload(op, bearer)
+    const variant = rng.pick(['wrong-type', 'wrong-type', 'missing', 'envelope', 'short-envelope', 'not-object'])
+    let body
+    let note
+    if (variant === 'wrong-type') {
+      const field = rng.pick(Object.keys(fields).filter((name) => INVALID[name] && !BEARER_IGNORED.has(name)))
+      let value = rng.pick(INVALID[field])
+      if (typeof value === 'function') value = value()
+      body = { ...fields, [field]: value }
+      note = `bearer ${op}.${field} = ${clip(JSON.stringify(value) ?? String(value), 80)}`
+    } else if (variant === 'missing') {
+      const field = rng.pick(Object.keys(fields).filter((name) => !OPTIONAL_FIELDS.has(name)))
+      body = { ...fields }
+      delete body[field]
+      note = `bearer ${op} without ${field}`
+    } else if (variant === 'envelope' || variant === 'short-envelope') {
+      const env = await signed(op, bearer.owner.key, fields)
+      body = variant === 'envelope' ? { ...fields, ...env } : { p: env.payload, s: env.signature }
+      note = `bearer ${op} with a ${variant}`
+    } else {
+      body = rng.pick(['[]', 'null', '"x"', '42', '{', ''])
+      note = `bearer ${op} body ${body || '(empty)'}`
+    }
+    await send({
+      op,
+      body,
+      headers: { ...bearer.owner.account.auth, ...(typeof body === 'string' ? { 'content-type': 'application/json' } : {}) },
+      expect: [400],
+      error: 'bad_request',
+      note,
+    })
+  },
+
+  /**
+   * A bearer `inbox/register` must carry an `account` proof for the token's
+   * own account, signed by that account's key over this inbox.
+   */
+  'bearer-register-proof': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    const owner = await newBearerOwner()
+    const { account } = owner
+    const variant = rng.pick(['missing', 'other-account', 'unknown-account', 'forged-signature', 'wrong-inbox', 'stranger-token', 'repeat'])
+    const proof = {
+      missing: () => undefined,
+      'other-account': () => linkProof(bearer.stranger, owner.inboxId, owner.key.publicKey),
+      'unknown-account': async () => ({ ...(await linkProof(account, owner.inboxId, owner.key.publicKey)), accountId: rid() }),
+      'forged-signature': async () => linkProof({ ...account, key: await newKey() }, owner.inboxId, owner.key.publicKey),
+      'wrong-inbox': () => linkProof(account, rid(), owner.key.publicKey),
+      'stranger-token': () => linkProof(account, owner.inboxId, owner.key.publicKey),
+      repeat: () => linkProof(account, owner.inboxId, owner.key.publicKey),
+    }[variant]
+    const [expect, error] = {
+      missing: [[400], 'bad_request'],
+      'other-account': [[403], 'forbidden'],
+      'unknown-account': [[403], 'forbidden'],
+      'forged-signature': [[401], 'bad_signature'],
+      'wrong-inbox': [[401], 'bad_signature'],
+      'stranger-token': [[403], 'forbidden'],
+      repeat: [[200], undefined],
+    }[variant]
+    const headers = variant === 'stranger-token' ? bearer.stranger.auth : account.auth
+    await owner.register({ account: await proof() }, expect, error, headers, `bearer inbox/register: ${variant}`)
+    await owner.send('inbox/delete')
+  },
+
+  /**
+   * Bearer `blob/put`: the fields in `x-buddies-payload` and no signature.
+   * A signature header (either naming) or only the short payload header is
+   * 400, `ts`/`nonce` are ignored, the bytes must still hash to `blobId`,
+   * and the account checks hold.
+   */
+  'bearer-blob-put': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    const variant = rng.pick(['roundtrip', 'signature-header', 'short-signature-header', 'short-payload', 'ignored-ts-nonce', 'flipped-bit', 'stranger', 'not-linked'])
+    const blob = await photo(rng.int(1, 64 * 1024))
+    if (variant === 'not-linked') {
+      const legacy = await newOwner()
+      await newWriter(legacy)
+      await putBlobBearer({ ...legacy, account: bearer.stranger }, blob, { expect: [409], error: 'not_linked', note: 'bearer blob/put into an inbox registered before accounts' })
+      await legacy.send('inbox/delete', {})
+      return
+    }
+    const owner = await newBearerOwner()
+    await newWriter(owner)
+    const auth = owner.account.auth
+    if (variant === 'roundtrip') {
+      await putBlobBearer(owner, blob)
+      const got = await send({ op: 'blob/get', body: unsignedEnvelope({ inboxId: owner.inboxId, blobId: blob.blobId, token: blob.token }), headers: bearer.stranger.auth, raw: true, expect: [200], note: 'bearer blob/get' })
+      if (!sameBytes(got.bytes, blob.bytes)) throw new FuzzFailure('bearer blob/get bytes differ from blob/put', caseLog.at(-1))
+      await putBlobBearer(owner, blob, { note: 'bearer blob/put retry (no replay)' })
+    } else if (variant === 'signature-header' || variant === 'short-signature-header') {
+      const name = variant === 'signature-header' ? ENVELOPE_HEADERS.signature : 'x-buddies-s'
+      await putBlobBearer(owner, blob, { headers: { ...auth, [name]: b64u(randomBytes(64)) }, expect: [400], error: 'bad_request', note: `bearer blob/put with ${name}` })
+    } else if (variant === 'short-payload') {
+      await send({
+        op: 'blob/put',
+        body: blob.bytes,
+        headers: { 'content-type': 'application/octet-stream', 'x-buddies-p': fieldsHeader({ inboxId: owner.inboxId, blobId: blob.blobId, bytes: blob.bytes.length, expiresAt: Date.now() + 86_400_000, readTokenHash: blob.readTokenHash }), ...auth },
+        expect: [400],
+        error: 'bad_request',
+        note: 'bearer blob/put with only x-buddies-p',
+      })
+    } else if (variant === 'ignored-ts-nonce') {
+      await putBlobBearer(owner, blob, { fields: { ts: rng.pick([0, -1, Date.now() - 86_400_000, 'x']), nonce: rng.pick(['', null, rid()]) }, note: 'bearer blob/put with ts/nonce (ignored)' })
+    } else if (variant === 'flipped-bit') {
+      const body = new Uint8Array(blob.bytes)
+      body[rng.int(0, body.length - 1)] ^= 1 << rng.int(0, 7)
+      await putBlobBearer(owner, blob, { body, expect: [400], error: 'bad_request', note: 'bearer blob/put with a flipped bit' })
+    } else {
+      await putBlobBearer(owner, blob, { headers: bearer.stranger.auth, expect: [403], error: 'forbidden', note: "bearer blob/put with another account's token" })
+    }
+    await owner.send('inbox/delete')
+  },
+
+  /**
+   * Writer ops in bearer requests: the writer-signed envelope stays the
+   * capability whoever's token rides along; a bad writer signature, a stale
+   * `ts`, a bad token, or plain JSON fields are refused.
+   */
+  'bearer-writer': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    const owner = await newBearerOwner()
+    const writer = await newWriter(owner)
+    const op = rng.pick(['card/put', 'event/put', 'slot/leave'])
+    const fields = await validPayload(op, { owner, writer })
+    const variant = rng.pick(['any-session', 'any-session', 'bad-writer-signature', 'stale', 'bad-token', 'plain-json'])
+    if (variant === 'any-session') {
+      await sendWriterBearer(writer, op, fields, bearer.stranger.auth, { note: `bearer ${op} with an unrelated session` })
+    } else if (variant === 'bad-writer-signature') {
+      await sendWriterBearer(writer, op, fields, bearer.stranger.auth, { key: await newKey(), expect: [401], error: 'bad_signature', note: `bearer ${op} signed by a stranger` })
+    } else if (variant === 'stale') {
+      await sendWriterBearer(writer, op, { ...fields, ts: Date.now() - L.timestampSkewMs - rng.int(1_000, 86_400_000) }, bearer.stranger.auth, { expect: [401], error: 'stale', note: `bearer ${op} with a stale ts` })
+    } else if (variant === 'bad-token') {
+      await sendWriterBearer(writer, op, fields, { authorization: `Bearer ${b64u(randomBytes(40))}` }, { expect: [401], error: 'unauthorized', note: `${op} with a bad token` })
+    } else {
+      await send({ op, body: fields, headers: bearer.stranger.auth, expect: [400], error: 'bad_request', note: `${op} as plain JSON` })
+    }
+    await owner.send('inbox/delete')
+  },
+
+  /**
+   * A bearer round trip: register with a proof, add a slot, a buddy's
+   * event/put, sync it back (twice, no replay), delete, then the inbox is gone.
+   */
+  'bearer-round-trip': async (rng, canary) => {
+    const bearer = canary.bearer
+    if (!bearer) return SKIPPED
+    await keepFresh(bearer.stranger)
+    const owner = await newBearerOwner()
+    const writer = await newWriter(owner)
+    const eventId = rid()
+    await sendWriterBearer(writer, 'event/put', { eventId, kind: 'plan.joined', blob: blob(rng.int(1, 512)), push: false }, bearer.stranger.auth)
+    for (let i = 0; i < 2; i++) {
+      const sync = await owner.send('inbox/sync', { since: 0, ts: 0, nonce: 'same' })
+      if (sync.json?.events?.filter((event) => event.eventId === eventId).length !== 1)
+        throw new FuzzFailure('bearer sync is missing the buddy event', caseLog.at(-1))
+    }
+    await owner.send('inbox/delete')
+    await owner.send('inbox/sync', { since: 0 }, [404], 'not_found')
+  },
+
+  /**
+   * Per-account edge limits: one session's unsigned tier, from a fresh
+   * address every request, runs out after `limit`; another session from the
+   * same address still has its own budget.
+   */
+  'bearer-caller-limits': async (_rng, canary) => {
+    if (!canary.bearer) return SKIPPED
+    const limit = WIRE_EDGE_LIMITS.unsigned
+    const session = await openSession()
+    for (let i = 0; i < 2 * limit + 1; i++) {
+      const response = await send({
+        op: 'invite/fetch',
+        body: unsignedEnvelope({ inviteId: rid() }),
+        headers: session.auth,
+        expect: i < limit ? [404] : [404, 429],
+        note: `bearer invite/fetch ${i + 1} from a new address`,
+      })
+      if (response.status === 429) {
+        if (response.json?.error !== 'rate_limited' || response.headers.get('retry-after') !== '60')
+          throw new FuzzFailure('edge refusal without rate_limited + Retry-After: 60', caseLog.at(-1))
+        const shared = caseLog.at(-1).request.headers['cf-connecting-ip']
+        const other = await openSession()
+        await send({ op: 'invite/fetch', body: unsignedEnvelope({ inviteId: rid() }), headers: { ...other.auth, 'cf-connecting-ip': shared }, expect: [404], note: 'another account from the same address' })
+        return
+      }
+    }
+    throw new FuzzFailure(`no 429 after ${2 * limit + 1} bearer requests from one account`, caseLog.at(-1))
+  },
 }
 
 // --- Canary -------------------------------------------------------------------
@@ -856,6 +1265,23 @@ const setupCanary = async () => {
   await owner.send('device/register', { deviceId: rid(), apnsToken: randomBytes(32).toString('hex'), apnsEnvironment: 'sandbox', templates: TEMPLATES })
   const snapshot = (await owner.send('inbox/sync', { since: 0 })).json
   return { owner, writer, snapshot }
+}
+
+/**
+ * The bearer canary: an inbox registered by bearer request on its own
+ * session, with a buddy's card and event (sent with the buddy's token), a
+ * roster, and a device; plus a stranger session for cross-account cases.
+ */
+const setupBearerCanary = async () => {
+  const owner = await newBearerOwner()
+  const writer = await newWriter(owner)
+  const stranger = await openSession()
+  await sendWriterBearer(writer, 'card/put', { blob: blob(512) }, stranger.auth)
+  await sendWriterBearer(writer, 'event/put', { eventId: rid(), kind: 'plan.joined', blob: blob(64), push: false }, stranger.auth)
+  await owner.send('roster/put', { blob: blob(256) })
+  await owner.send('device/register', { deviceId: rid(), apnsToken: randomBytes(32).toString('hex'), apnsEnvironment: 'sandbox', templates: TEMPLATES })
+  const snapshot = (await owner.send('inbox/sync', { since: 0 })).json
+  return { owner, writer, stranger, snapshot }
 }
 
 const stable = (value) => JSON.stringify(value)
@@ -879,10 +1305,12 @@ caseLog = []
 let canary
 try {
   canary = await setupCanary()
+  canary.bearer = DEV_BYPASS ? await setupBearerCanary() : null
 } catch (error) {
   console.error('fuzz: canary setup failed (harness or server bug):', error.message, JSON.stringify(error.exchange ?? {}, null, 2))
   process.exit(1)
 }
+if (!canary.bearer) console.log('fuzz: no dev bypass token; bearer generators are skipped')
 
 for (const index of indices) {
   const name = names[(index + offset) % names.length]
@@ -891,7 +1319,7 @@ for (const index of indices) {
   const bucket = (stats.byGenerator[name] ??= { cases: 0, failures: 0 })
   bucket.cases++
   try {
-    await GENERATORS[name](rng, canary)
+    if ((await GENERATORS[name](rng, canary)) === SKIPPED) bucket.skipped = (bucket.skipped ?? 0) + 1
   } catch (error) {
     bucket.failures++
     const failure = {
@@ -923,10 +1351,29 @@ if (!canaryOk) {
   failures.push({ case: 'canary', generator: 'canary', reason: 'canary inbox changed or became unsyncable', detail: canaryDetail, transcript: caseLog })
   console.log('FAIL canary: inbox state changed or unsyncable after fuzzing')
 }
+let bearerCanaryOk = null
+let bearerCanaryDetail = null
+if (canary.bearer) {
+  caseLog = []
+  try {
+    await keepFresh(canary.bearer.owner.account)
+    const after = await canary.bearer.owner.send('inbox/sync', { since: 0 })
+    bearerCanaryOk = stable(after.json) === stable(canary.bearer.snapshot)
+    if (!bearerCanaryOk) bearerCanaryDetail = { before: canary.bearer.snapshot, after: after.json }
+  } catch (error) {
+    bearerCanaryOk = false
+    bearerCanaryDetail = { error: error.message, exchange: error.exchange }
+  }
+  if (!bearerCanaryOk) {
+    failures.push({ case: 'bearer-canary', generator: 'canary', reason: 'bearer canary inbox changed or became unsyncable', detail: bearerCanaryDetail, transcript: caseLog })
+    console.log('FAIL bearer canary: inbox state changed or unsyncable after fuzzing')
+  }
+}
 const healthAfter = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(TIMEOUT_MS) }).then((r) => r.ok).catch(() => false)
 if (!healthAfter) failures.push({ case: 'health', generator: 'health', reason: '/health not ok after fuzzing' })
-// Clean up the canary so repeated runs don't accumulate state.
+// Clean up the canaries so repeated runs don't accumulate state.
 await canary.owner.send('inbox/delete', {}).catch(() => undefined)
+if (canary.bearer) await canary.bearer.owner.send('inbox/delete').catch(() => undefined)
 
 const sorted = [...stats.latencies].sort((a, b) => a - b)
 const pct = (p) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] ?? 0
@@ -938,11 +1385,14 @@ const report = {
   startedAt: startedAt.toISOString(),
   durationMs: Date.now() - startedAt.getTime(),
   requests: stats.requests,
+  bearer: canary.bearer != null,
+  sessionsOpened: stats.sessionsOpened,
   devProxyRetries: stats.devProxyRetries,
   statuses: stats.statuses,
   latencyMs: { p50: pct(50), p95: pct(95), max: sorted.at(-1) ?? 0 },
   generators: stats.byGenerator,
   canary: { intact: canaryOk, detail: canaryDetail },
+  bearerCanary: canary.bearer ? { intact: bearerCanaryOk, detail: bearerCanaryDetail } : 'skipped (no dev bypass token)',
   healthAfter,
   failures,
 }
@@ -953,7 +1403,9 @@ writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`)
 console.log(
   `fuzz: ${indices.length} cases, ${stats.requests} requests, statuses ${JSON.stringify(stats.statuses)}, p95 ${pct(95)}ms, max ${report.latencyMs.max}ms, wrangler-dev proxy retries ${stats.devProxyRetries}`
 )
-console.log(`fuzz: canary ${canaryOk ? 'intact' : 'BROKEN'}, health after ${healthAfter ? 'ok' : 'FAILED'}`)
+console.log(
+  `fuzz: canary ${canaryOk ? 'intact' : 'BROKEN'}, bearer canary ${canary.bearer ? (bearerCanaryOk ? 'intact' : 'BROKEN') : 'skipped'}, ${stats.sessionsOpened} sessions, health after ${healthAfter ? 'ok' : 'FAILED'}`
+)
 console.log(`fuzz: report ${reportPath}`)
 if (failures.length) {
   console.log(`fuzz: ${failures.length} failure(s); seed ${SEED}. First repro:`)
