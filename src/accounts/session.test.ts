@@ -294,12 +294,15 @@ describe('POST /sessions/refresh', () => {
   it('accepts the replaced token for 60 seconds after a lost response', async () => {
     const session = await open()
     const rotated = await refresh(session.refreshToken)
+    const row = sessionRows()[0]
     advance(59 * SECOND)
     const retried = await refresh(session.refreshToken)
     expect(retried.status).toBe(200)
-    // The pair issued in between is gone (presenting it would end the
-    // session); the retried one works.
-    expect(retried.body.refreshToken).not.toBe(rotated.body.refreshToken)
+    // The same token the lost response carried, so none is left dangling;
+    // the retry writes nothing.
+    expect(retried.body.refreshToken).toBe(rotated.body.refreshToken)
+    expect(retried.body.accessToken).not.toBe(rotated.body.accessToken)
+    expect(sessionRows()[0]).toEqual(row)
     const next = await refresh(retried.body.refreshToken)
     expect(next.status).toBe(200)
     expect((await refresh(next.body.refreshToken)).status).toBe(200)
@@ -379,6 +382,39 @@ const recordQueries = () => {
     return prepare(query)
   })
   return queries
+}
+
+/**
+ * Holds the first statement matching `pattern` when it runs, until
+ * `release()`: `waiting` resolves once it's held. Interleaves concurrent
+ * refreshes at a chosen point.
+ */
+const holdFirst = (pattern: RegExp) => {
+  const d1 = h.accountsDb!
+  const prepare = d1.prepare.bind(d1)
+  let held = false
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  let reached!: () => void
+  const waiting = new Promise<void>((resolve) => (reached = resolve))
+  vi.spyOn(d1, 'prepare').mockImplementation((query: string) => {
+    const statement = prepare(query)
+    if (held || !pattern.test(query)) return statement
+    held = true
+    return {
+      bind: (...params: unknown[]) => {
+        const bound = statement.bind(...params)
+        return {
+          run: async () => {
+            reached()
+            await gate
+            return bound.run()
+          },
+        }
+      },
+    } as unknown as typeof statement
+  })
+  return { waiting, release }
 }
 
 const B64U_ALPHABET =
@@ -463,6 +499,76 @@ describe('refresh token reuse', () => {
     expect(sessionRows()[0]).toEqual(row)
   })
 
+  it('keeps the minute’s retry working across a token secret rotation', async () => {
+    const session = await open()
+    const rotated = await refresh(session.refreshToken)
+    const oldSecret = h.env.ACCOUNT_TOKEN_SECRET!
+    h.env.ACCOUNT_TOKEN_SECRET = 'rotated-account-token-secret-0123456789'
+    h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS = oldSecret
+    advance(10 * SECOND)
+    const retried = await refresh(session.refreshToken)
+    expect(retried.status).toBe(200)
+    expect(retried.body.refreshToken).toBe(rotated.body.refreshToken)
+
+    // Without the previous slot the retry fails, but the session lives.
+    delete h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS
+    expect((await refresh(session.refreshToken)).status).toBe(401)
+    expect(sessionRows()[0].revoked_at).toBeNull()
+    expect((await refresh(rotated.body.refreshToken)).status).toBe(200)
+  })
+})
+
+describe('concurrent refreshes', () => {
+  it('rotates once when two refreshes send the same token, and both get the new one', async () => {
+    const session = await open()
+    // The first reads the row, then waits to rotate while the second
+    // reads the same row and rotates first.
+    const hold = holdFirst(/^update "account_sessions"/)
+    const first = refresh(session.refreshToken)
+    await hold.waiting
+    const second = await refresh(session.refreshToken)
+    hold.release()
+    const firstReply = await first
+    expect(second.status).toBe(200)
+    expect(firstReply.status).toBe(200)
+    expect(firstReply.body.refreshToken).toBe(second.body.refreshToken)
+
+    // Whichever the device kept, the session goes on.
+    const [row] = sessionRows()
+    expect(row.revoked_at).toBeNull()
+    advance(10 * MINUTE)
+    expect((await refresh(firstReply.body.refreshToken)).status).toBe(200)
+  })
+
+  it('gives two retries of the replaced token the same token, without writing', async () => {
+    const session = await open()
+    const rotated = await refresh(session.refreshToken)
+    const row = sessionRows()[0]
+    const replies = await Promise.all([
+      refresh(session.refreshToken),
+      refresh(session.refreshToken),
+    ])
+    for (const reply of replies) {
+      expect(reply.status).toBe(200)
+      expect(reply.body.refreshToken).toBe(rotated.body.refreshToken)
+    }
+    expect(sessionRows()[0]).toEqual(row)
+  })
+
+  it('answers a rotation that lost its race with 401 if the session moved on, without ending it', async () => {
+    const session = await open()
+    const hold = holdFirst(/^update "account_sessions"/)
+    const first = refresh(session.refreshToken)
+    await hold.waiting
+    const second = await refresh(session.refreshToken)
+    // The device moves on before the first refresh looks again.
+    const third = await refresh(second.body.refreshToken)
+    expect(third.status).toBe(200)
+    hold.release()
+    expect((await first).status).toBe(401)
+    expect(sessionRows()[0].revoked_at).toBeNull()
+    expect((await refresh(third.body.refreshToken)).status).toBe(200)
+  })
 })
 
 describe('DELETE /sessions/current', () => {

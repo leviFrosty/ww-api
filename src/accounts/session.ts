@@ -13,7 +13,12 @@ import {
 } from './signed'
 import { accountsDb, newAccountId, registerAccount } from './store'
 import { closeSession, createSession, refreshSession } from './sessionStore'
-import { accessTokenKeys, signAccessToken, type AccessTokenKeys } from './tokens'
+import {
+  accessTokenKeys,
+  rotationKeys,
+  signAccessToken,
+  type AccessTokenKeys,
+} from './tokens'
 import type { SessionPlatform } from './schema'
 
 /**
@@ -135,7 +140,11 @@ const handleRefresh = guarded('session/refresh', async (c) => {
     return buddiesErrorResponse('bad_request')
   const token = parseRefreshToken(body.refreshToken)
   if (!token) return buddiesErrorResponse('unauthorized')
-  const issued = await refreshSession(accountsDb(setup.db), token)
+  const issued = await refreshSession(
+    accountsDb(setup.db),
+    rotationKeys(setup.keys),
+    token
+  )
   if (!issued) return buddiesErrorResponse('unauthorized')
   return c.json({
     ok: true,

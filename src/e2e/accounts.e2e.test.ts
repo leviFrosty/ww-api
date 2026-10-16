@@ -336,6 +336,30 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
       expect((await refresh(token)).status).toBe(401)
   })
 
+  it('gives a double refresh and a lost-response retry the same token', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const [one, two] = await Promise.all([
+      refresh(session.refreshToken),
+      refresh(session.refreshToken),
+    ])
+    expect(one.status).toBe(200)
+    expect(two.status).toBe(200)
+    expect(two.body.refreshToken).toBe(one.body.refreshToken)
+    // A retry within the minute, as after a lost response, gets it again.
+    const retried = await refresh(session.refreshToken)
+    expect(retried.body.refreshToken).toBe(one.body.refreshToken)
+
+    // Whichever answer the device kept, the session goes on.
+    const next = await refresh(one.body.refreshToken as string)
+    expect(next.status).toBe(200)
+    const info = await http('GET', '/accounts/v1/account', {
+      headers: { authorization: `Bearer ${next.body.accessToken}` },
+    })
+    expect(info.body.accountId).toBe(session.accountId)
+  })
+
   it('refuses a bad bearer token without trying the envelope', async () => {
     const key = await registered()
     const res = await http('POST', '/accounts/v1/account/info', {

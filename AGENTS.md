@@ -599,12 +599,18 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
 - **Refresh**: plain JSON `{ refreshToken }`. A refresh token is
   `<sessionId>.<secret>` (b64u, 16 and 32 bytes; opaque to the app), so the
   session is found by id, and a malformed one is 401 before any D1 read.
-  Each refresh replaces the token. The one just replaced still works for 60
-  seconds from its rotation (a lost response; retries don't extend it).
-  Presenting it later, or any older token of a live session (or one it
-  never issued), ends the session. An unknown, ended, or expired session
-  is 401 `unauthorized`. Sessions last 90 days from opening and refreshing
-  never extends them. Read edge tier.
+  Each refresh replaces the token with one derived from it (HMAC under a key
+  from `ACCOUNT_TOKEN_SECRET`), with a compare-and-swap on the hash it read,
+  so the row rotates once and every refresh presenting the same token gets
+  the same next one. The one just replaced gets it again for 60 seconds
+  from its rotation (a lost response, or two refreshes at once; retries
+  don't extend it and write nothing), so a device's double refresh can't
+  strand it with a dead token. Presenting it later, or any older token of a
+  live session (or one it never issued), ends the session. An unknown,
+  ended, or expired session is 401 `unauthorized`; a refresh that lost its
+  rotation race to a session that has since moved on again is 401 without
+  ending it. Sessions last 90 days from opening and refreshing never
+  extends them. Read edge tier.
 - **Close**: `DELETE /sessions/current`, Bearer, no body; ends the token's
   own session, idempotent. Read tier. Session ids never go in URLs.
 - **Storage**: D1 `account_sessions` (migration
@@ -638,7 +644,9 @@ openssl rand -base64 32 | wrangler secret put ACCOUNT_TOKEN_SECRET
 wrangler secret delete ACCOUNT_TOKEN_SECRET_PREVIOUS
 ```
 
-Skipping the previous slot only costs each device one extra refresh. Local
+Skipping the previous slot only costs each device one extra refresh, and
+a refresh retried within the minute after the rotation (a lost response)
+gets 401, so that device opens a new session. Local
 `wrangler dev` reads `ACCOUNT_TOKEN_SECRET` from `.dev.vars`
 (`.dev.vars.example`); the verify launcher and the test harness set their
 own.

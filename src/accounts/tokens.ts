@@ -18,6 +18,10 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
  * valid until they expire. Without it, they fail once and the app refreshes.
  *
+ * Each secret also yields the key refresh tokens rotate under
+ * (`rotationKey`, src/accounts/sessionStore.ts), kept apart from the signing
+ * key by its own derivation.
+ *
  * The issuer names the environment (`APP_ATTEST_ENVIRONMENT`) and each
  * environment has its own secret, so a development token never passes on
  * production.
@@ -53,6 +57,8 @@ export interface AccessTokenClaims {
 interface TokenKey {
   kid: string
   key: CryptoKey
+  /** HMAC-SHA256 key for deriving refresh tokens: SHA-256 of a label and the secret. */
+  rotationKey: CryptoKey
 }
 
 export interface AccessTokenKeys {
@@ -80,14 +86,21 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
       const digest = await sha256Bytes(
         encoder.encode(`ww-account/v1/token-kid\n${secret}`)
       )
-      const key = await crypto.subtle.importKey(
-        'raw',
-        encoder.encode(secret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign', 'verify']
-      )
-      return { kid: bytesToBase64Url(digest).slice(0, 16), key }
+      const hmac = (bytes: Uint8Array) =>
+        crypto.subtle.importKey(
+          'raw',
+          bytes,
+          { name: 'HMAC', hash: 'SHA-256' },
+          false,
+          ['sign', 'verify']
+        )
+      const [key, rotationKey] = await Promise.all([
+        hmac(encoder.encode(secret)),
+        sha256Bytes(
+          encoder.encode(`ww-account/v1/refresh-rotation\n${secret}`)
+        ).then(hmac),
+      ])
+      return { kid: bytesToBase64Url(digest).slice(0, 16), key, rotationKey }
     })()
     cached.catch(() => keyCache.delete(secret))
     keyCache.set(secret, cached)
@@ -130,6 +143,12 @@ export const accessTokenKeys = async (
   ])
   return { issuer, current, previous }
 }
+
+/** The keys refresh tokens rotate under: the current one first. */
+export const rotationKeys = (keys: AccessTokenKeys): CryptoKey[] =>
+  keys.previous
+    ? [keys.current.rotationKey, keys.previous.rotationKey]
+    : [keys.current.rotationKey]
 
 const encodeJson = (value: unknown): string =>
   bytesToBase64Url(encoder.encode(JSON.stringify(value)))
