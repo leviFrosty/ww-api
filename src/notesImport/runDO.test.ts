@@ -89,6 +89,8 @@ interface FakeRunState {
   meta: Map<string, string>
   events: Array<{ seq: number; type: string; data: string }>
   alarms: number[]
+  /** Whether `meta` and `events` exist (created on the first write). */
+  tables: boolean
 }
 
 const fakeContext = (state: FakeRunState): DurableObjectState =>
@@ -97,7 +99,15 @@ const fakeContext = (state: FakeRunState): DurableObjectState =>
     storage: {
       sql: {
         exec: (query: string, ...args: unknown[]) => {
-          if (query.startsWith('CREATE TABLE')) return cursor([])
+          if (query.startsWith('CREATE TABLE')) {
+            state.tables = true
+            return cursor([])
+          }
+          if (query.startsWith('SELECT name FROM sqlite_master')) {
+            return cursor(state.tables ? [{ name: 'meta' }] : [])
+          }
+          // Like SQLite: deleteAll() drops the tables with the rows.
+          if (!state.tables) throw new Error('no such table')
           if (query === 'DELETE FROM events') {
             state.events = []
             return cursor([])
@@ -139,6 +149,7 @@ const fakeContext = (state: FakeRunState): DurableObjectState =>
       deleteAll: vi.fn(async () => {
         state.meta.clear()
         state.events = []
+        state.tables = false
       }),
     },
     waitUntil: vi.fn(),
@@ -148,7 +159,12 @@ const makeRun = async (
   recordUsage: ReturnType<typeof vi.fn>,
   extraEnv: Partial<Environment> = {}
 ) => {
-  const state: FakeRunState = { meta: new Map(), events: [], alarms: [] }
+  const state: FakeRunState = {
+    meta: new Map(),
+    events: [],
+    alarms: [],
+    tables: false,
+  }
   const index = {
     recordUsage,
     release: vi.fn(async () => undefined),
@@ -276,6 +292,47 @@ describe('NotesImportRun cancellation and destruction settlement', () => {
     expect(run.getResult()).toEqual({ status: null })
     expect(state.meta.size).toBe(0)
     expect(state.events).toEqual([])
+  })
+})
+
+describe('NotesImportRun storage', () => {
+  it('stores nothing when asked about an import that never started', async () => {
+    const { run, state } = await makeRun(vi.fn())
+    expect(run.getResult()).toEqual({ status: null })
+    await expect(run.cancel()).resolves.toEqual({ status: null })
+    await run.alarm()
+    expect(state.tables).toBe(false)
+  })
+
+  it('starts the same import again on the instance that destroyed it', async () => {
+    const recordUsage = vi.fn(async () => ({
+      credits: CREDITS,
+      emptyCharged: false,
+    }))
+    mocks.resolveTerminalSupporter.mockResolvedValue(false)
+    const { run, state } = await makeRun(recordUsage)
+    await run.start(INPUT)
+    await run.destroy()
+    expect(state.tables).toBe(false)
+
+    await expect(run.start(INPUT)).resolves.toBe('started')
+    await run.alarm()
+    expect(run.getResult()).toMatchObject({ status: 'done' })
+  })
+
+  it('starts again after the retention alarm wiped a finished run', async () => {
+    const recordUsage = vi.fn(async () => ({
+      credits: CREDITS,
+      emptyCharged: false,
+    }))
+    mocks.resolveTerminalSupporter.mockResolvedValue(false)
+    const { run } = await makeRun(recordUsage)
+    await run.start(INPUT)
+    await run.alarm()
+    await run.alarm()
+    expect(run.getResult()).toEqual({ status: null })
+
+    await expect(run.start(INPUT)).resolves.toBe('started')
   })
 })
 
