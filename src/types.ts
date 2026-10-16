@@ -258,6 +258,12 @@ export interface Environment {
    */
   ACCOUNT_BACKUPS?: R2Bucket;
 
+  /**
+   * Minimum app version (`major.minor.patch`) for the whole app, served by
+   * GET /app/v1/config. KV `app:min-version` overrides. Unset = no floor.
+   */
+  APP_MIN_VERSION?: string;
+
   // --- Buddies relay -------------------------------------------------------
 
   /**
