@@ -21,6 +21,7 @@ import {
   V1_CODES,
 } from '../attestation/openapi'
 import { notesImportResultValidator } from './schema'
+import { SYNC_IMPORT_DEADLINE_MS } from './cap'
 
 /**
  * OpenAPI descriptions for the Notes Import routes (`src/notesImport/route.ts`).
@@ -29,6 +30,9 @@ import { notesImportResultValidator } from './schema'
  */
 
 const TAG = 'Notes Import'
+
+/** How long the synchronous path waits on the model. */
+const SYNC_DEADLINE_MINUTES = SYNC_IMPORT_DEADLINE_MS / 60_000
 
 // --- Shared bodies and responses ----------------------------------------
 
@@ -421,7 +425,7 @@ export const legacyImportDocs = describeRoute({
   summary: 'Import notes synchronously (legacy)',
   description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. Bearer requests take the same body as kickoff’s. Legacy requests are App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
 
-${GATE_DESCRIPTION} The same concurrency cap as kickoff applies, and each request holds a slot of its own while it runs, identical ones included (they still charge once).`,
+${GATE_DESCRIPTION} The same concurrency cap as kickoff applies, and each request holds a slot of its own while it runs, identical ones included (they still charge once). A model run that hasn't finished within ${SYNC_DEADLINE_MINUTES} minutes is stopped and answered \`502\` \`model_error\`, charging nothing.`,
   deprecated: true,
   security: bearerOrLegacy,
   parameters: [devBypassHeader],
@@ -437,9 +441,10 @@ ${GATE_DESCRIPTION} The same concurrency cap as kickoff applies, and each reques
     200: jsonResponse('The finished import.', successSchema),
     ...importGateErrors(true),
     500: niError('Unexpected failure.', ['server_error']),
-    502: niError('The model failed or returned an invalid result.', [
-      'model_error',
-    ]),
+    502: niError(
+      `The model failed, returned an invalid result, or didn’t finish within ${SYNC_DEADLINE_MINUTES} minutes.`,
+      ['model_error']
+    ),
     503: niError(
       `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
       ['unavailable', 'disabled', 'server_error']
