@@ -184,13 +184,13 @@ describe('trace sampling', () => {
     createSentryConfig({ APP_ATTEST_ENVIRONMENT: development ? 'development' : 'production' } as Environment)
       .tracesSampler!({ name, transactionContext: { name }, parentSampled })
 
-  it.each(['GET /notes-import/status', 'GET /geocode', 'GET /autocomplete', 'GET /health', 'GET /c/private-payload', 'GET /unknown'])(
+  it.each(['GET /notes-import/status', 'GET /attestation/v1/status', 'GET /geocode', 'GET /autocomplete', 'GET /health', 'GET /c/private-payload', 'GET /contacts', 'GET /unknown'])(
     'samples routine transaction %s at 10%, including sampled parents', (name) => {
       expect(sample(name)).toBe(0.1)
       expect(sample(name, false, true)).toBe(0.1)
     }
   )
-  it.each(['POST /notes-import', 'POST /notes-import/kickoff', 'POST /notes-import/challenge', 'POST /notes-import/attest', 'GET /notes-import/id/events'])(
+  it.each(['POST /notes-import', 'POST /notes-import/kickoff', 'POST /notes-import/challenge', 'POST /notes-import/attest', 'GET /notes-import/id/events', 'POST /attestation/v1/challenge', 'POST /attestation/v1/register', 'POST /attestation/v1/verify'])(
     'retains import transaction %s even with an unsampled parent', (name) => {
       expect(sample(name, false, false)).toBe(1)
     }

@@ -1,13 +1,25 @@
 import { z } from 'zod'
 import { describeRoute } from 'hono-openapi'
 import {
-  apiErrorSchema,
   errorResponse,
-  json,
   jsonBody,
   jsonResponse,
   rateLimitedResponse,
 } from '../openapi/schemas'
+import {
+  accountId,
+  appAttestV2AssertionFields,
+  ATTESTATION_NOTE,
+  attestationErrorSchema,
+  attestationProvidersShape,
+  attestationResponses,
+  devBypassHeader,
+  installId,
+  playIntegrityFields,
+  sha256Hex,
+  storageUnavailable,
+  V1_CODES,
+} from '../attestation/openapi'
 import { notesImportResultValidator } from './schema'
 
 /**
@@ -17,83 +29,6 @@ import { notesImportResultValidator } from './schema'
  */
 
 const TAG = 'Notes Import'
-
-// --- Shared fields -------------------------------------------------------
-
-const sha256Hex = (description: string) =>
-  z
-    .string()
-    .regex(/^[a-f0-9]{64}$/)
-    .meta({ description: `${description} (lowercase hex SHA-256)` })
-
-const installId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,64}$/)
-  .meta({
-    description:
-      'The install id (`uuid`). App Attest keys are pinned to it; usage is metered on it when no `accountId` is sent.',
-  })
-
-const accountId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,64}$/)
-  .optional()
-  .meta({
-    description:
-      'Optional shared account id. When present, Supporter status, allowances, the concurrency cap, and replay all key on it instead of `uuid`. A malformed value is a 400, never ignored.',
-  })
-
-const operationId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,128}$/)
-  .meta({
-    description:
-      'Client-chosen id for one challenge → request round trip. Reusing it with different data is `operation_conflict`.',
-  })
-
-const keyId = z
-  .string()
-  .regex(/^[A-Za-z0-9+/]{43}=$/)
-  .meta({
-    description: 'The App Attest key id (standard base64 of 32 bytes).',
-  })
-
-const challenge = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/)
-  .meta({
-    description:
-      'The one-time server challenge from `POST /notes-import/challenge` (43-character base64url). Consumed on use.',
-  })
-
-const purpose = z
-  .enum([
-    'notes-import-kickoff',
-    'notes-import-verify',
-    'notes-import-transcribe',
-  ])
-  .meta({
-    description:
-      'Which protected request the challenge is for. It must match the route that consumes it.',
-  })
-
-const expiresAt = z.number().int().meta({
-  description: 'When the challenge expires (epoch ms; 5 minutes after issue).',
-})
-
-const playIntegrityProvider = z.literal('play-integrity').meta({
-  description:
-    'Opts the request into the Android Play Integrity path. Bodies without it take the App Attest path.',
-})
-
-const devBypassHeader = {
-  name: 'x-ww-dev-bypass',
-  in: 'header' as const,
-  required: false,
-  schema: { type: 'string' as const },
-  description:
-    'Development worker only: the `NOTES_IMPORT_DEV_BYPASS_TOKEN` secret. A match skips attestation and the RevenueCat check and uses the Supporter allowances. Production never sets the token, so the header is ignored there.',
-}
 
 // --- Shared bodies and responses ----------------------------------------
 
@@ -130,31 +65,12 @@ const creditsSchema = z
       'Usage snapshot, shared by kickoff, `done`, the legacy response, and allowance denials.',
   })
 
-const notesImportErrorSchema = apiErrorSchema
+const notesImportErrorSchema = attestationErrorSchema
   .extend({
     detail: z.string().optional().meta({
       description:
         'On `unavailable`, why (`disabled`, `no_provider`, or an operator message). On the development worker, a debug detail for `server_error` and `model_error`.',
     }),
-    reason: z.string().optional().meta({
-      description:
-        'Stable App Attest or Play Integrity reason, on attestation failures: `invalid_request`, `unsupported_protocol`, `operation_conflict`, `too_many_challenges`, `challenge_not_found`, `challenge_expired`, `identity_not_bound`, `key_not_active`, `recovery_not_enrolled`, `recovery_token_mismatch`, `attestation_invalid`, `assertion_invalid`, `counter_not_increasing`, `storage_unavailable`; Android adds `integrity_unavailable`, `integrity_token_invalid`, `app_not_recognized`, `device_integrity_failed`.',
-    }),
-    action: z
-      .enum([
-        'none',
-        'retry',
-        'request_challenge',
-        'start_new_operation',
-        'bind',
-        'enroll_recovery',
-        'use_active_key',
-      ])
-      .optional()
-      .meta({
-        description:
-          'What the client should do next, beside `reason`. Transient failures never ask for key rotation.',
-      }),
     credits: creditsSchema.optional().meta({
       description: 'On `limit_reached` and `refinement_limit`.',
     }),
@@ -168,66 +84,8 @@ const notesImportErrorSchema = apiErrorSchema
 const niError = (description: string, codes: readonly string[]) =>
   errorResponse(description, codes, notesImportErrorSchema)
 
-const V1_CODES = [
-  'device_verification_failed',
-  'assertion_failed',
-  'challenge_expired',
-  'counter_conflict',
-] as const
-
-const ATTESTATION_NOTE =
-  'App Attest v1 (legacy) failures are always 401 with `device_verification_failed`, `assertion_failed`, `challenge_expired`, or `counter_conflict`, which never ask the client to rotate its key. App Attest v2 and Play Integrity failures are `attestation_failed` at the reason’s own status; branch on `reason`/`action`.'
-
 const killSwitchUnavailable =
   '`unavailable`: the kill switch is off or no allowlisted model host is healthy (`detail` says which; `Retry-After: 60`). '
-
-const storageUnavailable =
-  '`server_error`: attestation storage or Google’s decode service is unavailable (`Retry-After: 30`).'
-
-const attestationResponses = {
-  401: niError(
-    `Attestation failed: an unknown, consumed, or expired challenge, an invalid assertion or token, or an identity whose key isn’t bound or active. ${ATTESTATION_NOTE}`,
-    ['attestation_failed', ...V1_CODES]
-  ),
-  403: niError(
-    'Play Integrity only: the app isn’t the Play-distributed build (`app_not_recognized`) or the device fails the required integrity verdict (`device_integrity_failed`).',
-    ['attestation_failed']
-  ),
-  409: niError(
-    'App Attest v2 / Play Integrity: `operationId` was used with different data (`operation_conflict`), or the assertion’s sign count didn’t increase (`counter_not_increasing`). Start a new operation.',
-    ['attestation_failed']
-  ),
-}
-
-// --- Attested request fields --------------------------------------------
-
-/** App Attest v2 assertion fields shared by verify, kickoff, and transcribe. */
-const appAttestV2AssertionFields = (forPurpose: string) => ({
-  protocolVersion: z.literal(2),
-  operation: z.literal('assert'),
-  operationId,
-  keyId,
-  purpose: z.literal(forPurpose),
-  challenge,
-  assertion: z.string().max(65_536).meta({
-    description:
-      'App Attest assertion (base64) over SHA-256 of the client data `witnesswork.app-attest|2|assert|<purpose>|<operationId>|<challenge>|<uuid>|<accountId or empty>|<contentHash>|<requestHash>`.',
-  }),
-})
-
-/** Play Integrity fields shared by verify, kickoff, and transcribe. */
-const playIntegrityFields = (forPurpose: string) => ({
-  attestationProvider: playIntegrityProvider,
-  protocolVersion: z.literal(1),
-  operation: z.literal('assert'),
-  operationId,
-  purpose: z.literal(forPurpose),
-  challenge,
-  integrityToken: z.string().max(32_768).meta({
-    description:
-      'A Play Integrity standard-request token whose `requestHash` is the lowercase hex SHA-256 of `witnesswork.play-integrity|1|assert|<purpose>|<operationId>|<challenge>|<uuid>|<accountId or empty>|<contentHash>|<requestHash>`. Never send `keyId` or `assertion` with it.',
-  }),
-})
 
 // --- GET /notes-import/status --------------------------------------------
 
@@ -237,26 +95,8 @@ const allowancePair = z.object({
 })
 
 const capabilitiesSchema = z.object({
-  appAttest: z.object({
-    protocolVersions: z.array(z.number().int()).meta({
-      description: 'App Attest protocol versions accepted: `[1, 2]`.',
-    }),
-  }),
-  playIntegrity: z
-    .object({
-      protocolVersions: z.array(z.number().int()).meta({
-        description: 'Play Integrity protocol versions accepted: `[1]`.',
-      }),
-      cloudProjectNumber: z.string().meta({
-        description:
-          'The Google Cloud project number the app passes to the Play Integrity standard-request provider.',
-      }),
-    })
-    .optional()
-    .meta({
-      description:
-        'Present only when this worker can verify Android requests. Android keeps Notes Import closed while it is absent.',
-    }),
+  // The same as GET /attestation/v1/status `providers`.
+  ...attestationProvidersShape,
   transcribe: z
     .object({
       maxPages: z
@@ -319,324 +159,6 @@ Completed responses are reused in each Worker isolate for up to 30 seconds (KV r
   responses: {
     200: jsonResponse('The current status.', statusSchema),
     ...rateLimitedResponse,
-  },
-})
-
-// --- POST /notes-import/challenge ------------------------------------------
-
-const challengeRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-    })
-    .meta({
-      title: 'App Attest v1 (legacy)',
-      description:
-        'An empty body, `{}`, or `{ "protocolVersion": 1 }`. Returns a bare challenge for a v1 attestation or assertion.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.enum(['bind', 'enroll']),
-      operationId,
-      uuid: installId,
-      keyId,
-    })
-    .meta({
-      title: 'App Attest v2 bind / enroll',
-      description:
-        'A challenge for `POST /notes-import/attest`: `bind` attests a new key, `enroll` adds a recovery token with the active key. No assertion fields allowed.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('assert'),
-      operationId,
-      uuid: installId,
-      keyId,
-      purpose,
-      accountId,
-      contentHash: sha256Hex(
-        'The content hash the protected request will carry'
-      ),
-      requestHash: sha256Hex(
-        'The request hash the protected request will carry'
-      ),
-    })
-    .meta({
-      title: 'App Attest v2 assert',
-      description:
-        'A challenge bound to one protected request (verify, kickoff, or transcribe). The later request must repeat these values exactly.',
-    }),
-  z
-    .object({
-      attestationProvider: playIntegrityProvider,
-      protocolVersion: z.literal(1),
-      operation: z.literal('assert'),
-      operationId,
-      uuid: installId,
-      accountId,
-      purpose,
-      contentHash: sha256Hex(
-        'The content hash the protected request will carry'
-      ),
-      requestHash: sha256Hex(
-        'The request hash the protected request will carry'
-      ),
-    })
-    .meta({
-      title: 'Play Integrity',
-      description:
-        'Android. Same binding as the App Attest v2 assert challenge, without `keyId`.',
-    }),
-])
-
-const challengeResponseSchema = z.union([
-  z.object({ challenge: z.string() }).meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.enum(['bind', 'enroll', 'assert']),
-      operationId,
-      challenge,
-      expiresAt,
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      attestationProvider: z.literal('play-integrity'),
-      protocolVersion: z.literal(1),
-      operation: z.literal('assert'),
-      operationId,
-      challenge,
-      expiresAt,
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-export const challengeDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Issue an attestation challenge',
-  description: `Step one of every attested call. Returns a one-time challenge (5-minute lifetime) for App Attest v1, App Attest v2 (\`bind\`, \`enroll\`, or \`assert\`), or Play Integrity.
-
-v2 and Play Integrity challenges are bound to their request: the descriptor (operation, \`operationId\`, \`uuid\`, \`keyId\`, purpose, \`accountId\`, and both hashes) is stored, and the consuming request must match it. Re-requesting the same \`operationId\` with the same data returns the outstanding challenge. At most 32 unexpired challenges per install.
-
-**Hashes.** \`contentHash\` is SHA-256 of \`notesText\` (kickoff), of the base64 \`image\` string as sent (transcribe), or any value the client picks (verify). \`requestHash\` is SHA-256 of the sorted-key canonical JSON \`{"context","notesText","refinement"}\` (kickoff; \`refinement\` is \`null\` when absent), of \`{"imageHash","mimeType"}\` (transcribe), or equal to \`contentHash\` (verify).`,
-  requestBody: {
-    required: false,
-    description: 'Optional; an empty body asks for a v1 challenge.',
-    content: json(challengeRequestSchema),
-  },
-  responses: {
-    200: jsonResponse('A challenge.', challengeResponseSchema),
-    400: niError(
-      'Invalid JSON, an invalid challenge request (`reason: invalid_request`), or an unsupported `protocolVersion` (`reason: unsupported_protocol`). v2 requests the lifecycle rejects answer `attestation_failed`.',
-      ['bad_request', 'attestation_failed']
-    ),
-    409: niError(
-      '`operationId` was already used with different data (`operation_conflict`).',
-      ['attestation_failed']
-    ),
-    429: niError(
-      'Too many requests from this IP (`rate_limited`, `Retry-After: 60`), or 32 unexpired challenges for this install (`attestation_failed`, `reason: too_many_challenges`; Play Integrity sends `Retry-After: 300`).',
-      ['rate_limited', 'attestation_failed']
-    ),
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError(
-      'Challenge storage is unavailable, or Play Integrity isn’t configured on this worker (`reason: integrity_unavailable`). `Retry-After: 30`.',
-      ['server_error']
-    ),
-  },
-})
-
-// --- POST /notes-import/attest ---------------------------------------------
-
-const recoveryToken = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{43}$/)
-  .meta({
-    description:
-      'A 256-bit secret the app keeps (43-character base64url). Only a verifier is stored; it lets a reinstall or a new key take over the install id later.',
-  })
-
-const attestRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-      keyId: z.string(),
-      attestation: z.string().meta({
-        description: 'App Attest attestation object (base64).',
-      }),
-      challenge: z.string(),
-      uuid: z.string(),
-    })
-    .meta({
-      title: 'App Attest v1 (legacy)',
-      description: 'Binds a key to the install id.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('bind'),
-      operationId,
-      uuid: installId,
-      keyId,
-      challenge,
-      attestation: z.string().meta({
-        description:
-          'App Attest attestation object (base64) whose client data hash is SHA-256 of `witnesswork.app-attest|2|bind|<operationId>|<challenge>|<uuid>|<tokenHash>`, where `tokenHash` is base64url SHA-256 of the decoded recovery token.',
-      }),
-      recoveryToken,
-    })
-    .meta({
-      title: 'App Attest v2 bind',
-      description:
-        'Attests a key for the install id with a recovery token. Rebinding the same install to a new key requires the recovery token enrolled earlier.',
-    }),
-  z
-    .object({
-      protocolVersion: z.literal(2),
-      operation: z.literal('enroll'),
-      operationId,
-      uuid: installId,
-      keyId,
-      challenge,
-      assertion: z.string().max(65_536).meta({
-        description:
-          'Assertion by the active key over SHA-256 of `witnesswork.app-attest|2|enroll|<operationId>|<challenge>|<uuid>|<keyId>|<tokenHash>`.',
-      }),
-      recoveryToken,
-    })
-    .meta({
-      title: 'App Attest v2 enroll',
-      description:
-        'Adds a recovery token to an install already bound by a legacy key.',
-    }),
-])
-
-const attestResponseSchema = z.union([
-  z.object({ ok: z.literal(true) }).meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      ok: z.literal(true),
-      protocolVersion: z.literal(2),
-      operationId,
-      status: z
-        .enum(['bound', 'already_bound', 'rotated', 'recovery_enrolled'])
-        .meta({
-          description:
-            '`bound`: first key; `already_bound`: this key was already active; `rotated`: a new key replaced the old one with the recovery token; `recovery_enrolled`: enroll succeeded.',
-        }),
-      recoveryEnrolled: z.boolean(),
-    })
-    .meta({ title: 'App Attest v2' }),
-])
-
-export const attestDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Register an App Attest key',
-  description: `iOS only. Binds a Secure Enclave key to the install id (v1 or v2 \`bind\`), or enrolls a v2 recovery token with the active key (\`enroll\`), using a challenge from \`POST /notes-import/challenge\`.
-
-The attested App ID must be \`<team id>.<bundle id>\` for an accepted bundle id (the App Store app, plus the TestFlight Beta app on production); the key stays bound to the one it matched. Play Integrity has no registration step: a body with \`attestationProvider: "play-integrity"\` is a 400 with \`reason: unsupported_protocol\`.`,
-  requestBody: jsonBody(attestRequestSchema),
-  responses: {
-    200: jsonResponse('Registered.', attestResponseSchema),
-    400: niError(
-      'Invalid JSON, missing fields, a Play Integrity body, or (v2) an invalid field or recovery token. Route-level checks answer `bad_request`; v2 checks in the lifecycle answer `attestation_failed` with `reason: invalid_request` or `unsupported_protocol`.',
-      ['bad_request', 'attestation_failed']
-    ),
-    401: niError(
-      `The challenge, attestation, or recovery token didn’t verify: \`challenge_not_found\`, \`challenge_expired\`, \`attestation_invalid\`, \`recovery_not_enrolled\` (\`action: enroll_recovery\`), \`recovery_token_mismatch\`, \`identity_not_bound\`. ${ATTESTATION_NOTE}`,
-      ['attestation_failed', ...V1_CODES]
-    ),
-    409: niError(
-      '`operationId` was already used with different data (`operation_conflict`).',
-      ['attestation_failed']
-    ),
-    ...rateLimitedResponse,
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError('App Attest storage is unavailable. `Retry-After: 30`.', [
-      'server_error',
-    ]),
-  },
-})
-
-// --- POST /notes-import/verify ---------------------------------------------
-
-const verifyRequestSchema = z.union([
-  z
-    .object({
-      protocolVersion: z.literal(1).optional(),
-      uuid: z.string(),
-      accountId,
-      keyId: z.string(),
-      challenge: z.string(),
-      assertion: z.string().meta({
-        description:
-          'Assertion over SHA-256 of `<challenge>|<uuid>|<contentHash>`, or `<challenge>|<uuid>|<accountId>|<contentHash>` when `accountId` is sent.',
-      }),
-      contentHash: sha256Hex('Any value the client picks'),
-    })
-    .meta({ title: 'App Attest v1 (legacy)' }),
-  z
-    .object({
-      uuid: installId,
-      accountId,
-      ...appAttestV2AssertionFields('notes-import-verify'),
-      contentHash: sha256Hex('Any value the client picks'),
-      requestHash: sha256Hex('Must equal `contentHash`'),
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      uuid: installId,
-      accountId,
-      ...playIntegrityFields('notes-import-verify'),
-      contentHash: sha256Hex('Any value the client picks'),
-      requestHash: sha256Hex('Must equal `contentHash`'),
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-const verifyResponseSchema = z.union([
-  z
-    .object({ ok: z.literal(true) })
-    .meta({ title: 'App Attest v1 (or dev bypass)' }),
-  z
-    .object({
-      ok: z.literal(true),
-      protocolVersion: z.literal(2),
-      operationId,
-    })
-    .meta({ title: 'App Attest v2' }),
-  z
-    .object({
-      ok: z.literal(true),
-      attestationProvider: z.literal('play-integrity'),
-      protocolVersion: z.literal(1),
-      operationId,
-    })
-    .meta({ title: 'Play Integrity' }),
-])
-
-export const verifyDocs = describeRoute({
-  tags: [TAG],
-  summary: 'Verify attestation (diagnostic)',
-  description: `An attested no-op for the app’s developer tools. Runs the same verification as the metered routes, consuming the challenge and advancing the sign count, but touches no allowance and runs no model.
-
-There is no payload, so \`requestHash\` must equal \`contentHash\` (v2 and Play Integrity), with purpose \`notes-import-verify\`. Not gated by the kill switch.`,
-  parameters: [devBypassHeader],
-  requestBody: jsonBody(verifyRequestSchema),
-  responses: {
-    200: jsonResponse('The attestation verified.', verifyResponseSchema),
-    400: niError(
-      'Invalid JSON, missing or malformed fields, `requestHash` ≠ `contentHash`, or an invalid v2 / Play Integrity request (`reason: invalid_request`).',
-      ['bad_request', 'attestation_failed']
-    ),
-    ...attestationResponses,
-    ...rateLimitedResponse,
-    500: niError('Unexpected failure.', ['server_error']),
-    503: niError(storageUnavailable, ['server_error']),
   },
 })
 

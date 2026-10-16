@@ -120,7 +120,7 @@ describe('app store ratings', () => {
 })
 
 describe('universal links', () => {
-  it('serves the AASA as JSON with /c, /c/*, and /b#1 components', async () => {
+  it('serves the AASA as JSON with the readable and short link paths', async () => {
     const res = await http('GET', '/.well-known/apple-app-site-association')
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('application/json')
@@ -130,6 +130,9 @@ describe('universal links', () => {
       expect(appId).toMatch(/^[A-Z0-9]{10}\.com\.leviwilkerson\.jwtime(beta|dev)?$/)
     }
     expect(detail.components).toEqual([
+      { '/': '/contacts', '#': '?*' },
+      { '/': '/buddies/invite', '#': '1?*' },
+      { '/': '/accounts/handoff', '#': '1?*' },
       { '/': '/c', '#': '?*' },
       { '/': '/c/*' },
       { '/': '/b', '#': '1?*' },
@@ -137,14 +140,15 @@ describe('universal links', () => {
     ])
   })
 
-  it('GET /c renders the localized contact fallback page', async () => {
-    const english = await http('GET', '/c')
+  it.each(['/contacts', '/c'])('GET %s renders the localized contact fallback page', async (path) => {
+    const english = await http('GET', path)
     expect(english.status).toBe(200)
     expect(english.headers.get('content-type')).toContain('text/html')
     expect(english.text).toContain('id="open-app"')
     expect(english.text).toContain('witnesswork://import-contact/')
+    expect(english.text).toContain(`property="og:url" content="https://ww-proxy.leviwilkerson.com${path}"`)
 
-    const spanish = await http('GET', '/c?lang=es')
+    const spanish = await http('GET', `${path}?lang=es`)
     expect(spanish.status).toBe(200)
     expect(spanish.headers.get('content-language')).toMatch(/^es/)
     expect(spanish.text).toContain('<html lang="es')
@@ -162,8 +166,8 @@ describe('universal links', () => {
     expect(hostile.text).not.toContain('<script>x</script>')
   })
 
-  it('GET /b serves the buddy invite page with a locked-down CSP', async () => {
-    const res = await http('GET', '/b')
+  it.each(['/buddies/invite', '/b'])('GET %s serves the buddy invite page with a locked-down CSP', async (path) => {
+    const res = await http('GET', path)
     expect(res.status).toBe(200)
     expect(res.text).toContain('WitnessWork buddy invite')
     expect(res.headers.get('content-security-policy')).toContain("default-src 'none'")

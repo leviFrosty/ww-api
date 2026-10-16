@@ -14,9 +14,6 @@ import {
   handleLegacyContactLinkRequest,
 } from "./contactLink";
 import {
-  handleChallengeRequest,
-  handleAttestRequest,
-  handleNotesImportVerifyRequest,
   handleNotesImportRequest,
   handleNotesImportStatusRequest,
   handleNotesImportKickoffRequest,
@@ -28,9 +25,7 @@ import {
   handleNotesImportAdminResetRequest,
 } from "./notesImport/route";
 import {
-  attestDocs as notesImportAttestDocs,
   cancelDocs as notesImportCancelDocs,
-  challengeDocs as notesImportChallengeDocs,
   destroyDocs as notesImportDestroyDocs,
   eventsDocs as notesImportEventsDocs,
   kickoffDocs as notesImportKickoffDocs,
@@ -38,8 +33,24 @@ import {
   resultDocs as notesImportResultDocs,
   statusDocs as notesImportStatusDocs,
   transcribeDocs as notesImportTranscribeDocs,
-  verifyDocs as notesImportVerifyDocs,
 } from "./notesImport/openapi";
+import {
+  ATTESTATION_BASE_PATH,
+  deprecatedPath,
+  handleAttestationChallengeRequest,
+  handleAttestationRegisterRequest,
+  handleAttestationStatusRequest,
+  handleAttestationVerifyRequest,
+} from "./attestation/route";
+import {
+  challengeDocs as attestationChallengeDocs,
+  legacyAttestDocs,
+  legacyChallengeDocs,
+  legacyVerifyDocs,
+  registerDocs as attestationRegisterDocs,
+  statusDocs as attestationStatusDocs,
+  verifyDocs as attestationVerifyDocs,
+} from "./attestation/openapi";
 import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
 import { Sentry } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
@@ -59,6 +70,9 @@ import {
   geocodeDocs,
   healthDocs,
   legacyContactLinkDocs,
+  shortBuddyInvitePageDocs,
+  shortContactLinkDocs,
+  shortHandoffPageDocs,
   notesImportAdminResetDocs,
 } from "./openapi/coreDocs";
 
@@ -109,6 +123,7 @@ app.use("/geocode", rateLimit("places"));
 app.use("/autocomplete", rateLimit("places"));
 app.use("/notes-import", rateLimit("notes-import"));
 app.use("/notes-import/*", rateLimit("notes-import"));
+app.use("/attestation/*", rateLimit("attestation"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
 
@@ -121,23 +136,55 @@ app.get(
   appStoreRatingsDocs,
   handleAppStoreRatingsRequest
 );
-// Notes Import: availability probe, App Attest handshake + the metered call.
+// Device attestation for the whole API (App Attest on iOS, Play Integrity on
+// Android): challenges, App Attest key registration, and a diagnostic verify.
+// Each protected route checks its own assertion (src/attestation/http.ts).
+const attestationPath = (op: string) => `${ATTESTATION_BASE_PATH}/${op}`;
+app.get(
+  attestationPath("status"),
+  attestationStatusDocs,
+  handleAttestationStatusRequest
+);
+app.post(
+  attestationPath("challenge"),
+  attestationChallengeDocs,
+  handleAttestationChallengeRequest
+);
+app.post(
+  attestationPath("register"),
+  attestationRegisterDocs,
+  handleAttestationRegisterRequest
+);
+app.post(
+  attestationPath("verify"),
+  attestationVerifyDocs,
+  handleAttestationVerifyRequest
+);
+// Notes Import: availability probe, the metered calls, and its run routes.
 app.get(
   "/notes-import/status",
   notesImportStatusDocs,
   handleNotesImportStatusRequest
 );
+// The attestation routes' old paths, for deployed apps: same handlers, plus a
+// `Deprecation` header. Remove once the minimum app version uses the new ones.
 app.post(
   "/notes-import/challenge",
-  notesImportChallengeDocs,
-  handleChallengeRequest
+  legacyChallengeDocs,
+  deprecatedPath("/notes-import/challenge", attestationPath("challenge")),
+  handleAttestationChallengeRequest
 );
-app.post("/notes-import/attest", notesImportAttestDocs, handleAttestRequest);
-// Attested no-op: dev-tools diagnostics prove the assertion path server-side.
+app.post(
+  "/notes-import/attest",
+  legacyAttestDocs,
+  deprecatedPath("/notes-import/attest", attestationPath("register")),
+  handleAttestationRegisterRequest
+);
 app.post(
   "/notes-import/verify",
-  notesImportVerifyDocs,
-  handleNotesImportVerifyRequest
+  legacyVerifyDocs,
+  deprecatedPath("/notes-import/verify", attestationPath("verify")),
+  handleAttestationVerifyRequest
 );
 // Streaming import: attested kickoff → SSE progress stream → result snapshot.
 app.post(
@@ -183,9 +230,11 @@ app.route("/admin/accounts", createAccountsAdminRoutes());
 // Universal-link support for WitnessWork contact sharing. AASA must be served
 // at this exact path with Content-Type application/json and no redirects.
 app.get("/.well-known/apple-app-site-association", aasaDocs, handleAasaRequest);
-// Shared contacts ride in the fragment (`/c#<payload>`), which never reaches
-// the worker. `/c/:payload` keeps links from older app versions working.
-app.get("/c", contactLinkDocs, handleContactLinkRequest);
+// Shared contacts ride in the fragment (`/contacts#<payload>`), which never
+// reaches the worker. The short `/c` (and `/c/:payload`, from the oldest
+// builds) are in links people already sent, so they stay for good.
+app.get("/contacts", contactLinkDocs, handleContactLinkRequest);
+app.get("/c", shortContactLinkDocs, handleContactLinkRequest);
 app.get("/c/:payload", legacyContactLinkDocs, handleLegacyContactLinkRequest);
 // Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
 // rate-limited per caller inside the handler (src/buddies/limits.ts).
@@ -195,10 +244,13 @@ app.route("/buddies/v1", createBuddiesRoutes());
 // instead) and rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
-app.get("/b", buddyInvitePageDocs, handleBuddyInvitePage);
+// `/b` is the short path in invites already sent.
+app.get("/buddies/invite", buddyInvitePageDocs, handleBuddyInvitePage);
+app.get("/b", shortBuddyInvitePageDocs, handleBuddyInvitePage);
 // Set Up Another Device QR codes opened by a camera instead of the app; the
-// handoff secret stays in the URL fragment.
-app.get("/h", handoffPageDocs, handleHandoffPage);
+// handoff secret stays in the URL fragment. `/h` is the short path.
+app.get("/accounts/handoff", handoffPageDocs, handleHandoffPage);
+app.get("/h", shortHandoffPageDocs, handleHandoffPage);
 // Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
 // with per-account limits in the RoutePlanningQuota DO.
 app.route("/route-planning", createRoutePlanningRoutes());
