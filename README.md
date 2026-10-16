@@ -20,8 +20,10 @@ to read:
 - **Standard HTTP.** The right methods and status codes, JSON bodies, one
   error envelope (`{ "ok": false, "error", "code" }`), and `Retry-After` on
   every 429 and 503. Where a route departs from REST on purpose, its docs say
-  why. For example, the Buddies and accounts relays use `POST /{op}` so ids
-  stay out of URLs, which production logs.
+  why. For example, the Buddies relay and the accounts handoff and backup
+  ops use `POST /{op}` so ids stay out of URLs, which production logs, while
+  account sessions are plain resources (`POST /accounts/v1/sessions`,
+  `DELETE /accounts/v1/sessions/current`).
 - **Documented.** Every route and field is described in `/docs`, generated
   from the routes, so you can call the API without reading the source.
 
@@ -162,6 +164,36 @@ live WebSocket), send the same two values in `x-buddies-payload` /
 `x-buddies-signature` or `x-ww-payload` / `x-ww-signature`. Each op in `/docs`
 lists its decoded `payload` fields. The wire contract is
 [`docs/buddies-protocol.md`](docs/buddies-protocol.md).
+
+App versions with account sessions sign far less: they sign only to open a
+session (and to delete backups), and call every other accounts route with
+`Authorization: Bearer <accessToken>` (below).
+
+### Accounts and sessions (`/accounts/v1/*`)
+
+Anonymous accounts (a random id and a public key). An app proves it's
+WitnessWork once per session and then calls with short-lived bearer tokens:
+
+- **`POST /accounts/v1/sessions`** opens a session: an envelope self-signed
+  by the account key (op `session/open`) carrying an attestation from
+  `POST /attestation/v1/challenge` (purpose `account-session`, both hashes
+  `hex(SHA-256("ww-account/v1/session\n" + accountPub))`). Answers 201 with
+  an access token (a 15-minute JWT), a refresh token, and `Location:
+  /accounts/v1/sessions/current`. Sessions last 90 days.
+- **`POST /accounts/v1/sessions/refresh`** trades `{ refreshToken }` for a
+  new pair; each refresh token works once (plus a 60-second grace for a lost
+  response).
+- **`DELETE /accounts/v1/sessions/current`** ends the token's session.
+- **`GET /accounts/v1/account`** reads the token's account.
+- Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
+  take the bearer token too, as `POST /{op}` with ids in bodies.
+
+Older app versions authenticate the pre-session way (signed envelopes,
+`account/register`, `account/info`) while the legacy switch (KV
+`auth:legacy`) is on; once it's off they get 426 `upgrade_required`.
+`GET /app/v1/config` (no auth) tells the app its minimum version, so it can
+show Update Required first. The runbook is in `AGENTS.md`, "Turning off
+backward compatibility".
 
 ### `/autocomplete`
 
@@ -447,6 +479,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   `limit_reached` and `refinement_limit`, Buddies' `limit`).
 - Routes add their own fields beside these (`reason`, `action`, `credits`,
   `serverTime`, HERE's own error fields on the place-search proxy).
+- A bearer route's missing, expired, or invalid token is 401 `unauthorized`
+  with `WWW-Authenticate: Bearer error="invalid_token"`: refresh once and
+  retry. A request authenticated the pre-session way after the legacy switch
+  is off is 426 `upgrade_required`, without `Retry-After`.
 - `/geocode` and `/autocomplete` pass HERE's status through; a HERE error body
   keeps its fields and gains the envelope (`bad_request`, `not_found`,
   `rate_limited`, `upstream_error`). HERE unreachable or answering non-JSON is
@@ -459,10 +495,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
 bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
-`attestation`, `route-planning`, `admin`, `app` (`/app/v1/*`)
-(`src/rateLimit.ts`). The old
-`/notes-import/*` attestation paths still count in `notes-import`. Refusals are 429
-`rate_limited` with `Retry-After: 60`.
+`attestation`, `route-planning`, `admin`, and `app` (`/app/v1/*`)
+(`src/rateLimit.ts`). The old `/notes-import/*` attestation paths still
+count in `notes-import`. Refusals are 429 `rate_limited` with
+`Retry-After: 60`. Buddies and accounts have their own per-caller tiers.
 
 Unexpected errors are 500 `server_error` and are reported to Sentry.
 
