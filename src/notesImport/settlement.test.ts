@@ -67,4 +67,33 @@ describe('resolveTerminalSupporter', () => {
     ).resolves.toBe(true)
     expect(captureException).toHaveBeenCalledWith(error)
   })
+
+  it('asks about a bearer run’s account, never its meter id', async () => {
+    const checkSupporter = vi.fn(async () => true)
+    await expect(
+      resolveTerminalSupporter({
+        ...BASE,
+        kickoffSupporter: false,
+        account: { accountId: 'account-id', revenueCatAppUserId: 'rc-user' },
+        checkSupporter,
+      })
+    ).resolves.toBe(true)
+    expect(checkSupporter).toHaveBeenCalledWith({
+      apiKey: 'rc-key',
+      appUserId: 'rc-user',
+    })
+  })
+
+  it('confirms a bearer run without a RevenueCat id as free, asking no one', async () => {
+    const checkSupporter = vi.fn(async () => true)
+    await expect(
+      resolveTerminalSupporter({
+        ...BASE,
+        kickoffSupporter: false,
+        account: { accountId: 'account-id', revenueCatAppUserId: null },
+        checkSupporter,
+      })
+    ).resolves.toBe(false)
+    expect(checkSupporter).not.toHaveBeenCalled()
+  })
 })

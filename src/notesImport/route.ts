@@ -50,9 +50,20 @@ import {
   verifyV2Assertion,
 } from '../attestation/http'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
+import {
+  authenticateAccount,
+  hasAuthorization,
+  type AccountAuth,
+  type AccountAuthError,
+  type RequireAccountOptions,
+} from '../accounts/auth'
+import { isLegacyAuthEnabled } from '../accounts/legacySwitch'
+import { isAccountSupporter } from '../accounts/supporter'
+import { BEARER_CHALLENGE } from '../buddies/errorResponse'
 import { handleAdminResetRequest } from './admin'
 import {
   buildAllowanceDenial,
+  type NotesImportAccountKickoffResponse,
   type NotesImportKickoffResponse,
 } from './contracts'
 import type { NotesImportSuccess } from './events'
@@ -106,6 +117,8 @@ const UNAVAILABLE_RETRY_AFTER_SECONDS = 30
 const KILL_SWITCH_RETRY_AFTER_SECONDS = 60
 /** A run usually settles within a minute; poll for a free slot meanwhile. */
 const ACTIVE_CAP_RETRY_AFTER_SECONDS = 15
+/** A legacy request once the legacy switch is off. */
+const UPGRADE_REQUIRED = 426
 
 /**
  * Notes Import's error response: the shared envelope (src/errors.ts) with the
@@ -153,10 +166,122 @@ const errorDetail = (e: unknown): string => {
 
 const subKey = (token: string) => `notes-import:sub:${token}`
 
+// --- Who's calling --------------------------------------------------------
+
+/**
+ * Notes Import's caller (witness-work ADR 0027). A request with an
+ * `Authorization` header is a bearer request, always: its access token names
+ * the account, and the account is the meter. One without it is a legacy
+ * request (per-request attestation on the metered routes, the subscribe
+ * token on the run routes), served while the legacy switch is on and refused
+ * with 426 `upgrade_required` once it's off.
+ *
+ * Every refusal keeps Notes Import's error shape (`error` a message, `code`
+ * the stable code), which both kinds of client read; a 401 also sends
+ * `WWW-Authenticate`.
+ */
+type Caller = { account: AccountAuth | null } | { response: Response }
+
+const ACCOUNT_REFUSALS: Record<
+  AccountAuthError,
+  { status: number; message: string; code: string; retryAfter?: number }
+> = {
+  unauthorized: {
+    status: HTTP_STATUS.UNAUTHORIZED,
+    message: 'The access token is missing, expired, or invalid',
+    code: 'unauthorized',
+  },
+  suspended: {
+    status: HTTP_STATUS.FORBIDDEN,
+    message: 'This account is suspended',
+    code: 'suspended',
+  },
+  disabled: {
+    status: HTTP_STATUS.SERVICE_UNAVAILABLE,
+    message: 'Accounts are temporarily unavailable',
+    code: 'disabled',
+    retryAfter: KILL_SWITCH_RETRY_AFTER_SECONDS,
+  },
+  internal: {
+    status: HTTP_STATUS.INTERNAL_SERVER_ERROR,
+    message: 'Auth error',
+    code: 'server_error',
+  },
+}
+
+async function resolveCaller(
+  ctx: AppContext,
+  options: RequireAccountOptions = {}
+): Promise<Caller> {
+  if (hasAuthorization(ctx)) {
+    const result = await authenticateAccount(ctx, options)
+    if (result.ok) return { account: result.account }
+    const refusal = ACCOUNT_REFUSALS[result.error]
+    const response = err(
+      ctx,
+      refusal.status,
+      refusal.message,
+      refusal.code,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      refusal.retryAfter
+    )
+    if (result.error === 'unauthorized')
+      response.headers.set('WWW-Authenticate', BEARER_CHALLENGE)
+    return { response }
+  }
+  if (await isLegacyAuthEnabled(ctx.env)) return { account: null }
+  // No Retry-After: only updating the app helps.
+  return {
+    response: err(
+      ctx,
+      UPGRADE_REQUIRED,
+      'Update WitnessWork to keep using Notes Import',
+      'upgrade_required'
+    ),
+  }
+}
+
+/**
+ * A `dev` session (opened with the dev bypass) stands in for the
+ * `x-ww-dev-bypass` header: unlimited allowances and debug detail, never
+ * Supporter status. Dev worker only: production never verifies a `dev`
+ * token, and this also needs the bypass token configured.
+ */
+const isDevSession = (config: NotesImportConfig, account: AccountAuth) =>
+  account.platform === 'dev' && config.devBypassToken != null
+
+/**
+ * Names the account that started a bearer import. Stored on its run
+ * (`NotesImportRun.isOwnedBy`) for as long as the run is kept; a hash, so
+ * the run holds no account id once its input is dropped.
+ */
+export const importOwnerKey = (accountId: string): Promise<string> =>
+  sha256Hex(`ww-api:notes-import:owner:${accountId}`)
+
+/**
+ * A bearer request's optional `revenueCatAppUserId`: the id, null when
+ * absent, or undefined when malformed. The same shape as the legacy
+ * `accountId` it replaces: it becomes a RevenueCat URL path segment.
+ */
+const parseRevenueCatAppUserId = (
+  record: Record<string, unknown>
+): string | null | undefined => {
+  const value = record.revenueCatAppUserId
+  if (value == null) return null
+  return typeof value === 'string' && isValidAccountId(value)
+    ? value
+    : undefined
+}
+
 /**
  * GET /notes-import/status — cheap availability probe for the app's import
  * entry points. No App Attest (it's a public health check) and no inference:
  * a manual KV kill-switch plus OpenRouter's free provider-health metadata.
+ * Public and the same for everyone: it never reads `Authorization` or
+ * reports an account's allowance.
  */
 export async function handleNotesImportStatusRequest(ctx: AppContext) {
   const status = await getPublicNotesImportStatus(ctx.env, waitUntilOf(ctx))
@@ -165,9 +290,12 @@ export async function handleNotesImportStatusRequest(ctx: AppContext) {
 }
 
 interface NotesImportBody {
+  /** Legacy requests only. */
   uuid: string
-  /** Shared account id (ADR 0011); absent on pre-account clients. */
+  /** Shared account id (ADR 0011); absent on pre-account clients. Legacy only. */
   accountId?: string
+  /** Bearer requests: the app's RevenueCat app user id, for the Supporter check. */
+  revenueCatAppUserId?: string
   notesText: string
   contentHash: string
   requestHash?: string
@@ -183,21 +311,32 @@ interface NotesImportBody {
   refinement?: { previousResultJSON: string; instruction: string }
 }
 
+/** A bearer request's account, as the gate resolved it. */
+interface GateAccount {
+  accountId: string
+  /** `importOwnerKey(accountId)`. */
+  ownerKey: string
+  /** What the request named for the Supporter check (`isAccountSupporter`). */
+  revenueCatAppUserId: string | null
+}
+
 /** A request that passed authentication + the credit gate, ready to spend inference. */
 interface GateOk {
   ok: true
   body: NotesImportBody
-  uuid: string
   /**
-   * The identity everything per-user keys on: the shared account id when the
-   * client sent one, else the per-device install uuid (old clients). Names
-   * the per-user index DO (credits + concurrency cap) and the RevenueCat
-   * subscriber — so a Supporter's second device, which adopted the purchasing
-   * device's account id, is recognized as that same RevenueCat customer
-   * instead of being metered as a free user. App Attest key pinning stays on
-   * `uuid`.
+   * The identity everything per-user keys on. A bearer request's is the
+   * session's account id. A legacy request's is the shared account id when
+   * the client sent one, else the per-device install uuid (old clients), and
+   * it's also the RevenueCat subscriber — so a Supporter's second device,
+   * which adopted the purchasing device's account id, is recognized as that
+   * same RevenueCat customer instead of being metered as a free user. Names
+   * the per-user index DO (credits + concurrency cap). App Attest key pinning
+   * stays on the install uuid.
    */
   meterId: string
+  /** The bearer request's account; null on legacy requests. */
+  account: GateAccount | null
   notesText: string
   contentHash: string
   supporter: boolean
@@ -208,7 +347,10 @@ interface GateOk {
   windowDurationMs: number
   decision: CreditDecision
   isRefinement: boolean
-  /** True when the dev-bypass token was used (gates dev-only error detail). */
+  /**
+   * The dev-bypass token was used, or the bearer session is `dev`: unlimited
+   * allowances, and gates dev-only error detail.
+   */
   devBypass: boolean
   /** Usage-event context; the caller stamps `startedAt` when a run starts. */
   analytics: Omit<NotesImportAnalyticsContext, 'startedAt'>
@@ -217,17 +359,21 @@ type GateResult = GateOk | { ok: false; response: Response }
 
 /**
  * The shared security boundary for the metered model call: parse + validate the
- * body, recompute the authoritative content and request hashes, verify App
- * Attest (or the dev bypass), resolve supporter status, and run the credit
- * pre-flight. Both the streaming kickoff and legacy synchronous path use this
- * boundary; v1 signs the content hash, while v2 also signs the canonical
- * request hash. Returns either a ready-to-spend `GateOk` or a fully-formed
- * error `Response`.
+ * body, authenticate, resolve supporter status, and run the credit pre-flight.
+ * Both the streaming kickoff and legacy synchronous path use this boundary.
+ *
+ * A bearer request (`account`) was authenticated by its access token: the
+ * session attested once, so the body carries no attestation fields and no
+ * hashes. A legacy request recomputes the authoritative content and request
+ * hashes and verifies App Attest, Play Integrity, or the dev bypass; v1 signs
+ * the content hash, while v2 also signs the canonical request hash. Returns
+ * either a ready-to-spend `GateOk` or a fully-formed error `Response`.
  */
 async function authenticateAndGate(
   ctx: AppContext,
   config: NotesImportConfig,
-  assertionPurpose: AppAttestAssertionPurpose | null
+  assertionPurpose: AppAttestAssertionPurpose | null,
+  account: AccountAuth | null
 ): Promise<GateResult> {
   // Kill-switch / provider-health enforcement. `GET /notes-import/status`
   // advertises this so the app can disable its entry points BEFORE attesting,
@@ -285,34 +431,37 @@ async function authenticateAndGate(
     }
   }
   const body = record as unknown as NotesImportBody
-
-  const uuid = asString(body.uuid)
   const notesText = typeof body.notesText === 'string' ? body.notesText : null
-  if (!uuid || notesText == null || !body.context) {
-    return {
-      ok: false,
-      response: err(
-        ctx,
-        HTTP_STATUS.BAD_REQUEST,
-        'Missing uuid, notesText, or context',
-        'bad_request'
-      ),
-    }
-  }
+  const badRequest = (message: string): GateResult => ({
+    ok: false,
+    response: err(ctx, HTTP_STATUS.BAD_REQUEST, message, 'bad_request'),
+  })
 
-  // Optional shared account id. Reject a malformed one outright rather than
-  // silently falling back to the uuid — a well-behaved client never sends one,
-  // and letting garbage through would put it in a DO name and a signed field.
-  const accountId = body.accountId != null ? asString(body.accountId) : null
-  if (body.accountId != null && (!accountId || !isValidAccountId(accountId))) {
-    return {
-      ok: false,
-      response: err(
-        ctx,
-        HTTP_STATUS.BAD_REQUEST,
-        'Invalid accountId',
-        'bad_request'
-      ),
+  let uuid: string | null = null
+  let accountId: string | null = null
+  let revenueCatAppUserId: string | null = null
+  if (account) {
+    if (notesText == null || !body.context) {
+      return badRequest('Missing notesText or context')
+    }
+    const named = parseRevenueCatAppUserId(record)
+    if (named === undefined) return badRequest('Invalid revenueCatAppUserId')
+    revenueCatAppUserId = named
+  } else {
+    uuid = asString(body.uuid)
+    if (!uuid || notesText == null || !body.context) {
+      return badRequest('Missing uuid, notesText, or context')
+    }
+
+    // Optional shared account id. Reject a malformed one outright rather than
+    // silently falling back to the uuid — a well-behaved client never sends one,
+    // and letting garbage through would put it in a DO name and a signed field.
+    accountId = body.accountId != null ? asString(body.accountId) : null
+    if (
+      body.accountId != null &&
+      (!accountId || !isValidAccountId(accountId))
+    ) {
+      return badRequest('Invalid accountId')
     }
   }
 
@@ -328,188 +477,53 @@ async function authenticateAndGate(
     }
   }
 
-  // The content hash is authoritative: recompute it and require the client's
-  // claimed hash to match, so the signed assertion provably covers exactly the
-  // text being parsed (and the meter keys on real content).
+  // The content hash is authoritative: the meter keys on real content, and a
+  // legacy request's signed assertion must cover exactly the text parsed.
   const contentHash = await sha256Hex(notesText)
-  if (asString(body.contentHash) && body.contentHash !== contentHash) {
-    return {
-      ok: false,
-      response: err(
-        ctx,
-        HTTP_STATUS.BAD_REQUEST,
-        'contentHash does not match notesText',
-        'bad_request'
-      ),
-    }
-  }
-
-  const protocolVersion = appAttestProtocolVersion(body)
-  let requestHash: string | undefined
-  if (protocolVersion === 2) {
-    requestHash = asString(body.requestHash) ?? undefined
-    const expectedRequestHash = await computeNotesImportRequestHash({
-      notesText,
-      context: body.context,
-      refinement: body.refinement ?? null,
-    })
-    if (
-      !requestHash ||
-      !isLowercaseSha256(requestHash) ||
-      requestHash !== expectedRequestHash
-    ) {
-      return {
-        ok: false,
-        response: appAttestBadRequest(
-          ctx,
-          'requestHash does not match the Notes Import payload'
-        ),
-      }
-    }
-  }
 
   // --- Request authentication (the security boundary) -------------------
-  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
-  const devBypass =
-    config.devBypassToken != null &&
-    timingSafeEqual(bypassHeader, config.devBypassToken)
-
-  if (!devBypass && isPlayIntegrityRequest(record)) {
-    if (assertionPurpose == null) {
-      return {
-        ok: false,
-        response: err(
-          ctx,
-          HTTP_STATUS.BAD_REQUEST,
-          'Play Integrity is not supported on the legacy synchronous endpoint',
-          'bad_request',
-          undefined,
-          undefined,
-          'unsupported_protocol',
-          'none'
-        ),
-      }
-    }
-    // The token binds the canonical payload hash, so it must be authoritative.
-    const expectedRequestHash = await computeNotesImportRequestHash({
-      notesText,
-      context: body.context,
-      refinement: body.refinement ?? null,
-    })
-    if (body.requestHash !== expectedRequestHash) {
-      return {
-        ok: false,
-        response: appAttestBadRequest(
-          ctx,
-          'requestHash does not match the Notes Import payload'
-        ),
-      }
-    }
-    const failure = await verifyPlayIntegrityRecord(
-      ctx,
+  let devBypass: boolean
+  if (account) {
+    devBypass = isDevSession(config, account)
+  } else {
+    const failure = await verifyLegacyImportRequest(ctx, config, {
       record,
-      assertionPurpose
-    )
-    if (failure) return { ok: false, response: failure }
-  } else if (!devBypass) {
-    if (
-      assertionPurpose == null &&
-      appAttestProtocolVersion(body) === 2
-    ) {
-      return {
-        ok: false,
-        response: err(
-          ctx,
-          HTTP_STATUS.BAD_REQUEST,
-          'App Attest v2 is not supported on the legacy synchronous endpoint',
-          'bad_request',
-          undefined,
-          undefined,
-          'unsupported_protocol',
-          'none'
-        ),
-      }
-    }
-    const keyId = asString(body.keyId)
-    const challenge = asString(body.challenge)
-    const assertion = asString(body.assertion)
-    if (!keyId || !challenge || !assertion) {
-      return {
-        ok: false,
-        response: err(
-          ctx,
-          HTTP_STATUS.UNAUTHORIZED,
-          'Missing App Attest credentials',
-          'attestation_required',
-          undefined,
-          undefined,
-          'invalid_request',
-          'bind'
-        ),
-      }
-    }
-    const v2Request =
-      protocolVersion === 2
-        ? parseV2AssertionFinalRequest(
-            record,
-            assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE
-          )
-        : null
-    if (protocolVersion === 2 && !v2Request) {
-      return {
-        ok: false,
-        response: appAttestBadRequest(
-          ctx,
-          'Invalid App Attest v2 protected assertion'
-        ),
-      }
-    }
-    try {
-      if (v2Request) {
-        await verifyV2Assertion(ctx, v2Request)
-      } else {
-        await appAttestLifecycle(ctx.env).verifyAssertion(body, {
-          uuid,
-          accountId: accountId ?? undefined,
-          contentHash,
-          purpose: assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE,
-        })
-      }
-    } catch (e) {
-      if (e instanceof AppAttestError) {
-        return {
-          ok: false,
-          response: appAttestFailureResponse(ctx, e, body),
-        }
-      }
-      Sentry.captureException(e)
-      return {
-        ok: false,
-        response: err(
-          ctx,
-          HTTP_STATUS.INTERNAL_SERVER_ERROR,
-          'Auth error',
-          'server_error'
-        ),
-      }
-    }
+      body,
+      uuid: uuid!,
+      accountId,
+      notesText,
+      contentHash,
+      assertionPurpose,
+    })
+    if ('response' in failure) return { ok: false, response: failure.response }
+    devBypass = failure.devBypass
   }
 
   // --- Supporter status + credit gate -----------------------------------
-  // Everything below keys on the account id when the client sent one (per-
-  // person Supporter check, credits, caps — ADR 0011), else the install uuid.
-  const meterId = accountId ?? uuid
+  // Everything below keys on the meter: the session's account, or on legacy
+  // requests the account id when the client sent one (per-person Supporter
+  // check, credits, caps — ADR 0011), else the install uuid.
+  const meterId = account ? account.accountId : (accountId ?? uuid!)
+  const gateAccount: GateAccount | null = account
+    ? {
+        accountId: account.accountId,
+        ownerKey: await importOwnerKey(account.accountId),
+        revenueCatAppUserId,
+      }
+    : null
 
   // Keep real entitlement distinct from dev bypass: bypass overrides allowance
   // values only, while only an actual Supporter suppresses Supporter CTAs.
   let supporter = false
   if (!devBypass) {
     try {
-      supporter = await isSupporter({
-        apiKey: ctx.env.REVENUECAT_API_KEY,
-        appUserId: meterId,
-        entitlementId: config.entitlementId,
-      })
+      supporter = gateAccount
+        ? await isAccountSupporter(ctx.env, gateAccount)
+        : await isSupporter({
+            apiKey: ctx.env.REVENUECAT_API_KEY,
+            appUserId: meterId,
+            entitlementId: config.entitlementId,
+          })
     } catch (e) {
       if (!(e instanceof RevenueCatError)) Sentry.captureException(e)
       // Fail closed to non-Supporter — the free meter still lets them import.
@@ -520,15 +534,17 @@ async function authenticateAndGate(
   const isRefinement = !!body.refinement
   const analytics: GateOk['analytics'] = {
     distinctId: await analyticsDistinctId(meterId),
-    platform: devBypass
-      ? 'dev'
-      : isPlayIntegrityRequest(record)
-        ? 'android'
-        : 'ios',
+    platform: account
+      ? account.platform
+      : devBypass
+        ? 'dev'
+        : isPlayIntegrityRequest(record)
+          ? 'android'
+          : 'ios',
     transport: assertionPurpose == null ? 'legacy' : 'stream',
     refinement: isRefinement,
     supporter,
-    hasAccount: accountId != null,
+    hasAccount: account != null || accountId != null,
     notesChars: notesText.length,
   }
   const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
@@ -573,8 +589,8 @@ async function authenticateAndGate(
   return {
     ok: true,
     body,
-    uuid,
     meterId,
+    account: gateAccount,
     notesText,
     contentHash,
     supporter,
@@ -590,21 +606,208 @@ async function authenticateAndGate(
 }
 
 /**
+ * A legacy import request's own authentication: its claimed hashes, then App
+ * Attest, Play Integrity, or the dev-bypass header. Unchanged from before
+ * account sessions.
+ */
+async function verifyLegacyImportRequest(
+  ctx: AppContext,
+  config: NotesImportConfig,
+  request: {
+    record: Record<string, unknown>
+    body: NotesImportBody
+    uuid: string
+    accountId: string | null
+    notesText: string
+    contentHash: string
+    assertionPurpose: AppAttestAssertionPurpose | null
+  }
+): Promise<{ devBypass: boolean } | { response: Response }> {
+  const { record, body, uuid, accountId, notesText, contentHash } = request
+  const { assertionPurpose } = request
+  // Require the client's claimed hash to match, so the signed assertion
+  // provably covers exactly the text being parsed.
+  if (asString(body.contentHash) && body.contentHash !== contentHash) {
+    return {
+      response: err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'contentHash does not match notesText',
+        'bad_request'
+      ),
+    }
+  }
+
+  const protocolVersion = appAttestProtocolVersion(body)
+  let requestHash: string | undefined
+  if (protocolVersion === 2) {
+    requestHash = asString(body.requestHash) ?? undefined
+    const expectedRequestHash = await computeNotesImportRequestHash({
+      notesText,
+      context: body.context,
+      refinement: body.refinement ?? null,
+    })
+    if (
+      !requestHash ||
+      !isLowercaseSha256(requestHash) ||
+      requestHash !== expectedRequestHash
+    ) {
+      return {
+        response: appAttestBadRequest(
+          ctx,
+          'requestHash does not match the Notes Import payload'
+        ),
+      }
+    }
+  }
+
+  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
+  const devBypass =
+    config.devBypassToken != null &&
+    timingSafeEqual(bypassHeader, config.devBypassToken)
+
+  if (!devBypass && isPlayIntegrityRequest(record)) {
+    if (assertionPurpose == null) {
+      return {
+        response: err(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'Play Integrity is not supported on the legacy synchronous endpoint',
+          'bad_request',
+          undefined,
+          undefined,
+          'unsupported_protocol',
+          'none'
+        ),
+      }
+    }
+    // The token binds the canonical payload hash, so it must be authoritative.
+    const expectedRequestHash = await computeNotesImportRequestHash({
+      notesText,
+      context: body.context,
+      refinement: body.refinement ?? null,
+    })
+    if (body.requestHash !== expectedRequestHash) {
+      return {
+        response: appAttestBadRequest(
+          ctx,
+          'requestHash does not match the Notes Import payload'
+        ),
+      }
+    }
+    const failure = await verifyPlayIntegrityRecord(
+      ctx,
+      record,
+      assertionPurpose
+    )
+    if (failure) return { response: failure }
+  } else if (!devBypass) {
+    if (
+      assertionPurpose == null &&
+      appAttestProtocolVersion(body) === 2
+    ) {
+      return {
+        response: err(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'App Attest v2 is not supported on the legacy synchronous endpoint',
+          'bad_request',
+          undefined,
+          undefined,
+          'unsupported_protocol',
+          'none'
+        ),
+      }
+    }
+    const keyId = asString(body.keyId)
+    const challenge = asString(body.challenge)
+    const assertion = asString(body.assertion)
+    if (!keyId || !challenge || !assertion) {
+      return {
+        response: err(
+          ctx,
+          HTTP_STATUS.UNAUTHORIZED,
+          'Missing App Attest credentials',
+          'attestation_required',
+          undefined,
+          undefined,
+          'invalid_request',
+          'bind'
+        ),
+      }
+    }
+    const v2Request =
+      protocolVersion === 2
+        ? parseV2AssertionFinalRequest(
+            record,
+            assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE
+          )
+        : null
+    if (protocolVersion === 2 && !v2Request) {
+      return {
+        response: appAttestBadRequest(
+          ctx,
+          'Invalid App Attest v2 protected assertion'
+        ),
+      }
+    }
+    try {
+      if (v2Request) {
+        await verifyV2Assertion(ctx, v2Request)
+      } else {
+        await appAttestLifecycle(ctx.env).verifyAssertion(body, {
+          uuid,
+          accountId: accountId ?? undefined,
+          contentHash,
+          purpose: assertionPurpose ?? NOTES_IMPORT_KICKOFF_PURPOSE,
+        })
+      }
+    } catch (e) {
+      if (e instanceof AppAttestError) {
+        return { response: appAttestFailureResponse(ctx, e, body) }
+      }
+      Sentry.captureException(e)
+      return {
+        response: err(
+          ctx,
+          HTTP_STATUS.INTERNAL_SERVER_ERROR,
+          'Auth error',
+          'server_error'
+        ),
+      }
+    }
+  }
+  return { devBypass }
+}
+
+/**
  * Stable, content-derived import id. Idempotent per (user, content) so a
  * reconnect lands on the same run DO; a refinement is a distinct run because its
  * instruction is part of the identity. `imp_` prefix keeps DO names readable.
  * Keyed on the meter identity (account id when present) so a person's devices
  * share replay idempotency, and so an import's slot always lives in the same
  * index DO that acquired it.
+ *
+ * A bearer import's basis is `account:<accountId>:<contentHash>` (plus
+ * `:r:<SHA-256 of the instruction>`), which never contains `|`. Every legacy
+ * basis does, and a legacy uuid can be any string, so this keeps a legacy
+ * request from ever landing on (and getting a subscribe token for) an
+ * account's run.
  */
 const deriveImportId = async (
-  meterId: string,
-  contentHash: string,
-  refinement?: { instruction: string }
+  gate: Pick<GateOk, 'meterId' | 'account' | 'contentHash' | 'body'>
 ): Promise<string> => {
-  const basis = refinement
-    ? `${meterId}|${contentHash}|r|${refinement.instruction}`
-    : `${meterId}|${contentHash}`
+  const { meterId, account, contentHash } = gate
+  const refinement = gate.body.refinement
+  let basis: string
+  if (account) {
+    basis = `account:${account.accountId}:${contentHash}`
+    if (refinement) basis += `:r:${await sha256Hex(refinement.instruction)}`
+  } else {
+    basis = refinement
+      ? `${meterId}|${contentHash}|r|${refinement.instruction}`
+      : `${meterId}|${contentHash}`
+  }
   return `imp_${(await sha256Hex(basis)).slice(0, 40)}`
 }
 
@@ -612,15 +815,20 @@ const deriveImportId = async (
  * POST /notes-import/kickoff — attested, metered entry point for the STREAMING
  * import. Authenticates + gates exactly like the legacy path, enforces the
  * per-user concurrency cap, starts a background run in a per-import Durable
- * Object, and returns immediately with `{ importId, subscribeToken }`. The
- * client then opens the SSE stream at `/notes-import/:importId/events`.
+ * Object, and returns immediately with `{ importId, subscribeToken }` (a
+ * bearer request gets no subscribe token: its run routes take the access
+ * token). The client then opens the SSE stream at
+ * `/notes-import/:importId/events`.
  */
 export async function handleNotesImportKickoffRequest(ctx: AppContext) {
+  const caller = await resolveCaller(ctx, { requireActive: true })
+  if ('response' in caller) return caller.response
   const config = getNotesImportConfig(ctx.env)
   const gate = await authenticateAndGate(
     ctx,
     config,
-    NOTES_IMPORT_KICKOFF_PURPOSE
+    NOTES_IMPORT_KICKOFF_PURPOSE,
+    caller.account
   )
   if (!gate.ok) return gate.response
   const {
@@ -637,7 +845,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     isRefinement,
   } = gate
 
-  const importId = await deriveImportId(meterId, contentHash, body.refinement)
+  const importId = await deriveImportId(gate)
 
   // Per-user concurrency cap, enforced race-free in the single-threaded index DO.
   const cap = supporterConcurrency
@@ -681,6 +889,12 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       devBypass: gate.devBypass,
       decision,
       analytics,
+      ...(gate.account && {
+        account: {
+          ownerKey: gate.account.ownerKey,
+          revenueCatAppUserId: gate.account.revenueCatAppUserId,
+        },
+      }),
     })
   } catch (e) {
     // Couldn't start → release the slot so it isn't leaked.
@@ -713,11 +927,15 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
 
   // Short-lived capability for the stream. App Attest can't sign a long-lived
   // SSE connection; it doesn't need to — the abusable operation (inference) was
-  // already gated above, so the stream just reads an authorized resource.
-  const subscribeToken = randomToken()
-  await ctx.env.NOTES_KV.put(subKey(subscribeToken), importId, {
-    expirationTtl: config.subscribeTokenTtlSeconds,
-  })
+  // already gated above, so the stream just reads an authorized resource. A
+  // bearer request needs none: its run routes check the run's owner instead.
+  let subscribeToken: string | null = null
+  if (!gate.account) {
+    subscribeToken = randomToken()
+    await ctx.env.NOTES_KV.put(subKey(subscribeToken), importId, {
+      expirationTtl: config.subscribeTokenTtlSeconds,
+    })
+  }
 
   // Point-in-time usage preview. It writes nothing and can differ from terminal
   // state after success, time/config/entitlement changes, or another commit.
@@ -730,6 +948,14 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
     windowDurationMs,
   })
 
+  if (subscribeToken == null) {
+    const response = {
+      importId,
+      refinement: isRefinement,
+      credits,
+    } satisfies NotesImportAccountKickoffResponse
+    return ctx.json(response)
+  }
   const response = {
     importId,
     subscribeToken,
@@ -739,7 +965,39 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
   return ctx.json(response)
 }
 
-/** Resolve + authorize a stream request to its run DO, or return an error Response. */
+/** Every import id kickoff issues. */
+const IMPORT_ID_PATTERN = /^imp_[a-f0-9]{40}$/
+
+/**
+ * Resolve + authorize a run route's import, or return an error Response. A
+ * bearer request may use only an import its own account started; anything
+ * else (another account's, a legacy one, unknown, or past retention) is the
+ * same 404, so a response never says whether an import exists. A legacy
+ * request shows its subscribe token, as before.
+ */
+async function authorizeRun(
+  ctx: AppContext
+): Promise<{ importId: string } | { response: Response }> {
+  const caller = await resolveCaller(ctx)
+  if ('response' in caller) return caller
+  if (!caller.account) return authorizeStream(ctx)
+
+  const importId = ctx.req.param('importId') ?? ''
+  const notFound = () => ({
+    response: err(ctx, HTTP_STATUS.NOT_FOUND, 'Import not found', 'not_found'),
+  })
+  // Don't wake a Durable Object for a name kickoff never issues.
+  if (!IMPORT_ID_PATTERN.test(importId)) return notFound()
+  const run = ctx.env.NOTES_IMPORT_RUN.get(
+    ctx.env.NOTES_IMPORT_RUN.idFromName(importId)
+  )
+  const owned = await run.isOwnedBy(
+    await importOwnerKey(caller.account.accountId)
+  )
+  return owned ? { importId } : notFound()
+}
+
+/** Resolve + authorize a legacy stream request (subscribe token) to its run DO. */
 async function authorizeStream(
   ctx: AppContext
 ): Promise<{ importId: string } | { response: Response }> {
@@ -775,7 +1033,7 @@ async function authorizeStream(
  * event log since `Last-Event-ID` then tails live (lossless resume).
  */
 export async function handleNotesImportEventsRequest(ctx: AppContext) {
-  const authed = await authorizeStream(ctx)
+  const authed = await authorizeRun(ctx)
   if ('response' in authed) return authed.response
 
   const lastEventId =
@@ -797,7 +1055,7 @@ export async function handleNotesImportEventsRequest(ctx: AppContext) {
  * the client's "edit & resend" flow before kicking off the edited import.
  */
 export async function handleNotesImportCancelRequest(ctx: AppContext) {
-  const authed = await authorizeStream(ctx)
+  const authed = await authorizeRun(ctx)
   if ('response' in authed) return authed.response
 
   const runId = ctx.env.NOTES_IMPORT_RUN.idFromName(authed.importId)
@@ -813,7 +1071,7 @@ export async function handleNotesImportCancelRequest(ctx: AppContext) {
  * waiting for the retention alarm. Backs the history view's per-row delete.
  */
 export async function handleNotesImportDestroyRequest(ctx: AppContext) {
-  const authed = await authorizeStream(ctx)
+  const authed = await authorizeRun(ctx)
   if ('response' in authed) return authed.response
 
   const runId = ctx.env.NOTES_IMPORT_RUN.idFromName(authed.importId)
@@ -827,7 +1085,7 @@ export async function handleNotesImportDestroyRequest(ctx: AppContext) {
  * capability auth as the stream.
  */
 export async function handleNotesImportResultRequest(ctx: AppContext) {
-  const authed = await authorizeStream(ctx)
+  const authed = await authorizeRun(ctx)
   if ('response' in authed) return authed.response
 
   const runId = ctx.env.NOTES_IMPORT_RUN.idFromName(authed.importId)
@@ -857,8 +1115,10 @@ export function handleNotesImportAdminResetRequest(ctx: AppContext) {
  * auth/credit/ZDR semantics as kickoff via the shared gate.
  */
 export async function handleNotesImportRequest(ctx: AppContext) {
+  const caller = await resolveCaller(ctx, { requireActive: true })
+  if ('response' in caller) return caller.response
   const config = getNotesImportConfig(ctx.env)
-  const gate = await authenticateAndGate(ctx, config, null)
+  const gate = await authenticateAndGate(ctx, config, null, caller.account)
   if (!gate.ok) return gate.response
   const {
     meterId,
@@ -886,7 +1146,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     : config.activeImportCap
   const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const idx = ctx.env.NOTES_IMPORT_INDEX.get(idxId)
-  const slotKey = `legacy:${await deriveImportId(meterId, contentHash, body.refinement)}`
+  const slotKey = `legacy:${await deriveImportId(gate)}`
   const acquired = await idx.acquire(slotKey, cap)
   if (!acquired.ok) {
     track(ctx, notesImportLimitReachedEvent(gate.analytics, 'active_cap'))
@@ -943,6 +1203,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       apiKey: ctx.env.REVENUECAT_API_KEY,
       appUserId: meterId,
       entitlementId: config.entitlementId,
+      account: gate.account ?? undefined,
     })
     const terminalLimits = await resolveNotesImportLimits(
       ctx.env,
@@ -1001,6 +1262,9 @@ const TRANSCRIBE_WINDOW_MS = 24 * 60 * 60 * 1000
  * and a free user with no imports left is refused before any page is read.
  */
 export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
+  const caller = await resolveCaller(ctx, { requireActive: true })
+  if ('response' in caller) return caller.response
+  const { account } = caller
   const config = getNotesImportConfig(ctx.env)
   const status = await getNotesImportStatus({
     kv: ctx.env.NOTES_KV,
@@ -1035,20 +1299,47 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
     return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid JSON body', 'bad_request')
   }
 
-  const uuid = asString(record.uuid)
   const image = asString(record.image)
   const mimeType = record.mimeType
-  if (!uuid || !image || !isTranscribeMimeType(mimeType)) {
-    return err(
-      ctx,
-      HTTP_STATUS.BAD_REQUEST,
-      'Missing uuid, image, or a supported mimeType',
-      'bad_request'
-    )
-  }
-  const accountId = record.accountId != null ? asString(record.accountId) : null
-  if (record.accountId != null && (!accountId || !isValidAccountId(accountId))) {
-    return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request')
+  let uuid: string | null = null
+  let accountId: string | null = null
+  let revenueCatAppUserId: string | null = null
+  if (account) {
+    if (!image || !isTranscribeMimeType(mimeType)) {
+      return err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Missing image or a supported mimeType',
+        'bad_request'
+      )
+    }
+    const named = parseRevenueCatAppUserId(record)
+    if (named === undefined) {
+      return err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Invalid revenueCatAppUserId',
+        'bad_request'
+      )
+    }
+    revenueCatAppUserId = named
+  } else {
+    uuid = asString(record.uuid)
+    if (!uuid || !image || !isTranscribeMimeType(mimeType)) {
+      return err(
+        ctx,
+        HTTP_STATUS.BAD_REQUEST,
+        'Missing uuid, image, or a supported mimeType',
+        'bad_request'
+      )
+    }
+    accountId = record.accountId != null ? asString(record.accountId) : null
+    if (
+      record.accountId != null &&
+      (!accountId || !isValidAccountId(accountId))
+    ) {
+      return err(ctx, HTTP_STATUS.BAD_REQUEST, 'Invalid accountId', 'bad_request')
+    }
   }
 
   const bytes = base64DecodedBytes(image)
@@ -1069,45 +1360,59 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
     )
   }
 
-  // Both hashes are authoritative: the signed assertion must cover exactly
-  // this image and mime type.
   const contentHash = await sha256Hex(image)
-  const requestHash = await computeNotesImportTranscribeRequestHash({
-    imageHash: contentHash,
-    mimeType,
-  })
-  if (record.contentHash !== contentHash || record.requestHash !== requestHash) {
-    return appAttestBadRequest(
-      ctx,
-      'contentHash or requestHash does not match the transcription payload'
-    )
-  }
+  let devBypass: boolean
+  if (account) {
+    // The session attested once; a bearer request carries no hashes.
+    devBypass = isDevSession(config, account)
+  } else {
+    // Both hashes are authoritative: the signed assertion must cover exactly
+    // this image and mime type.
+    const requestHash = await computeNotesImportTranscribeRequestHash({
+      imageHash: contentHash,
+      mimeType,
+    })
+    if (
+      record.contentHash !== contentHash ||
+      record.requestHash !== requestHash
+    ) {
+      return appAttestBadRequest(
+        ctx,
+        'contentHash or requestHash does not match the transcription payload'
+      )
+    }
 
-  // --- Request authentication (v2 App Attest or Play Integrity only) ----
-  const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
-  const devBypass =
-    config.devBypassToken != null &&
-    timingSafeEqual(bypassHeader, config.devBypassToken)
-  if (!devBypass) {
-    const failure = await requireAttestation(
-      ctx,
-      record,
-      NOTES_IMPORT_TRANSCRIBE_PURPOSE,
-      'Page transcription requires App Attest v2 or Play Integrity'
-    )
-    if (failure) return failure
+    // --- Request authentication (v2 App Attest or Play Integrity only) --
+    const bypassHeader = ctx.req.header('x-ww-dev-bypass') ?? ''
+    devBypass =
+      config.devBypassToken != null &&
+      timingSafeEqual(bypassHeader, config.devBypassToken)
+    if (!devBypass) {
+      const failure = await requireAttestation(
+        ctx,
+        record,
+        NOTES_IMPORT_TRANSCRIBE_PURPOSE,
+        'Page transcription requires App Attest v2 or Play Integrity'
+      )
+      if (failure) return failure
+    }
   }
 
   // --- Entitlement, import allowance, and page limit --------------------
-  const meterId = accountId ?? uuid
+  const meterId = account ? account.accountId : (accountId ?? uuid!)
   let supporter = false
   if (!devBypass) {
     try {
-      supporter = await isSupporter({
-        apiKey: ctx.env.REVENUECAT_API_KEY,
-        appUserId: meterId,
-        entitlementId: config.entitlementId,
-      })
+      supporter = account
+        ? await isAccountSupporter(ctx.env, {
+            accountId: account.accountId,
+            revenueCatAppUserId,
+          })
+        : await isSupporter({
+            apiKey: ctx.env.REVENUECAT_API_KEY,
+            appUserId: meterId,
+            entitlementId: config.entitlementId,
+          })
     } catch (e) {
       if (!(e instanceof RevenueCatError)) Sentry.captureException(e)
       supporter = false
