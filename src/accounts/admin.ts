@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { AppContext, AppEnv } from '../types'
-import { Sentry } from '../sentry'
+import { captureFailure } from '../sentry'
 import { timingSafeEqual } from '../crypto'
 import { apiError } from '../errors'
 import { BUDDIES_ID_PATTERN } from '../buddies/contracts'
@@ -117,7 +117,8 @@ const handleStatus = async (c: AppContext): Promise<Response> => {
     )
   )
   const failed = results.filter((result) => result.status === 'rejected')
-  for (const result of failed) Sentry.captureException(result.reason)
+  for (const result of failed)
+    captureFailure(result.reason, 'admin/accounts/status')
   return c.json({
     ok: failed.length === 0,
     account: await describe(db, { ...account, status }),
