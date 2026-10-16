@@ -150,6 +150,9 @@ heartbeat).
 - *Retention/cleanup* → alarm, `resultRetentionSeconds` (default 3600).
 - *Caps per tier* → `activeImportCap` (2) / `activeImportCapSupporter` (5),
   enforced in the index DO; kickoff returns `409`/`active_cap` at the cap.
+  The legacy synchronous `POST /notes-import` takes a slot per request
+  (`legacy:<uuid>`, identical requests included), released in a `finally`
+  and aged out after 15 minutes in case that never runs.
 - *Idempotency* → `importId = imp_<sha256(uuid|contentHash[|refinement])>` →
   reconnect lands on the same run; a refinement is a distinct run.
 - *Rollout* → legacy `POST /notes-import` retained as a fallback.

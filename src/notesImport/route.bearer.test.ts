@@ -15,6 +15,8 @@ import { accountsDb, setAccountStatus } from '../accounts/store'
 import { accessTokenKeys, signAccessToken } from '../accounts/tokens'
 import { analyticsDistinctId } from '../analytics'
 import { app } from '../app'
+import { SYNC_SLOT_MAX_AGE_MS } from './cap'
+import { getNotesImportConfig } from './config'
 import { NotesImportIndex } from './indexDO'
 import { NotesImportRun } from './runDO'
 import { importOwnerKey } from './route'
@@ -31,6 +33,8 @@ const mocks = vi.hoisted(() => ({
   runModel: vi.fn(),
   transcribe: vi.fn(),
   capture: vi.fn(async () => undefined),
+  /** Stands in for App Attest v1 verification when a test sets it. */
+  appAttest: null as { verifyAssertion: () => Promise<void> } | null,
 }))
 
 vi.mock('cloudflare:workers', () => ({
@@ -44,6 +48,14 @@ vi.mock('cloudflare:workers', () => ({
   },
 }))
 vi.mock('./llm', () => ({ runNotesImportModel: mocks.runModel }))
+vi.mock('../appAttest', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../appAttest')>()
+  return {
+    ...original,
+    appAttestLifecycle: (env: Environment) =>
+      mocks.appAttest ?? original.appAttestLifecycle(env),
+  }
+})
 vi.mock('./transcribe', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./transcribe')>()),
   transcribeNotesPage: mocks.transcribe,
@@ -116,6 +128,7 @@ beforeEach(async () => {
   })
   mocks.transcribe.mockReset()
   mocks.capture.mockClear()
+  mocks.appAttest = null
 })
 
 afterEach(() => {
@@ -379,6 +392,264 @@ describe('empty notes', () => {
 
     // Text around the whitespace is still an import.
     expect((await kickoff(token, { notesText: '  1 hour  ' })).status).toBe(200)
+  })
+})
+
+describe('synchronous imports and the concurrency cap', () => {
+  const MODEL_OUTPUT = {
+    result: RESULT,
+    usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 10 },
+    resolvedProvider: 'azure',
+  }
+
+  /** Holds every model run until `release()`. */
+  const holdModel = () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    mocks.runModel.mockImplementation(async () => {
+      await gate
+      return MODEL_OUTPUT
+    })
+    return release
+  }
+
+  const slots = (meter: string) =>
+    indexes.storage(meter).query('SELECT importId FROM active') as {
+      importId: string
+    }[]
+
+  /**
+   * Sends `count` identical synchronous imports at once with the model held:
+   * `cap` of them run, each in a slot of its own, and the rest are refused
+   * while they do. Then they finish and charge once.
+   */
+  const burst = async (
+    meter: string,
+    cap: number,
+    send: () => Promise<Reply>
+  ) => {
+    const release = holdModel()
+    const settled: Reply[] = []
+    const replies = Array.from({ length: cap + 2 }, () =>
+      send().then((reply) => (settled.push(reply), reply))
+    )
+    await vi.waitFor(() => {
+      expect(mocks.runModel).toHaveBeenCalledTimes(cap)
+      expect(settled).toHaveLength(2)
+    })
+    for (const refused of settled) {
+      expect(refused.status).toBe(429)
+      expect(refused.body).toMatchObject({ code: 'active_cap' })
+      expect(refused.headers.get('retry-after')).toBe('15')
+    }
+    const held = slots(meter).map(({ importId }) => importId)
+    expect(held).toHaveLength(cap)
+    expect(new Set(held).size).toBe(cap)
+    for (const slot of held) expect(slot).toMatch(/^legacy:[0-9a-f-]{36}$/)
+
+    release()
+    const done = (await Promise.all(replies)).filter(
+      (reply) => reply.status === 200
+    )
+    expect(done).toHaveLength(cap)
+    expect(mocks.runModel).toHaveBeenCalledTimes(cap)
+    expect(slots(meter)).toEqual([])
+    return done
+  }
+
+  /** The meter's content records and import window. */
+  const usage = (meter: string) => ({
+    records: indexes
+      .storage(meter)
+      .query('SELECT hash, charged, refinements FROM hash_record'),
+    window: indexes
+      .storage(meter)
+      .query("SELECT v FROM credit_meta WHERE k = 'count'"),
+  })
+
+  it('gives every identical bearer request its own slot, and charges once', async () => {
+    const session = await devSession()
+    const token = await iosToken(session)
+    const done = await burst(
+      session.accountId,
+      getNotesImportConfig(h.env).activeImportCap,
+      () =>
+        call('POST', '/notes-import', {
+          headers: bearer(token),
+          body: { notesText: 'Field service 1 hour', context: CONTEXT },
+        })
+    )
+    // One charge for the content, however many runs it took.
+    expect(usage(session.accountId)).toEqual({
+      records: [
+        {
+          hash: await sha256Hex('Field service 1 hour'),
+          charged: 1,
+          refinements: 0,
+        },
+      ],
+      window: [{ v: 1 }],
+    })
+    for (const reply of done)
+      expect(reply.body.credits).toMatchObject({ remaining: 2, limit: 3 })
+  })
+
+  it('gives every identical legacy request its own slot, and charges once', async () => {
+    // App Attest v1, the legacy synchronous route's only attestation.
+    mocks.appAttest = { verifyAssertion: vi.fn(async () => undefined) }
+    const body = legacyBody({
+      keyId: 'key-id',
+      challenge: 'challenge',
+      assertion: 'assertion',
+    })
+    const done = await burst(
+      body.uuid,
+      getNotesImportConfig(h.env).activeImportCap,
+      () => call('POST', '/notes-import', { body })
+    )
+    expect(mocks.appAttest.verifyAssertion).toHaveBeenCalledTimes(
+      getNotesImportConfig(h.env).activeImportCap + 2
+    )
+    expect(usage(body.uuid)).toEqual({
+      records: [
+        {
+          hash: await sha256Hex('Field service 1 hour'),
+          charged: 1,
+          refinements: 0,
+        },
+      ],
+      window: [{ v: 1 }],
+    })
+    for (const reply of done)
+      expect(reply.body.credits).toMatchObject({ remaining: 2, limit: 3 })
+  })
+
+  it('gives every identical dev-bypass request its own slot, under the Supporter cap', async () => {
+    await burst(
+      legacyBody().uuid,
+      getNotesImportConfig(h.env).activeImportCapSupporter,
+      () =>
+        call('POST', '/notes-import', {
+          headers: legacyHeaders,
+          body: legacyBody(),
+        })
+    )
+    // Unlimited, so nothing counts against a window.
+    expect(usage(legacyBody().uuid)).toEqual({
+      records: [
+        {
+          hash: await sha256Hex('Field service 1 hour'),
+          charged: 0,
+          refinements: 0,
+        },
+      ],
+      window: [],
+    })
+  })
+
+  it('counts each identical refinement that ran, as before', async () => {
+    const session = await devSession()
+    const token = await iosToken(session)
+    const send = (fields: Record<string, unknown> = {}) =>
+      call('POST', '/notes-import', {
+        headers: bearer(token),
+        body: { notesText: 'Field service 1 hour', context: CONTEXT, ...fields },
+      })
+    expect((await send()).status).toBe(200)
+    mocks.runModel.mockClear()
+    const refinement = {
+      instruction: 'Make it two hours',
+      previousResult: RESULT,
+    }
+    const cap = getNotesImportConfig(h.env).activeImportCap
+    await burst(session.accountId, cap, () => send({ refinement }))
+    // Refinements count per run, so the cap now bounds how many count at once.
+    expect(usage(session.accountId)).toEqual({
+      records: [
+        {
+          hash: await sha256Hex('Field service 1 hour'),
+          charged: 1,
+          refinements: cap,
+        },
+      ],
+      window: [{ v: 1 }],
+    })
+  })
+
+  it('never shares a slot with a streaming run of the same content', async () => {
+    const session = await devSession()
+    const token = await iosToken(session)
+    const started = await kickoff(token)
+    expect(started.status).toBe(200)
+    const release = holdModel()
+    const sync = call('POST', '/notes-import', {
+      headers: bearer(token),
+      body: { notesText: 'Field service 1 hour', context: CONTEXT },
+    })
+    await vi.waitFor(() => expect(slots(session.accountId)).toHaveLength(2))
+    // With the cap (2) full, a third import of the same notes waits.
+    const third = await call('POST', '/notes-import', {
+      headers: bearer(token),
+      body: { notesText: 'Field service 1 hour', context: CONTEXT },
+    })
+    expect(third.status).toBe(429)
+    release()
+    expect((await sync).status).toBe(200)
+    expect(slots(session.accountId)).toEqual([
+      { importId: started.body.importId },
+    ])
+  })
+
+  it('drops a synchronous slot nobody released after 15 minutes, never a run’s', async () => {
+    const session = await devSession()
+    const send = async () =>
+      call('POST', '/notes-import', {
+        headers: bearer(await iosToken(session)),
+        body: { notesText: 'Field service 1 hour', context: CONTEXT },
+      })
+    // A streaming run holds a slot until it settles (its alarm never fires
+    // here).
+    const started = await kickoff(await iosToken(session), {
+      notesText: 'Other notes',
+    })
+    expect(started.status).toBe(200)
+    // A request whose client went away: its model run never returns, so its
+    // `finally` never releases its slot.
+    mocks.runModel.mockImplementation(() => new Promise(() => undefined))
+    void send()
+    await vi.waitFor(() => expect(slots(session.accountId)).toHaveLength(2))
+    const [{ startedAt }] = indexes
+      .storage(session.accountId)
+      .query(
+        "SELECT startedAt FROM active WHERE importId LIKE 'legacy:%'"
+      ) as { startedAt: number }[]
+
+    mocks.runModel.mockResolvedValue(MODEL_OUTPUT)
+    vi.setSystemTime(startedAt + SYNC_SLOT_MAX_AGE_MS - 1)
+    expect((await send()).status).toBe(429)
+    vi.setSystemTime(startedAt + SYNC_SLOT_MAX_AGE_MS)
+    expect((await send()).status).toBe(200)
+    expect(slots(session.accountId)).toEqual([
+      { importId: started.body.importId },
+    ])
+  })
+})
+
+describe('NotesImportIndex synchronous slots', () => {
+  it('ages out the content-keyed slots from before, too', async () => {
+    const index = indexes.object('meter')
+    // How the synchronous path keyed its slot before each request got its own.
+    index.acquire(`legacy:imp_${'a'.repeat(40)}`, 2)
+    expect(index.acquireSync(1)).toEqual({ ok: false, active: 1 })
+    vi.setSystemTime(START + SYNC_SLOT_MAX_AGE_MS)
+    const taken = index.acquireSync(1)
+    expect(taken).toEqual({
+      ok: true,
+      active: 1,
+      slot: expect.stringMatching(/^legacy:[0-9a-f-]{36}$/),
+    })
+    index.release((taken as { slot: string }).slot)
+    expect(index.list()).toEqual([])
   })
 })
 

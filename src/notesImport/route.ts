@@ -1134,23 +1134,20 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     isRefinement,
   } = gate
 
-  // The legacy path has no run DO, so it must enforce the same per-user
-  // concurrency cap itself — without it a single-second burst of DISTINCT-hash
-  // requests races the meter (the very bypass this fix closes). Namespace the
-  // slot key ('legacy:') so it can NEVER collide with a streaming run's
-  // importId: a run DO releases by the bare importId, so a shared key would let
-  // this path's finally-release drop a live streaming run's slot. Distinct keys
-  // keep the two paths independent; a duplicate-content legacy burst still
-  // collapses to one slot (acquire is idempotent for a held id), while the
-  // distinct-hash attack takes one slot each and is capped. Synchronous path →
-  // a plain try/finally release (no run DO to hand the slot off to).
+  // The synchronous path has no run DO, so it enforces the same per-user
+  // concurrency cap itself, and every request runs the model, so every
+  // request takes a slot of its own (`acquireSync`): a burst of requests,
+  // identical or not, is capped. Its keys ('legacy:<uuid>') never collide
+  // with a streaming run's importId, which a run DO releases by. Charging is
+  // per content hash in recordUsage, so identical requests still charge once.
+  // A plain try/finally release (no run DO to hand the slot off to); a
+  // disconnected client's slot ages out instead (SYNC_SLOT_MAX_AGE_MS).
   const cap = supporterConcurrency
     ? config.activeImportCapSupporter
     : config.activeImportCap
   const idxId = ctx.env.NOTES_IMPORT_INDEX.idFromName(meterId)
   const idx = ctx.env.NOTES_IMPORT_INDEX.get(idxId)
-  const slotKey = `legacy:${await deriveImportId(gate)}`
-  const acquired = await idx.acquire(slotKey, cap)
+  const acquired = await idx.acquireSync(cap)
   if (!acquired.ok) {
     track(ctx, notesImportLimitReachedEvent(gate.analytics, 'active_cap'))
     return err(
@@ -1250,7 +1247,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
     } satisfies NotesImportSuccess
     return ctx.json(response)
   } finally {
-    await idx.release(slotKey)
+    await idx.release(acquired.slot)
   }
 }
 

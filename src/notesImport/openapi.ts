@@ -421,7 +421,7 @@ export const legacyImportDocs = describeRoute({
   summary: 'Import notes synchronously (legacy)',
   description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. Bearer requests take the same body as kickoff’s. Legacy requests are App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
 
-${GATE_DESCRIPTION} The same concurrency cap as kickoff applies.`,
+${GATE_DESCRIPTION} The same concurrency cap as kickoff applies, and each request holds a slot of its own while it runs, identical ones included (they still charge once).`,
   deprecated: true,
   security: bearerOrLegacy,
   parameters: [devBypassHeader],
