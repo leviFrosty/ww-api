@@ -69,7 +69,7 @@ pnpm fuzz:buddies --seed 42 --case 17   # replay one failing case
 
 The seed decides each case's mutation and its parameters. Ids, keys, and nonces are fresh every run, so you can replay a seed against the same persisted state.
 
-There are 19 generators:
+There are 28 generators, 9 of them for bearer requests (skipped, and counted as skipped, without a dev bypass token):
 
 - **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `signature`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
@@ -77,6 +77,7 @@ There are 19 generators:
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
 - **Photo blobs:** `blob/put` → `blob/get` round trip with an idempotent retry, 1 MiB accepted and one byte more `too_large`, a flipped bit (`bad_request`), a stranger's signature, and the same 404 for a wrong token, an unknown blob or inbox, and a deleted blob.
 - **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
+- **Bearer requests** (sessions opened through the dev bypass): bad tokens on every route class (forged, truncated, `alg: none`, a refresh token, other schemes; always 401 `unauthorized` with the challenge, never the envelope), another account's token (403 `forbidden`), an inbox registered before accounts (409 `not_linked`), malformed plain-JSON bodies and envelopes sent with a token (400), `inbox/register` proofs (missing, another account's, forged, for another inbox), bearer `blob/put` headers, writer ops with any session's token, a bearer round trip, and per-account edge limits from rotating addresses.
 
 The oracle checks every request:
 
@@ -85,7 +86,7 @@ The oracle checks every request:
 - Buddies errors are `{error}` JSON (the full body is `{ok: false, error, code}`); only a 200 `blob/get` is raw bytes;
 - each mutation gets its documented status (for example, a bad signature is 401 `bad_signature`).
 
-After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapshot, and `/health` must still be ok. When a case fails, the fuzzer prints the seed, a `--case` repro command, and the exact failing request, then exits 1.
+After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapshot (and so must the bearer canary's, registered and synced by bearer request), and `/health` must still be ok. The report records secret headers (`authorization`, `x-ww-dev-bypass`) as `<redacted>`. When a case fails, the fuzzer prints the seed, a `--case` repro command, and the exact failing request, then exits 1.
 
 ## Evidence
 
@@ -133,7 +134,7 @@ Only names are listed here; never print values.
 ## Helpers
 
 - `scripts/verify/dev.mjs`: `up`, `doctor`, `url`, `kv <get|put|delete> <key> [value]`, `down [--wipe]`. Also available as `pnpm verify <cmd>`.
-- `pnpm test:e2e` uses `vitest.e2e.config.ts`. It runs files serially because the kill-switch test flips shared KV. Helpers are in `src/test/e2e.ts`: `http`, `RelayOwner`, `RelayWriter`, `localKv`, `writeTranscript`.
+- `pnpm test:e2e` uses `vitest.e2e.config.ts`. It runs files serially because the kill-switch test flips shared KV. Helpers are in `src/test/e2e.ts`: `http`, `RelayOwner`, `RelayWriter`, `openSession`, `BearerRelayOwner`, `sendWriter`, `localKv`, `writeTranscript`.
 - `pnpm fuzz:buddies` runs `scripts/verify/fuzz-buddies.mjs`. It uses the plain-Node wire client `scripts/verify/buddies-wire.mjs`, which `scripts/verify/buddies-wire.test.ts` (part of `pnpm test`) keeps in sync with `src/buddies/contracts.ts` and `envelope.ts`.
 - CI is `.github/workflows/test.yml`: typecheck, unit tests, `up`, `doctor`, e2e, `fuzz --runs 100`, then `down`. Evidence is uploaded as the `verify-evidence` artifact.
 - To keep the feature map honest as routes change, use `/maintain-verification-skill`.

@@ -45,6 +45,20 @@ export const WIRE_EDGE_LIMITS = {
   blobGet: 600,
 }
 
+/** Owner ops: a bearer request sends their fields as plain JSON (no envelope). */
+export const OWNER_OPS = [
+  'inbox/sync',
+  'inbox/delete',
+  'device/register',
+  'device/unregister',
+  'slot/add',
+  'slot/remove',
+  'roster/put',
+  'invite/create',
+  'invite/delete',
+  'blob/delete',
+]
+
 export const SIGNED_OPS = [
   'inbox/register',
   'inbox/sync',
@@ -106,3 +120,31 @@ export const unsignedEnvelope = (payload) => ({
 })
 
 export const sha256 = async (bytes) => new Uint8Array(await subtle.digest('SHA-256', bytes))
+
+/** A bearer `inbox/live` or `blob/put`'s fields: b64u(UTF-8 JSON) for `x-buddies-payload`. */
+export const fieldsHeader = (fields) => b64u(encoder.encode(JSON.stringify(fields)))
+
+// --- Accounts (sessions) --------------------------------------------------
+
+export const ACCOUNT_SIGNING_CONTEXT = 'ww-account/v1\n'
+
+/** The bytes an account-key envelope's signature covers (`src/accounts/contracts.ts`). */
+export const accountSignedMessage = (op, payloadBytes) => {
+  const prefix = encoder.encode(`${ACCOUNT_SIGNING_CONTEXT}${op}\n`)
+  const message = new Uint8Array(prefix.length + payloadBytes.length)
+  message.set(prefix, 0)
+  message.set(payloadBytes, prefix.length)
+  return message
+}
+
+/** A self-signed account envelope for `op` (e.g. `session/open`). */
+export const accountEnvelope = async (op, key, fields = {}) => {
+  const bytes = encoder.encode(
+    JSON.stringify({ accountPub: key.publicKey, ts: Date.now(), nonce: b64u(webcrypto.getRandomValues(new Uint8Array(16))), ...fields })
+  )
+  return { payload: b64u(bytes), signature: b64u(await key.sign(accountSignedMessage(op, bytes))) }
+}
+
+/** What the account key signs to link an inbox (`inbox/register`'s `account` proof). */
+export const inboxLinkMessage = (accountId, inboxId, ownerPub) =>
+  encoder.encode(`${ACCOUNT_SIGNING_CONTEXT}inbox/link\n${accountId}\n${inboxId}\n${ownerPub}`)
