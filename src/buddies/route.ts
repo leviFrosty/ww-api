@@ -382,8 +382,8 @@ const handleBuddiesOp = async (
 
 /**
  * Upgrades to the owner's live socket. The signed envelope rides in the
- * `x-buddies-p` / `x-buddies-s` headers because a WebSocket upgrade has no
- * body (and ids never go in URLs). The Worker counts it as a read and checks
+ * `x-buddies-payload` / `x-buddies-signature` headers because a WebSocket
+ * upgrade has no body (and ids never go in URLs). The Worker counts it as a read and checks
  * its shape and `ts` to find the inbox; the inbox DO verifies it and accepts
  * the socket.
  */
@@ -428,8 +428,8 @@ const refuseBlobOp = async (
 
 /**
  * `POST blob/put`: an owner-signed upload of one sealed photo. The envelope
- * rides in the `x-buddies-p` / `x-buddies-s` headers (op `blob/put`) and the
- * body is the raw sealed bytes. `bytes` is checked before the body is read
+ * rides in the `x-buddies-payload` / `x-buddies-signature` headers (op
+ * `blob/put`) and the body is the raw sealed bytes. `bytes` is checked before the body is read
  * and the read stops past it; the body's SHA-256 must be `blobId`, so the
  * signature covers the bytes too. The inbox DO verifies the signature, takes
  * the nonce, applies the caps, and writes the object.
@@ -463,7 +463,7 @@ const handleBlobPut = async (c: AppContext): Promise<Response> => {
 }
 
 /**
- * `POST blob/get`: an unsigned `{ "p": … }` envelope whose payload names the
+ * `POST blob/get`: an unsigned `{ "payload": … }` envelope whose payload names the
  * sender's inbox, the blob, and the read token (the capability). Answers the
  * raw sealed bytes, or one `not_found` for an unknown inbox or blob, an
  * expired blob, and a wrong token alike.

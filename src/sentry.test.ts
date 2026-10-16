@@ -123,6 +123,8 @@ describe('Sentry scrubbers', () => {
 
   it('drops the Buddies live-socket auth headers from events and transactions', () => {
     const headers = () => ({
+      'x-buddies-payload': 'eyJpbmJveElkIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSJ9',
+      'X-Buddies-Signature': 'c2lnbmF0dXJl',
       'x-buddies-p': 'eyJpbmJveElkIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSJ9',
       'X-Buddies-S': 'c2lnbmF0dXJl',
       upgrade: 'websocket',
@@ -150,6 +152,8 @@ describe('Sentry scrubbers', () => {
       request: {
         url: 'https://ww-proxy.test/accounts/v1/backup/put',
         headers: {
+          'x-ww-payload': 'eyJhY2NvdW50UHViIjoiQUFBQSJ9',
+          'X-WW-Signature': 'c2lnbmF0dXJl',
           'x-ww-p': 'eyJhY2NvdW50UHViIjoiQUFBQSJ9',
           'X-WW-S': 'c2lnbmF0dXJl',
           'x-ww-dev-bypass': 'kept',

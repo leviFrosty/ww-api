@@ -68,6 +68,8 @@ const DOCUMENTATION = {
 
 **Errors.** Every JSON error uses one envelope: \`{ "ok": false, "error", "code", "retryAfter"? }\`. Read \`code\`; \`error\` repeats it, except on Notes Import and route planning, where it is a human-readable message. Every 429 and 503 sends \`Retry-After\`.
 
+**Signed requests.** Buddies and accounts ops send \`{ "payload", "signature" }\`: \`payload\` is the request’s fields as base64url-encoded UTF-8 JSON, and \`signature\` is an Ed25519 signature over the op’s context line followed by those exact bytes. Each op lists its decoded \`payload\` fields. Older app builds send the same values as \`p\` and \`s\` (headers \`x-buddies-p\`/\`x-buddies-s\`, \`x-ww-p\`/\`x-ww-s\`), which are still accepted.
+
 **Rate limits.** Places, Notes Import, route planning, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
     license: { name: 'See repository', url: REPO_URL },
   },

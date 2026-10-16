@@ -1,6 +1,10 @@
 import type { AppContext, Environment } from '../types'
 import { isPlainObject } from '../buddies/contracts'
-import { parseEnvelope, readEnvelopeText } from '../buddies/envelope'
+import {
+  isEnvelopeBody,
+  parseEnvelope,
+  readEnvelopeText,
+} from '../buddies/envelope'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import {
   ACCOUNT_LIMITS,
@@ -139,7 +143,7 @@ const handleDone = guarded('handoff/done', async (c) => {
 })
 
 /**
- * Either phone: a signed envelope (`p`, `s`) is the old phone, anything else
+ * Either phone: a signed envelope (`payload`, `signature`) is the old phone, anything else
  * must be the new phone's `channelId` and `claimToken`.
  */
 const handleCancel = guarded('handoff/cancel', async (c) => {
@@ -152,7 +156,7 @@ const handleCancel = guarded('handoff/cancel', async (c) => {
   } catch {
     body = null
   }
-  if (isPlainObject(body) && 'p' in body) {
+  if (isPlainObject(body) && isEnvelopeBody(body)) {
     const verified = await verifyEnvelope(
       'handoff/cancel',
       text == null ? null : parseEnvelope(text)

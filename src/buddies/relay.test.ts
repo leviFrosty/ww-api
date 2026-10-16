@@ -120,17 +120,33 @@ describe('signed envelopes', () => {
       owner.key
     )
     // Valid payload bytes from one request, signature from another.
-    expect(await h.post('/inbox/sync', { p: tampered.p, s: signed.s })).toEqual(
-      {
-        status: 401,
-        body: relayError('bad_signature'),
-      }
-    )
-    expect(await h.post('/inbox/sync', { p: signed.p })).toEqual({
+    expect(
+      await h.post('/inbox/sync', {
+        payload: tampered.payload,
+        signature: signed.signature,
+      })
+    ).toEqual({
+      status: 401,
+      body: relayError('bad_signature'),
+    })
+    expect(await h.post('/inbox/sync', { payload: signed.payload })).toEqual({
       status: 401,
       body: relayError('bad_signature'),
     })
     expect((await h.post('/inbox/sync', signed)).status).toBe(200)
+  })
+
+  it('still accepts the short envelope names older builds send', async () => {
+    const owner = await Owner.create(h)
+    const signed = await envelope(
+      'inbox/sync',
+      { inboxId: owner.inboxId, since: 0, ts: Date.now(), nonce: randomId() },
+      owner.key
+    )
+    expect(
+      (await h.post('/inbox/sync', { p: signed.payload, s: signed.signature }))
+        .status
+    ).toBe(200)
   })
 
   it('binds the signature to the op in the path', async () => {

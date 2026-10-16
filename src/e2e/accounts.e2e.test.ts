@@ -35,8 +35,8 @@ const signedEnvelope = async (
     })
   )
   return {
-    p: b64u(bytes),
-    s: b64u(await signer.sign(accountSignedMessage(op, bytes))),
+    payload: b64u(bytes),
+    signature: b64u(await signer.sign(accountSignedMessage(op, bytes))),
   }
 }
 
@@ -170,14 +170,14 @@ describe('POST /accounts/v1/handoff/*', () => {
 
 describe('POST /accounts/v1/backup/*', () => {
   const put = async (key: SigningKey, slotId: string, bytes: Uint8Array) => {
-    const { p, s } = await signedEnvelope('backup/put', key, {
+    const { payload, signature } = await signedEnvelope('backup/put', key, {
       slotId,
       size: bytes.byteLength,
       sha256: await sha256B64u(bytes),
     })
     return httpBytes('/accounts/v1/backup/put', {
       bytes,
-      headers: { 'x-ww-p': p, 'x-ww-s': s },
+      headers: { 'x-ww-payload': payload, 'x-ww-signature': signature },
     })
   }
 
@@ -212,14 +212,14 @@ describe('POST /accounts/v1/backup/*', () => {
   it('refuses a body whose sha256 differs', async () => {
     const key = await registered()
     const bytes = randomBytes(1_000)
-    const { p, s } = await signedEnvelope('backup/put', key, {
+    const { payload, signature } = await signedEnvelope('backup/put', key, {
       slotId: randomId(),
       size: bytes.byteLength,
       sha256: await sha256B64u(randomBytes(1_000)),
     })
     const res = await httpBytes('/accounts/v1/backup/put', {
       bytes,
-      headers: { 'x-ww-p': p, 'x-ww-s': s },
+      headers: { 'x-ww-payload': payload, 'x-ww-signature': signature },
     })
     expect(res.status).toBe(400)
     expect(res.body.code).toBe('bad_request')

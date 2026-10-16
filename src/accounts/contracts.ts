@@ -10,8 +10,8 @@ import {
  * account is a random `accountId` the server mints and the public key of the
  * account signing key, which every device derives from the User's account key.
  *
- * Requests use the Buddies envelope `{ "p": b64u(JSON), "s": b64u(Ed25519) }`
- * under their own signing context, so no account signature can pass for a
+ * Requests use the Buddies envelope
+ * `{ "payload": b64u(JSON), "signature": b64u(Ed25519) }` under their own signing context, so no account signature can pass for a
  * Buddies one or the other way round.
  */
 
@@ -32,6 +32,11 @@ export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
 /** `backup/put` sends its signed envelope in these headers; the body is the blob. */
 export const ACCOUNT_ENVELOPE_HEADERS = {
+  payload: 'x-ww-payload',
+  signature: 'x-ww-signature',
+} as const
+/** The short header names older app builds send; still accepted. */
+export const LEGACY_ACCOUNT_ENVELOPE_HEADERS = {
   payload: 'x-ww-p',
   signature: 'x-ww-s',
 } as const
@@ -77,7 +82,7 @@ const concat = (prefix: Uint8Array, rest: Uint8Array): Uint8Array => {
   return message
 }
 
-/** The bytes an account op's signature covers: context, op, then `p` decoded. */
+/** The bytes an account op's signature covers: context, op, then `payload` decoded. */
 export const accountSignedMessage = (
   op: AccountsOp,
   payloadBytes: Uint8Array

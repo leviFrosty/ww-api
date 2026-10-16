@@ -2,6 +2,38 @@
 
 A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, iOS universal links, etc. with Sentry monitoring.
 
+## Open source, open API
+
+WW API is open source, like the [WitnessWork app](https://github.com/leviFrosty/witness-work)
+it serves. Anyone can read the code, the protocol docs in [`docs/`](docs/),
+and the generated API reference at [`/docs`](https://ww-proxy.leviwilkerson.com/docs).
+Since the whole contract is public, there's nothing to gain by obscuring it:
+short or cryptic field names, headers, or paths would only make the API harder
+to read, debug, and build on.
+
+So the API aims to be standard REST, carefully maintained, and easy for people
+to read:
+
+- **Plain names.** Fields, headers, and query parameters are spelled out in
+  full (`payload` and `signature`, not `p` and `s`). Units go in the name or
+  the description (`durationSeconds`, `expiresAt` in epoch ms).
+- **Standard HTTP.** The right methods and status codes, JSON bodies, one
+  error envelope (`{ "ok": false, "error", "code" }`), and `Retry-After` on
+  every 429 and 503. Where a route departs from REST on purpose, its docs say
+  why. For example, the Buddies and accounts relays use `POST /{op}` so ids
+  stay out of URLs, which production logs.
+- **Documented.** Every route and field is described in `/docs`, generated
+  from the routes, so you can call the API without reading the source.
+
+Security never depends on the API being hard to read. It comes from Ed25519
+signatures, App Attest / Play Integrity, capability secrets, rate limits, and
+end-to-end encryption (the Buddies relay only ever sees ciphertext).
+
+Some names shipped before this rule. Those still work as legacy aliases (for
+example, signed envelopes still accept `p`/`s` and the `x-buddies-p`/`-s` and
+`x-ww-p`/`-s` headers from older app builds), but new code and docs use only
+the full names.
+
 ## Prerequisites
 
 - [pnpm](https://pnpm.io/) installed
@@ -114,6 +146,22 @@ GitHub Actions will automatically deploy to Cloudflare Workers. Monitor deployme
 ## API Endpoints
 
 Full API reference: [`/docs`](https://ww-proxy.leviwilkerson.com/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://ww-proxy.leviwilkerson.com/openapi.json). Locally: `http://localhost:8787/docs`.
+
+### Signed requests (Buddies and accounts)
+
+Signed ops send a JSON envelope:
+
+```json
+{ "payload": "<base64url of the UTF-8 JSON request fields>", "signature": "<base64url Ed25519 signature>" }
+```
+
+`signature` covers the op's context line (`ww-buddies/v1\n<op>\n` or
+`ww-account/v1\n<op>\n`) followed by the exact decoded `payload` bytes. Routes
+whose body is raw bytes, or that have no body (`blob/put`, `backup/put`, the
+live WebSocket), send the same two values in `x-buddies-payload` /
+`x-buddies-signature` or `x-ww-payload` / `x-ww-signature`. Each op in `/docs`
+lists its decoded `payload` fields. The wire contract is
+[`docs/buddies-protocol.md`](docs/buddies-protocol.md).
 
 ### `/autocomplete`
 

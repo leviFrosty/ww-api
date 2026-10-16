@@ -283,8 +283,8 @@ describe('blob/put and blob/get', () => {
     const liveSigned = await blobPutHeaders(payload, owner.key)
     const signedAsOther = {
       ...liveSigned,
-      'x-buddies-s': (await envelope('inbox/live', payload, owner.key))
-        .s as string,
+      'x-buddies-signature': (await envelope('inbox/live', payload, owner.key))
+        .signature as string,
     }
     expect(await put(signedAsOther)).toEqual({
       status: 401,
@@ -293,12 +293,12 @@ describe('blob/put and blob/get', () => {
     // A payload swapped under the owner's signature.
     const forged = {
       ...liveSigned,
-      'x-buddies-p': (
+      'x-buddies-payload': (
         await blobPutHeaders(
           { ...payload, expiresAt: payload.expiresAt + 1 },
           owner.key
         )
-      )['x-buddies-p'],
+      )['x-buddies-payload'],
     }
     expect(await put(forged)).toEqual({
       status: 401,
@@ -311,11 +311,11 @@ describe('blob/put and blob/get', () => {
     })
     expect(
       await put({
-        'x-buddies-p': '!!',
-        'x-buddies-s': liveSigned['x-buddies-s'],
+        'x-buddies-payload': '!!',
+        'x-buddies-signature': liveSigned['x-buddies-signature'],
       })
     ).toEqual({ status: 400, body: relayError('bad_request') })
-    expect(await put({ ...liveSigned, 'x-buddies-s': 'A'.repeat(85) })).toEqual(
+    expect(await put({ ...liveSigned, 'x-buddies-signature': 'A'.repeat(85) })).toEqual(
       { status: 401, body: relayError('bad_signature') }
     )
     // Stale on either side.

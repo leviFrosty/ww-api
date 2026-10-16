@@ -135,26 +135,36 @@ describe('verifyBuddiesSignature', () => {
 describe('parseEnvelope', () => {
   it('returns the decoded payload bytes, the parsed payload, and the raw signature', () => {
     const payload = '{"inboxId":"abc","since":0}'
-    const parsed = parseEnvelope(JSON.stringify({ p: b64u(payload), s: 'sig' }))
+    const parsed = parseEnvelope(
+      JSON.stringify({ payload: b64u(payload), signature: 'sig' })
+    )
     expect(parsed).not.toBeNull()
     expect(new TextDecoder().decode(parsed?.payloadBytes)).toBe(payload)
     expect(parsed?.payload).toEqual({ inboxId: 'abc', since: 0 })
     expect(parsed?.signature).toBe('sig')
   })
 
+  it('accepts the legacy short names `p` and `s`', () => {
+    const payload = '{"inboxId":"abc"}'
+    const parsed = parseEnvelope(JSON.stringify({ p: b64u(payload), s: 'sig' }))
+    expect(parsed?.payload).toEqual({ inboxId: 'abc' })
+    expect(parsed?.signature).toBe('sig')
+  })
+
   it.each([
     ['non-JSON', 'nope'],
     ['an array', '[]'],
-    ['a missing p', '{"s":"x"}'],
-    ['an empty p', '{"p":""}'],
-    ['padded base64', JSON.stringify({ p: `${b64u('{"a":1}')}=` })],
-    ['standard base64', JSON.stringify({ p: '+/+/' })],
-    ['a payload that is not JSON', JSON.stringify({ p: b64u('hello') })],
-    ['a payload that is an array', JSON.stringify({ p: b64u('[1]') })],
-    ['a payload that is null', JSON.stringify({ p: b64u('null') })],
+    ['a missing payload', '{"signature":"x"}'],
+    ['an empty payload', '{"payload":""}'],
+    ['an empty legacy p', '{"p":""}'],
+    ['padded base64', JSON.stringify({ payload: `${b64u('{"a":1}')}=` })],
+    ['standard base64', JSON.stringify({ payload: '+/+/' })],
+    ['a payload that is not JSON', JSON.stringify({ payload: b64u('hello') })],
+    ['a payload that is an array', JSON.stringify({ payload: b64u('[1]') })],
+    ['a payload that is null', JSON.stringify({ payload: b64u('null') })],
     [
       'invalid UTF-8',
-      JSON.stringify({ p: b64u(Uint8Array.from([0x7b, 0xff, 0x7d])) }),
+      JSON.stringify({ payload: b64u(Uint8Array.from([0x7b, 0xff, 0x7d])) }),
     ],
   ])('rejects %s', (_, text) => {
     expect(parseEnvelope(text)).toBeNull()
@@ -199,7 +209,7 @@ describe('readEnvelopeText', () => {
 /**
  * The signed envelope from witness-work's known-answer file
  * (`src/features/buddies/lib/testing/cryptoVectors.json`), which iOS and
- * Android check in Hermes. The relay's WebCrypto Ed25519 must accept the same
+ * Android check in Hermes. It uses the legacy short names `p` and `s`. The relay's WebCrypto Ed25519 must accept the same
  * bytes the app's @noble/curves signs.
  */
 const APP_VECTOR = {

@@ -74,8 +74,8 @@ const signed = async (
     })
   )
   return {
-    p: b64u(bytes),
-    s: b64u(await signer.sign(accountSignedMessage(op, bytes))),
+    payload: b64u(bytes),
+    signature: b64u(await signer.sign(accountSignedMessage(op, bytes))),
   }
 }
 

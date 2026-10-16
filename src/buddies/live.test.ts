@@ -129,29 +129,41 @@ describe('opening a live socket', () => {
     expect(
       await h.live({
         upgrade: 'websocket',
-        'x-buddies-p': sync.p,
-        'x-buddies-s': sync.s!,
+        'x-buddies-payload': sync.payload,
+        'x-buddies-signature': sync.signature!,
       })
     ).toEqual(error(401, 'bad_signature'))
 
     const fresh = await liveHeaders(fields(), owner.key)
-    const { 'x-buddies-s': _signature, ...unsigned } = fresh
+    const { 'x-buddies-signature': _signature, ...unsigned } = fresh
     expect(await h.live(unsigned)).toEqual(error(401, 'bad_signature'))
-    expect(await h.live({ ...fresh, 'x-buddies-s': 'x' })).toEqual(
+    expect(await h.live({ ...fresh, 'x-buddies-signature': 'x' })).toEqual(
       error(401, 'bad_signature')
     )
     expect(await h.live({ upgrade: 'websocket' })).toEqual(
       error(400, 'bad_request')
     )
-    expect(await h.live({ ...fresh, 'x-buddies-p': '!!' })).toEqual(
+    expect(await h.live({ ...fresh, 'x-buddies-payload': '!!' })).toEqual(
       error(400, 'bad_request')
     )
     expect(await owner.connect({ inboxId: 'short' })).toEqual(
       error(400, 'bad_request')
     )
 
-    // Only the one good attempt got a socket.
-    expect(h.inboxes.storage(owner.inboxId).sockets()).toHaveLength(1)
+    // Older builds send the short header names; they still open a socket.
+    const legacy = await envelope('inbox/live', fields(), owner.key)
+    expect(
+      (
+        await h.live({
+          upgrade: 'websocket',
+          'x-buddies-p': legacy.payload,
+          'x-buddies-s': legacy.signature!,
+        })
+      ).status
+    ).toBe(101)
+
+    // Only the two good attempts got a socket.
+    expect(h.inboxes.storage(owner.inboxId).sockets()).toHaveLength(2)
   })
 
   it('needs a GET WebSocket upgrade', async () => {

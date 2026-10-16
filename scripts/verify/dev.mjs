@@ -440,7 +440,7 @@ async function doctor() {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.1' },
       body: JSON.stringify({
-        p: Buffer.from(JSON.stringify({ inviteId: 'doctorProbe00000000000' })).toString('base64url'),
+        payload: Buffer.from(JSON.stringify({ inviteId: 'doctorProbe00000000000' })).toString('base64url'),
       }),
     })
     if (probe.status === 404 && probe.body?.error === 'not_found') ok('buddies relay enabled')
@@ -458,7 +458,7 @@ async function doctor() {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.3' },
       body: JSON.stringify({
-        p: Buffer.from(JSON.stringify({ inboxId: 'doctorProbe00000000000', blobId: zeros, token: zeros })).toString('base64url'),
+        payload: Buffer.from(JSON.stringify({ inboxId: 'doctorProbe00000000000', blobId: zeros, token: zeros })).toString('base64url'),
       }),
     })
     if (probe.status === 404 && probe.body?.error === 'not_found') ok('buddies photos enabled')

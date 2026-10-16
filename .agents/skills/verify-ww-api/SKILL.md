@@ -70,7 +70,7 @@ The seed decides each case's mutation and its parameters. Ids, keys, and nonces 
 
 There are 19 generators:
 
-- **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `s`.
+- **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `signature`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
 - **Bad payloads:** a wrong-typed field, a missing field, malformed envelopes (bad JSON, base64, UTF-8), unicode and huge strings.
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
