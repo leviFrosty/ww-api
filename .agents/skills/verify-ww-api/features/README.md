@@ -44,5 +44,6 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Buddies relay](./buddies-relay.md) covers pairing end to end, sync read-backs, auth failures, caps, the kill switch, and fuzzing.
 - [Universal link pages](./universal-link-pages.md) covers the AASA, the `/contacts` (`/c`, `/c/:payload`) contact pages, and the `/buddies/invite` (`/b`) invite page.
 - [Admin reset](./admin.md) covers the maintainer usage reset and its 404 fail-closed auth.
+- [Accounts and sessions](./accounts.md) covers sessions through the dev bypass, `GET /accounts/v1/account`, bearer handoff and backup, the legacy switch, and `/app/v1/config`.
 
 Not mapped yet: supporter route planning (`/route-planning`, needs `HERE_API_KEY`). Map it with `maintain-verification-skill` before relying on it.
