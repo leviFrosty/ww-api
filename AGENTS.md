@@ -222,8 +222,48 @@ pnpm run admin:reset-usage <meterId>         # production
 pnpm run admin:reset-usage --dev <meterId>   # development
 ```
 
+The meter id is the account id for app versions with sessions (from an inbox
+id: `POST /admin/accounts/lookup`), else the shared account id or install uuid.
+
 `ADMIN_API_TOKEN` and `ADMIN_API_TOKEN_DEV` must match separate Wrangler
 `ADMIN_API_TOKEN` secrets in prod/dev. Never reuse the development bypass token.
+
+## Notes Import on account sessions
+
+Notes Import identifies the caller by the session's account (witness-work ADR
+0027). The wire contract is in README.md ("Who's calling") and `/docs`.
+
+- **Bearer**: kickoff, the synchronous `POST /notes-import`, and transcribe
+  take `Authorization: Bearer` and plain fields (no attestation, no hashes);
+  `meterId` is the token's account id. They refuse a suspended account
+  (`requireActive`, 403). Run routes (`events`, `result`, `cancel`, `destroy`)
+  take the token instead of `?token=` and serve only that account's imports:
+  anything else is 404 `not_found`, unknown and foreign alike. Kickoff mints no
+  subscribe token.
+- **Ownership**: a bearer run stores `owner` =
+  `importOwnerKey(accountId)` (a SHA-256, not the id) in its `meta` table at
+  `start()`; `NotesImportRun.isOwnedBy` compares it and stores nothing for an
+  unknown id (tables are created on the first write). Bearer import ids hash
+  `account:<accountId>:<contentHash>[:r:<SHA-256 of the instruction>]`, which
+  has no `|`, so no legacy basis (`<meter>|<contentHash>…`, any uuid) can
+  produce one: a legacy kickoff can never get a subscribe token for an
+  account's run.
+- **Supporter**: one seam, `isAccountSupporter`
+  (`src/accounts/supporter.ts`), at kickoff and settlement. Until RevenueCat
+  is linked to the account it checks the request's optional
+  `revenueCatAppUserId`; absent is free. The RevenueCat-linking change swaps
+  its body and drops the field.
+- **Dev**: a `dev` session gets the dev bypass's allowances only where
+  `NOTES_IMPORT_DEV_BYPASS_TOKEN` is set (dev worker); the bypass header is
+  ignored on bearer requests.
+- **Errors**: Notes Import's shape (message in `error`) for every refusal,
+  bearer and legacy: 401 `unauthorized` with `WWW-Authenticate`, 403
+  `suspended`, 503 `disabled`, and 426 `upgrade_required` (no `Retry-After`)
+  for a legacy request once `auth:legacy` is off.
+- **Allowances don't carry over**: usage under an install uuid or shared
+  account id stays on that meter; each account starts a fresh window.
+- `GET /notes-import/status` is unchanged: public, the same for everyone, and
+  cached per isolate as below. It never reads `Authorization`.
 
 ## Status caching and trace sampling
 
@@ -761,18 +801,21 @@ it commented out.
 
 | Event | When | Properties beyond the shared ones |
 | --- | --- | --- |
-| `api_notes_import_started` | An attested import starts a fresh model run (kickoff or legacy; not reconnects) | `notes_chars`, `new_content`, `imports_remaining` |
+| `api_notes_import_started` | An authenticated import starts a fresh model run (kickoff or legacy; not reconnects) | `notes_chars`, `new_content`, `imports_remaining` |
 | `api_notes_import_finished` | Once per started run | `outcome` (`success`, `model_error`, `cancelled`, `interrupted`), `duration_ms`, `notes_chars`; on success: `empty`, `empty_charged`, record counts (`contacts`, `visits`, `time_entries`, `categories`, `warnings`, `publisher_detected`), `imports_remaining`, `model`, `provider`, `input_tokens`, `output_tokens`, `reasoning_tokens` |
 | `api_notes_import_limit_reached` | An authenticated request is refused by an allowance or the concurrency cap | `limit` (`imports`, `refinements`, `active_cap`) |
 
-Every event carries `platform` (`ios`, `android`, `dev` for the bypass),
-`transport` (`stream`, `legacy`), `refinement`, `supporter`, `has_account`, and
-`environment`. The internal-TestFlight Beta app talks to prod, so its imports
+Every event carries `platform` (`ios`, `android`, `dev`: the session's
+platform on bearer requests, else App Attest, Play Integrity, or the bypass
+header), `transport` (`stream`, `legacy`), `refinement`, `supporter`,
+`has_account` (true on every bearer request), and `environment`. The internal-TestFlight Beta app talks to prod, so its imports
 are counted as `ios`.
 
 - **Identity**: `distinct_id` is `ww_` plus a truncated SHA-256 of the meter id
-  (account id, else install uuid), so unique users, DAU/WAU/MAU and retention
-  work without the id itself reaching PostHog. It can't be joined to the app's
+  (the session's account id on bearer requests; on legacy ones the shared
+  account id, else the install uuid), so unique users, DAU/WAU/MAU and
+  retention work without the id itself reaching PostHog. A User's bearer
+  imports get a new `distinct_id`, not their legacy one. It can't be joined to the app's
   own anonymous PostHog ids. Events set `$process_person_profile: false` and
   `$geoip_disable: true`.
 - **Privacy**: properties are structural only. Never add notes text, model
@@ -929,7 +972,7 @@ on raw `wrangler deploy`.
 
 Each import runs in a `NotesImportRun` SQLite Durable Object (`NotesImportIndex`
 per user holds the concurrency cap) via AI SDK v6 `streamText` +
-`Output.object`: attested kickoff (`POST /notes-import/kickoff`) → SSE progress
+`Output.object`: authenticated kickoff (`POST /notes-import/kickoff`) → SSE progress
 (`GET /notes-import/:id/events`) → result snapshot (`/result`). The legacy
 `POST /notes-import` remains as a fallback. Model, providers, reasoning effort,
 and the output-token budget are `NOTES_IMPORT_*` vars in `wrangler.toml`
