@@ -417,6 +417,20 @@ which every device derives from the User's account key. Accounts let us
 suspend someone for abuse; later phases add moving between iOS and Android.
 Code in `src/accounts/`, schema in `src/accounts/schema.ts` (Drizzle on D1).
 
+**The account is the source of truth for who a User is** (witness-work ADR
+0027). Every user-scoped route identifies the caller by the `accountId` of an
+attested session's bearer token, through the `requireAccount()` middleware,
+and keys its authorization, metering, limits, and audit records on that id.
+Don't add a route that trusts a client-sent install id, RevenueCat id, or
+inbox id to say who the User is, or that builds its own signed envelope or
+per-request attestation: attestation happens once, when a session opens (`POST
+/accounts/v1/sessions`). Feature ids (inboxes, backup slots, imports) belong
+to an account. The RevenueCat identity is being linked to the account so
+Supporter status is kept in step from RevenueCat webhooks and answered from
+the account, not from an id the app sends. The pre-session ways of
+authenticating survive only behind the legacy switch (`auth:legacy`), for app
+versions from before sessions.
+
 - `POST /accounts/v1/account/register`: self-signed under the
   `ww-account/v1` context; idempotent per key. Counts against the Buddies
   register edge tier and the per-caller daily quota.

@@ -156,15 +156,39 @@ describe('Sentry scrubbers', () => {
           'X-WW-Signature': 'c2lnbmF0dXJl',
           'x-ww-p': 'eyJhY2NvdW50UHViIjoiQUFBQSJ9',
           'X-WW-S': 'c2lnbmF0dXJl',
-          'x-ww-dev-bypass': 'kept',
+          'x-ww-sha256': 'kept',
           'content-type': 'application/octet-stream',
         },
       },
     }
     expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual({
-      'x-ww-dev-bypass': 'kept',
+      'x-ww-sha256': 'kept',
       'content-type': 'application/octet-stream',
     })
+  })
+
+  it('drops bearer, admin, and dev bypass tokens from events and transactions', () => {
+    const headers = () => ({
+      Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',
+      'x-ww-admin-token': 'admin-secret',
+      'X-WW-Dev-Bypass': 'bypass-secret',
+      'x-authorization-hint': 'kept',
+      accept: 'application/json',
+    })
+    const kept = { 'x-authorization-hint': 'kept', accept: 'application/json' }
+    const error: ErrorEvent = {
+      type: undefined,
+      request: { url: 'https://ww-proxy.test/accounts/v1/account/info', headers: headers() },
+    }
+    const transaction: TransactionEvent = {
+      type: 'transaction',
+      request: { url: 'https://ww-proxy.test/admin/accounts/status', headers: headers() },
+    }
+
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual(kept)
+    expect(
+      (config.beforeSendTransaction!(transaction, {}) as TransactionEvent).request?.headers
+    ).toEqual(kept)
   })
 
   it('leaves events without contact links untouched', () => {

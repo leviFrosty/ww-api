@@ -46,24 +46,29 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
 }
 
 /**
- * The Buddies live socket sends its signed envelope (which holds the inbox
- * id) in `x-buddies-*` request headers, and accounts' `backup/put` sends its
- * envelope (account key and slot id) in `x-ww-payload`/`x-ww-signature` (or
- * the legacy `x-ww-p`/`x-ww-s`). The SDK copies request headers into events,
- * so drop them outright.
+ * The SDK copies request headers into events (with `sendDefaultPii: false`
+ * it leaves out only cookies), so drop every header that carries a
+ * credential or an id outright:
+ * - `authorization`: bearer tokens.
+ * - `x-ww-admin-token` and `x-ww-dev-bypass`: the admin and dev bypass tokens.
+ * - `x-buddies-*`: the Buddies live socket's signed envelope (holds the inbox
+ *   id).
+ * - `x-ww-payload`/`x-ww-signature` (or the legacy `x-ww-p`/`x-ww-s`):
+ *   accounts' `backup/put` envelope (account key and slot id).
  */
-const BUDDIES_HEADER = /^(x-buddies-|x-ww-(p|s|payload|signature)$)/i;
+const SECRET_HEADER =
+  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature)$)/i;
 
-function dropBuddiesHeaders(event: Event): void {
+function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;
   if (!headers) return;
   for (const name of Object.keys(headers)) {
-    if (BUDDIES_HEADER.test(name)) delete headers[name];
+    if (SECRET_HEADER.test(name)) delete headers[name];
   }
 }
 
 function scrubEvent<T extends Event>(event: T): T {
-  dropBuddiesHeaders(event);
+  dropSecretHeaders(event);
   return scrubStrings(event) as T;
 }
 
