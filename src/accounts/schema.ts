@@ -50,6 +50,43 @@ export const accountStatusEvents = sqliteTable(
   (t) => [index('account_status_events_account_idx').on(t.accountId)]
 )
 
+export const SESSION_PLATFORMS = ['ios', 'android', 'dev'] as const
+export type SessionPlatform = (typeof SESSION_PLATFORMS)[number]
+
+/**
+ * Attested sessions (witness-work ADR 0027): one row per session opened
+ * (`POST /accounts/v1/sessions`). Only the account, the platform, the sealed
+ * device label, the SHA-256 of the current and previous refresh token, and
+ * times. Never the install, its App Attest key, `accountPub`, or an IP.
+ */
+export const accountSessions = sqliteTable(
+  'account_sessions',
+  {
+    /** b64u of 16 random bytes; the access token's `sid`. */
+    id: text('id').primaryKey(),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** What attested the session; `dev` is the development bypass. */
+    platform: text('platform', { enum: SESSION_PLATFORMS }).notNull(),
+    /** The device label, sealed under a key only the account's devices hold. */
+    device: text('device'),
+    /** b64u SHA-256 of the current refresh token's bytes. */
+    refreshHash: text('refresh_hash').notNull().unique(),
+    /** The one it replaced, accepted for a minute after `rotatedAt`. */
+    previousRefreshHash: text('previous_refresh_hash'),
+    rotatedAt: integer('rotated_at', { mode: 'timestamp_ms' }),
+    createdAt: createdAt(),
+    /** 90 days after it opened; refreshing never moves it. */
+    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+    revokedAt: integer('revoked_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [
+    index('account_sessions_account_idx').on(t.accountId),
+    index('account_sessions_previous_refresh_idx').on(t.previousRefreshHash),
+  ]
+)
+
 /**
  * Which account owns each Buddies inbox. Written only after the inbox accepted
  * a registration signed by its owner key that also carried the account key's

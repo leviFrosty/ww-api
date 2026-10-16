@@ -1,5 +1,6 @@
 import { asc, eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/d1'
+import { bytesToBase64Url } from '../crypto'
 import {
   accountInboxes,
   accountStatusEvents,
@@ -10,6 +11,10 @@ import {
 
 export const accountsDb = (d1: D1Database) => drizzle(d1)
 export type AccountsDb = ReturnType<typeof accountsDb>
+
+/** A fresh account id: b64u of 16 random bytes. */
+export const newAccountId = (): string =>
+  bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))
 
 export interface AccountRecord {
   id: string
@@ -124,8 +129,9 @@ export const setAccountStatus = async (
 }
 
 /**
- * What `account/info` shows the account's own devices: its row, the inboxes
- * it owns, and when its status changed. Status reasons stay with moderation.
+ * What `GET /account` (and the legacy `account/info`) shows the account's own
+ * devices: its row, the inboxes it owns, and when its status changed. Status
+ * reasons stay with moderation.
  */
 export interface AccountInfo extends AccountRecord {
   createdAt: number
@@ -135,12 +141,16 @@ export interface AccountInfo extends AccountRecord {
 
 export const findAccountInfo = async (
   db: AccountsDb,
-  accountPub: string
+  by: { accountPub: string } | { accountId: string }
 ): Promise<AccountInfo | null> => {
   const account = await db
     .select({ ...accountColumns, createdAt: accounts.createdAt })
     .from(accounts)
-    .where(eq(accounts.accountPub, accountPub))
+    .where(
+      'accountId' in by
+        ? eq(accounts.id, by.accountId)
+        : eq(accounts.accountPub, by.accountPub)
+    )
     .get()
   if (!account) return null
   const [inboxIds, statusChanges] = await Promise.all([

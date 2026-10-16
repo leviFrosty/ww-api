@@ -132,7 +132,11 @@ export const BUDDIES_ERROR_STATUS = {
   limit: 429,
   rate_limited: 429,
   disabled: 503,
-  /** `inbox/live` without a WebSocket upgrade. */
+  /**
+   * `inbox/live` without a WebSocket upgrade, and any request authenticated
+   * the way it was before sessions once the legacy switch (`auth:legacy`) is
+   * off. Never carries `Retry-After`: updating the app is the fix.
+   */
   upgrade_required: 426,
   /** A `blob/put` body (declared or streamed) over `blobBytes`. */
   too_large: 413,
@@ -144,8 +148,18 @@ export const BUDDIES_ERROR_STATUS = {
   suspended: 403,
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,
-  /** A handoff channel another account opened. */
+  /**
+   * A handoff channel another account opened, or a `backup/delete` signed by
+   * another account than the bearer token's.
+   */
   forbidden: 403,
+  /**
+   * A missing, expired, or invalid access token, or an ended session's
+   * refresh token. Sent with `WWW-Authenticate: Bearer error="invalid_token"`.
+   */
+  unauthorized: 401,
+  /** Opening a session refused the attestation (`reason` says why). */
+  attestation_failed: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS

@@ -3,7 +3,7 @@
  * with Sentry and the cron handler, and re-exports the Durable Objects.
  */
 import { Hono } from "hono";
-import type { Environment, AppContext, HealthCheckResponse } from "./types";
+import type { AppEnv, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { apiError, dateHeader } from "./errors";
 import { rateLimit } from "./rateLimit";
@@ -78,7 +78,7 @@ import {
   notesImportAdminResetDocs,
 } from "./openapi/coreDocs";
 
-export const app = new Hono<{ Bindings: Environment }>();
+export const app = new Hono<AppEnv>();
 
 async function handleGeocodeRequest(context: AppContext) {
   return proxyRequestToHereApi(context, HERE_API.GEOCODE_URL);
@@ -244,9 +244,12 @@ app.get("/c/:payload", legacyContactLinkDocs, handleLegacyContactLinkRequest);
 // Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
 // rate-limited per caller inside the handler (src/buddies/limits.ts).
 app.route("/buddies/v1", createBuddiesRoutes());
-// Anonymous accounts (witness-work ADR 0024, 0026): POST /accounts/v1/{op},
-// signed like Buddies ops (handoff's new-phone ops carry a claim token
-// instead) and rate-limited per caller inside the handler.
+// Anonymous accounts (witness-work ADR 0024, 0026, 0027): sessions
+// (`/accounts/v1/sessions`, attested once through /attestation/v1) hand out
+// bearer tokens for `GET /accounts/v1/account` and the `POST
+// /accounts/v1/{op}` handoff and backup ops; ops from before sessions still
+// take signed envelopes while the legacy switch is on (handoff's new-phone ops
+// carry a claim token instead). Rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 // `/b` is the short path in invites already sent.

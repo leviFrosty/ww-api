@@ -326,6 +326,54 @@ export const verifyAppAttestV2Record = async (
   }
 }
 
+/** Which provider attested a request: App Attest (iOS) or Play Integrity. */
+export type AttestedPlatform = 'ios' | 'android'
+
+/**
+ * `requireAttestation`'s check for a route with its own error format (the
+ * accounts envelope, say): resolves with the platform that attested, or
+ * throws `AppAttestError` / `PlayIntegrityError` with its stable `reason`.
+ * A request that doesn't parse for `purpose` is `invalid_request`, and
+ * anything but App Attest v2 or Play Integrity `unsupported_protocol`. The
+ * route checks its hashes first, as for `requireAttestation`.
+ */
+export const verifyAttestation = async (
+  ctx: AppContext,
+  record: Record<string, unknown>,
+  purpose: AttestationPurpose
+): Promise<AttestedPlatform> => {
+  if (isPlayIntegrityRequest(record)) {
+    const request = parsePlayIntegrityAssertionRequest(record, purpose)
+    if (!request) {
+      throw new PlayIntegrityError(
+        'invalid_request',
+        'Invalid Play Integrity request'
+      )
+    }
+    await verifyPlayIntegrityAssertion(
+      ctx.env,
+      request,
+      playIntegrityDependencies
+    )
+    return 'android'
+  }
+  if (appAttestProtocolVersion(record) !== 2) {
+    throw new AppAttestError(
+      'This request requires App Attest v2 or Play Integrity',
+      { reason: 'unsupported_protocol', status: HTTP_STATUS.BAD_REQUEST }
+    )
+  }
+  const request = parseV2AssertionFinalRequest(record, purpose)
+  if (!request) {
+    throw new AppAttestError('Invalid App Attest v2 assertion', {
+      reason: 'invalid_request',
+      status: HTTP_STATUS.BAD_REQUEST,
+    })
+  }
+  await verifyV2Assertion(ctx, request)
+  return 'ios'
+}
+
 /**
  * The attestation check for a protected request: App Attest v2 (iOS) or Play
  * Integrity (Android), signed for `purpose`; App Attest v1 is refused. Null
