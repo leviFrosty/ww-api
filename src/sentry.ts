@@ -29,20 +29,55 @@ export function redactContactLinkPayloads(value: string): string {
  * header, breadcrumbs), and Notes Import traces at 100%, so their values are
  * cut from every string in an event, like contact links. Names are lowercase
  * and match without regard to case.
+ *
+ * A name is compared as the worker reads it: Hono and `URLSearchParams`
+ * decode percent-escapes (and `+`) in names, so `?to%6Ben=` is a `token`
+ * too. The raw name stays in the string; only the value is cut.
  */
 const SECRET_QUERY_PARAMETERS = ['token', 'apikey'];
-const SECRET_QUERY_PARAMETER = new RegExp(
-  `((?:^|[?&])(?:${SECRET_QUERY_PARAMETERS.join('|')})=)[^&#\\s"'<>]*`,
-  'gi'
-);
+/**
+ * A query parameter's `name=` at the start of a string or after `?` or `&`.
+ * It matches only up to the `=`, so a parameter inside another one's value
+ * (`?next=/x?token=…`) is found as well.
+ */
+const QUERY_PARAMETER_NAME = /(?:^|[?&])([^&#=?\s"'<>]*)=/g;
+/**
+ * A value runs to the next `&` or the fragment, or to whatever ends the URL
+ * in the string (whitespace, a quote, an angle bracket, the string's end).
+ */
+const QUERY_PARAMETER_VALUE = /[^&#\s"'<>]*/y;
 const REDACTED_QUERY_VALUE = '[redacted]';
 
-export function redactSecretQueryParameters(value: string): string {
-  return value.replace(SECRET_QUERY_PARAMETER, `$1${REDACTED_QUERY_VALUE}`);
+/**
+ * A raw query parameter name decoded as `URLSearchParams` decodes it: `+` is
+ * a space, and percent-escapes are decoded, a malformed one left as it is
+ * (never an error).
+ */
+function decodeQueryParameterName(name: string): string {
+  if (!/[%+]/.test(name)) return name;
+  for (const [decoded] of new URLSearchParams(`${name}=`)) return decoded;
+  return name;
 }
 
 const isSecretQueryParameter = (name: string): boolean =>
-  SECRET_QUERY_PARAMETERS.includes(name.toLowerCase());
+  SECRET_QUERY_PARAMETERS.includes(
+    decodeQueryParameterName(name).toLowerCase()
+  );
+
+export function redactSecretQueryParameters(value: string): string {
+  let redacted = '';
+  let copied = 0;
+  for (const match of value.matchAll(QUERY_PARAMETER_NAME)) {
+    // A name inside a value that was just cut is gone with it.
+    if (match.index < copied || !isSecretQueryParameter(match[1])) continue;
+    const valueStart = match.index + match[0].length;
+    QUERY_PARAMETER_VALUE.lastIndex = valueStart;
+    QUERY_PARAMETER_VALUE.exec(value);
+    redacted += value.slice(copied, valueStart) + REDACTED_QUERY_VALUE;
+    copied = QUERY_PARAMETER_VALUE.lastIndex;
+  }
+  return copied === 0 ? value : redacted + value.slice(copied);
+}
 
 /**
  * Drizzle's query errors carry the SQL and its bound parameters (account ids,
