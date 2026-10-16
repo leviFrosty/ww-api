@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import type { AppContext, Environment } from '../types'
+import type { AppContext, AppEnv, Environment } from '../types'
 import { Sentry } from '../sentry'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import {
@@ -507,7 +507,7 @@ const handleBlobGet = async (c: AppContext): Promise<Response> => {
 export const createBuddiesRoutes = (
   deps: BuddiesRouteDependencies = { push: defaultApnsDependencies }
 ) => {
-  const routes = new Hono<{ Bindings: Environment }>()
+  const routes = new Hono<AppEnv>()
   for (const op of BUDDIES_OPS) {
     routes.post(`/${op}`, buddiesOpDocs[op], (c) =>
       handleBuddiesOp(c, op, deps)

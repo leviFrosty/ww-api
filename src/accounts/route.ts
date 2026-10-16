@@ -1,22 +1,28 @@
 import { Hono } from 'hono'
-import type { AppContext, Environment } from '../types'
-import { Sentry } from '../sentry'
-import { bytesToBase64Url } from '../crypto'
-import {
-  buddiesErrorResponse,
-  buddiesInternalError,
-} from '../buddies/errorResponse'
+import type { AppContext, AppEnv } from '../types'
+import { buddiesErrorResponse } from '../buddies/errorResponse'
 import { buddiesCallerKey } from '../buddies/limits'
-import { accountsDb, findAccountInfo, registerAccount } from './store'
 import {
+  accountsDb,
+  findAccountInfo,
+  newAccountId,
+  registerAccount,
+  type AccountInfo,
+} from './store'
+import {
+  guarded,
   quotaName,
   refuseAtEdge,
   refuseOverDailyQuota,
   verifiedBody,
 } from './signed'
+import { authenticateAccount, bearerOrLegacy } from './auth'
+import { refuseLegacyAuth } from './legacySwitch'
 import { handoffHandlers } from './handoff'
 import { backupHandlers } from './backup'
+import { sessionHandlers } from './session'
 import {
+  accountDocs,
   accountInfoDocs,
   accountRegisterDocs,
   backupDeleteDocs,
@@ -30,10 +36,10 @@ import {
   handoffReceiveDocs,
   handoffSendDocs,
   handoffStatusDocs,
+  sessionCloseDocs,
+  sessionOpenDocs,
+  sessionRefreshDocs,
 } from './openapi'
-
-const randomAccountId = (): string =>
-  bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))
 
 /**
  * `POST /accounts/v1/account/register`: the account for a signing key, created
@@ -41,78 +47,104 @@ const randomAccountId = (): string =>
  * key always gets the same `accountId`, so a replay learns nothing new. It
  * counts against the register edge tier and the caller's daily quota.
  *
- * Privacy: nothing here logs or reports the body, the key, or the account id.
- */
-const handleRegister = async (c: AppContext): Promise<Response> => {
-  try {
-    if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
-    const limited = await refuseAtEdge(c, 'inbox/register')
-    if (limited) return limited
-
-    const verified = await verifiedBody(c, 'account/register')
-    if ('refusal' in verified) return verified.refusal
-    const { payload } = verified
-
-    // The caller's rolling-day registration quota, shared in kind with
-    // Buddies' `inbox/register` (a DO per caller, under its own name).
-    const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
-    const refused = await refuseOverDailyQuota(
-      c.env,
-      await quotaName('register-caller', callerKey),
-      undefined,
-      'account/register',
-      'registrationsPerDay'
-    )
-    if (refused) return refused
-
-    const account = await registerAccount(
-      accountsDb(c.env.ACCOUNTS_DB),
-      payload.accountPub,
-      randomAccountId
-    )
-    return c.json({ ok: true, accountId: account.id, status: account.status })
-  } catch (error) {
-    console.error('accounts: request failed', { op: 'account/register' })
-    Sentry.captureException(error)
-    return buddiesInternalError()
-  }
-}
-
-/**
- * `POST /accounts/v1/account/info`: what the database holds for the signing
- * key's own account, for the app's developer tools. Read-only and self-signed,
- * so only the account key's holder can read it; it never creates an account
- * (an unknown key is 404 `unknown_account`). Counts against the read edge tier.
+ * Opening a session (`POST /accounts/v1/sessions`) replaces it; it stays for
+ * app versions before sessions, so it's refused with 426 `upgrade_required`
+ * once the legacy switch is off.
  *
  * Privacy: nothing here logs or reports the body, the key, or the account id.
  */
-const handleInfo = async (c: AppContext): Promise<Response> => {
-  try {
-    if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
-    const limited = await refuseAtEdge(c, 'inbox/sync')
-    if (limited) return limited
+const handleRegister = guarded('account/register', async (c) => {
+  if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
+  const upgrade = await refuseLegacyAuth(c.env)
+  if (upgrade) return upgrade
+  const limited = await refuseAtEdge(c, 'inbox/register')
+  if (limited) return limited
 
-    const verified = await verifiedBody(c, 'account/info')
-    if ('refusal' in verified) return verified.refusal
-    const { payload } = verified
+  const verified = await verifiedBody(c, 'account/register')
+  if ('refusal' in verified) return verified.refusal
+  const { payload } = verified
 
-    const info = await findAccountInfo(
-      accountsDb(c.env.ACCOUNTS_DB),
-      payload.accountPub
-    )
-    if (!info) return buddiesErrorResponse('unknown_account')
-    const { id, ...rest } = info
-    return c.json({ ok: true, accountId: id, ...rest })
-  } catch (error) {
-    console.error('accounts: request failed', { op: 'account/info' })
-    Sentry.captureException(error)
-    return buddiesInternalError()
-  }
+  // The caller's rolling-day registration quota, shared in kind with
+  // Buddies' `inbox/register` (a DO per caller, under its own name).
+  const callerKey = buddiesCallerKey(c.req.header('CF-Connecting-IP'))
+  const refused = await refuseOverDailyQuota(
+    c.env,
+    await quotaName('register-caller', callerKey),
+    undefined,
+    'account/register',
+    'registrationsPerDay'
+  )
+  if (refused) return refused
+
+  const account = await registerAccount(
+    accountsDb(c.env.ACCOUNTS_DB),
+    payload.accountPub,
+    newAccountId
+  )
+  return c.json({ ok: true, accountId: account.id, status: account.status })
+})
+
+const infoResponse = (c: AppContext, info: AccountInfo | null): Response => {
+  if (!info) return buddiesErrorResponse('unknown_account')
+  const { id, ...rest } = info
+  return c.json({ ok: true, accountId: id, ...rest })
 }
+
+/**
+ * `GET /accounts/v1/account`: what the database holds for the bearer token's
+ * own account, for Settings → Account and the developer tools. Read-only: it
+ * never creates an account. Counts against the read edge tier.
+ *
+ * Privacy: nothing here logs or reports the token or the account id.
+ */
+const handleAccount = guarded('account', async (c) => {
+  const d1 = c.env.ACCOUNTS_DB
+  if (!d1) return buddiesErrorResponse('disabled')
+  const limited = await refuseAtEdge(c, 'inbox/sync')
+  if (limited) return limited
+  const auth = await authenticateAccount(c)
+  if (!auth.ok) return auth.response
+  const { accountId } = auth.account
+  return infoResponse(c, await findAccountInfo(accountsDb(d1), { accountId }))
+})
+
+/**
+ * `POST /accounts/v1/account/info`: `GET /account`'s answer for app versions
+ * before it. A bearer request with no body names the token's account; while
+ * the legacy switch is on, an envelope self-signed by the account key names
+ * the key's (an unknown key is 404 `unknown_account`). Read-only. Counts
+ * against the read edge tier.
+ *
+ * Privacy: nothing here logs or reports the body, the key, or the account id.
+ */
+const handleInfo = guarded('account/info', async (c) => {
+  const d1 = c.env.ACCOUNTS_DB
+  if (!d1) return buddiesErrorResponse('disabled')
+  const limited = await refuseAtEdge(c, 'inbox/sync')
+  if (limited) return limited
+  const db = accountsDb(d1)
+  return bearerOrLegacy(c, {
+    bearer: async ({ accountId }) =>
+      infoResponse(c, await findAccountInfo(db, { accountId })),
+    legacy: async () => {
+      const verified = await verifiedBody(c, 'account/info')
+      if ('refusal' in verified) return verified.refusal
+      const { accountPub } = verified.payload
+      return infoResponse(c, await findAccountInfo(db, { accountPub }))
+    },
+  })
+})
 
 /** Mounted at `/accounts/v1` by the Worker entry point. */
 export const createAccountsRoutes = () => {
-  const routes = new Hono<{ Bindings: Environment }>()
+  const routes = new Hono<AppEnv>()
+  // Sessions are resources. Backup and handoff stay `POST /{op}` (ids in
+  // bodies, never URLs, as in Buddies); see their openapi.ts entries.
+  routes.post('/sessions', sessionOpenDocs, sessionHandlers.open)
+  routes.post('/sessions/refresh', sessionRefreshDocs, sessionHandlers.refresh)
+  routes.delete('/sessions/current', sessionCloseDocs, sessionHandlers.close)
+  routes.get('/account', accountDocs, handleAccount)
+  // App versions before sessions (and `GET /account`).
   routes.post('/account/register', accountRegisterDocs, handleRegister)
   routes.post('/account/info', accountInfoDocs, handleInfo)
   routes.post('/handoff/open', handoffOpenDocs, handoffHandlers.open)

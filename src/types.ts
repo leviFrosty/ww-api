@@ -259,6 +259,27 @@ export interface Environment {
   ACCOUNT_BACKUPS?: R2Bucket;
 
   /**
+   * Signs session access tokens (HS256, witness-work ADR 0027). Secret, at
+   * least 32 characters, distinct per prod/dev worker. Without it, the
+   * session routes (`/accounts/v1/sessions*`) answer `disabled` and bearer
+   * tokens never pass.
+   */
+  ACCOUNT_TOKEN_SECRET?: string;
+
+  /**
+   * The secret `ACCOUNT_TOKEN_SECRET` replaced, while its tokens (15 minutes)
+   * run out. Secret; optional. Verifies only, never signs.
+   */
+  ACCOUNT_TOKEN_SECRET_PREVIOUS?: string;
+
+  /**
+   * Legacy-auth fallback when KV `auth:legacy` is absent: `"off"` refuses the
+   * pre-session ways of authenticating with 426 `upgrade_required`; anything
+   * else (and unset) accepts them.
+   */
+  AUTH_LEGACY?: string;
+
+  /**
    * Minimum app version (`major.minor.patch`) for the whole app, served by
    * GET /app/v1/config. KV `app:min-version` overrides. Unset = no floor.
    */
@@ -341,7 +362,20 @@ export interface Environment {
   >;
 }
 
-export type AppContext = Context<{ Bindings: Environment }>;
+/** Request-scoped values routes share through `c.var`. */
+export interface AppVariables {
+  /**
+   * The caller's account and session, set by `requireAccount()` and
+   * `bearerOrLegacy()` (src/accounts/auth.ts) on bearer requests only.
+   * Read it with `accountOf(c)`.
+   */
+  account?: import('./accounts/auth').AccountAuth;
+}
+
+/** The Hono environment every app and route group uses. */
+export type AppEnv = { Bindings: Environment; Variables: AppVariables };
+
+export type AppContext = Context<AppEnv>;
 
 export interface HealthCheckResponse {
   status: 'ok';

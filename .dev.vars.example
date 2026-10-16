@@ -27,6 +27,11 @@ REVENUECAT_API_KEY=sk_your_revenuecat_secret_here
 # sending header `x-ww-dev-bypass: <this value>`. Leave UNSET in production.
 NOTES_IMPORT_DEV_BYPASS_TOKEN=local-dev-bypass
 
+# Signs account session access tokens (witness-work ADR 0027). At least 32
+# characters; without it, /accounts/v1/session/* answers `disabled`. Local
+# only; generate with: openssl rand -base64 32
+ACCOUNT_TOKEN_SECRET=generate_with_openssl_rand_base64_32_local_only
+
 # Dedicated local admin-reset token. Do not reuse the dev-bypass token.
 ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32
 

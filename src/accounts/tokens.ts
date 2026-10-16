@@ -1,0 +1,251 @@
+import type { Environment } from '../types'
+import { bytesToBase64Url, sha256Bytes } from '../crypto'
+import { BUDDIES_ID_PATTERN, decodeB64u, isPlainObject } from '../buddies/contracts'
+import { ACCOUNT_LIMITS, isAccountId } from './contracts'
+import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
+
+/**
+ * Access tokens (witness-work ADR 0027, `docs/accounts-protocol.md`, "The
+ * access token"): JWTs signed with HMAC-SHA256 under the Worker secret
+ * `ACCOUNT_TOKEN_SECRET`, 15 minutes each. Nothing is stored; a token is
+ * valid while its signature, issuer, audience, and expiry check out.
+ *
+ * Claims: the registered `iss`, `aud`, `sub` (the account id), `iat`, and
+ * `exp`, plus `sid` (the session id, as in OpenID Connect) and `platform`
+ * (`ios`, `android`, or `dev`).
+ *
+ * Rotation: the header's `kid` is derived from the secret that signed it, so
+ * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
+ * valid until they expire. Without it, they fail once and the app refreshes.
+ *
+ * The issuer names the environment (`APP_ATTEST_ENVIRONMENT`) and each
+ * environment has its own secret, so a development token never passes on
+ * production.
+ *
+ * Privacy: tokens carry the account id and session id; never log them.
+ */
+
+export const ACCESS_TOKEN_AUDIENCE = 'ww-account'
+/** `openssl rand -base64 32` is 44 characters; anything shorter is refused. */
+export const MIN_TOKEN_SECRET_CHARS = 32
+/** Clock skew allowed on `iat`, seconds. */
+const IAT_SKEW_SECONDS = 60
+/** Far beyond any token this worker mints; longer input isn't parsed. */
+const MAX_TOKEN_CHARS = 2_048
+const ACCESS_TOKEN_SECONDS = ACCOUNT_LIMITS.accessTokenMs / 1_000
+
+export type TokenEnv = Pick<
+  Environment,
+  | 'ACCOUNT_TOKEN_SECRET'
+  | 'ACCOUNT_TOKEN_SECRET_PREVIOUS'
+  | 'APP_ATTEST_ENVIRONMENT'
+>
+
+/** Who a verified access token says is calling. */
+export interface AccessTokenClaims {
+  accountId: string
+  sessionId: string
+  platform: SessionPlatform
+  /** Epoch milliseconds. */
+  expiresAt: number
+}
+
+interface TokenKey {
+  kid: string
+  key: CryptoKey
+}
+
+export interface AccessTokenKeys {
+  issuer: string
+  current: TokenKey
+  previous: TokenKey | null
+}
+
+/** `ww-api/production` or `ww-api/development`; null when unset. */
+export const accessTokenIssuer = (
+  env: Pick<Environment, 'APP_ATTEST_ENVIRONMENT'>
+): string | null =>
+  env.APP_ATTEST_ENVIRONMENT === 'production' ||
+  env.APP_ATTEST_ENVIRONMENT === 'development'
+    ? `ww-api/${env.APP_ATTEST_ENVIRONMENT}`
+    : null
+
+const encoder = new TextEncoder()
+const keyCache = new Map<string, Promise<TokenKey>>()
+
+const tokenKey = (secret: string): Promise<TokenKey> => {
+  let cached = keyCache.get(secret)
+  if (!cached) {
+    cached = (async () => {
+      const digest = await sha256Bytes(
+        encoder.encode(`ww-account/v1/token-kid\n${secret}`)
+      )
+      const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign', 'verify']
+      )
+      return { kid: bytesToBase64Url(digest).slice(0, 16), key }
+    })()
+    cached.catch(() => keyCache.delete(secret))
+    keyCache.set(secret, cached)
+  }
+  return cached
+}
+
+let warnedShortSecret = false
+
+const usableSecret = (value: string | undefined): string | null => {
+  const secret = value?.trim()
+  if (!secret) return null
+  if (secret.length >= MIN_TOKEN_SECRET_CHARS) return secret
+  if (!warnedShortSecret) {
+    warnedShortSecret = true
+    console.warn(
+      `accounts: a token secret is shorter than ${MIN_TOKEN_SECRET_CHARS} characters; ignoring it`
+    )
+  }
+  return null
+}
+
+/**
+ * The keys this worker signs and verifies with, or null when sessions are
+ * off: no usable `ACCOUNT_TOKEN_SECRET`, or no `APP_ATTEST_ENVIRONMENT` to
+ * name the issuer. Never mints an unsigned token.
+ */
+export const accessTokenKeys = async (
+  env: TokenEnv
+): Promise<AccessTokenKeys | null> => {
+  const issuer = accessTokenIssuer(env)
+  const secret = usableSecret(env.ACCOUNT_TOKEN_SECRET)
+  if (!issuer || !secret) return null
+  const previousSecret = usableSecret(env.ACCOUNT_TOKEN_SECRET_PREVIOUS)
+  const [current, previous] = await Promise.all([
+    tokenKey(secret),
+    previousSecret && previousSecret !== secret
+      ? tokenKey(previousSecret)
+      : null,
+  ])
+  return { issuer, current, previous }
+}
+
+const encodeJson = (value: unknown): string =>
+  bytesToBase64Url(encoder.encode(JSON.stringify(value)))
+
+const decodeJson = (segment: string): Record<string, unknown> | null => {
+  const bytes = decodeB64u(segment)
+  if (!bytes) return null
+  try {
+    const value: unknown = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
+    )
+    return isPlainObject(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * A 15-minute access token for this session, cut short to the session's own
+ * `sessionExpiresAt` (epoch ms) when that comes first.
+ */
+export const signAccessToken = async (
+  keys: AccessTokenKeys,
+  session: {
+    accountId: string
+    sessionId: string
+    platform: SessionPlatform
+    sessionExpiresAt?: number
+  },
+  now: number = Date.now()
+): Promise<{ accessToken: string; accessExpiresAt: number }> => {
+  const iat = Math.floor(now / 1_000)
+  const exp = Math.min(
+    iat + ACCESS_TOKEN_SECONDS,
+    session.sessionExpiresAt == null
+      ? Infinity
+      : Math.floor(session.sessionExpiresAt / 1_000)
+  )
+  const header = encodeJson({ alg: 'HS256', typ: 'JWT', kid: keys.current.kid })
+  const payload = encodeJson({
+    iss: keys.issuer,
+    aud: ACCESS_TOKEN_AUDIENCE,
+    sub: session.accountId,
+    sid: session.sessionId,
+    platform: session.platform,
+    iat,
+    exp,
+  })
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    keys.current.key,
+    encoder.encode(`${header}.${payload}`)
+  )
+  return {
+    accessToken: `${header}.${payload}.${bytesToBase64Url(new Uint8Array(signature))}`,
+    accessExpiresAt: exp * 1_000,
+  }
+}
+
+const isPlatform = (value: unknown): value is SessionPlatform =>
+  SESSION_PLATFORMS.includes(value as SessionPlatform)
+
+const isSeconds = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+
+/**
+ * The claims of a token this worker signed and that hasn't expired, or null.
+ * Checks, in order: three base64url segments, an `HS256` header whose `kid`
+ * names a configured key, the signature, then `iss`, `aud`, `iat`, `exp`, and
+ * the shapes of `sub`, `sid`, and `platform`. A `dev` token never passes on
+ * production.
+ */
+export const verifyAccessToken = async (
+  keys: AccessTokenKeys,
+  token: string,
+  now: number = Date.now()
+): Promise<AccessTokenClaims | null> => {
+  if (token.length > MAX_TOKEN_CHARS) return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  const [headerPart, payloadPart, signaturePart] = parts
+
+  const header = decodeJson(headerPart)
+  if (
+    !header ||
+    header.alg !== 'HS256' ||
+    (header.typ !== undefined && header.typ !== 'JWT') ||
+    typeof header.kid !== 'string'
+  )
+    return null
+  const key = [keys.current, keys.previous].find(
+    (candidate) => candidate?.kid === header.kid
+  )?.key
+  if (!key) return null
+
+  const signature = decodeB64u(signaturePart)
+  if (!signature || signature.length !== 32) return null
+  const valid = await crypto.subtle.verify(
+    'HMAC',
+    key,
+    signature,
+    encoder.encode(`${headerPart}.${payloadPart}`)
+  )
+  if (!valid) return null
+
+  const claims = decodeJson(payloadPart)
+  if (!claims) return null
+  const { iss, aud, sub, sid, platform, iat, exp } = claims
+  const nowSeconds = now / 1_000
+  if (iss !== keys.issuer || aud !== ACCESS_TOKEN_AUDIENCE) return null
+  if (!isSeconds(iat) || !isSeconds(exp)) return null
+  if (iat > nowSeconds + IAT_SKEW_SECONDS) return null
+  if (exp <= nowSeconds || exp - iat > ACCESS_TOKEN_SECONDS) return null
+  if (!isAccountId(sub)) return null
+  if (typeof sid !== 'string' || !BUDDIES_ID_PATTERN.test(sid)) return null
+  if (!isPlatform(platform)) return null
+  if (platform === 'dev' && keys.issuer === 'ww-api/production') return null
+  return { accountId: sub, sessionId: sid, platform, expiresAt: exp * 1_000 }
+}

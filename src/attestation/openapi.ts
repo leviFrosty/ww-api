@@ -74,7 +74,7 @@ export const purpose = z
   .enum(ATTESTATION_PURPOSES)
   .meta({
     description:
-      'Which protected request the challenge is for (signed into the assertion). It must match the route that consumes it: `attestation-verify` (or `notes-import-verify`) for verify, `notes-import-kickoff`, `notes-import-transcribe`.',
+      'Which protected request the challenge is for (signed into the assertion). It must match the route that consumes it: `attestation-verify` (or `notes-import-verify`) for verify, `notes-import-kickoff`, `notes-import-transcribe`, and `account-session` for `POST /accounts/v1/sessions` (both hashes `hex(SHA-256(UTF-8("ww-account/v1/session\\n" + accountPub)))`).',
   })
 
 export const expiresAt = z.number().int().meta({

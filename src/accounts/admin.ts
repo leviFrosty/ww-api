@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import type { AppContext, Environment } from '../types'
+import type { AppContext, AppEnv } from '../types'
 import { Sentry } from '../sentry'
 import { timingSafeEqual } from '../crypto'
 import { apiError } from '../errors'
@@ -128,7 +128,7 @@ const handleStatus = async (c: AppContext): Promise<Response> => {
 
 /** Mounted at `/admin/accounts` (behind the `admin` rate limit). */
 export const createAccountsAdminRoutes = () => {
-  const routes = new Hono<{ Bindings: Environment }>()
+  const routes = new Hono<AppEnv>()
   routes.post('/lookup', accountLookupDocs, handleLookup)
   routes.post('/status', accountStatusDocs, handleStatus)
   return routes

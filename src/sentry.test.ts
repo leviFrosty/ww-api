@@ -167,6 +167,25 @@ describe('Sentry scrubbers', () => {
     })
   })
 
+  it('drops the bearer backup upload’s slot id', () => {
+    const error: ErrorEvent = {
+      type: undefined,
+      request: {
+        url: 'https://ww-proxy.test/accounts/v1/backup/put',
+        headers: {
+          Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',
+          'X-WW-Slot-Id': 'AAAAAAAAAAAAAAAAAAAAAA',
+          'x-ww-sha256': 'kept',
+          'content-length': '42',
+        },
+      },
+    }
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual({
+      'x-ww-sha256': 'kept',
+      'content-length': '42',
+    })
+  })
+
   it('drops bearer, admin, and dev bypass tokens from events and transactions', () => {
     const headers = () => ({
       Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',

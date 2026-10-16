@@ -54,10 +54,11 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  * - `x-buddies-*`: the Buddies live socket's signed envelope (holds the inbox
  *   id).
  * - `x-ww-payload`/`x-ww-signature` (or the legacy `x-ww-p`/`x-ww-s`):
- *   accounts' `backup/put` envelope (account key and slot id).
+ *   accounts' legacy `backup/put` envelope (account key and slot id).
+ * - `x-ww-slot-id`: the bearer `backup/put`'s slot id.
  */
 const SECRET_HEADER =
-  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature)$)/i;
+  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id)$)/i;
 
 function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;
