@@ -6,10 +6,12 @@ import {
   BUDDIES_ALWAYS_ALLOWED_OPS,
   BUDDIES_BLOB_GET_OP,
   BUDDIES_BLOB_PUT_OP,
+  BUDDIES_CLIENT_HEADER,
   BUDDIES_FIELD_PARSERS,
   BUDDIES_LIMITS,
   BUDDIES_LIVE_ACCOUNT_HEADER,
   BUDDIES_LIVE_OP,
+  BUDDIES_NOTIFICATION_SERVICE_CLIENT,
   BUDDIES_OPS,
   BUDDIES_OWNER_OPS,
   BUDDIES_PAYLOAD_PARSERS,
@@ -32,6 +34,7 @@ import {
   type OwnerCall,
   type PushJob,
   type Signed,
+  type SyncPayload,
 } from './contracts'
 import {
   isEnvelopeBody,
@@ -60,7 +63,10 @@ import {
   parseJsonOrNull,
   type AccountAuth,
 } from '../accounts/auth'
-import { refuseLegacyAuth } from '../accounts/legacySwitch'
+import {
+  isLegacyAuthEnabled,
+  upgradeRequiredResponse,
+} from '../accounts/legacySwitch'
 import { isBuddiesEnabled, isBuddiesPhotosEnabled } from './killSwitch'
 import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
 import {
@@ -95,7 +101,8 @@ import {
  * compared with the token's account); invite and blob reads send today's
  * body. A request without the header is a legacy request, served as before
  * sessions while the legacy switch is on, 426 `upgrade_required` once it's
- * off.
+ * off, except the iOS Notification Service Extension's owner-signed
+ * `inbox/sync` for an inbox with a confirmed account link (`admitCaller`).
  *
  * Privacy: every id travels in the body (or, for the live socket, in headers),
  * and nothing here logs or reports the body, headers, payload, token, or any
@@ -148,6 +155,12 @@ const photosAvailable = async (env: Environment): Promise<boolean> =>
 interface Caller {
   key: string
   account: AccountAuth | null
+  /**
+   * A legacy request admitted while the legacy switch is off: only the
+   * Notification Service Extension's `inbox/sync`, which the inbox serves
+   * only with a confirmed account link.
+   */
+  linkedOnly: boolean
 }
 
 type Admission = { ok: true; caller: Caller } | { ok: false; response: Response }
@@ -160,6 +173,14 @@ type Admission = { ok: true; caller: Caller } | { ok: false; response: Response 
  * `upgrade_required` once the legacy switch is off, and otherwise counts
  * against the client IP. Suspension isn't checked here: the inbox's copy of
  * the account status decides, as before sessions.
+ *
+ * One legacy request outlives the switch: `inbox/sync` from the iOS
+ * Notification Service Extension (`x-buddies-client: notification-service`),
+ * which fetches events too big for a push and can't hold the session's
+ * rotating refresh token without racing the app. It's admitted as
+ * `linkedOnly`: the inbox still checks the owner signature, `ts`, nonce, and
+ * suspension, and answers 426 unless its account link is confirmed, so it
+ * serves only inboxes whose owner has moved to sessions.
  */
 const admitCaller = async (
   c: AppContext,
@@ -170,19 +191,26 @@ const admitCaller = async (
     const auth = await authenticateAccount(c)
     if (!auth.ok) return auth
     const key = await buddiesAccountCallerKey(auth.account.accountId)
-    caller = { key, account: auth.account }
+    caller = { key, account: auth.account, linkedOnly: false }
   } else {
-    const refused = await refuseLegacyAuth(c.env)
-    if (refused) return { ok: false, response: refused }
+    const legacy = await isLegacyAuthEnabled(c.env)
+    if (!legacy && !isNotificationServiceSync(c, op))
+      return { ok: false, response: upgradeRequiredResponse() }
     caller = {
       key: buddiesCallerKey(c.req.header('CF-Connecting-IP')),
       account: null,
+      linkedOnly: !legacy,
     }
   }
   return (await allowBuddiesCaller(c.env, op, caller.key))
     ? { ok: true, caller }
     : { ok: false, response: edgeLimited() }
 }
+
+/** The Notification Service Extension's `inbox/sync` (see `admitCaller`). */
+const isNotificationServiceSync = (c: AppContext, op: BuddiesRouteOp) =>
+  op === 'inbox/sync' &&
+  c.req.header(BUDDIES_CLIENT_HEADER) === BUDDIES_NOTIFICATION_SERVICE_CLIENT
 
 type OwnerRunners = {
   [K in BuddiesOwnerOp]: (
@@ -301,15 +329,25 @@ const registerInbox = async (
   return ok({ body: accountId ? { accountId } : {} })
 }
 
+/**
+ * `inbox/sync`. `linkedOnly`: a legacy one admitted after the legacy switch
+ * went off (`admitCaller`), served only for an inbox with a confirmed account
+ * link. `capabilities` tells the app which optional relay features it may use.
+ */
+const syncInbox = async (
+  env: Environment,
+  call: OwnerCall<SyncPayload>,
+  linkedOnly = false
+): Promise<Outcome> => {
+  const result = await inbox(env, call.inboxId).sync(call, { linkedOnly })
+  if (!result.ok) return result
+  const capabilities = { photos: await photosAvailable(env) }
+  return ok({ body: { ...result.value, capabilities } })
+}
+
 /** Owner ops, signed (legacy) or by the bearer token's account. */
 const OWNER_OPS: OwnerRunners = {
-  // `capabilities` tells the app which optional relay features it may use.
-  'inbox/sync': async (env, call) => {
-    const result = await inbox(env, call.inboxId).sync(call)
-    if (!result.ok) return result
-    const capabilities = { photos: await photosAvailable(env) }
-    return ok({ body: { ...result.value, capabilities } })
-  },
+  'inbox/sync': (env, call) => syncInbox(env, call),
   'inbox/delete': async (env, call) =>
     empty(await inbox(env, call.inboxId).deleteInbox(call)),
   'device/register': async (env, call) =>
@@ -433,6 +471,12 @@ const runSigned = async <K extends BuddiesSignedOp>(
   const call = signedCall(op, envelope, now)
   if (!call.ok) return call
   if (isStale(call.value.ts, now)) return { ok: false, error: 'stale' }
+  if (caller.linkedOnly) {
+    // `admitCaller` lets only `inbox/sync` through this way.
+    if (op !== 'inbox/sync') return fail('upgrade_required')
+    const sync = call.value as unknown as Signed<SyncPayload>
+    return syncInbox(env, sync, true)
+  }
   if (op === 'inbox/register') {
     const register = call.value as unknown as Signed<
       BuddiesPayloads['inbox/register']

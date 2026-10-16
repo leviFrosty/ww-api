@@ -449,10 +449,19 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
+  /**
+   * `linkedOnly`: a legacy (owner-signed) sync the Worker admitted after the
+   * legacy switch went off, from the iOS Notification Service Extension.
+   * Checked as ever, and served only while this inbox has a confirmed account
+   * link (its owner moved to sessions), else `upgrade_required`.
+   */
   async sync(
-    call: OwnerCall<SyncPayload>
+    call: OwnerCall<SyncPayload>,
+    { linkedOnly = false }: { linkedOnly?: boolean } = {}
   ): Promise<BuddiesResult<SyncResponse>> {
-    const auth = await this.#authenticate('inbox/sync', call, 'owner')
+    const auth = await this.#authenticate('inbox/sync', call, 'owner', {
+      linkedOnly,
+    })
     if (!auth.ok) return auth
     return this.#commit(call, 'owner', auth.value, (now) =>
       ok(this.#snapshot(call.since, now))
@@ -1217,11 +1226,17 @@ export class BuddyInbox extends DurableObject<Environment> {
    * that take effect (`#commit` spends it). Both are about the authenticated
    * signer, so nobody else can use up an inbox's budget. An owner's budget is
    * shared by both ways of authenticating.
+   *
+   * `linkedOnly` (a signed call admitted after the legacy switch went off):
+   * once the signature holds, an inbox without a confirmed account link is
+   * `upgrade_required`. Nothing un-confirms a link (a wipe drops the inbox
+   * too), so the check holds through `#commit`.
    */
   async #authenticate(
     op: BuddiesSigningOp,
     call: AuthCall,
-    ref: KeyRef
+    ref: KeyRef,
+    { linkedOnly = false }: { linkedOnly?: boolean } = {}
   ): Promise<BuddiesResult<string>> {
     const key = this.#key(call, ref)
     if (!key.ok) return key
@@ -1236,6 +1251,8 @@ export class BuddyInbox extends DurableObject<Environment> {
         call.signature
       )
       if (!valid) return fail('bad_signature')
+      if (linkedOnly && this.#confirmedAccountId() == null)
+        return fail('upgrade_required')
     }
     if (ref === 'owner' && !SUSPENDED_ALLOWED_OPS.has(op) && this.#suspended())
       return fail('suspended')

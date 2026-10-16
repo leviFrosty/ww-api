@@ -25,6 +25,7 @@ import { createAccountsRoutes } from '../accounts/route'
 import { createAccountsAdminRoutes } from '../accounts/admin'
 import { resetAccountStatusCache } from '../accounts/auth'
 import {
+  BUDDIES_CLIENT_HEADER,
   BUDDIES_LIVE_ACCOUNT_HEADER,
   BUDDIES_OPS,
   type BuddiesSignedOp,
@@ -993,6 +994,186 @@ describe('the legacy switch', () => {
     expect((await BearerOwner.create(false).then((o) => o.register())).status).toBe(
       200
     )
+  })
+})
+
+describe('the Notification Service Extension’s sync', () => {
+  const EXTENSION = { [BUDDIES_CLIENT_HEADER]: 'notification-service' }
+
+  /** The extension's fetch: an owner-signed `inbox/sync`, no token. */
+  const extensionSync = async (
+    owner: { inboxId: string; key: SigningKey },
+    headers: Record<string, string> = EXTENSION,
+    fields: Record<string, unknown> = {},
+    op: BuddiesSignedOp = 'inbox/sync'
+  ) =>
+    h.post(
+      `/${op}`,
+      await envelope(
+        op,
+        {
+          inboxId: owner.inboxId,
+          since: 0,
+          ts: Date.now(),
+          nonce: randomId(),
+          ...fields,
+        },
+        owner.key
+      ),
+      headers
+    )
+
+  it('off: serves a confirmed inbox’s signed sync, with every check it had', async () => {
+    const owner = await BearerOwner.create()
+    const writer = await owner.addWriter()
+    expect((await writer.putEvent()).status).toBe(200)
+    await legacyOff()
+    const nonces = nonceRows(owner.inboxId)
+
+    const served = await extensionSync(owner)
+    expect(served.status).toBe(200)
+    expect(served.body.events).toHaveLength(1)
+    expect(served.body).toEqual((await owner.sync()).body)
+    // Signed as ever: the nonce is recorded and can't be replayed.
+    expect(nonceRows(owner.inboxId)).toBe(nonces + 1)
+    const nonce = randomId()
+    expect((await extensionSync(owner, EXTENSION, { nonce })).status).toBe(200)
+    expect(await extensionSync(owner, EXTENSION, { nonce })).toEqual({
+      status: 409,
+      body: relayError('replay'),
+    })
+    expect(
+      await extensionSync(owner, EXTENSION, { ts: Date.now() - 6 * 60_000 })
+    ).toMatchObject({ status: 401, body: { code: 'stale' } })
+    const stranger = { inboxId: owner.inboxId, key: await SigningKey.generate() }
+    expect(await extensionSync(stranger)).toEqual({
+      status: 401,
+      body: relayError('bad_signature'),
+    })
+    expect(await extensionSync({ ...owner, inboxId: randomId() })).toEqual({
+      status: 404,
+      body: relayError('not_found'),
+    })
+
+    await setStatus(owner.session.accountId, 'suspended')
+    expect(await extensionSync(owner)).toEqual({
+      status: 403,
+      body: relayError('suspended'),
+    })
+    await setStatus(owner.session.accountId, 'active')
+    expect((await extensionSync(owner)).status).toBe(200)
+  })
+
+  it('off: still 426 for an inbox without a confirmed link', async () => {
+    // Registered before accounts: no link at all.
+    const unlinked = await Owner.create(h)
+    // Linked in the inbox, but the accounts database never wrote it.
+    const unconfirmed = await BearerOwner.create(false)
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const failing = failInboxLinks()
+    expect((await unconfirmed.register()).status).toBe(500)
+    failing.mockRestore()
+    // A row from before confirmation.
+    const old = await BearerOwner.create()
+    h.inboxes
+      .storage(old.inboxId)
+      .query('ALTER TABLE owner_account DROP COLUMN confirmed')
+    h.inboxes.restart(old.inboxId)
+    await legacyOff()
+
+    for (const owner of [unlinked, unconfirmed, old]) {
+      const nonces = nonceRows(owner.inboxId)
+      expect(await extensionSync(owner)).toEqual({
+        status: 426,
+        body: relayError('upgrade_required'),
+      })
+      expect(nonceRows(owner.inboxId)).toBe(nonces)
+    }
+    // The signature comes first, so a stranger learns nothing about links.
+    const stranger = { inboxId: old.inboxId, key: await SigningKey.generate() }
+    expect((await extensionSync(stranger)).status).toBe(401)
+
+    // Relinking confirms it, and the extension's fetch works again.
+    expect((await old.register()).status).toBe(200)
+    expect((await extensionSync(old)).status).toBe(200)
+  })
+
+  it('off: 426 for every other legacy request, header or not', async () => {
+    const owner = await BearerOwner.create()
+    const writer = await owner.addWriter()
+    await legacyOff()
+    const nonces = nonceRows(owner.inboxId)
+
+    expect((await extensionSync(owner, {})).status).toBe(426)
+    for (const value of ['Notification-Service', 'notification-services', 'app']) {
+      expect(
+        (await extensionSync(owner, { [BUDDIES_CLIENT_HEADER]: value })).status,
+        value
+      ).toBe(426)
+    }
+    for (const op of BUDDIES_OPS) {
+      if (op === 'inbox/sync') continue
+      const response = await h.post(`/${op}`, '{}', EXTENSION)
+      expect(response, op).toEqual({
+        status: 426,
+        body: relayError('upgrade_required'),
+      })
+    }
+    expect(
+      (await extensionSync(owner, EXTENSION, {}, 'inbox/delete')).status
+    ).toBe(426)
+    expect(
+      (
+        await h.post(
+          '/event/put',
+          await envelope(
+            'event/put',
+            {
+              inboxId: writer.inboxId,
+              slotId: writer.slotId,
+              eventId: randomId(),
+              kind: 'plan.joined',
+              blob: blobOfSize(48),
+              push: false,
+              ts: Date.now(),
+              nonce: randomId(),
+            },
+            writer.key
+          ),
+          EXTENSION
+        )
+      ).status
+    ).toBe(426)
+    const legacy = await Owner.create(h, false)
+    Object.assign(legacy, { inboxId: owner.inboxId, key: owner.key })
+    expect(
+      (
+        await h.live({
+          ...(await liveHeaders(
+            { inboxId: owner.inboxId, ts: Date.now(), nonce: randomId() },
+            owner.key
+          )),
+          ...EXTENSION,
+        })
+      ).status
+    ).toBe(426)
+    expect(
+      (await legacy.putBlob(await photoBlob(), {}, { headers: EXTENSION }))
+        .status
+    ).toBe(426)
+    expect(nonceRows(owner.inboxId)).toBe(nonces)
+  })
+
+  it('on: the header changes nothing, legacy or bearer', async () => {
+    const unlinked = await Owner.create(h)
+    expect((await extensionSync(unlinked)).status).toBe(200)
+    expect((await extensionSync(unlinked, {})).status).toBe(200)
+
+    const owner = await BearerOwner.create()
+    expect((await extensionSync(owner)).status).toBe(200)
+    expect((await owner.sync({ ...owner.auth, ...EXTENSION })).status).toBe(200)
+    await legacyOff()
+    expect((await owner.sync({ ...owner.auth, ...EXTENSION })).status).toBe(200)
   })
 })
 

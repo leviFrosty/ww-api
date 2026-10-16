@@ -15,9 +15,11 @@ import {
   signedBody,
 } from '../openapi/schemas'
 import {
+  BUDDIES_CLIENT_HEADER,
   BUDDIES_ERROR_STATUS,
   BUDDIES_LIMITS,
   BUDDIES_LIVE_CLOSE,
+  BUDDIES_NOTIFICATION_SERVICE_CLIENT,
   type BuddiesErrorCode,
   type BuddiesOp,
 } from './contracts'
@@ -428,9 +430,22 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     description: paragraphs(
       'Returns everything with `seq > since` (cards, events, the roster) plus the complete slot list, and which optional relay features are on. Counts as owner activity for the 180-day retention.',
       SIGNED_BY.owner,
+      `**Notification Service Extension** (iOS): it fetches events too big for a push and can’t hold the session’s rotating refresh token, so it keeps sending the legacy owner-signed form with \`${BUDDIES_CLIENT_HEADER}: ${BUDDIES_NOTIFICATION_SERVICE_CLIENT}\`. That request is still served after the legacy switch is off, for an inbox with a confirmed account link (its owner registered it on a session): the signature, \`ts\`, nonce, and suspension are checked as ever. An inbox without one gets 426 \`upgrade_required\`, as does every other op with the header. While the switch is on, the header changes nothing.`,
       tierLine('read'),
       KILL_SWITCH_OFF
     ),
+    parameters: [
+      {
+        name: BUDDIES_CLIENT_HEADER,
+        in: 'header' as const,
+        required: false,
+        schema: {
+          type: 'string' as const,
+          enum: [BUDDIES_NOTIFICATION_SERVICE_CLIENT],
+        },
+        description: `Only the iOS Notification Service Extension sends it, on its legacy owner-signed sync: \`${BUDDIES_NOTIFICATION_SERVICE_CLIENT}\`. Ignored on bearer requests and while the legacy switch is on.`,
+      },
+    ],
     requestBody: ownerBody('inbox/sync', {
         inboxId,
         since: z.number().int().min(0).meta({
@@ -440,7 +455,10 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       }),
     responses: {
       200: jsonResponse('What changed since `since`.', syncSchema),
-      ...refusals(ownerRefusals('read')),
+      ...refusals({
+        ...ownerRefusals('read'),
+        upgrade_required: `${DEFAULT_REASONS.upgrade_required} Except the Notification Service Extension’s sync (\`${BUDDIES_CLIENT_HEADER}: ${BUDDIES_NOTIFICATION_SERVICE_CLIENT}\`) for an inbox with a confirmed account link; without one, it’s refused too.`,
+      }),
     },
   }),
 
