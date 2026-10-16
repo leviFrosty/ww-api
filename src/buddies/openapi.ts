@@ -5,6 +5,7 @@ import {
   apiErrorSchema,
   staleErrorSchema,
   b64u,
+  signedEnvelopeSchema,
   unsignedEnvelopeSchema,
   buddiesId,
   errorResponse,
@@ -25,13 +26,23 @@ import { BUDDIES_ABUSE_LIMITS, type BuddiesEdgeTier } from './limits'
 /**
  * OpenAPI descriptions for the Buddies relay (`/buddies/v1`). The wire
  * contract is docs/buddies-protocol.md; the payload schemas below are for
- * readers only and mirror `BUDDIES_PAYLOAD_PARSERS` in contracts.ts, which
+ * readers only and mirror `BUDDIES_FIELD_PARSERS` in contracts.ts, which
  * stays the authority. Update both together.
+ *
+ * Every route documents both ways to authenticate (witness-work ADR 0027):
+ * a bearer request (`Authorization: Bearer`, first) and the legacy form
+ * shipped app builds send while the legacy switch is on.
  */
 
 type Responses = NonNullable<DescribeRouteOptions['responses']>
 
 const TAGS = ['Buddies']
+/** A bearer token, or (while the legacy switch is on) none: the legacy form. */
+const BEARER_OR_LEGACY: Record<string, string[]>[] = [{ bearerAuth: [] }, {}]
+
+/** `describeRoute` with the Buddies tag and both ways to authenticate. */
+const describeOp = (options: DescribeRouteOptions) =>
+  describeRoute({ tags: TAGS, security: BEARER_OR_LEGACY, ...options })
 const KIB = 1_024
 const kib = (bytes: number) => `${bytes / KIB} KiB`
 const count = (n: number) => n.toLocaleString('en-US')
@@ -62,6 +73,32 @@ const sealed = (what: string, maxBytes: number) =>
 const signedPayload = (fields: z.ZodRawShape) =>
   z.object({ ...fields, ts, nonce })
 
+/** An owner op's fields, with the legacy envelope's `ts` and `nonce` marked as such. */
+const ownerFields = (fields: z.ZodRawShape) =>
+  z.object({
+    ...fields,
+    ts: ts.optional().meta({
+      description: `Legacy envelope only, and required there. ${ts.description}`,
+    }),
+    nonce: nonce.optional().meta({
+      description: `Legacy envelope only, and required there. ${nonce.description}`,
+    }),
+  })
+
+/**
+ * An owner op's body: the fields as plain JSON (bearer), or the
+ * owner-signed envelope whose decoded `payload` adds `ts` and `nonce`
+ * (legacy).
+ */
+const ownerBody = (op: string, fields: z.ZodRawShape) =>
+  jsonBody(
+    z.union([
+      z.object(fields).meta({ title: 'Bearer' }),
+      signedEnvelopeSchema.meta({ title: 'Legacy envelope' }),
+    ]),
+    `**Bearer:** the fields as plain JSON, without \`ts\` or \`nonce\`; an envelope is \`bad_request\`.\n\n**Legacy:** the envelope, owner-signed (op \`${op}\`); its decoded \`payload\` is the fields plus \`ts\` and \`nonce\`.\n\n**Fields:**\n\n${fieldTable(ownerFields(fields))}`
+  )
+
 const okSchema = z.object({ ok: z.literal(true) })
 const seqSchema = z.object({
   ok: z.literal(true),
@@ -71,6 +108,8 @@ const seqSchema = z.object({
 })
 
 // --- Descriptions ---------------------------------------------------------
+
+const paragraphs = (...lines: string[]) => lines.join('\n\n')
 
 const TIER_NAMES: Record<BuddiesEdgeTier, string> = {
   unsigned: 'unsigned invite',
@@ -86,7 +125,7 @@ const perMinute = (tier: BuddiesEdgeTier) =>
 
 /** The per-caller tier sentence every op's description carries. */
 const tierLine = (tier: BuddiesEdgeTier) =>
-  `**Rate limit:** the ${TIER_NAMES[tier]} tier, ${perMinute(tier)} per caller (client IP, IPv6 by /64), checked before any Durable Object wakes.`
+  `**Rate limit:** the ${TIER_NAMES[tier]} tier, ${perMinute(tier)} per caller (the session’s account for a bearer request, else the client IP, IPv6 by /64), checked before any Durable Object wakes.`
 
 const OWNER_BUDGET = `the owner key's ${count(BUDDIES_ABUSE_LIMITS.ownerRequests)} requests that take effect per 10 minutes`
 const WRITER_BUDGET = `the slot's ${count(BUDDIES_ABUSE_LIMITS.writerRequests)} requests that take effect per 10 minutes`
@@ -98,17 +137,29 @@ const KILL_SWITCH_EXEMPT =
 const PHOTOS_SWITCH =
   '**Photos switch:** also needs photo blobs on (KV `buddies:photos`, else `BUDDIES_PHOTOS`); off, it answers `photos_disabled`. Buddies’ own switch wins.'
 
-const SIGNED_BY = {
-  owner:
-    '**Signed by** the inbox owner key (the `ownerPub` stored for `inboxId`).',
-  writer:
-    '**Signed by** the writer key registered for (`inboxId`, `slotId`) with `slot/add`.',
-  self: '**Self-signed** by `ownerPub` in the payload (proof of possession).',
-  unsigned:
-    '**Unsigned:** send `{ "payload": … }` only, no `signature`, `ts`, or `nonce`. Knowing the ids and secrets is the capability.',
-} as const
+const LEGACY_SWITCH =
+  'It works while the legacy switch (KV `auth:legacy`) is on; once it’s off, a legacy request is 426 `upgrade_required`. A request with an `Authorization` header is always a bearer request and never falls back.'
 
-const paragraphs = (...lines: string[]) => lines.join('\n\n')
+const SIGNED_BY = {
+  owner: paragraphs(
+    '**Bearer:** `Authorization: Bearer <access token>` and the fields as plain JSON, without `ts` or `nonce`. The inbox must be linked to the token’s account: another account’s inbox is `forbidden`, and one registered before accounts is `not_linked` (link it with a bearer `inbox/register`, then retry).',
+    `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH}`
+  ),
+  writer: paragraphs(
+    '**Signed by** the writer key registered for (`inboxId`, `slotId`) with `slot/add`: the signature is the slot’s capability, in both forms.',
+    '**Bearer:** `Authorization: Bearer <access token>` plus the writer-signed envelope. The relay checks the token’s session but never compares its account with the slot or stores it, so it can’t tell which account writes into which inbox.',
+    `**Legacy** (no \`Authorization\` header): the envelope alone. ${LEGACY_SWITCH}`
+  ),
+  self: paragraphs(
+    '**Self-signed** by `ownerPub` in the payload (proof of possession), in both forms.',
+    '**Bearer:** `Authorization: Bearer <access token>` plus the envelope, whose `account` proof is required and must name the token’s account (`forbidden` otherwise), so the inbox is linked to it.',
+    `**Legacy** (no \`Authorization\` header): the envelope alone; \`account\` is optional. ${LEGACY_SWITCH}`
+  ),
+  unsigned: paragraphs(
+    '**Unsigned:** send `{ "payload": … }` only, no `signature`, `ts`, or `nonce`. Knowing the ids and secrets is the capability.',
+    `**Bearer:** \`Authorization: Bearer <access token>\` plus the same body. **Legacy** (no \`Authorization\` header): the body alone. ${LEGACY_SWITCH}`
+  ),
+} as const
 
 // --- Errors ---------------------------------------------------------------
 
@@ -121,7 +172,15 @@ const DEFAULT_REASONS: Partial<Record<BuddiesErrorCode, string>> = {
     'Unknown inbox: never registered, deleted, or wiped after 180 days without an owner op.',
   suspended:
     'The inbox’s account is suspended (only `inbox/delete` and `slot/remove` still work).',
-  disabled: 'The Buddies kill switch is off. `Retry-After: 60`.',
+  disabled:
+    'The Buddies kill switch is off, or (bearer) this worker has no account sessions. `Retry-After: 60`.',
+  unauthorized:
+    'A bearer request’s access token is missing, malformed, expired, or invalid (`WWW-Authenticate: Bearer error="invalid_token"`). Refresh it once and retry; it never falls back to the legacy form.',
+  upgrade_required:
+    'A legacy request (no `Authorization` header) after the legacy switch (KV `auth:legacy`) was turned off. Only updating the app helps; no `Retry-After`.',
+  forbidden: 'Bearer: the inbox is linked to another account than the token’s.',
+  not_linked:
+    'Bearer: the inbox was registered before accounts and is linked to none. Link it with a bearer `inbox/register` (with its `account` proof), then retry.',
   photos_disabled:
     'Photo blobs are off (KV `buddies:photos`), or this worker has no blob bucket. `Retry-After: 60`.',
 }
@@ -141,6 +200,13 @@ const STALE_HEADERS = {
   },
 }
 
+const BEARER_CHALLENGE_HEADERS = {
+  'WWW-Authenticate': {
+    description: '`Bearer error="invalid_token"` (on `unauthorized`).',
+    schema: { type: 'string' as const },
+  },
+}
+
 const STATUS_SUMMARY: Record<number, string> = {
   400: 'Bad request.',
   401: 'Not authenticated.',
@@ -149,7 +215,7 @@ const STATUS_SUMMARY: Record<number, string> = {
   409: 'Conflict.',
   410: 'Gone.',
   413: 'Body too large.',
-  426: 'Not a WebSocket upgrade.',
+  426: 'Upgrade required.',
   429: 'Too many requests, or a cap was hit.',
   503: 'Switched off.',
 }
@@ -180,12 +246,14 @@ const refusals = (
       codes,
       hasStale ? staleErrorSchema : apiErrorSchema
     )
-    responses[status] =
-      status === 429 || status === 503
-        ? { ...response, headers: RETRY_AFTER_HEADER }
-        : hasStale
-          ? { ...response, headers: STALE_HEADERS }
-          : response
+    const headers = {
+      ...(status === 429 || status === 503 ? RETRY_AFTER_HEADER : {}),
+      ...(hasStale ? STALE_HEADERS : {}),
+      ...(codes.includes('unauthorized') ? BEARER_CHALLENGE_HEADERS : {}),
+    }
+    responses[status] = Object.keys(headers).length
+      ? { ...response, headers }
+      : response
   }
   responses[500] = errorResponse(
     'Unexpected failure. The body never names the request.',
@@ -197,17 +265,27 @@ const refusals = (
 const edgeLimited = (tier: BuddiesEdgeTier) =>
   `More than ${perMinute(tier)} from this caller in the ${TIER_NAMES[tier]} tier (\`Retry-After: 60\`)`
 
+/** The refusals every route shares, for its two ways to authenticate. */
+const AUTH_REFUSALS = {
+  unauthorized: true as const,
+  upgrade_required: true as const,
+}
+
 /** The refusals every owner op shares, before op-specific ones. */
 const ownerRefusals = (
   tier: BuddiesEdgeTier,
   { killSwitch = true, suspendable = true } = {}
 ) => ({
   bad_request: true as const,
-  bad_signature: 'Signature missing, malformed, or not by the owner key.',
-  stale: true as const,
+  bad_signature:
+    'Legacy: signature missing, malformed, or not by the owner key.',
+  stale: `Legacy only. ${DEFAULT_REASONS.stale}`,
+  ...AUTH_REFUSALS,
+  forbidden: true as const,
   ...(suspendable ? { suspended: true as const } : {}),
   not_found: true as const,
-  replay: true as const,
+  replay: `Legacy only. ${DEFAULT_REASONS.replay}`,
+  not_linked: true as const,
   rate_limited: `${edgeLimited(tier)}, or ${OWNER_BUDGET} are spent (\`Retry-After\` until the window ends).`,
   ...(killSwitch ? { disabled: true as const } : {}),
 })
@@ -218,6 +296,7 @@ const writerRefusals = (extraRateLimit = '') => ({
   bad_signature:
     'Signature missing, malformed, or not by the slot’s writer key.',
   stale: true as const,
+  ...AUTH_REFUSALS,
   not_found: true as const,
   gone: 'The slot doesn’t exist: the inbox owner removed you (or never added you).',
   replay: true as const,
@@ -285,8 +364,7 @@ const syncSchema = z.object({
 })
 
 export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
-  'inbox/register': describeRoute({
-    tags: TAGS,
+  'inbox/register': describeOp({
     summary: 'Register an inbox',
     description: paragraphs(
       'Creates the inbox, or refreshes it. Idempotent for the same `ownerPub`; a different key is `conflict`, even after the inbox was deleted or wiped (the relay keeps a hash of the owner key forever).',
@@ -294,7 +372,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       'With `account`, the inbox is linked to that anonymous account (written only after the inbox accepted the registration, so the link takes both keys). The answer carries `accountId` once the inbox belongs to an account. Without the accounts database the proof is ignored.',
       `${tierLine('register')} Validly signed registrations also count toward ${count(BUDDIES_ABUSE_LIMITS.registrationsPerDay)} per caller per rolling day.`,
       KILL_SWITCH_OFF,
-      'App Attest is not required yet: a reserved `attest` field is accepted and ignored.'
+      'Bearer requests come from an attested session (attestation happens once, when the session opens); legacy requests aren’t attested. A reserved `attest` field is accepted and ignored.'
     ),
     requestBody: signedBody(
       signedPayload({
@@ -310,7 +388,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
           .optional()
           .meta({
             description:
-              'Links the inbox to an account. Absent from builds before accounts.',
+              'Links the inbox to an account. Required in a bearer request, for the token’s account; optional in a legacy one (absent from builds before accounts).',
           }),
       }),
       'Self-signed: `signature` verifies against the payload’s own `ownerPub`.'
@@ -326,10 +404,13 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         })
       ),
       ...refusals({
-        bad_request: true,
+        bad_request: `${DEFAULT_REASONS.bad_request} Also a bearer request without \`account\`.`,
         bad_signature:
           'Signature not by `ownerPub`, or the `account` signature is not by that account.',
         stale: true,
+        ...AUTH_REFUSALS,
+        forbidden:
+          'Bearer: `account` names another account than the token’s.',
         suspended:
           'The inbox, or the account named in `account`, is suspended.',
         unknown_account: '`account.accountId` doesn’t exist.',
@@ -337,13 +418,12 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         conflict:
           'The inbox is registered (or was, before a wipe) with a different `ownerPub`, or is linked to a different account.',
         rate_limited: `${edgeLimited('register')}, or the caller’s ${count(BUDDIES_ABUSE_LIMITS.registrationsPerDay)} registrations a day are spent (\`Retry-After\` until the oldest leaves the window).`,
-        disabled: true,
+        disabled: `${DEFAULT_REASONS.disabled} Also a bearer request on a worker without the accounts database.`,
       }),
     },
   }),
 
-  'inbox/sync': describeRoute({
-    tags: TAGS,
+  'inbox/sync': describeOp({
     summary: 'Sync the inbox',
     description: paragraphs(
       'Returns everything with `seq > since` (cards, events, the roster) plus the complete slot list, and which optional relay features are on. Counts as owner activity for the 180-day retention.',
@@ -351,24 +431,20 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('read'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('inbox/sync', {
         inboxId,
         since: z.number().int().min(0).meta({
           description:
             'The last `seq` this device has applied; `0` for everything.',
         }),
       }),
-      'Owner-signed (op `inbox/sync`).'
-    ),
     responses: {
       200: jsonResponse('What changed since `since`.', syncSchema),
       ...refusals(ownerRefusals('read')),
     },
   }),
 
-  'inbox/delete': describeRoute({
-    tags: TAGS,
+  'inbox/delete': describeOp({
     summary: 'Delete the inbox',
     description: paragraphs(
       'Wipes the inbox (slots, cards, events, devices, roster, photo blobs) and every open invite it created, closing its live sockets with 4001. Only a hash of the owner key is kept, so only that key can register the `inboxId` again.',
@@ -376,10 +452,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
     ),
-    requestBody: signedBody(
-      signedPayload({ inboxId }),
-      'Owner-signed (op `inbox/delete`).'
-    ),
+    requestBody: ownerBody('inbox/delete', { inboxId }),
     responses: {
       200: jsonResponse('Deleted.', okSchema),
       ...refusals(
@@ -388,8 +461,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'device/register': describeRoute({
-    tags: TAGS,
+  'device/register': describeOp({
     summary: 'Register a device for pushes',
     description: paragraphs(
       `Upserts a push device by \`deviceId\`. At most ${BUDDIES_LIMITS.devices} per inbox; past that the least recently registered is evicted. One device per token: a token another \`deviceId\` holds moves here. Apps re-register about daily, which bumps eviction order.`,
@@ -398,8 +470,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('write'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('device/register', {
         inboxId,
         deviceId: buddiesId('The device'),
         pushService: z.enum(['apns', 'fcm']).optional().meta({
@@ -437,8 +508,6 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
             description: `\`{ [kind]: { title, body } }\`, already localized: at most ${BUDDIES_LIMITS.templates} kinds (\`^[a-z][a-z0-9.]*$\`, ≤ ${BUDDIES_LIMITS.kindChars} chars), strings ≤ ${BUDDIES_LIMITS.templateChars} characters. A kind without a template gets no push on this device.`,
           }),
       }),
-      'Owner-signed (op `device/register`).'
-    ),
     responses: {
       200: jsonResponse('Registered.', okSchema),
       ...refusals({
@@ -448,8 +517,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'device/unregister': describeRoute({
-    tags: TAGS,
+  'device/unregister': describeOp({
     summary: 'Unregister a device',
     description: paragraphs(
       'Removes a push device. Idempotent.',
@@ -457,18 +525,14 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('write'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({ inboxId, deviceId: buddiesId('The device') }),
-      'Owner-signed (op `device/unregister`).'
-    ),
+    requestBody: ownerBody('device/unregister', { inboxId, deviceId: buddiesId('The device') }),
     responses: {
       200: jsonResponse('Unregistered.', okSchema),
       ...refusals(ownerRefusals('write')),
     },
   }),
 
-  'slot/add': describeRoute({
-    tags: TAGS,
+  'slot/add': describeOp({
     summary: 'Add a buddy’s writer slot',
     description: paragraphs(
       `Registers a buddy’s writer key in this inbox. Idempotent for the same key. At most ${BUDDIES_LIMITS.slotsPlusOpenInvites} slots plus open invites. Signals live sockets.`,
@@ -476,14 +540,11 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('write'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('slot/add', {
         inboxId,
         slotId: buddiesId('The new slot'),
         writerPub: bytes32('The buddy’s Ed25519 writer public key'),
       }),
-      'Owner-signed (op `slot/add`).'
-    ),
     responses: {
       200: jsonResponse('Added.', okSchema),
       ...refusals({
@@ -494,8 +555,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'slot/remove': describeRoute({
-    tags: TAGS,
+  'slot/remove': describeOp({
     summary: 'Remove a buddy’s slot',
     description: paragraphs(
       'Deletes the slot, its card, and its events. Idempotent. Signals live sockets when a slot was removed.',
@@ -503,10 +563,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
     ),
-    requestBody: signedBody(
-      signedPayload({ inboxId, slotId: buddiesId('The slot to remove') }),
-      'Owner-signed (op `slot/remove`).'
-    ),
+    requestBody: ownerBody('slot/remove', { inboxId, slotId: buddiesId('The slot to remove') }),
     responses: {
       200: jsonResponse('Removed (or already gone).', okSchema),
       ...refusals(
@@ -515,8 +572,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'roster/put': describeRoute({
-    tags: TAGS,
+  'roster/put': describeOp({
     summary: 'Replace the roster',
     description: paragraphs(
       'Replaces the encrypted roster (last writer wins; clients merge first). Takes the next `seq` and signals live sockets.',
@@ -524,31 +580,26 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('write'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('roster/put', {
         inboxId,
         blob: sealed('The roster', BUDDIES_LIMITS.rosterBytes),
       }),
-      'Owner-signed (op `roster/put`).'
-    ),
     responses: {
       200: jsonResponse('Stored.', seqSchema),
       ...refusals(ownerRefusals('write')),
     },
   }),
 
-  'invite/create': describeRoute({
-    tags: TAGS,
+  'invite/create': describeOp({
     summary: 'Create an invite',
     description: paragraphs(
       `Uploads a sealed invite card under \`inviteId\` for a buddy to fetch and claim. Per inbox: at most ${BUDDIES_LIMITS.openInvites} open invites and ${BUDDIES_LIMITS.slotsPlusOpenInvites} slots plus open invites (\`limit\`), and ${BUDDIES_LIMITS.inviteCreations} creations per rolling 24 h (\`rate_limited\`).`,
       SIGNED_BY.owner,
       tierLine('write'),
       KILL_SWITCH_OFF,
-      'App Attest is not required yet: a reserved `attest` field is accepted and ignored.'
+      'Bearer requests come from an attested session (attestation happens once, when the session opens); legacy requests aren’t attested. A reserved `attest` field is accepted and ignored.'
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('invite/create', {
         inboxId,
         inviteId: buddiesId('The new invite, derived from the link secret'),
         claimVerifier: bytes32('`b64u(SHA-256(claimSecret))`'),
@@ -558,8 +609,6 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
             'Epoch ms, after now and at most 7 days + 5 minutes ahead of the relay clock.',
         }),
       }),
-      'Owner-signed (op `invite/create`).'
-    ),
     responses: {
       200: jsonResponse('Created.', okSchema),
       ...refusals({
@@ -573,8 +622,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'invite/delete': describeRoute({
-    tags: TAGS,
+  'invite/delete': describeOp({
     summary: 'Delete an invite',
     description: paragraphs(
       'Deletes an invite this inbox created (cancel, confirm, or reject). Idempotent; an invite another inbox created is left alone.',
@@ -582,18 +630,14 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       tierLine('write'),
       KILL_SWITCH_OFF
     ),
-    requestBody: signedBody(
-      signedPayload({ inboxId, inviteId: buddiesId('The invite') }),
-      'Owner-signed (op `invite/delete`).'
-    ),
+    requestBody: ownerBody('invite/delete', { inboxId, inviteId: buddiesId('The invite') }),
     responses: {
       200: jsonResponse('Deleted (or already gone).', okSchema),
       ...refusals(ownerRefusals('write')),
     },
   }),
 
-  'blob/delete': describeRoute({
-    tags: TAGS,
+  'blob/delete': describeOp({
     summary: 'Delete photo blobs',
     description: paragraphs(
       'Deletes photo blobs from the sender’s own inbox. Reads stop at once; the stored objects go right after (retried from the inbox alarm if storage fails). Idempotent: unknown ids succeed.',
@@ -602,8 +646,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       KILL_SWITCH_OFF,
       PHOTOS_SWITCH
     ),
-    requestBody: signedBody(
-      signedPayload({
+    requestBody: ownerBody('blob/delete', {
         inboxId,
         blobIds: z
           .array(bytes32('A blob id'))
@@ -613,16 +656,13 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
             description: `1 to ${BUDDIES_LIMITS.blobDeleteIds} canonical blob ids; duplicates are fine.`,
           }),
       }),
-      'Owner-signed (op `blob/delete`).'
-    ),
     responses: {
       200: jsonResponse('Deleted.', okSchema),
       ...refusals({ ...ownerRefusals('write'), photos_disabled: true }),
     },
   }),
 
-  'card/put': describeRoute({
-    tags: TAGS,
+  'card/put': describeOp({
     summary: 'Replace your Buddy Card',
     description: paragraphs(
       `Replaces the writer slot’s card in the recipient’s inbox. Takes the next \`seq\` and signals live sockets. Counts toward the slot’s ${BUDDIES_LIMITS.writesPerSlot} writes per hour (with \`event/put\`).`,
@@ -648,8 +688,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'event/put': describeRoute({
-    tags: TAGS,
+  'event/put': describeOp({
     summary: 'Append an event',
     description: paragraphs(
       'Appends a sealed event to the recipient’s inbox, deduplicated on `eventId`: a repeat returns the original `seq` and never pushes. Takes the next `seq` and signals live sockets. Events are deleted 30 days after creation.',
@@ -686,8 +725,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'slot/leave': describeRoute({
-    tags: TAGS,
+  'slot/leave': describeOp({
     summary: 'Leave a buddy’s inbox',
     description: paragraphs(
       'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave.',
@@ -709,14 +747,14 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         bad_signature:
           'Signature missing, malformed, or not by the slot’s writer key.',
         stale: true,
+        ...AUTH_REFUSALS,
         replay: true,
         rate_limited: `${edgeLimited('write')}.`,
       }),
     },
   }),
 
-  'invite/fetch': describeRoute({
-    tags: TAGS,
+  'invite/fetch': describeOp({
     summary: 'Fetch an invite',
     description: paragraphs(
       'Reads an invite’s sealed card and status. Expired, deleted, and burned invites are `not_found`.',
@@ -742,6 +780,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       ),
       ...refusals({
         bad_request: true,
+        ...AUTH_REFUSALS,
         not_found: 'Unknown, expired, deleted, or burned invite.',
         rate_limited: `${edgeLimited('unsigned')}.`,
         disabled: true,
@@ -749,8 +788,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     },
   }),
 
-  'invite/claim': describeRoute({
-    tags: TAGS,
+  'invite/claim': describeOp({
     summary: 'Claim an invite',
     description: paragraphs(
       'Claims an invite with its secret and a sealed claim card. The relay compares `SHA-256(claimSecret)` to the stored verifier in constant time. The first valid claim wins; the winner’s exact retry (same secret, byte-identical `blob`) gets `{ ok }` again without a second event or push. On success the relay appends `{ slotId: "", kind: "invite.claimed", eventId: inviteId, blob }` to the creator’s inbox and pushes it.',
@@ -758,7 +796,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       SIGNED_BY.unsigned,
       tierLine('unsigned'),
       KILL_SWITCH_OFF,
-      'App Attest is not required yet.'
+      'Bearer requests come from an attested session; legacy requests aren’t attested.'
     ),
     requestBody: jsonBody(
       unsignedEnvelopeSchema,
@@ -775,6 +813,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
       ...refusals({
         bad_request: true,
         bad_signature: `Wrong \`claimSecret\`. The ${BUDDIES_LIMITS.badClaims}th wrong one burns the invite.`,
+        ...AUTH_REFUSALS,
         not_found:
           'Unknown, expired, deleted, or burned invite, or the creator cancelled it while the claim was delivered.',
         conflict:
@@ -788,30 +827,35 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
 
 // --- Header-envelope routes -----------------------------------------------
 
-const envelopeHeaders = (op: string, payload: z.ZodType) => [
+/**
+ * The request's fields in `x-buddies-payload`, and (legacy only) the owner's
+ * signature over them in `x-buddies-signature`.
+ */
+const fieldHeaders = (op: string, fields: z.ZodRawShape) => [
   {
     name: 'x-buddies-payload',
     in: 'header' as const,
     required: true,
     schema: { type: 'string' as const },
-    description: `The envelope’s \`payload\`: the request’s fields as UTF-8 JSON, base64url without padding.\n\n**Decoded:**\n\n${fieldTable(payload)}`,
+    description: `The request’s fields as UTF-8 JSON, base64url without padding. A legacy request’s are its envelope \`payload\`, which adds \`ts\` and \`nonce\`.\n\n**Decoded:**\n\n${fieldTable(ownerFields(fields))}`,
   },
   {
     name: 'x-buddies-signature',
     in: 'header' as const,
-    required: true,
+    required: false,
     schema: { type: 'string' as const },
-    description: `The envelope’s \`signature\`: Ed25519 signature by the owner key over \`ww-buddies/v1\\n${op}\\n\` followed by the decoded \`x-buddies-payload\` bytes (base64url, no padding).`,
+    description: `**Legacy only, and required there** (no \`Authorization\` header): the envelope’s \`signature\`, an Ed25519 signature by the owner key over \`ww-buddies/v1\\n${op}\\n\` followed by the decoded \`x-buddies-payload\` bytes (base64url, no padding). A bearer request sends none (\`bad_request\`).`,
   },
 ]
 
 const { gone, replaced, suspended } = BUDDIES_LIVE_CLOSE
 
-export const buddiesLiveDocs = describeRoute({
-  tags: TAGS,
+export const buddiesLiveDocs = describeOp({
   summary: 'Live socket (WebSocket)',
   description: paragraphs(
-    'Upgrades to a WebSocket that says *that* the owner’s inbox changed, so the app syncs within a second while in the foreground. It never carries content. The owner-signed envelope (op `inbox/live`) rides in headers, since an upgrade has no body and ids never go in URLs. Same `stale` and `replay` checks as a POST owner op. Opening a socket is not owner activity for the 180-day retention.',
+    'Upgrades to a WebSocket that says *that* the owner’s inbox changed, so the app syncs within a second while in the foreground. It never carries content. The request rides in headers, since an upgrade has no body and ids never go in URLs. Opening a socket is not owner activity for the 180-day retention.',
+    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one registered before accounts.',
+    `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`inbox/live\`) in \`x-buddies-payload\` and \`x-buddies-signature\`, with the same \`stale\` and \`replay\` checks as a POST owner op. ${LEGACY_SWITCH}`,
     '**Server → app messages:**\n\n- `{"type":"hello","seq":N}` right after the upgrade, `N` being the inbox head.\n- `{"type":"changed","seq":N}` after every committed write that changes what `inbox/sync` returns: new events, cards, the roster, a delivered claim, and slot changes. Slot changes don’t advance `seq`, so sync on every `changed`.',
     '**Keepalive:** send the text `ping` about every 25 s; the relay answers `pong` without waking the inbox. Anything else the app sends is ignored.',
     `**Close codes:** \`${gone.code} "${gone.reason}"\` the inbox was deleted or wiped (sync, which restores it); \`${replaced.code} "${replaced.reason}"\` an ${BUDDIES_LIMITS.liveSockets + 1}th socket opened and closed the oldest (at most ${BUDDIES_LIMITS.liveSockets} per inbox); \`${suspended.code} "${suspended.reason}"\` the inbox’s account was suspended. Reconnect with backoff while in the foreground.`,
@@ -826,17 +870,16 @@ export const buddiesLiveDocs = describeRoute({
       schema: { type: 'string' as const, enum: ['websocket'] },
       description: 'Must be `websocket`, else `426 upgrade_required`.',
     },
-    ...envelopeHeaders(
-      'inbox/live',
-      signedPayload({ inboxId: buddiesId('Your inbox') })
-    ),
+    ...fieldHeaders('inbox/live', { inboxId: buddiesId('Your inbox') }),
   ],
   responses: {
     101: { description: 'Switching protocols: the socket is open.' },
     ...refusals({
       ...ownerRefusals('read'),
-      bad_request: 'Missing or malformed `x-buddies-payload`, or a bad payload.',
-      upgrade_required: 'Not a WebSocket upgrade (`Upgrade: websocket`).',
+      bad_request:
+        'Missing or malformed `x-buddies-payload`, a bad payload, or a bearer upgrade with `x-buddies-signature`.',
+      upgrade_required:
+        'Not a WebSocket upgrade (`Upgrade: websocket`), or a legacy upgrade after the legacy switch (KV `auth:legacy`) was turned off. No `Retry-After`.',
     }),
   },
 })
@@ -850,11 +893,12 @@ const binary = (description: string) => ({
   },
 })
 
-export const buddiesBlobPutDocs = describeRoute({
-  tags: TAGS,
+export const buddiesBlobPutDocs = describeOp({
   summary: 'Upload a photo blob',
   description: paragraphs(
-    `Stores one sealed photo in the sender’s own inbox for buddies to fetch with \`blob/get\`. The body is the raw sealed bytes (not base64), 1 to ${count(BUDDIES_LIMITS.blobBytes)}; the owner-signed envelope (op \`blob/put\`) rides in headers. The relay recomputes \`blobId = b64u(SHA-256(body))\`, so the signature covers the bytes too. Only an inbox with at least one buddy (slot) can store one.`,
+    `Stores one sealed photo in the sender’s own inbox for buddies to fetch with \`blob/get\`. The body is the raw sealed bytes (not base64), 1 to ${count(BUDDIES_LIMITS.blobBytes)}, so the request’s fields ride in headers. The relay recomputes \`blobId = b64u(SHA-256(body))\`, so the fields (and a legacy signature) cover the bytes too. Only an inbox with at least one buddy (slot) can store one.`,
+    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one registered before accounts.',
+    `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`blob/put\`) in \`x-buddies-payload\` and \`x-buddies-signature\`. ${LEGACY_SWITCH}`,
     'Idempotent per `blobId`: a repeat keeps the first `readTokenHash` (retries must reuse the token) and moves the expiry to the later of the two; one that doesn’t move it stores nothing and costs no upload.',
     `**Caps per inbox:** ${BUDDIES_ABUSE_LIMITS.inboxBlobs} live blobs and 150 MiB live; ${BUDDIES_ABUSE_LIMITS.blobUploads} uploads (object writes) per rolling 24 h. Blobs are deleted at \`expiresAt\`, by \`blob/delete\`, or with the inbox.`,
     'If storing the object fails the answer is a 500; a retry finishes the upload.',
@@ -862,9 +906,7 @@ export const buddiesBlobPutDocs = describeRoute({
     KILL_SWITCH_OFF,
     PHOTOS_SWITCH
   ),
-  parameters: envelopeHeaders(
-    'blob/put',
-    signedPayload({
+  parameters: fieldHeaders('blob/put', {
       inboxId: buddiesId('Your (the sender’s) inbox'),
       blobId: bytes32('`b64u(SHA-256(body))`'),
       bytes: z
@@ -881,8 +923,7 @@ export const buddiesBlobPutDocs = describeRoute({
       readTokenHash: bytes32(
         '`b64u(SHA-256(readToken))`, the 32-byte read capability the app shares with recipients'
       ),
-    })
-  ),
+  }),
   requestBody: {
     required: true,
     ...binary(
@@ -902,7 +943,7 @@ export const buddiesBlobPutDocs = describeRoute({
     ...refusals({
       ...ownerRefusals('blobPut'),
       bad_request:
-        'Missing or malformed headers or payload, an `expiresAt` out of range, a body whose length isn’t `bytes`, or whose SHA-256 isn’t `blobId`.',
+        'Missing or malformed headers or payload, an `expiresAt` out of range, a body whose length isn’t `bytes`, or whose SHA-256 isn’t `blobId`. Also a bearer upload with `x-buddies-signature`.',
       not_found: `${DEFAULT_REASONS.not_found} Also when the blob or inbox was deleted while it uploaded.`,
       no_buddies: 'The inbox has no slots, so nobody could read the photo.',
       too_large: `\`bytes\`, \`Content-Length\`, or the streamed body is over ${kib(BUDDIES_LIMITS.blobBytes)}.`,
@@ -912,8 +953,7 @@ export const buddiesBlobPutDocs = describeRoute({
   },
 })
 
-export const buddiesBlobGetDocs = describeRoute({
-  tags: TAGS,
+export const buddiesBlobGetDocs = describeOp({
   summary: 'Download a photo blob',
   description: paragraphs(
     'Returns the exact sealed bytes put, for a recipient holding the reference from a share event. Changes nothing and isn’t owner activity.',
@@ -952,6 +992,7 @@ export const buddiesBlobGetDocs = describeRoute({
     },
     ...refusals({
       bad_request: true,
+      ...AUTH_REFUSALS,
       not_found:
         'Unknown inbox or blob, a deleted, expired, or unfinished blob, or a wrong token.',
       rate_limited: `${edgeLimited('blobGet')}.`,

@@ -1,4 +1,5 @@
 import type { Environment } from '../types'
+import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import type { BuddiesRouteOp } from './contracts'
 
 /**
@@ -18,10 +19,13 @@ const MIB = 1_024 * 1_024
 
 export const BUDDIES_ABUSE_LIMITS = {
   /**
-   * Requests per minute per caller (client IP, IPv6 by /64), checked in the
-   * Worker before any Durable Object wakes. Enforced by the `[[ratelimits]]`
-   * bindings in `wrangler.toml` (repeated under `[env.dev]`), which
-   * `limits.test.ts` keeps equal to these numbers.
+   * Requests per minute per caller, checked in the Worker before any Durable
+   * Object wakes. The caller is the session's account for a bearer request
+   * (`buddiesAccountCallerKey`), else the client IP, IPv6 by /64
+   * (`buddiesCallerKey`). Enforced by the `[[ratelimits]]` bindings in
+   * `wrangler.toml` (repeated under `[env.dev]`), which `limits.test.ts`
+   * keeps equal to these numbers. The budgets were sized per IP, so a whole
+   * household; one account gets the same, which is only more generous.
    */
   edge: {
     /** Invite fetch + claim: ~3 calls per acceptance, ~4 people accepting at once on one Wi-Fi ≈ 12/min → 10×. */
@@ -37,7 +41,7 @@ export const BUDDIES_ABUSE_LIMITS = {
     /** Photo downloads: each buddy device fetches each photo once; a household opening a few shared Plans ≈ 60/min → 10×. */
     blobGet: { binding: 'BUDDIES_BLOB_GET_LIMITER', perMinute: 600 },
   },
-  /** Signed registrations per caller per rolling day: ~200 people starting Buddies on one assembly-hall Wi-Fi → 10×. */
+  /** Signed registrations per caller (IP or account, as above) per rolling day: ~200 people starting Buddies on one assembly-hall Wi-Fi → 10×. */
   registrationsPerDay: 2_000,
   registrationWindowMs: DAY_MS,
   /** Stored events per slot (kept 30 days): a power user sharing every Plan from 3 devices sends ≤ ~900 a month → 11×. */
@@ -146,6 +150,21 @@ export const buddiesCallerKey = (ip: string | null | undefined): string => {
   const prefix = groups.slice(0, 4).map((group) => group.toString(16))
   return `${prefix.join(':')}::/64`
 }
+
+const encoder = new TextEncoder()
+
+/**
+ * The key a bearer request's per-caller limits count against: a hash of the
+ * session's account, so people behind one NAT stop sharing a budget and
+ * neither the limiter nor a quota's name ever holds an account id. The
+ * `account:` prefix keeps it apart from every IP key.
+ */
+export const buddiesAccountCallerKey = async (
+  accountId: string
+): Promise<string> =>
+  `account:${bytesToBase64Url(
+    await sha256Bytes(encoder.encode(`ww-buddies/v1/caller-account\n${accountId}`))
+  )}`
 
 /** Logs a limit hit for tuning: the op and the limit's name, nothing else. */
 export const logLimitHit = (op: string, limit: string): void => {
