@@ -1,7 +1,12 @@
-import { and, eq, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, desc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm'
 import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import { ACCOUNT_LIMITS, type RefreshToken } from './contracts'
-import { accountSessions, type SessionPlatform } from './schema'
+import {
+  accountActivity,
+  accountSessions,
+  type SessionPlatform,
+} from './schema'
+import { activityInsert, sessionIsLive } from './activity'
 import type { AccountsDb } from './store'
 import type { RefreshKeys } from './tokens'
 
@@ -29,6 +34,10 @@ import type { RefreshKeys } from './tokens'
  * the same token gets the same next one: a retry after a lost response, or
  * two refreshes at once from one device, never leave the device holding a
  * token the session no longer knows.
+ *
+ * Every way a live session ends, and every one that opens, is logged to the
+ * account's activity in the same batch (ADR 0028); expiring isn't, and a
+ * token that fails its MAC never reaches the log.
  */
 
 const {
@@ -180,6 +189,20 @@ export const createSession = async (
       createdAt: new Date(now),
       expiresAt: new Date(expiresAt),
     }),
+    activityInsert(
+      db,
+      { accountId: input.accountId, kind: 'session.opened', sessionId: id },
+      { now }
+    ),
+    // `session.replaced` for each session the cap is about to end, before
+    // the update ends them. (Columns in the table's order; see
+    // `activityInsert`.)
+    db.insert(accountActivity).select(
+      sql`SELECT NULL, account_id, 'session.replaced',
+          id, platform, device, ${id}, ${input.platform}, ${input.device},
+          NULL, ${now}
+        FROM account_sessions WHERE id IN (${overflow})`
+    ),
     db
       .update(accountSessions)
       .set({ revokedAt: new Date(now) })
@@ -196,13 +219,37 @@ export const createSession = async (
   }
 }
 
-const revoke = (db: AccountsDb, sessionId: string, now: number) =>
-  db
-    .update(accountSessions)
-    .set({ revokedAt: new Date(now) })
-    .where(
-      and(eq(accountSessions.id, sessionId), isNull(accountSessions.revokedAt))
-    )
+/**
+ * Ends a live session and logs why, in one batch. Nothing is logged for a
+ * session that had already ended or expired.
+ */
+const endSession = async (
+  db: AccountsDb,
+  ended: {
+    accountId: string
+    sessionId: string
+    kind: 'session.signed_out' | 'session.revoked' | 'session.refresh_reused'
+    actorSessionId?: string
+  },
+  now: number
+): Promise<void> => {
+  await db.batch([
+    activityInsert(db, ended, {
+      now,
+      onlyIf: sessionIsLive(ended.accountId, ended.sessionId, now),
+    }),
+    db
+      .update(accountSessions)
+      .set({ revokedAt: new Date(now) })
+      .where(
+        and(
+          eq(accountSessions.id, ended.sessionId),
+          eq(accountSessions.accountId, ended.accountId),
+          isNull(accountSessions.revokedAt)
+        )
+      ),
+  ])
+}
 
 const findSession = async (
   db: AccountsDb,
@@ -277,8 +324,17 @@ const refreshStep = async (
   }
 
   // Issued by this worker, but replaced over a minute ago, or older still:
-  // someone kept a copy.
-  if (!raced) await revoke(db, row.id, now)
+  // someone kept a copy. Logged as suspicious (`session.refresh_reused`).
+  if (!raced)
+    await endSession(
+      db,
+      {
+        accountId: row.accountId,
+        sessionId: row.id,
+        kind: 'session.refresh_reused',
+      },
+      now
+    )
   return { done: null }
 }
 
@@ -322,22 +378,97 @@ export const refreshSession = async (
 }
 
 /** Ends the account's session; ending an ended one is a no-op. */
-export const closeSession = async (
+export const closeSession = (
   db: AccountsDb,
   accountId: string,
   sessionId: string,
   now: number = Date.now()
-): Promise<void> => {
-  await db
-    .update(accountSessions)
-    .set({ revokedAt: new Date(now) })
+): Promise<void> =>
+  endSession(db, { accountId, sessionId, kind: 'session.signed_out' }, now)
+
+/**
+ * Ends another of the account's sessions from the calling one
+ * (`session.revoked`), or the caller's own (`session.signed_out`). False
+ * when the account has no such session; an ended one is `true` (idempotent).
+ */
+export const revokeSession = async (
+  db: AccountsDb,
+  input: { accountId: string; sessionId: string; bySessionId: string },
+  now: number = Date.now()
+): Promise<boolean> => {
+  if (input.sessionId === input.bySessionId) {
+    await closeSession(db, input.accountId, input.sessionId, now)
+    return true
+  }
+  const found = await db
+    .select({ id: accountSessions.id })
+    .from(accountSessions)
     .where(
       and(
-        eq(accountSessions.id, sessionId),
-        eq(accountSessions.accountId, accountId),
-        isNull(accountSessions.revokedAt)
+        eq(accountSessions.id, input.sessionId),
+        eq(accountSessions.accountId, input.accountId)
       )
     )
+    .get()
+  if (!found) return false
+  await endSession(
+    db,
+    {
+      accountId: input.accountId,
+      sessionId: input.sessionId,
+      kind: 'session.revoked',
+      actorSessionId: input.bySessionId,
+    },
+    now
+  )
+  return true
+}
+
+/** A live session, as `GET /accounts/v1/sessions` lists it. */
+export interface LiveSession {
+  sessionId: string
+  platform: SessionPlatform
+  /** The sealed device label, as the session sent it. */
+  device?: string
+  createdAt: number
+  /** Its last refresh, or when it opened. */
+  lastActiveAt: number
+  expiresAt: number
+}
+
+/** The account's live sessions, newest first. */
+export const listLiveSessions = async (
+  db: AccountsDb,
+  accountId: string,
+  now: number = Date.now()
+): Promise<LiveSession[]> => {
+  const rows = await db
+    .select({
+      id: accountSessions.id,
+      platform: accountSessions.platform,
+      device: accountSessions.device,
+      createdAt: accountSessions.createdAt,
+      rotatedAt: accountSessions.rotatedAt,
+      expiresAt: accountSessions.expiresAt,
+    })
+    .from(accountSessions)
+    .where(
+      and(
+        eq(accountSessions.accountId, accountId),
+        isNull(accountSessions.revokedAt),
+        gt(accountSessions.expiresAt, new Date(now))
+      )
+    )
+    .orderBy(desc(accountSessions.createdAt), desc(accountSessions.id))
+    .all()
+  return rows.map((row) => ({
+    sessionId: row.id,
+    platform: row.platform,
+    ...(row.device != null ? { device: row.device } : {}),
+    createdAt: row.createdAt.getTime(),
+    lastActiveAt: (row.rotatedAt ?? row.createdAt).getTime(),
+    expiresAt: row.expiresAt.getTime(),
+  }))
 }
 
 /**

@@ -21,8 +21,10 @@ import { refuseLegacyAuth } from './legacySwitch'
 import { handoffHandlers } from './handoff'
 import { backupHandlers } from './backup'
 import { sessionHandlers } from './session'
+import { handleActivity } from './activityRoute'
 import {
   accountDocs,
+  activityListDocs,
   accountInfoDocs,
   accountRegisterDocs,
   backupDeleteDocs,
@@ -38,7 +40,9 @@ import {
   handoffStatusDocs,
   sessionCloseDocs,
   sessionOpenDocs,
+  sessionListDocs,
   sessionRefreshDocs,
+  sessionRevokeDocs,
 } from './openapi'
 
 /**
@@ -143,7 +147,11 @@ export const createAccountsRoutes = () => {
   routes.post('/sessions', sessionOpenDocs, sessionHandlers.open)
   routes.post('/sessions/refresh', sessionRefreshDocs, sessionHandlers.refresh)
   routes.delete('/sessions/current', sessionCloseDocs, sessionHandlers.close)
+  routes.get('/sessions', sessionListDocs, sessionHandlers.list)
+  // Ends another session; a POST so its id stays out of the URL.
+  routes.post('/sessions/revoke', sessionRevokeDocs, sessionHandlers.revoke)
   routes.get('/account', accountDocs, handleAccount)
+  routes.get('/activity', activityListDocs, handleActivity)
   // App versions before sessions (and `GET /account`).
   routes.post('/account/register', accountRegisterDocs, handleRegister)
   routes.post('/account/info', accountInfoDocs, handleInfo)

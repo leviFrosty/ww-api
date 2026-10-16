@@ -10,6 +10,8 @@ import {
   backupPrefix,
 } from './contracts'
 import { readPlainJson } from './auth'
+import { recordActivity, recordBackupDownload } from './activity'
+import { accountsDb } from './store'
 import {
   accountCall,
   accountForKey,
@@ -38,6 +40,10 @@ import {
  *
  * `backup/put` counts against the Buddies photo-upload edge tier, the rest
  * against the read tier.
+ *
+ * Deleting a slot that exists, and downloading one (once per slot, session,
+ * and day), go in the account's activity (ADR 0028) before R2 is touched, so
+ * a deletion is never unlogged.
  *
  * Privacy: nothing here logs or reports bodies, keys, account ids, or slot
  * ids.
@@ -116,6 +122,10 @@ const jsonFields =
   <K extends AccountsOp>(c: AppContext, op: K) =>
   async (): Promise<BearerFields<K>> =>
     plainFields(op, await readPlainJson(c))
+
+/** The bearer session making the call; null for a legacy envelope. */
+const callerSessionId = (c: AppContext): string | null =>
+  c.get('account')?.sessionId ?? null
 
 const hex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
@@ -203,6 +213,11 @@ const handleGet = guarded('backup/get', async (c) =>
     async (bucket, accountId, { slotId }) => {
       const object = await bucket.get(backupObjectKey(accountId, slotId))
       if (!object) return buddiesErrorResponse('not_found')
+      await recordBackupDownload(accountsDb(c.env.ACCOUNTS_DB!), {
+        accountId,
+        sessionId: callerSessionId(c),
+        slotId,
+      })
       return new Response(object.body, {
         headers: {
           'Content-Type': 'application/octet-stream',
@@ -247,10 +262,19 @@ const handleDelete = guarded('backup/delete', async (c) =>
     async (bucket, accountId, { slotId }) => {
       const keys =
         slotId != null
-          ? [backupObjectKey(accountId, slotId)]
+          ? (await bucket.head(backupObjectKey(accountId, slotId)))
+            ? [backupObjectKey(accountId, slotId)]
+            : []
           : (await listSlots(bucket, accountId)).map((slot) =>
               backupObjectKey(accountId, slot.slotId)
             )
+      if (keys.length === 0) return c.json({ ok: true })
+      await recordActivity(accountsDb(c.env.ACCOUNTS_DB!), {
+        accountId,
+        kind: 'backup.deleted',
+        sessionId: callerSessionId(c),
+        slotId: slotId ?? null,
+      })
       // R2 deletes at most 1,000 keys a call.
       for (let start = 0; start < keys.length; start += 1_000)
         await bucket.delete(keys.slice(start, start + 1_000))

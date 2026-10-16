@@ -1,4 +1,4 @@
-import { asc, eq } from 'drizzle-orm'
+import { asc, eq, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/d1'
 import { bytesToBase64Url } from '../crypto'
 import {
@@ -8,6 +8,7 @@ import {
   type AccountStatus,
   type AccountStatusReason,
 } from './schema'
+import { activityInsert } from './activity'
 
 export const accountsDb = (d1: D1Database) => drizzle(d1)
 export type AccountsDb = ReturnType<typeof accountsDb>
@@ -60,10 +61,20 @@ export const registerAccount = async (
 ): Promise<AccountRecord> => {
   const existing = await findAccountByPub(db, accountPub)
   if (existing) return existing
-  await db
-    .insert(accounts)
-    .values({ id: newId(), accountPub })
-    .onConflictDoNothing({ target: accounts.accountPub })
+  // `account.created` only when this insert made the row: a racing device
+  // that won leaves no row under this id.
+  const id = newId()
+  await db.batch([
+    db
+      .insert(accounts)
+      .values({ id, accountPub })
+      .onConflictDoNothing({ target: accounts.accountPub }),
+    activityInsert(
+      db,
+      { accountId: id, kind: 'account.created' },
+      { onlyIf: sql`EXISTS (SELECT 1 FROM accounts WHERE id = ${id})` }
+    ),
+  ])
   const account = await findAccountByPub(db, accountPub)
   if (!account) throw new Error('accounts: registered account is missing')
   return account
@@ -113,7 +124,10 @@ export const accountInboxIds = async (
       .all()
   ).map((row) => row.inboxId)
 
-/** Sets the status and records why, in one batch. */
+/**
+ * Sets the status and records why, in one batch. A change also goes in the
+ * account's activity (`account.suspended`/`.reinstated`), without the reason.
+ */
 export const setAccountStatus = async (
   db: AccountsDb,
   accountId: string,
@@ -121,6 +135,17 @@ export const setAccountStatus = async (
   reason: AccountStatusReason
 ): Promise<void> => {
   await db.batch([
+    activityInsert(
+      db,
+      {
+        accountId,
+        kind: status === 'suspended' ? 'account.suspended' : 'account.reinstated',
+      },
+      {
+        onlyIf: sql`EXISTS (SELECT 1 FROM accounts
+          WHERE id = ${accountId} AND status != ${status})`,
+      }
+    ),
     db.update(accounts).set({ status }).where(eq(accounts.id, accountId)),
     db.insert(accountStatusEvents).values({ accountId, status, reason }),
   ])
