@@ -338,6 +338,29 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('/accounts/v1/sessions (dev bypass)', () => {
       expect((await refresh(token)).status).toBe(401)
   })
 
+  it('never ends a session for a refresh token it didn’t issue', async () => {
+    const refresh = (refreshToken: string) =>
+      http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
+    const session = await openSession()
+    const [sessionId, secret, mac] = session.refreshToken.split('.')
+    // The session id is no secret (every access token's `sid`); without the
+    // worker's MAC, a token naming it is refused and the session lives.
+    for (const token of [
+      `${sessionId}.${b64u(randomBytes(32))}.${b64u(randomBytes(32))}`,
+      `${sessionId}.${b64u(randomBytes(32))}.${mac}`,
+      // Two-part tokens from before the MAC.
+      `${sessionId}.${secret}`,
+      `${sessionId}.${b64u(randomBytes(32))}`,
+    ]) {
+      const refused = await refresh(token)
+      expect(refused.status).toBe(401)
+      expect(refused.body.code).toBe('unauthorized')
+    }
+    const next = await refresh(session.refreshToken)
+    expect(next.status).toBe(200)
+    expect((await refresh(next.body.refreshToken as string)).status).toBe(200)
+  })
+
   it('gives a double refresh and a lost-response retry the same token', async () => {
     const refresh = (refreshToken: string) =>
       http('POST', '/accounts/v1/sessions/refresh', { body: { refreshToken } })
