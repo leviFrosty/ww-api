@@ -744,7 +744,11 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
   `session.refresh_reused` (a replaced refresh token after its grace minute;
   the app flags it), `handoff.sent`, `backup.deleted` (no `slotId` = all),
   `backup.downloaded` (once per slot, session, and day),
-  `account.suspended`/`.reinstated` (never the reason). Expiry, refreshes,
+  `account.suspended`/`.reinstated` (never the reason),
+  `buddies.inbox_linked` (a new link, in `linkInbox`'s batch),
+  `buddies.deleted` (the Worker, after the inbox DO accepted `inbox/delete`;
+  never in the DO). Writer ops log nothing, so nothing ties a writing
+  account to another account's inbox. Expiry, refreshes,
   reads, and uploads aren't logged. Clients skip unknown kinds, so adding
   one is safe.
 - **Recording a new action**: add the kind to `ACTIVITY_KINDS`
@@ -761,8 +765,6 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
 - **Privacy**: no IP, location, user agent, content, or anything about
   buddies. Device names stay inside the sealed labels. Never log entries,
   session ids, or slot ids.
-- **Phase 2**: Buddies hooks (an inbox linked, Buddies deleted) once the
-  relay is on bearer tokens.
 
 ### Updates and the legacy switch
 

@@ -105,6 +105,8 @@ export const ACTIVITY_KINDS = [
   'backup.downloaded',
   'account.suspended',
   'account.reinstated',
+  'buddies.inbox_linked',
+  'buddies.deleted',
 ] as const
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number]
 

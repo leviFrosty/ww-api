@@ -67,6 +67,7 @@ import {
   isLegacyAuthEnabled,
   upgradeRequiredResponse,
 } from '../accounts/legacySwitch'
+import { recordActivity } from '../accounts/activity'
 import { isBuddiesEnabled, isBuddiesPhotosEnabled } from './killSwitch'
 import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
 import {
@@ -315,7 +316,12 @@ const registerInbox = async (
   if (db && check.claim) {
     let owner
     try {
-      owner = await linkInbox(db, call.inboxId, check.claim)
+      owner = await linkInbox(
+        db,
+        call.inboxId,
+        check.claim,
+        account?.sessionId ?? null
+      )
     } catch (error) {
       if (account) throw error
       console.warn('buddies: linking an inbox failed')
@@ -461,6 +467,36 @@ const admitRegistration = async (
   }
 }
 
+/**
+ * `buddies.deleted` in the account's activity (witness-work ADR 0028), once
+ * the inbox accepted `inbox/delete`: for a bearer request the token's account
+ * and session (the inbox checked it owns the inbox), for a legacy one the
+ * account the inbox is linked to, if any. Recorded here, never in the inbox
+ * DO, and only for the owner's own inbox: writer ops log nothing. A failed
+ * write is reported; the deletion already happened.
+ */
+const recordBuddiesDeleted = async (
+  env: Environment,
+  inboxId: string,
+  account: AccountAuth | null
+): Promise<void> => {
+  if (!env.ACCOUNTS_DB) return
+  try {
+    const db = accountsDb(env.ACCOUNTS_DB)
+    const accountId =
+      account?.accountId ?? (await findInboxAccount(db, inboxId))?.id
+    if (!accountId) return
+    await recordActivity(db, {
+      accountId,
+      kind: 'buddies.deleted',
+      sessionId: account?.sessionId ?? null,
+    })
+  } catch (error) {
+    console.error('buddies: activity write failed', { op: 'inbox/delete' })
+    captureFailure(error, 'inbox/delete')
+  }
+}
+
 const runSigned = async <K extends BuddiesSignedOp>(
   op: K,
   env: Environment,
@@ -486,7 +522,10 @@ const runSigned = async <K extends BuddiesSignedOp>(
       (await admitRegistration(env, register, caller.key))
     if (refused) return refused
   }
-  return SIGNED_OPS[op](env, call.value, caller.account)
+  const outcome = await SIGNED_OPS[op](env, call.value, caller.account)
+  if (op === 'inbox/delete' && outcome.ok)
+    await recordBuddiesDeleted(env, call.value.inboxId, null)
+  return outcome
 }
 
 /**
@@ -504,7 +543,13 @@ const runByAccount = async <K extends BuddiesOwnerOp>(
   if (!isPlainObject(body) || isEnvelopeBody(body)) return fail('bad_request')
   const fields = BUDDIES_FIELD_PARSERS[op](body, Date.now())
   if (!fields) return fail('bad_request')
-  return OWNER_OPS[op](env, { ...fields, accountId: account.accountId })
+  const outcome = await OWNER_OPS[op](env, {
+    ...fields,
+    accountId: account.accountId,
+  })
+  if (op === 'inbox/delete' && outcome.ok)
+    await recordBuddiesDeleted(env, fields.inboxId, account)
+  return outcome
 }
 
 const runUnsigned = async <K extends BuddiesUnsignedOp>(
