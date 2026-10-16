@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { Hono } from 'hono'
 import type {
   Breadcrumb,
   CloudflareOptions,
@@ -78,6 +79,34 @@ describe('redactSecretQueryParameters', () => {
       'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=k3y',
       'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=[redacted]',
     ],
+    // Hono and URLSearchParams decode names, so these are `token` too. The
+    // raw name stays.
+    [`${EVENTS}?to%6ben=s3cr3t`, `${EVENTS}?to%6ben=[redacted]`],
+    [
+      `${EVENTS}?lastEventId=3&%74%6F%6B%65%6E=s3cr3t#top`,
+      `${EVENTS}?lastEventId=3&%74%6F%6B%65%6E=[redacted]#top`,
+    ],
+    ['TO%4Ben=s3cr3t&lastEventId=3', 'TO%4Ben=[redacted]&lastEventId=3'],
+    ['?to%6ben=s3cr3t', '?to%6ben=[redacted]'],
+    [
+      'https://ww-proxy.test/autocomplete?q=Main&api%4Bey=k3y',
+      'https://ww-proxy.test/autocomplete?q=Main&api%4Bey=[redacted]',
+    ],
+    // A secret's value runs to the next `&`, whatever it holds.
+    [`${EVENTS}?token=s3c?r3t=x&a=1`, `${EVENTS}?token=[redacted]&a=1`],
+    [`${EVENTS}?token=s3c%26r3t&a=1`, `${EVENTS}?token=[redacted]&a=1`],
+    [`${EVENTS}?token=&a=1`, `${EVENTS}?token=[redacted]&a=1`],
+    // A parameter inside another one's value, as in a nested URL.
+    [
+      `${EVENTS}?next=/x?to%6ben=s3cr3t&a=1`,
+      `${EVENTS}?next=/x?to%6ben=[redacted]&a=1`,
+    ],
+    [`${EVENTS}??token=s3cr3t`, `${EVENTS}??token=[redacted]`],
+    // Every secret in a string, not only the first.
+    [
+      `${EVENTS}?token=a&to%6ben=b and ${EVENTS}?apikey=c`,
+      `${EVENTS}?token=[redacted]&to%6ben=[redacted] and ${EVENTS}?apikey=[redacted]`,
+    ],
   ])('redacts %s', (input, expected) => {
     expect(redactSecretQueryParameters(input)).toBe(expected)
   })
@@ -88,8 +117,66 @@ describe('redactSecretQueryParameters', () => {
     'https://ww-proxy.test/autocomplete?q=token',
     'https://ww-proxy.test/geocode?q=a%3Dtoken%3D1',
     'a token=s3cr3t in prose',
+    // Names that decode to something else, malformed escapes included.
+    `${EVENTS}?to%6ben%=x&tok%ZZen=x&to%256ben=x&tokens=x&to+ken=x`,
+    `${EVENTS}?%E0token=x&token%00=x&mytoken=x&api_key=x`,
   ])('leaves %s alone', (input) => {
     expect(redactSecretQueryParameters(input)).toBe(input)
+  })
+
+  // Whatever spelling of a name the worker reads as `token` (Hono, on the
+  // legacy run routes) or `apiKey` (URLSearchParams, in the HERE proxy), the
+  // scrubbed URL keeps none of its value.
+  const app = new Hono().get('*', (c) =>
+    c.json({ token: c.req.query('token') ?? null })
+  )
+  /** `decodeURIComponent` with `+` as a space, or the name if malformed. */
+  const decodeName = (name: string): string => {
+    try {
+      return decodeURIComponent(name.replace(/\+/g, ' '))
+    } catch {
+      return name
+    }
+  }
+  it.each([
+    'token',
+    'to%6ben',
+    'to%6Ben',
+    '%74oken',
+    '%74%6f%6b%65%6e',
+    'TOKEN',
+    'To%4Ben',
+    'apiKey',
+    'api%4Bey',
+    '%61%70%69%4b%65%79',
+    'APIKEY',
+    'to%6ben%',
+    'tok%ZZen',
+    'to%256ben',
+    'to+ken',
+    '%E0token',
+  ])('cuts the value of %s whenever the worker reads it', async (name) => {
+    const SECRET = 'value-the-worker-reads-0123'
+    const decoded = decodeName(name)
+    for (const query of [
+      `${name}=${SECRET}`,
+      `lastEventId=3&${name}=${SECRET}&x=%20`,
+      `${name}=${SECRET}&q=a+b`,
+    ]) {
+      const url = `${EVENTS}?${query}`
+      const { token } = (await (await app.request(url)).json()) as {
+        token: string | null
+      }
+      const read = [token, new URL(url).searchParams.get('apiKey')]
+      const scrubbed = redactSecretQueryParameters(url)
+      expect(read.includes(SECRET)).toBe(
+        decoded === 'token' || decoded === 'apiKey'
+      )
+      // Cut whenever the name decodes to a secret one, in any case.
+      expect(scrubbed.includes(SECRET)).toBe(
+        !/^(token|apikey)$/i.test(decoded)
+      )
+    }
   })
 })
 
@@ -302,6 +389,15 @@ describe('Sentry scrubbers', () => {
       [
         [['Token', SECRET], ['lastEventId', '3']],
         [['Token', '[redacted]'], ['lastEventId', '3']],
+      ],
+      // Keys as they were sent, still encoded.
+      [
+        { 'to%6Ben': SECRET, 'api%4Bey': SECRET, lastEventId: '3' },
+        { 'to%6Ben': '[redacted]', 'api%4Bey': '[redacted]', lastEventId: '3' },
+      ],
+      [
+        [['%74oken', SECRET], ['lastEventId', '3']],
+        [['%74oken', '[redacted]'], ['lastEventId', '3']],
       ],
     ]) {
       const scrubbed = config.beforeSend!(

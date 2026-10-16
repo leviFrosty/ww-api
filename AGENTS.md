@@ -298,7 +298,9 @@ Because those traces record request URLs whole, `src/sentry.ts` cuts the value
 of every `token` query parameter (legacy run routes' subscribe token, `?token=`)
 and `apiKey` (a client-sent HERE key) from every string in an event,
 transaction, span, and breadcrumb (`token=[redacted]`), and from an object or
-pair-list `request.query_string`. A new route that takes a credential in its
+pair-list `request.query_string`. Names match as the worker reads them,
+percent-escapes decoded (`?to%6Ben=` is `token` to Hono), and without regard
+to case. A new route that takes a credential in its
 query string adds its name to `SECRET_QUERY_PARAMETERS` (better: take it in a
 header).
 
