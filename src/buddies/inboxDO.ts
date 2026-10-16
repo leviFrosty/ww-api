@@ -320,13 +320,22 @@ const TOMBSTONE_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_tombstone (
  * ADR 0024). Not in `SCHEMA`: an inbox registered without an account doesn't
  * have it. A wipe deletes it; the accounts database keeps the link, and the
  * Worker passes it back on the next registration. Bearer owner requests
- * (witness-work ADR 0027) are authorized against `account_id`: another
- * account is `forbidden`, and an inbox without the row is `not_linked`.
+ * (witness-work ADR 0027) are authorized against `account_id` once
+ * `confirmed`: another account is `forbidden`, and an inbox without a
+ * confirmed link is `not_linked`.
+ *
+ * `confirmed` means the accounts database holds the same link. The Worker
+ * only writes the row with the account that database names (an existing
+ * link, a new one once written, or a status change), so moderation, which
+ * finds an account's inboxes there, reaches every inbox its tokens can act
+ * for. Rows from before the column count as unconfirmed until the app links
+ * the inbox again.
  */
 const OWNER_ACCOUNT_SCHEMA = `CREATE TABLE IF NOT EXISTS owner_account (
    singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
    account_id TEXT NOT NULL,
-   suspended  INTEGER NOT NULL DEFAULT 0
+   suspended  INTEGER NOT NULL DEFAULT 0,
+   confirmed  INTEGER NOT NULL DEFAULT 0
  )`
 
 /**
@@ -382,8 +391,9 @@ export class BuddyInbox extends DurableObject<Environment> {
   // `ts` or `nonce` to check or record.
 
   /**
-   * `accountId` is the account that owns the inbox, once the Worker has checked
-   * the link (null for registrations without one). It never clears a
+   * `accountId` is the account the accounts database already links the inbox
+   * to (null when it links none), taken as confirmed. A new link is confirmed
+   * with `confirmAccount` once that database has it. It never clears a
    * suspension: only `setAccountStatus` does.
    */
   async register(
@@ -424,10 +434,11 @@ export class BuddyInbox extends DurableObject<Environment> {
           )
         }
         if (accountId) {
-          this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+          this.#ensureOwnerAccount()
           this.#sql.exec(
-            `INSERT INTO owner_account (singleton, account_id) VALUES (1, ?)
-             ON CONFLICT (singleton) DO UPDATE SET account_id = excluded.account_id`,
+            `INSERT INTO owner_account (singleton, account_id, confirmed) VALUES (1, ?, 1)
+             ON CONFLICT (singleton) DO UPDATE
+             SET account_id = excluded.account_id, confirmed = 1`,
             accountId
           )
         }
@@ -1109,19 +1120,48 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
+   * The accounts database linked this inbox to `accountId`, after this inbox
+   * accepted the owner-signed registration: from now on that account's
+   * bearer requests act as the owner. It's the database's winner, so when
+   * two accounts claimed the inbox at once, the inbox names the same one.
+   * `suspended` is the account's status as read after the link was written,
+   * so a suspension that listed the account's inboxes just before still
+   * applies. Never clears a suspension. Idempotent; a no-op for an inbox
+   * that isn't registered.
+   */
+  async confirmAccount(accountId: string, suspended: boolean): Promise<void> {
+    if (!this.#ready() || !this.#meta()) return
+    this.ctx.storage.transactionSync(() => {
+      this.#ensureOwnerAccount()
+      this.#sql.exec(
+        `INSERT INTO owner_account (singleton, account_id, suspended, confirmed) VALUES (1, ?, ?, 1)
+         ON CONFLICT (singleton) DO UPDATE
+         SET account_id = excluded.account_id, confirmed = 1,
+             suspended = MAX(suspended, excluded.suspended)`,
+        accountId,
+        suspended ? 1 : 0
+      )
+    })
+    if (suspended) this.#closeLiveSockets(BUDDIES_LIVE_CLOSE.suspended)
+  }
+
+  /**
    * The accounts admin suspended or reinstated this inbox's account. Owner ops
    * other than leaving answer `suspended` until it's reinstated, and live
-   * sockets close. An inbox that isn't registered keeps nothing: the Worker
-   * checks the accounts database before it registers again.
+   * sockets close. The admin found this inbox among the account's in the
+   * accounts database, so the link is confirmed too. An inbox that isn't
+   * registered keeps nothing: the Worker checks the accounts database before
+   * it registers again.
    */
   async setAccountStatus(accountId: string, suspended: boolean): Promise<void> {
     if (!this.#ready() || !this.#meta()) return
     this.ctx.storage.transactionSync(() => {
-      this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+      this.#ensureOwnerAccount()
       this.#sql.exec(
-        `INSERT INTO owner_account (singleton, account_id, suspended) VALUES (1, ?, ?)
+        `INSERT INTO owner_account (singleton, account_id, suspended, confirmed) VALUES (1, ?, ?, 1)
          ON CONFLICT (singleton) DO UPDATE
-         SET account_id = excluded.account_id, suspended = excluded.suspended`,
+         SET account_id = excluded.account_id, suspended = excluded.suspended,
+             confirmed = 1`,
         accountId,
         suspended ? 1 : 0
       )
@@ -1257,11 +1297,12 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * Whether an account call may act for this inbox: only the account it's
-   * linked to. An inbox registered before accounts has no link to compare
+   * confirmed to be linked to. An inbox registered before accounts, or whose
+   * link the accounts database hasn't confirmed, has none to compare
    * (`not_linked`); the app links it with `inbox/register` and retries.
    */
   #refuseAccount(accountId: string): BuddiesFailure | null {
-    const linked = this.#ownerAccountId()
+    const linked = this.#confirmedAccountId()
     if (linked == null) return fail('not_linked')
     return linked === accountId ? null : fail('forbidden')
   }
@@ -1334,8 +1375,22 @@ export class BuddyInbox extends DurableObject<Environment> {
         )
       }
       if (this.#hasTable('device')) this.#migrateDevices()
+      if (this.#hasTable('owner_account')) this.#ensureOwnerAccount()
     }
     return exists
+  }
+
+  /**
+   * `owner_account`, with `confirmed` added in place to a table from before
+   * it (as 0: those links were never checked against the accounts database).
+   */
+  #ensureOwnerAccount(): void {
+    this.#sql.exec(OWNER_ACCOUNT_SCHEMA)
+    if (!this.#hasColumn('owner_account', 'confirmed')) {
+      this.#sql.exec(
+        'ALTER TABLE owner_account ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0'
+      )
+    }
   }
 
   /**
@@ -1394,14 +1449,16 @@ export class BuddyInbox extends DurableObject<Environment> {
       : null
   }
 
-  /** The account this inbox is linked to, or null when none. */
-  #ownerAccountId(): string | null {
+  /** The account this inbox is confirmed to be linked to, or null. */
+  #confirmedAccountId(): string | null {
     if (!this.#hasTable('owner_account')) return null
     return (
       this.#sql
         .exec<{
           accountId: string
-        }>('SELECT account_id AS accountId FROM owner_account WHERE singleton = 1')
+        }>(
+          'SELECT account_id AS accountId FROM owner_account WHERE singleton = 1 AND confirmed = 1'
+        )
         .toArray()[0]?.accountId ?? null
     )
   }

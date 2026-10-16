@@ -254,6 +254,14 @@ const refuseBearerRegistration = (
  * it fails) a legacy registration works as before accounts, without links; a
  * bearer one, which exists to link the inbox, answers `disabled` (or fails
  * with 500) instead, so the app retries.
+ *
+ * The inbox lets bearer requests act as the owner only for a link the
+ * accounts database holds, where moderation finds it: an existing link goes
+ * along with the registration, and a new one is confirmed in the inbox once
+ * the database has written it, naming the database's winner (another
+ * account's claim may have won: `conflict`). If either step fails, the inbox
+ * keeps answering bearer owner requests `not_linked` until a registration
+ * gets through; registering again is idempotent.
  */
 const registerInbox = async (
   env: Environment,
@@ -273,20 +281,23 @@ const registerInbox = async (
     }
   }
   if (!check.ok) return check
-  const accountId = check.linked ?? check.claim
-  const result = await inbox(env, call.inboxId).register(call, accountId)
+  const stub = inbox(env, call.inboxId)
+  const result = await stub.register(call, check.linked)
   if (!result.ok) return result
   if (db && check.claim) {
+    let owner
     try {
-      const owner = await linkInbox(db, call.inboxId, check.claim)
-      if (owner !== check.claim) return fail('conflict')
+      owner = await linkInbox(db, call.inboxId, check.claim)
     } catch (error) {
       if (account) throw error
       console.warn('buddies: linking an inbox failed')
       Sentry.captureException(error)
       return ok({ body: {} })
     }
+    await stub.confirmAccount(owner.id, owner.status === 'suspended')
+    if (owner.id !== check.claim) return fail('conflict')
   }
+  const accountId = check.linked ?? check.claim
   return ok({ body: accountId ? { accountId } : {} })
 }
 

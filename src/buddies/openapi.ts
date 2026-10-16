@@ -142,7 +142,7 @@ const LEGACY_SWITCH =
 
 const SIGNED_BY = {
   owner: paragraphs(
-    '**Bearer:** `Authorization: Bearer <access token>` and the fields as plain JSON, without `ts` or `nonce`. The inbox must be linked to the token’s account: another account’s inbox is `forbidden`, and one registered before accounts is `not_linked` (link it with a bearer `inbox/register`, then retry).',
+    '**Bearer:** `Authorization: Bearer <access token>` and the fields as plain JSON, without `ts` or `nonce`. The inbox must be linked to the token’s account: another account’s inbox is `forbidden`, and one with no confirmed link (registered before accounts, or its linking registration failed part-way) is `not_linked` (link it with a bearer `inbox/register`, then retry).',
     `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH}`
   ),
   writer: paragraphs(
@@ -180,7 +180,7 @@ const DEFAULT_REASONS: Partial<Record<BuddiesErrorCode, string>> = {
     'A legacy request (no `Authorization` header) after the legacy switch (KV `auth:legacy`) was turned off. Only updating the app helps; no `Retry-After`.',
   forbidden: 'Bearer: the inbox is linked to another account than the token’s.',
   not_linked:
-    'Bearer: the inbox was registered before accounts and is linked to none. Link it with a bearer `inbox/register` (with its `account` proof), then retry.',
+    'Bearer: the inbox has no confirmed link to an account: it was registered before accounts, or the registration that linked it failed part-way. Link it with a bearer `inbox/register` (with its `account` proof), then retry; registering again is idempotent.',
   photos_disabled:
     'Photo blobs are off (KV `buddies:photos`), or this worker has no blob bucket. `Retry-After: 60`.',
 }
@@ -854,7 +854,7 @@ export const buddiesLiveDocs = describeOp({
   summary: 'Live socket (WebSocket)',
   description: paragraphs(
     'Upgrades to a WebSocket that says *that* the owner’s inbox changed, so the app syncs within a second while in the foreground. It never carries content. The request rides in headers, since an upgrade has no body and ids never go in URLs. Opening a socket is not owner activity for the 180-day retention.',
-    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one registered before accounts.',
+    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one with no confirmed link.',
     `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`inbox/live\`) in \`x-buddies-payload\` and \`x-buddies-signature\`, with the same \`stale\` and \`replay\` checks as a POST owner op. ${LEGACY_SWITCH}`,
     '**Server → app messages:**\n\n- `{"type":"hello","seq":N}` right after the upgrade, `N` being the inbox head.\n- `{"type":"changed","seq":N}` after every committed write that changes what `inbox/sync` returns: new events, cards, the roster, a delivered claim, and slot changes. Slot changes don’t advance `seq`, so sync on every `changed`.',
     '**Keepalive:** send the text `ping` about every 25 s; the relay answers `pong` without waking the inbox. Anything else the app sends is ignored.',
@@ -897,7 +897,7 @@ export const buddiesBlobPutDocs = describeOp({
   summary: 'Upload a photo blob',
   description: paragraphs(
     `Stores one sealed photo in the sender’s own inbox for buddies to fetch with \`blob/get\`. The body is the raw sealed bytes (not base64), 1 to ${count(BUDDIES_LIMITS.blobBytes)}, so the request’s fields ride in headers. The relay recomputes \`blobId = b64u(SHA-256(body))\`, so the fields (and a legacy signature) cover the bytes too. Only an inbox with at least one buddy (slot) can store one.`,
-    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one registered before accounts.',
+    '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one with no confirmed link.',
     `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`blob/put\`) in \`x-buddies-payload\` and \`x-buddies-signature\`. ${LEGACY_SWITCH}`,
     'Idempotent per `blobId`: a repeat keeps the first `readTokenHash` (retries must reuse the token) and moves the expiry to the later of the two; one that doesn’t move it stores nothing and costs no upload.',
     `**Caps per inbox:** ${BUDDIES_ABUSE_LIMITS.inboxBlobs} live blobs and 150 MiB live; ${BUDDIES_ABUSE_LIMITS.blobUploads} uploads (object writes) per rolling 24 h. Blobs are deleted at \`expiresAt\`, by \`blob/delete\`, or with the inbox.`,

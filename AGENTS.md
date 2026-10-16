@@ -315,8 +315,17 @@ Links. Clients are iOS and Android
   JSON, no envelope, `ts`, or `nonce` (`inbox/live` and `blob/put` in
   `x-buddies-payload`, no signature header); the inbox DO compares the
   token's account with its `owner_account` row: another account is 403
-  `forbidden`, none 409 `not_linked` (an inbox registered before accounts;
-  the app links it with `inbox/register` and retries). Writer ops send the
+  `forbidden`, none 409 `not_linked` (an inbox registered before accounts,
+  or whose link isn't confirmed; the app links it with `inbox/register`
+  and retries). The row counts only once `confirmed`, meaning D1's
+  `account_inboxes` holds the same link, where moderation finds it: the
+  Worker passes an existing D1 link along with the registration, and
+  confirms a new one (D1's winner, so concurrent claims agree; the loser
+  gets 409 `conflict`) only after D1 wrote it. A registration that fails
+  between the two leaves the inbox `not_linked` until a retry gets
+  through. Rows from before the column (added in place as 0) count as
+  unconfirmed: their owner's first bearer owner op gets `not_linked`, and
+  the relink confirms it. Writer ops send the
   token plus the writer-signed envelope, still the slot's capability; the
   token's account is never compared with the slot or stored. Invite and
   blob reads send the token plus today's body. Without the header it's a
@@ -326,7 +335,7 @@ Links. Clients are iOS and Android
   `x-buddies-session-account` header, which the Worker always strips from
   client requests (the DO trusts it). Suspension and both switches work as
   before in both forms; `owner_account` needs no migration (created in
-  place at registration).
+  place at registration, `confirmed` added in place).
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
