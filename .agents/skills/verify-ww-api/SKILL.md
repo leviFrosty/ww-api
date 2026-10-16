@@ -18,7 +18,7 @@ node scripts/verify/dev.mjs up --secrets-from ~/dev/ww-api/.dev.vars # opt in to
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
 - Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, and `BUDDIES_PHOTOS=on`. The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
-- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN` and `ADMIN_API_TOKEN`, plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
+- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, and `ACCOUNT_TOKEN_SECRET` (account sessions), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
 ## Doctor
@@ -37,6 +37,7 @@ Read-only. Each check prints an `ok` or `FAIL` line, and the command exits 1 on 
 - Buddies is enabled (an unknown `invite/fetch` returns `not_found`, not `disabled`);
 - Buddies photos are enabled (an unknown `blob/get` returns `not_found`, not `photos_disabled`);
 - the dev bypass works (the value is never printed);
+- account sessions are on (an unknown refresh token returns `unauthorized`, not `disabled`);
 - which optional credentials are set.
 
 Run it first whenever anything looks off.
@@ -116,6 +117,7 @@ Only names are listed here; never print values.
 | --- | --- | --- |
 | `NOTES_IMPORT_DEV_BYPASS_TOKEN` | Notes Import bypass tests | generated per state dir |
 | `ADMIN_API_TOKEN` | admin reset positive tests | generated per state dir |
+| `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `OPENROUTER_API_KEY` | real provider health and the paid kickoff | unset; the status probe fails open |
