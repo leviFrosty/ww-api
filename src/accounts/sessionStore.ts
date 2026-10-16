@@ -3,23 +3,32 @@ import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import { ACCOUNT_LIMITS, type RefreshToken } from './contracts'
 import { accountSessions, type SessionPlatform } from './schema'
 import type { AccountsDb } from './store'
+import type { RefreshKeys } from './tokens'
 
 /**
  * Session rows in the accounts database (`account_sessions`). A session is
  * live until it's revoked or reaches `expiresAt`, 90 days after it opened.
  *
- * Refresh tokens are `<sessionId>.<secret>` (opaque to the app), so a token
- * names its session even after it was replaced. Only the SHA-256 of a whole
- * token is stored: the current one, and the one it replaced, which still
- * works for a minute after the rotation so a lost response doesn't end the
- * session. Presenting it later, or any older token of a live session, ends
- * the session.
+ * Refresh tokens are `<sessionId>.<secret>.<mac>` (opaque to the app), so a
+ * token names its session even after it was replaced. Only the SHA-256 of a
+ * whole token is stored: the current one, and the one it replaced, which
+ * still works for a minute after the rotation so a lost response doesn't end
+ * the session. Presenting it later, or any older token of a live session,
+ * ends the session.
  *
- * The token that replaces another is derived from it (HMAC under a key from
- * `ACCOUNT_TOKEN_SECRET`, `rotationKey` in src/accounts/tokens.ts), so every
- * refresh presenting the same token gets the same next one: a retry after a
- * lost response, or two refreshes at once from one device, never leave the
- * device holding a token the session no longer knows.
+ * The MAC (HMAC-SHA256 over `<sessionId>.<secret>` under `macKey`, from
+ * `ACCOUNT_TOKEN_SECRET` in src/accounts/tokens.ts) proves this worker
+ * issued the token. The session id is no secret (every access token carries
+ * it), so without the MAC anyone could end a session by sending its id with
+ * a made-up secret. A token whose MAC doesn't verify under the current or
+ * previous secret is refused before the database is read, and never ends a
+ * session.
+ *
+ * The token that replaces another is derived from it (HMAC under
+ * `rotationKey`, another key from the secret), so every refresh presenting
+ * the same token gets the same next one: a retry after a lost response, or
+ * two refreshes at once from one device, never leave the device holding a
+ * token the session no longer knows.
  */
 
 const {
@@ -57,21 +66,45 @@ const withHash = async (token: string) => ({
   hash: await refreshHash(token),
 })
 
-/** A session's first refresh token: a random secret. */
-const firstRefreshToken = (sessionId: string) =>
-  withHash(`${sessionId}.${bytesToBase64Url(randomBytes(32))}`)
+/** `body` (`<sessionId>.<secret>`) with its MAC under `keys`, and its hash. */
+const issueRefreshToken = async (keys: RefreshKeys, body: string) => {
+  const mac = await crypto.subtle.sign(
+    'HMAC',
+    keys.macKey,
+    encoder.encode(body)
+  )
+  return withHash(`${body}.${bytesToBase64Url(new Uint8Array(mac))}`)
+}
 
-/** The token that replaces `presented`, under `rotationKey`. */
-const nextRefreshToken = async (
-  rotationKey: CryptoKey,
+/**
+ * Whether `presented` carries a MAC from one of `keys`. `subtle.verify`
+ * compares in constant time.
+ */
+const isIssued = async (
+  keys: readonly RefreshKeys[],
   presented: RefreshToken
-) => {
+): Promise<boolean> => {
+  const body = encoder.encode(presented.body)
+  for (const { macKey } of keys) {
+    if (await crypto.subtle.verify('HMAC', macKey, presented.mac, body))
+      return true
+  }
+  return false
+}
+
+/** A session's first refresh token: a random secret. */
+const firstRefreshToken = (keys: RefreshKeys, sessionId: string) =>
+  issueRefreshToken(keys, `${sessionId}.${bytesToBase64Url(randomBytes(32))}`)
+
+/** The token that replaces `presented`, under one secret's `keys`. */
+const nextRefreshToken = async (keys: RefreshKeys, presented: RefreshToken) => {
   const secret = await crypto.subtle.sign(
     'HMAC',
-    rotationKey,
+    keys.rotationKey,
     encoder.encode(`ww-account/v1/refresh-next\n${presented.token}`)
   )
-  return withHash(
+  return issueRefreshToken(
+    keys,
     `${presented.sessionId}.${bytesToBase64Url(new Uint8Array(secret))}`
   )
 }
@@ -114,10 +147,11 @@ const record = (row: SessionRow): SessionRecord => ({
 
 /**
  * Opens a session, then ends the account's oldest live sessions past
- * `sessionsPerAccount`, in one batch.
+ * `sessionsPerAccount`, in one batch. `keys` are the current secret's.
  */
 export const createSession = async (
   db: AccountsDb,
+  keys: RefreshKeys,
   input: {
     accountId: string
     platform: SessionPlatform
@@ -126,7 +160,7 @@ export const createSession = async (
   now: number = Date.now()
 ): Promise<IssuedSession> => {
   const id = bytesToBase64Url(randomBytes(16))
-  const refresh = await firstRefreshToken(id)
+  const refresh = await firstRefreshToken(keys, id)
   const expiresAt = now + sessionMs
   // Every live session but the newest `sessionsPerAccount` (this one among
   // them). `LIMIT -1` is SQLite's "no limit", which Drizzle can't spell.
@@ -187,15 +221,15 @@ type RefreshStep =
   | { changed: true }
 
 /**
- * One refresh against the row as read: the current token rotates (a
- * compare-and-swap on the hash read, so only one refresh can rotate it),
- * the replaced one within its minute gets the token it was replaced by
- * again (no write), and any other token ends the session unless `raced`
- * (this refresh saw its token current a moment ago).
+ * One refresh of a token this worker issued, against the row as read: the
+ * current token rotates (a compare-and-swap on the hash read, so only one
+ * refresh can rotate it), the replaced one within its minute gets the token
+ * it was replaced by again (no write), and any other token ends the session
+ * unless `raced` (this refresh saw its token current a moment ago).
  */
 const refreshStep = async (
   db: AccountsDb,
-  rotationKeys: readonly CryptoKey[],
+  keys: readonly RefreshKeys[],
   presented: RefreshToken,
   hash: string,
   row: SessionRow | undefined,
@@ -205,7 +239,7 @@ const refreshStep = async (
   if (!row || !isLive(row, now)) return { done: null }
 
   if (timingSafeEqual(hash, row.refreshHash)) {
-    const next = await nextRefreshToken(rotationKeys[0], presented)
+    const next = await nextRefreshToken(keys[0], presented)
     const rotated = await db
       .update(accountSessions)
       .set({
@@ -231,27 +265,29 @@ const refreshStep = async (
   const inGrace =
     row.rotatedAt != null && now - row.rotatedAt.getTime() <= refreshGraceMs
   if (replaced && inGrace) {
-    // The current token is this one's replacement, derived under the key
-    // that rotated it: the current one, or the previous one just after the
-    // secret rotated.
-    for (const key of rotationKeys) {
-      const next = await nextRefreshToken(key, presented)
+    // The current token is this one's replacement, derived and signed under
+    // the secret that rotated it: the current one, or the previous one just
+    // after the secret rotated.
+    for (const secretKeys of keys) {
+      const next = await nextRefreshToken(secretKeys, presented)
       if (timingSafeEqual(next.hash, row.refreshHash))
         return { done: { session: record(row), refreshToken: next.token } }
     }
     return { done: null }
   }
 
-  // Replaced over a minute ago, or older still: someone kept a copy.
+  // Issued by this worker, but replaced over a minute ago, or older still:
+  // someone kept a copy.
   if (!raced) await revoke(db, row.id, now)
   return { done: null }
 }
 
 /**
- * Replaces the session's refresh token. Null means 401 `unauthorized`: an
- * unknown session, an ended or expired one, or a token the session replaced
- * that isn't the one just replaced within its minute, which also ends the
- * session.
+ * Replaces the session's refresh token. Null means 401 `unauthorized`: a
+ * token whose MAC doesn't verify (refused before any read, so it never ends
+ * a session), an unknown session, an ended or expired one, or a token the
+ * session replaced that isn't the one just replaced within its minute, which
+ * also ends the session.
  *
  * Within that minute the replaced token gets the same new token it was
  * replaced by; the minute counts from the rotation, so retries can't stretch
@@ -259,20 +295,21 @@ const refreshStep = async (
  * reads the row once more and finds its token just replaced, so both answer
  * with the same token; if the session moved on again in between, it's 401
  * and the session lives, since that token was current a moment ago.
- * `rotationKeys` are the current key first, then the previous one if set.
+ * `keys` are the current secret's first, then the previous one's if set.
  */
 export const refreshSession = async (
   db: AccountsDb,
-  rotationKeys: readonly CryptoKey[],
+  keys: readonly RefreshKeys[],
   presented: RefreshToken,
   now: number = Date.now()
 ): Promise<IssuedSession | null> => {
+  if (!(await isIssued(keys, presented))) return null
   const hash = await refreshHash(presented.token)
   for (const raced of [false, true]) {
     const row = await findSession(db, presented.sessionId)
     const step = await refreshStep(
       db,
-      rotationKeys,
+      keys,
       presented,
       hash,
       row,

@@ -329,29 +329,41 @@ export const sessionDeviceTooLarge = (payload: unknown): boolean =>
 export const sessionAttestationHash = (accountPub: string): Promise<string> =>
   sha256Hex(`ww-account/v1/session\n${accountPub}`)
 
-/** A refresh token as presented: the session it names, and the whole token. */
+/** A refresh token as presented, in its parts. */
 export interface RefreshToken {
+  /** The session it names. */
   sessionId: string
+  /** `<sessionId>.<secret>`, what its MAC covers. */
+  body: string
+  /** The MAC's 32 bytes. */
+  mac: Uint8Array
+  /** The whole token. */
   token: string
 }
 
-/** b64u of exactly `size` bytes, in its canonical spelling. */
-const isCanonicalB64u = (value: string, size: number): boolean => {
+/** The bytes of b64u for exactly `size` bytes, in its canonical spelling. */
+const canonicalB64u = (value: string, size: number): Uint8Array | null => {
   const bytes = decodeB64u(value)
-  return bytes != null && bytes.length === size && bytesToBase64Url(bytes) === value
+  return bytes != null &&
+    bytes.length === size &&
+    bytesToBase64Url(bytes) === value
+    ? bytes
+    : null
 }
 
 /**
- * A refresh token, opaque to the app: `<sessionId>.<secret>`, the session's
- * id (b64u, 16 bytes) and b64u of 32 bytes, each in its canonical spelling.
- * Null for anything else.
+ * A refresh token, opaque to the app: `<sessionId>.<secret>.<mac>`, the
+ * session's id (b64u, 16 bytes), then b64u of 32 bytes twice, each in its
+ * canonical spelling. Null for anything else, including the two-part
+ * `<sessionId>.<secret>` tokens from before the MAC.
  */
 export const parseRefreshToken = (value: unknown): RefreshToken | null => {
   if (typeof value !== 'string') return null
   const parts = value.split('.')
-  if (parts.length !== 2) return null
-  const [sessionId, secret] = parts
-  return isCanonicalB64u(sessionId, 16) && isCanonicalB64u(secret, 32)
-    ? { sessionId, token: value }
+  if (parts.length !== 3) return null
+  const [sessionId, secret, mac] = parts
+  const macBytes = canonicalB64u(mac, 32)
+  return canonicalB64u(sessionId, 16) && canonicalB64u(secret, 32) && macBytes
+    ? { sessionId, body: `${sessionId}.${secret}`, mac: macBytes, token: value }
     : null
 }

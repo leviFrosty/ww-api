@@ -604,5 +604,6 @@ logs.persist = true
 # Account session access tokens (ADR 0027); without it, /accounts/v1/sessions* is disabled.
 # A different value per worker, at least 32 characters (openssl rand -base64 32):
 # wrangler secret put ACCOUNT_TOKEN_SECRET [--env dev]
-# Rotation: the old value goes to ACCOUNT_TOKEN_SECRET_PREVIOUS first (verify only).
+# Rotation: the old value goes to ACCOUNT_TOKEN_SECRET_PREVIOUS first (verify only;
+# refresh tokens issued under it refresh only while it's set, see AGENTS.md).
 # wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS [--env dev]

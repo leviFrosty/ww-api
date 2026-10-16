@@ -15,7 +15,7 @@ import { accountsDb, newAccountId, registerAccount } from './store'
 import { closeSession, createSession, refreshSession } from './sessionStore'
 import {
   accessTokenKeys,
-  rotationKeys,
+  refreshKeys,
   signAccessToken,
   type AccessTokenKeys,
 } from './tokens'
@@ -107,11 +107,11 @@ const handleOpen = guarded('session/open', async (c) => {
 
   const db = accountsDb(setup.db)
   const account = await registerAccount(db, accountPub, newAccountId)
-  const { session, refreshToken } = await createSession(db, {
-    accountId: account.id,
-    platform,
-    device,
-  })
+  const { session, refreshToken } = await createSession(
+    db,
+    setup.keys.current,
+    { accountId: account.id, platform, device }
+  )
   return c.json(
     {
       ok: true,
@@ -127,7 +127,8 @@ const handleOpen = guarded('session/open', async (c) => {
 
 /**
  * `POST /sessions/refresh`: plain JSON `{ refreshToken }`, replaced every
- * time. A malformed token is 401 before any database read.
+ * time. A malformed token, or one whose MAC doesn't verify, is 401 before
+ * any database read.
  */
 const handleRefresh = guarded('session/refresh', async (c) => {
   const setup = await ready(c)
@@ -142,7 +143,7 @@ const handleRefresh = guarded('session/refresh', async (c) => {
   if (!token) return buddiesErrorResponse('unauthorized')
   const issued = await refreshSession(
     accountsDb(setup.db),
-    rotationKeys(setup.keys),
+    refreshKeys(setup.keys),
     token
   )
   if (!issued) return buddiesErrorResponse('unauthorized')

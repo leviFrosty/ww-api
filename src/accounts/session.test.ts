@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   SigningKey,
   TEST_DEV_BYPASS,
+  TEST_TOKEN_SECRET,
   createHarness,
   randomBytes,
   b64u,
@@ -81,6 +82,14 @@ const requestChallenge = (body: unknown) =>
   post('/attestation/v1/challenge', body)
 const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
 
+/** `<sessionId>.<secret>.<mac>`, as the worker issues them. */
+const REFRESH_TOKEN =
+  /^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/
+
+/** A well-formed refresh token for `sessionId` with a random secret and MAC. */
+const madeUp = (sessionId: string) =>
+  `${sessionId}.${b64u(randomBytes(32))}.${b64u(randomBytes(32))}`
+
 const sessionRows = () =>
   h.accountsDb!.db.prepare('SELECT * FROM account_sessions').all() as Record<
     string,
@@ -98,10 +107,10 @@ describe('POST /sessions with the dev bypass', () => {
       sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
       accessExpiresAt: START + 15 * MINUTE,
-      refreshToken: `${session.sessionId}.${session.refreshToken.split('.')[1]}`,
+      refreshToken: expect.stringMatching(REFRESH_TOKEN),
       sessionExpiresAt: START + 90 * DAY,
     })
-    expect(session.refreshToken).toMatch(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/)
+    expect(session.refreshToken.split('.')[0]).toBe(session.sessionId)
 
     // Only the account, platform, label, token hashes, and times.
     const [row] = sessionRows()
@@ -276,11 +285,10 @@ describe('POST /sessions/refresh', () => {
       ok: true,
       accessToken: expect.any(String),
       accessExpiresAt: Date.now() + 15 * MINUTE,
-      refreshToken: expect.stringMatching(
-        new RegExp(`^${session.sessionId}\\.[A-Za-z0-9_-]{43}$`)
-      ),
+      refreshToken: expect.stringMatching(REFRESH_TOKEN),
       sessionExpiresAt: session.sessionExpiresAt,
     })
+    expect(first.body.refreshToken.split('.')[0]).toBe(session.sessionId)
     expect(first.body.refreshToken).not.toBe(session.refreshToken)
     expect(first.body.accessToken).not.toBe(session.accessToken)
     expect((await info(first.body.accessToken)).status).toBe(200)
@@ -330,9 +338,7 @@ describe('POST /sessions/refresh', () => {
   })
 
   it('refuses unknown and malformed tokens', async () => {
-    const unknown = await refresh(
-      `${b64u(randomBytes(16))}.${b64u(randomBytes(32))}`
-    )
+    const unknown = await refresh(madeUp(b64u(randomBytes(16))))
     expect(unknown.status).toBe(401)
     expect(unknown.body).toEqual({
       ok: false,
@@ -440,14 +446,6 @@ describe('refresh token reuse', () => {
     expect((await refresh(second.body.refreshToken)).status).toBe(401)
   })
 
-  it('ends the session for a token it never issued', async () => {
-    const session = await open()
-    const forged = `${session.sessionId}.${b64u(randomBytes(32))}`
-    expect((await refresh(forged)).status).toBe(401)
-    expect(sessionRows()[0].revoked_at).toBe(Date.now())
-    expect((await refresh(session.refreshToken)).status).toBe(401)
-  })
-
   it('stores only hashes of whole tokens', async () => {
     const session = await open()
     const next = await refresh(session.refreshToken)
@@ -455,28 +453,39 @@ describe('refresh token reuse', () => {
     for (const token of [session.refreshToken, next.body.refreshToken]) {
       expect(stored).not.toContain(token)
       expect(stored).not.toContain(token.split('.')[1])
+      expect(stored).not.toContain(token.split('.')[2])
     }
   })
 
   it('refuses malformed tokens without reading or writing the database', async () => {
     const session = await open()
-    const [sessionId, secret] = session.refreshToken.split('.')
+    const [sessionId, secret, mac] = session.refreshToken.split('.')
     const queries = recordQueries()
     for (const token of [
+      '',
       secret,
       b64u(randomBytes(32)),
-      `${sessionId}.${secret}.x`,
-      `${sessionId}${secret}`,
-      `${sessionId}.`,
-      `.${secret}`,
-      `${sessionId}.${secret}=`,
-      `${sessionId}.${secret.slice(0, -1)}`,
-      `${sessionId}.${b64u(randomBytes(33))}`,
-      `${b64u(randomBytes(15))}.${secret}`,
+      // The two-part tokens from before the MAC.
+      `${sessionId}.${secret}`,
+      `${sessionId}.${secret}.${mac}.x`,
+      `${sessionId}.${secret}.`,
+      `${sessionId}${secret}${mac}`,
+      `${sessionId}..${mac}`,
+      `.${secret}.${mac}`,
+      `${sessionId}.${secret}.${mac}=`,
+      `${sessionId}.${secret}.${mac.slice(0, -1)}`,
+      `${sessionId}.${secret.slice(0, -1)}.${mac}`,
+      `${sessionId}.${secret}.${b64u(randomBytes(33))}`,
+      `${sessionId}.${b64u(randomBytes(33))}.${mac}`,
+      `${b64u(randomBytes(15))}.${secret}.${mac}`,
+      `${session.refreshToken} `,
+      'x'.repeat(5_000),
       // Non-canonical: the same bytes, spelled with a padding bit set.
-      `${setPaddingBit(sessionId)}.${secret}`,
-      `${sessionId}.${setPaddingBit(secret)}`,
-      `${sessionId}.${secret.replace(/./, '+')}`,
+      `${setPaddingBit(sessionId)}.${secret}.${mac}`,
+      `${sessionId}.${setPaddingBit(secret)}.${mac}`,
+      `${sessionId}.${secret}.${setPaddingBit(mac)}`,
+      `${sessionId}.${secret.replace(/./, '+')}.${mac}`,
+      `${sessionId}.${secret}.${mac.replace(/./, '/')}`,
     ]) {
       expect((await refresh(token)).status, token).toBe(401)
     }
@@ -490,11 +499,15 @@ describe('refresh token reuse', () => {
     expect((await close(bearer(session.accessToken))).status).toBe(200)
     const row = sessionRows()[0]
     const queries = recordQueries()
-    expect(
-      (await refresh(`${b64u(randomBytes(16))}.${b64u(randomBytes(32))}`))
-        .status
-    ).toBe(401)
+    // A well-formed token for an unknown session needs a real MAC to get
+    // as far as the database.
+    const unknownSession = await issuedFor(
+      TEST_TOKEN_SECRET,
+      `${b64u(randomBytes(16))}.${b64u(randomBytes(32))}`
+    )
+    expect((await refresh(unknownSession)).status).toBe(401)
     expect((await refresh(session.refreshToken)).status).toBe(401)
+    expect(queries).toHaveLength(2)
     expect(queries.every((query) => query.startsWith('select'))).toBe(true)
     expect(sessionRows()[0]).toEqual(row)
   })
@@ -510,11 +523,154 @@ describe('refresh token reuse', () => {
     expect(retried.status).toBe(200)
     expect(retried.body.refreshToken).toBe(rotated.body.refreshToken)
 
-    // Without the previous slot the retry fails, but the session lives.
+    // Without the previous slot, tokens signed under the old secret are
+    // refused, the current one included, but none ends the session.
     delete h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS
+    const row = sessionRows()[0]
     expect((await refresh(session.refreshToken)).status).toBe(401)
-    expect(sessionRows()[0].revoked_at).toBeNull()
+    expect((await refresh(rotated.body.refreshToken)).status).toBe(401)
+    expect(sessionRows()[0]).toEqual(row)
+  })
+
+  it('refreshes a token signed under the previous secret, signing its replacement under the new one', async () => {
+    const session = await open()
+    const oldSecret = h.env.ACCOUNT_TOKEN_SECRET!
+    h.env.ACCOUNT_TOKEN_SECRET = 'rotated-account-token-secret-0123456789'
+    h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS = oldSecret
+    advance(MINUTE)
+    const rotated = await refresh(session.refreshToken)
+    expect(rotated.status).toBe(200)
+    expect(rotated.body.refreshToken).toBe(
+      await issuedFor(
+        'rotated-account-token-secret-0123456789',
+        rotated.body.refreshToken.split('.').slice(0, 2).join('.')
+      )
+    )
+
+    delete h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS
+    advance(5 * MINUTE)
     expect((await refresh(rotated.body.refreshToken)).status).toBe(200)
+  })
+
+  it('still ends the session when a token signed under the previous secret comes back', async () => {
+    const session = await open()
+    const first = await refresh(session.refreshToken)
+    h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS = h.env.ACCOUNT_TOKEN_SECRET
+    h.env.ACCOUNT_TOKEN_SECRET = 'rotated-account-token-secret-0123456789'
+    advance(5 * MINUTE)
+    const second = await refresh(first.body.refreshToken)
+    expect(second.status).toBe(200)
+    // Both older tokens carry the old secret's MAC, so they're its own.
+    expect((await refresh(session.refreshToken)).status).toBe(401)
+    expect(sessionRows()[0].revoked_at).toBe(Date.now())
+    expect((await refresh(second.body.refreshToken)).status).toBe(401)
+  })
+})
+
+const encoder = new TextEncoder()
+
+const hmacKey = (raw: Uint8Array) =>
+  crypto.subtle.importKey(
+    'raw',
+    raw,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+
+/** An HMAC key derived like the worker's: SHA-256 of `label\nsecret`. */
+const derivedKey = async (label: string, secret: string) =>
+  hmacKey(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        'SHA-256',
+        encoder.encode(`${label}\n${secret}`)
+      )
+    )
+  )
+
+/** `body` with a MAC under `key`. */
+const withMac = async (key: CryptoKey, body: string) => {
+  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(body))
+  return `${body}.${b64u(new Uint8Array(mac))}`
+}
+
+/** `body` with the MAC the worker signs under `secret`. */
+const issuedFor = async (secret: string, body: string) =>
+  withMac(await derivedKey('ww-account/v1/refresh-mac', secret), body)
+
+describe('forged refresh tokens', () => {
+  it('never end a session: a made-up token for its id is refused before any read', async () => {
+    const session = await open()
+    const row = sessionRows()[0]
+    const queries = recordQueries()
+    for (let attempt = 0; attempt < 5; attempt++) {
+      expect(await refresh(madeUp(session.sessionId))).toMatchObject({
+        status: 401,
+        body: { code: 'unauthorized' },
+      })
+    }
+    expect(queries).toEqual([])
+    expect(sessionRows()[0]).toEqual(row)
+    expect((await refresh(session.refreshToken)).status).toBe(200)
+  })
+
+  it('refuses a real MAC moved to another secret or another session', async () => {
+    const victim = await open()
+    const attacker = await open()
+    const [attackerId, attackerSecret, attackerMac] =
+      attacker.refreshToken.split('.')
+    const rows = sessionRows()
+    const queries = recordQueries()
+    for (const token of [
+      `${attackerId}.${b64u(randomBytes(32))}.${attackerMac}`,
+      `${victim.sessionId}.${attackerSecret}.${attackerMac}`,
+      `${victim.sessionId}.${victim.refreshToken.split('.')[1]}.${attackerMac}`,
+    ]) {
+      expect((await refresh(token)).status, token).toBe(401)
+    }
+    expect(queries).toEqual([])
+    expect(sessionRows()).toEqual(rows)
+    expect((await refresh(victim.refreshToken)).status).toBe(200)
+    expect((await refresh(attacker.refreshToken)).status).toBe(200)
+  })
+
+  it('takes only a MAC under the refresh MAC key: the access-token key, the rotation key, or another secret never end a session', async () => {
+    const session = await open()
+    const body = () => `${session.sessionId}.${b64u(randomBytes(32))}`
+    for (const key of [
+      await hmacKey(encoder.encode(TEST_TOKEN_SECRET)),
+      await derivedKey('ww-account/v1/refresh-rotation', TEST_TOKEN_SECRET),
+      await derivedKey('ww-account/v1/token-kid', TEST_TOKEN_SECRET),
+      await derivedKey(
+        'ww-account/v1/refresh-mac',
+        'some-other-account-token-secret-0123456789'
+      ),
+    ]) {
+      expect((await refresh(await withMac(key, body()))).status).toBe(401)
+    }
+    expect(sessionRows()[0].revoked_at).toBeNull()
+
+    // The same made-up secret under the worker's own MAC key is a token it
+    // issued as far as it can tell, so it's reuse and ends the session: the
+    // MAC is all that kept the ones above from doing so.
+    const minted = await issuedFor(TEST_TOKEN_SECRET, body())
+    expect((await refresh(minted)).status).toBe(401)
+    expect(sessionRows()[0].revoked_at).toBe(Date.now())
+    expect((await refresh(session.refreshToken)).status).toBe(401)
+  })
+
+  it('refuses the two-part tokens from before the MAC without ending the session', async () => {
+    const session = await open()
+    const [sessionId, secret] = session.refreshToken.split('.')
+    const queries = recordQueries()
+    expect((await refresh(`${sessionId}.${secret}`)).status).toBe(401)
+    expect((await refresh(`${sessionId}.${b64u(randomBytes(32))}`)).status).toBe(
+      401
+    )
+    expect(queries).toEqual([])
+    expect(sessionRows()[0].revoked_at).toBeNull()
+    expect((await refresh(session.refreshToken)).status).toBe(200)
   })
 })
 

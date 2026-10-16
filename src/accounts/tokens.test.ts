@@ -3,6 +3,7 @@ import { bytesToBase64Url } from '../crypto'
 import {
   ACCESS_TOKEN_AUDIENCE,
   accessTokenKeys,
+  refreshKeys,
   signAccessToken,
   verifyAccessToken,
   type TokenEnv,
@@ -203,5 +204,33 @@ describe('access tokens', () => {
     const keys = await keysFor({ ACCOUNT_TOKEN_SECRET_PREVIOUS: 'short' })
     expect(keys.previous).toBeNull()
     warn.mockRestore()
+  })
+})
+
+describe('refresh token keys', () => {
+  const signWith = async (key: CryptoKey) =>
+    bytesToBase64Url(
+      new Uint8Array(
+        await crypto.subtle.sign('HMAC', key, encoder.encode('message'))
+      )
+    )
+
+  it('yields a MAC key and a rotation key per secret, the current first', async () => {
+    const rotated = await keysFor({
+      ACCOUNT_TOKEN_SECRET: OTHER_SECRET,
+      ACCOUNT_TOKEN_SECRET_PREVIOUS: SECRET,
+    })
+    const [current, previous] = refreshKeys(rotated)
+    expect(refreshKeys(rotated)).toHaveLength(2)
+    expect(refreshKeys(await keysFor())).toHaveLength(1)
+    const [own] = refreshKeys(await keysFor())
+    expect(await signWith(previous.macKey)).toBe(await signWith(own.macKey))
+    expect(await signWith(current.macKey)).not.toBe(await signWith(own.macKey))
+
+    // Each kept apart from the others and from the access-token key.
+    const macs = await Promise.all(
+      [own.macKey, own.rotationKey, rotated.previous!.key].map(signWith)
+    )
+    expect(new Set(macs).size).toBe(3)
   })
 })
