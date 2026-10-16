@@ -61,6 +61,7 @@ Every op also takes `Authorization: Bearer <access token>` from an attested acco
 - A missing, malformed, expired, or invalid token is `401 unauthorized` with `WWW-Authenticate: Bearer error="invalid_token"`; the client refreshes once and retries. A bearer request never falls back to the signature.
 - Bearer owner requests carry no `ts` or `nonce`, so there is no `stale` or `replay` for them, and repeating one is fine (`event/put` and `blob/put` stay idempotent by id). Signed parts (the `inbox/register` and writer envelopes) keep both checks.
 - A request without the header is a **legacy request**, served exactly as before while ww-api's legacy switch is on and refused with `426 upgrade_required` (no `Retry-After`) once it's off, `inbox/delete`, `slot/remove`, and `slot/leave` included ([Updates and the legacy switch](https://github.com/leviFrosty/witness-work/blob/main/docs/accounts-protocol.md#updates-and-the-legacy-switch)).
+- **One exception: the iOS Notification Service Extension's fetch.** It reads events too big for a push ([Named alerts](#named-alerts)) and can't hold the session's rotating refresh token without racing the app, so it keeps sending the legacy owner-signed `inbox/sync` with the header `x-buddies-client: notification-service`. Once the switch is off, the relay still serves that one request for an inbox with a **confirmed** account link (its owner registered it on a session; see `not_linked`), checking the owner signature, `ts`, nonce, and suspension as ever. An inbox without a confirmed link gets `426 upgrade_required` (after the signature check), as does every other op with the header. While the switch is on, and on bearer requests, the header changes nothing.
 - Suspension applies as before, by the inbox's copy of the account status, not by the token. The kill switch and the photos switch apply to both forms alike.
 - **Per-caller limits** count a bearer request against its account (a hash of it, so the relay's limiter never holds the id), a legacy one against its client IP (IPv6 by /64). The budgets are the same.
 
@@ -80,7 +81,7 @@ Success: HTTP 200 with `{ "ok": true, ... }`. Failure: `{ "ok": false, "error": 
 | 429  | `limit`            | A count cap was hit (slots, invites, devices)                         |
 | 429  | `rate_limited`     | A rate limit or a stored-event cap was hit; carries `Retry-After`     |
 | 503  | `disabled`         | Kill switch is off; carries `Retry-After`                             |
-| 426  | `upgrade_required` | `inbox/live` requested without a WebSocket upgrade, or a legacy request after the legacy switch was turned off; no `Retry-After` |
+| 426  | `upgrade_required` | `inbox/live` requested without a WebSocket upgrade, or a legacy request after the legacy switch was turned off (except the Notification Service Extension's `inbox/sync` for an inbox with a confirmed link); no `Retry-After` |
 | 401  | `unauthorized`     | A bearer request's token is missing, expired, or invalid; carries `WWW-Authenticate` |
 | 403  | `forbidden`        | A bearer request for an inbox linked to another account, or an `account` proof for another account than the token's |
 | 409  | `not_linked`       | A bearer owner request for an inbox with no confirmed link: registered before accounts, or its linking registration failed part-way (link it with `inbox/register`) |
@@ -285,7 +286,7 @@ Each device gets its alerts through the service it registered: APNs for iOS, Fir
 
 The device words each alert from its event, with keys that never leave it. The app does this in `src/features/buddies/lib/pushAlerts.ts` (Android, in its push task); on iOS the Notification Service Extension (`targets/notification-service`) mirrors it in Swift.
 
-1. **The event:** from `ww.eventId` and `ww.blob`, or, without them, an owner-signed `inbox/sync` with `since: seq − 1`, keeping the event with that `seq`. It only reads; the app's own sync applies the event as usual.
+1. **The event:** from `ww.eventId` and `ww.blob`, or, without them, an owner-signed `inbox/sync` with `since: seq − 1`, keeping the event with that `seq`. It only reads; the app's own sync applies the event as usual. On iOS the extension sends it with `x-buddies-client: notification-service`, so it keeps working after the legacy switch is off ([Authentication (sessions)](#authentication-sessions)).
 2. **The sender:** an `invite.claimed` opens with the key of the open invite whose id is the `eventId` (AAD `ww-buddies/v1/invite-claim|{inviteId}`). Anything else opens with the incoming content key of the buddy it authenticates for (AAD `ww-buddies/v1/event|{inboxId}|{slotId}|{eventId}`), trying each buddy (active or awaiting confirmation) in turn; a fetched event names its slot, so only that buddy is tried.
 3. **The words:** who, by the name this device shows (the User's nickname for them, else their own name), and what:
 

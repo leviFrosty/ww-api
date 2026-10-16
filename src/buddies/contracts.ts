@@ -62,6 +62,17 @@ export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
 export const BUDDIES_LIVE_ACCOUNT_HEADER = 'x-buddies-session-account'
 
 /**
+ * Names the part of the app that sent a request. The iOS Notification
+ * Service Extension sends `BUDDIES_NOTIFICATION_SERVICE_CLIENT` on its
+ * owner-signed `inbox/sync`: it can't hold the session's rotating refresh
+ * token, so it signs with the owner key even after the legacy switch is off,
+ * and that one legacy request stays served for an inbox with a confirmed
+ * account link. Ignored on every other request.
+ */
+export const BUDDIES_CLIENT_HEADER = 'x-buddies-client'
+export const BUDDIES_NOTIFICATION_SERVICE_CLIENT = 'notification-service'
+
+/**
  * Photo blobs (encrypted note photos, too big for an event). `blob/put` is
  * owner-signed like an owner op, but its body is the raw sealed bytes, so the
  * envelope rides in `BUDDIES_ENVELOPE_HEADERS`. `blob/get` is unsigned (the
@@ -141,8 +152,10 @@ export const BUDDIES_ERROR_STATUS = {
   /**
    * `inbox/live` without a WebSocket upgrade, and any request authenticated
    * the way it was before sessions (no `Authorization` header) once the
-   * legacy switch (`auth:legacy`) is off. Never carries `Retry-After`:
-   * updating the app is the fix.
+   * legacy switch (`auth:legacy`) is off, but the Notification Service
+   * Extension's `inbox/sync` for an inbox with a confirmed account link
+   * (`BUDDIES_CLIENT_HEADER`). Never carries `Retry-After`: updating the app
+   * is the fix.
    */
   upgrade_required: 426,
   /** A `blob/put` body (declared or streamed) over `blobBytes`. */
@@ -163,8 +176,9 @@ export const BUDDIES_ERROR_STATUS = {
    */
   forbidden: 403,
   /**
-   * A bearer Buddies owner request for an inbox registered before accounts
-   * (linked to none). The app links it with `inbox/register` and retries.
+   * A bearer Buddies owner request for an inbox with no confirmed account
+   * link: registered before accounts, or its linking registration failed
+   * part-way. The app links it with `inbox/register` and retries.
    */
   not_linked: 409,
   /**

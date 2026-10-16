@@ -330,7 +330,17 @@ Links. Clients are iOS and Android
   token's account is never compared with the slot or stored. Invite and
   blob reads send the token plus today's body. Without the header it's a
   legacy request, served byte for byte as before while `auth:legacy` is on,
-  and 426 `upgrade_required` once it's off, leaving ops included. The live
+  and 426 `upgrade_required` once it's off, leaving ops included. One
+  exception outlives the switch: the iOS Notification Service Extension
+  fetches events too big for a push with an owner-signed `inbox/sync`
+  (it can't hold the session's rotating refresh token without racing the
+  app) and sends `x-buddies-client: notification-service`. With the switch
+  off, the Worker admits that one legacy request (`admitCaller`, as
+  `linkedOnly`), and the inbox DO checks the signature, `ts`, nonce, and
+  suspension as ever, then serves it only for an inbox with a **confirmed**
+  `owner_account` link, else 426. Any other op with the header, or a wrong
+  value, is 426 as before; the header changes nothing while the switch is
+  on or on a bearer request. Nothing logs it. The live
   upgrade reaches the inbox DO with the token's account in the internal
   `x-buddies-session-account` header, which the Worker always strips from
   client requests (the DO trusts it). Suspension and both switches work as
@@ -701,11 +711,19 @@ foreground, and show Update Required below it.
 KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
 var, then on; edge-cached 60 s). While it's on, converted routes also take
 the way they authenticated before sessions. Off, those requests get 426
-`upgrade_required`, `account/register` included.
+`upgrade_required`, `account/register` included, except the iOS
+Notification Service Extension's owner-signed Buddies `inbox/sync`
+(`x-buddies-client: notification-service`) for an inbox with a confirmed
+account link (see Buddies → Authentication).
 
 #### Turning off backward compatibility
 
 Do these in order. Each step takes up to 60 seconds to reach every colo.
+
+Pick `X.Y.Z` as the first version that opens sessions **and** whose
+Notification Service Extension sends `x-buddies-client: notification-service`
+on its `inbox/sync`. An older extension's fetch gets 426, so its named
+Buddies alerts for events too big for the push fall back to the template.
 
 ```bash
 # 1. Raise the app-wide floor to the first version that opens sessions, so

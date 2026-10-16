@@ -1,12 +1,14 @@
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   blobOfSize,
+  envelope,
   photoBlob,
   randomBytes,
   randomId,
   relayError,
   unsignedEnvelope,
   b64u,
+  type SigningKey,
 } from '../test/buddiesClient'
 import {
   BearerRelayOwner,
@@ -33,7 +35,8 @@ import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
  * proof → slot/add → a buddy's event/put → owner sync → blob put/get → the
  * live socket's hello, changed, and pong), the account checks
  * (`not_linked`, `forbidden`), a bad token, and the legacy switch refusing
- * legacy requests with 426 while bearer ones work.
+ * legacy requests with 426 while bearer ones work, except the iOS
+ * Notification Service Extension's signed sync for a confirmed inbox.
  */
 
 afterAll(() => {
@@ -232,6 +235,50 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch on Budd
       localKv('delete', 'auth:legacy')
     }
     expect((await legacy.send('inbox/delete')).status).toBe(200)
+  })
+
+  it('still serves the Notification Service Extension’s signed sync for a confirmed inbox', async () => {
+    const extension = { 'x-buddies-client': 'notification-service' }
+    const extensionSync = async (
+      who: { inboxId: string; key: SigningKey },
+      headers: Record<string, string> = extension,
+      op = 'inbox/sync'
+    ) =>
+      http('POST', `/buddies/v1/${op}`, {
+        body: await envelope(
+          op,
+          { inboxId: who.inboxId, since: 0, ts: Date.now(), nonce: randomId() },
+          who.key
+        ),
+        headers,
+      })
+    const owner = await BearerRelayOwner.create()
+    const writer = await owner.addWriter()
+    const unlinked = await RelayOwner.register()
+    try {
+      localKv('put', 'auth:legacy', 'off')
+      const served = await extensionSync(owner)
+      expect(served.status).toBe(200)
+      expect(served.body).toMatchObject({ ok: true, seq: 0 })
+      expect((served.body as { slots: unknown[] }).slots).toEqual([
+        expect.objectContaining({ slotId: writer.slotId }),
+      ])
+
+      expect(await extensionSync(owner, {})).toMatchObject({
+        status: 426,
+        body: relayError('upgrade_required'),
+      })
+      expect(await extensionSync(unlinked)).toMatchObject({
+        status: 426,
+        body: relayError('upgrade_required'),
+      })
+      expect((await extensionSync(owner, extension, 'inbox/delete')).status).toBe(426)
+      expect((await owner.sync()).status).toBe(200)
+    } finally {
+      localKv('delete', 'auth:legacy')
+    }
+    expect((await owner.op('inbox/delete')).status).toBe(200)
+    expect((await unlinked.send('inbox/delete')).status).toBe(200)
   })
 })
 
