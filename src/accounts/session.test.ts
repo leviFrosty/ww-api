@@ -98,9 +98,10 @@ describe('POST /sessions with the dev bypass', () => {
       sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
       accessExpiresAt: START + 15 * MINUTE,
-      refreshToken: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      refreshToken: `${session.sessionId}.${session.refreshToken.split('.')[1]}`,
       sessionExpiresAt: START + 90 * DAY,
     })
+    expect(session.refreshToken).toMatch(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/)
 
     // Only the account, platform, label, token hashes, and times.
     const [row] = sessionRows()
@@ -275,7 +276,9 @@ describe('POST /sessions/refresh', () => {
       ok: true,
       accessToken: expect.any(String),
       accessExpiresAt: Date.now() + 15 * MINUTE,
-      refreshToken: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      refreshToken: expect.stringMatching(
+        new RegExp(`^${session.sessionId}\\.[A-Za-z0-9_-]{43}$`)
+      ),
       sessionExpiresAt: session.sessionExpiresAt,
     })
     expect(first.body.refreshToken).not.toBe(session.refreshToken)
@@ -294,8 +297,9 @@ describe('POST /sessions/refresh', () => {
     advance(59 * SECOND)
     const retried = await refresh(session.refreshToken)
     expect(retried.status).toBe(200)
-    // The pair issued in between is gone; the retried one works.
-    expect((await refresh(rotated.body.refreshToken)).status).toBe(401)
+    // The pair issued in between is gone (presenting it would end the
+    // session); the retried one works.
+    expect(retried.body.refreshToken).not.toBe(rotated.body.refreshToken)
     const next = await refresh(retried.body.refreshToken)
     expect(next.status).toBe(200)
     expect((await refresh(next.body.refreshToken)).status).toBe(200)
@@ -323,7 +327,9 @@ describe('POST /sessions/refresh', () => {
   })
 
   it('refuses unknown and malformed tokens', async () => {
-    const unknown = await refresh(b64u(randomBytes(32)))
+    const unknown = await refresh(
+      `${b64u(randomBytes(16))}.${b64u(randomBytes(32))}`
+    )
     expect(unknown.status).toBe(401)
     expect(unknown.body).toEqual({
       ok: false,
@@ -361,6 +367,102 @@ describe('POST /sessions/refresh', () => {
     vi.setSystemTime(START + 90 * DAY)
     expect((await refresh(last.body.refreshToken)).status).toBe(401)
   })
+})
+
+/** Every statement the accounts database prepares from here on. */
+const recordQueries = () => {
+  const d1 = h.accountsDb!
+  const prepare = d1.prepare.bind(d1)
+  const queries: string[] = []
+  vi.spyOn(d1, 'prepare').mockImplementation((query: string) => {
+    queries.push(query)
+    return prepare(query)
+  })
+  return queries
+}
+
+const B64U_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+/** Flips the last character's lowest bit, a padding bit for 16 and 32 bytes. */
+const setPaddingBit = (value: string): string =>
+  value.slice(0, -1) + B64U_ALPHABET[B64U_ALPHABET.indexOf(value.at(-1)!) ^ 1]
+
+describe('refresh token reuse', () => {
+  it('ends the session when any older token comes back, at any time', async () => {
+    const session = await open()
+    const first = await refresh(session.refreshToken)
+    advance(10 * SECOND)
+    const second = await refresh(first.body.refreshToken)
+    expect(second.status).toBe(200)
+    // Still inside the first rotation's minute, but two tokens old.
+    advance(5 * SECOND)
+    expect(await refresh(session.refreshToken)).toMatchObject({
+      status: 401,
+      body: { code: 'unauthorized' },
+    })
+    expect(sessionRows()[0].revoked_at).toBe(Date.now())
+    expect((await refresh(second.body.refreshToken)).status).toBe(401)
+  })
+
+  it('ends the session for a token it never issued', async () => {
+    const session = await open()
+    const forged = `${session.sessionId}.${b64u(randomBytes(32))}`
+    expect((await refresh(forged)).status).toBe(401)
+    expect(sessionRows()[0].revoked_at).toBe(Date.now())
+    expect((await refresh(session.refreshToken)).status).toBe(401)
+  })
+
+  it('stores only hashes of whole tokens', async () => {
+    const session = await open()
+    const next = await refresh(session.refreshToken)
+    const stored = JSON.stringify(sessionRows())
+    for (const token of [session.refreshToken, next.body.refreshToken]) {
+      expect(stored).not.toContain(token)
+      expect(stored).not.toContain(token.split('.')[1])
+    }
+  })
+
+  it('refuses malformed tokens without reading or writing the database', async () => {
+    const session = await open()
+    const [sessionId, secret] = session.refreshToken.split('.')
+    const queries = recordQueries()
+    for (const token of [
+      secret,
+      b64u(randomBytes(32)),
+      `${sessionId}.${secret}.x`,
+      `${sessionId}${secret}`,
+      `${sessionId}.`,
+      `.${secret}`,
+      `${sessionId}.${secret}=`,
+      `${sessionId}.${secret.slice(0, -1)}`,
+      `${sessionId}.${b64u(randomBytes(33))}`,
+      `${b64u(randomBytes(15))}.${secret}`,
+      // Non-canonical: the same bytes, spelled with a padding bit set.
+      `${setPaddingBit(sessionId)}.${secret}`,
+      `${sessionId}.${setPaddingBit(secret)}`,
+      `${sessionId}.${secret.replace(/./, '+')}`,
+    ]) {
+      expect((await refresh(token)).status, token).toBe(401)
+    }
+    expect(queries, JSON.stringify(queries)).toEqual([])
+    expect(sessionRows()[0].revoked_at).toBeNull()
+    expect((await refresh(session.refreshToken)).status).toBe(200)
+  })
+
+  it('answers an unknown or ended session with 401 and writes nothing', async () => {
+    const session = await open()
+    expect((await close(bearer(session.accessToken))).status).toBe(200)
+    const row = sessionRows()[0]
+    const queries = recordQueries()
+    expect(
+      (await refresh(`${b64u(randomBytes(16))}.${b64u(randomBytes(32))}`))
+        .status
+    ).toBe(401)
+    expect((await refresh(session.refreshToken)).status).toBe(401)
+    expect(queries.every((query) => query.startsWith('select'))).toBe(true)
+    expect(sessionRows()[0]).toEqual(row)
+  })
+
 })
 
 describe('DELETE /sessions/current', () => {

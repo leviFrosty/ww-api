@@ -120,7 +120,10 @@ const handleOpen = guarded('session/open', async (c) => {
   )
 })
 
-/** `POST /sessions/refresh`: plain JSON `{ refreshToken }`, replaced every time. */
+/**
+ * `POST /sessions/refresh`: plain JSON `{ refreshToken }`, replaced every
+ * time. A malformed token is 401 before any database read.
+ */
 const handleRefresh = guarded('session/refresh', async (c) => {
   const setup = await ready(c)
   if ('refusal' in setup) return setup.refusal

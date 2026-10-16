@@ -1,16 +1,19 @@
 import { and, eq, isNull, lte, or, sql } from 'drizzle-orm'
-import { bytesToBase64Url, sha256Bytes } from '../crypto'
-import { ACCOUNT_LIMITS } from './contracts'
+import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
+import { ACCOUNT_LIMITS, type RefreshToken } from './contracts'
 import { accountSessions, type SessionPlatform } from './schema'
 import type { AccountsDb } from './store'
 
 /**
  * Session rows in the accounts database (`account_sessions`). A session is
  * live until it's revoked or reaches `expiresAt`, 90 days after it opened.
- * Only the SHA-256 of a refresh token is stored: the current one, and the one
- * it replaced, which still works for a minute after the rotation so a lost
- * response doesn't end the session. Presenting it later, or any other
- * replaced token, ends the session.
+ *
+ * Refresh tokens are `<sessionId>.<secret>` (opaque to the app), so a token
+ * names its session even after it was replaced. Only the SHA-256 of a whole
+ * token is stored: the current one, and the one it replaced, which still
+ * works for a minute after the rotation so a lost response doesn't end the
+ * session. Presenting it later, or any older token of a live session, ends
+ * the session.
  */
 
 const {
@@ -37,13 +40,20 @@ export interface IssuedSession {
 const randomBytes = (size: number): Uint8Array =>
   crypto.getRandomValues(new Uint8Array(size))
 
-const refreshHash = async (token: Uint8Array): Promise<string> =>
-  bytesToBase64Url(await sha256Bytes(token))
+const encoder = new TextEncoder()
 
-const newRefreshToken = async () => {
-  const bytes = randomBytes(32)
-  return { token: bytesToBase64Url(bytes), hash: await refreshHash(bytes) }
-}
+/** b64u SHA-256 of the whole token's UTF-8. */
+const refreshHash = async (token: string): Promise<string> =>
+  bytesToBase64Url(await sha256Bytes(encoder.encode(token)))
+
+const withHash = async (token: string) => ({
+  token,
+  hash: await refreshHash(token),
+})
+
+/** A refresh token for the session: a random secret. */
+const newRefreshToken = (sessionId: string) =>
+  withHash(`${sessionId}.${bytesToBase64Url(randomBytes(32))}`)
 
 /** Rows a D1 write changed (Drizzle hands back D1's result for writes). */
 const changes = (result: unknown): number =>
@@ -53,6 +63,8 @@ const sessionColumns = {
   id: accountSessions.id,
   accountId: accountSessions.accountId,
   platform: accountSessions.platform,
+  refreshHash: accountSessions.refreshHash,
+  previousRefreshHash: accountSessions.previousRefreshHash,
   expiresAt: accountSessions.expiresAt,
   revokedAt: accountSessions.revokedAt,
   rotatedAt: accountSessions.rotatedAt,
@@ -62,6 +74,8 @@ type SessionRow = {
   id: string
   accountId: string
   platform: SessionPlatform
+  refreshHash: string
+  previousRefreshHash: string | null
   expiresAt: Date
   revokedAt: Date | null
   rotatedAt: Date | null
@@ -91,7 +105,7 @@ export const createSession = async (
   now: number = Date.now()
 ): Promise<IssuedSession> => {
   const id = bytesToBase64Url(randomBytes(16))
-  const refresh = await newRefreshToken()
+  const refresh = await newRefreshToken(id)
   const expiresAt = now + sessionMs
   // Every live session but the newest `sessionsPerAccount` (this one among
   // them). `LIMIT -1` is SQLite's "no limit", which Drizzle can't spell.
@@ -135,10 +149,21 @@ const revoke = (db: AccountsDb, sessionId: string, now: number) =>
       and(eq(accountSessions.id, sessionId), isNull(accountSessions.revokedAt))
     )
 
+const findSession = async (
+  db: AccountsDb,
+  sessionId: string
+): Promise<SessionRow | undefined> =>
+  (await db
+    .select(sessionColumns)
+    .from(accountSessions)
+    .where(eq(accountSessions.id, sessionId))
+    .get()) as SessionRow | undefined
+
 /**
  * Replaces the session's refresh token. Null means 401 `unauthorized`: an
- * unknown token, an ended or expired session, or a replaced token presented
- * more than a minute after it was replaced, which also ends the session.
+ * unknown session, an ended or expired one, or a token the session replaced
+ * that isn't the one just replaced within its minute, which also ends the
+ * session.
  *
  * Within that minute the replaced token gets another new token, and the one
  * issued in between stops working; the minute still counts from the first
@@ -146,19 +171,15 @@ const revoke = (db: AccountsDb, sessionId: string, now: number) =>
  */
 export const refreshSession = async (
   db: AccountsDb,
-  token: Uint8Array,
+  presented: RefreshToken,
   now: number = Date.now()
 ): Promise<IssuedSession | null> => {
-  const hash = await refreshHash(token)
+  const hash = await refreshHash(presented.token)
+  let row = await findSession(db, presented.sessionId)
+  if (!row || !isLive(row, now)) return null
 
-  const current = (await db
-    .select(sessionColumns)
-    .from(accountSessions)
-    .where(eq(accountSessions.refreshHash, hash))
-    .get()) as SessionRow | undefined
-  if (current) {
-    if (!isLive(current, now)) return null
-    const next = await newRefreshToken()
+  if (timingSafeEqual(hash, row.refreshHash)) {
+    const next = await newRefreshToken(row.id)
     const rotated = await db
       .update(accountSessions)
       .set({
@@ -168,43 +189,42 @@ export const refreshSession = async (
       })
       .where(
         and(
-          eq(accountSessions.id, current.id),
+          eq(accountSessions.id, row.id),
           eq(accountSessions.refreshHash, hash),
           isNull(accountSessions.revokedAt)
         )
       )
     if (changes(rotated) === 1)
-      return { session: record(current), refreshToken: next.token }
+      return { session: record(row), refreshToken: next.token }
     // A concurrent refresh with the same token won; this one is now the
     // replaced token, answered below.
+    row = await findSession(db, presented.sessionId)
+    if (!row || !isLive(row, now)) return null
   }
 
-  const replaced = (await db
-    .select(sessionColumns)
-    .from(accountSessions)
-    .where(eq(accountSessions.previousRefreshHash, hash))
-    .get()) as SessionRow | undefined
-  if (!replaced) return null
+  const replaced =
+    row.previousRefreshHash != null &&
+    timingSafeEqual(hash, row.previousRefreshHash)
   const inGrace =
-    replaced.rotatedAt != null &&
-    now - replaced.rotatedAt.getTime() <= refreshGraceMs
-  if (!isLive(replaced, now) || !inGrace) {
-    await revoke(db, replaced.id, now)
+    row.rotatedAt != null && now - row.rotatedAt.getTime() <= refreshGraceMs
+  if (!replaced || !inGrace) {
+    // Replaced over a minute ago, or older still: someone kept a copy.
+    await revoke(db, row.id, now)
     return null
   }
-  const next = await newRefreshToken()
+  const next = await newRefreshToken(row.id)
   const reissued = await db
     .update(accountSessions)
     .set({ refreshHash: next.hash })
     .where(
       and(
-        eq(accountSessions.id, replaced.id),
+        eq(accountSessions.id, row.id),
         eq(accountSessions.previousRefreshHash, hash),
         isNull(accountSessions.revokedAt)
       )
     )
   return changes(reissued) === 1
-    ? { session: record(replaced), refreshToken: next.token }
+    ? { session: record(row), refreshToken: next.token }
     : null
 }
 

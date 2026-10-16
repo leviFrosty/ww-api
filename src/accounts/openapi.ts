@@ -817,14 +817,23 @@ const sessionAttestationErrorSchema = apiErrorSchema
       'The accounts error envelope (`error` repeats `code`) plus the attestation’s `reason` and `action`.',
   })
 
+/** Refresh tokens: `<sessionId>.<secret>`, b64u of 16 and 32 bytes. */
+const refreshTokenSchema = (description: string) =>
+  z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/)
+    .meta({
+      description: `${description}. Opaque to the app: the session’s id and a secret, \`<sessionId>.<secret>\` (base64url, 16 and 32 bytes); store and send it as is`,
+    })
+
 const tokenPair = {
   accessToken: z.string().meta({
     description:
       'A JWT (HS256) for `Authorization: Bearer`, opaque to the app. Keep it in memory only.',
   }),
   accessExpiresAt: epochMs('When the access token expires (15 minutes)'),
-  refreshToken: b64u(
-    'The session’s refresh token, 32 bytes. Keep it in the platform keystore, not synced; each refresh replaces it'
+  refreshToken: refreshTokenSchema(
+    'The session’s refresh token. Keep it in the platform keystore, not synced; each refresh replaces it'
   ),
   sessionExpiresAt: epochMs(
     'When the session ends (90 days after it opened; refreshing never extends it)'
@@ -911,13 +920,15 @@ ${fieldTable(playIntegritySessionAttestation)}`
 export const sessionRefreshDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Refresh a session',
-  description: `Plain JSON, no envelope: a new access token and a new refresh token, which replaces this one. Sending the refresh token just replaced again within 60 seconds (a lost response) gets a new pair; sending any older one ends the session. An ended or expired session is \`unauthorized\`: open a new one, attesting again, without asking the User.
+  description: `Plain JSON, no envelope: a new access token and a new refresh token, which replaces this one. Sending the refresh token just replaced again within 60 seconds (a lost response) gets a new pair; sending it later, or any older one, ends the session. An ended or expired session is \`unauthorized\`: open a new one, attesting again, without asking the User.
 
 A \`POST\` on the \`sessions\` collection rather than the session itself, since the refresh token, not an id in the URL, names the session.
 
 ${readTier}`,
   requestBody: jsonBody(
-    z.object({ refreshToken: b64u('The session’s current refresh token') })
+    z.object({
+      refreshToken: refreshTokenSchema('The session’s current refresh token'),
+    })
   ),
   responses: {
     200: jsonResponse(
@@ -926,7 +937,7 @@ ${readTier}`,
     ),
     400: errorResponse('Malformed JSON, or no `refreshToken`.', ['bad_request']),
     401: errorResponse(
-      'Unknown, replaced, ended, or expired: open a new session.',
+      'Malformed, unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session.',
       ['unauthorized']
     ),
     429: errorResponse('Over the per-caller rate.', ['rate_limited']),
