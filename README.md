@@ -153,24 +153,26 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 
 ### `/.well-known/apple-app-site-association`
 
-Serves the AASA JSON used by iOS to validate universal links for contact
-sharing. Lists the prod (`com.leviwilkerson.jwtime`), beta
-(`com.leviwilkerson.jwtimebeta`), and dev (`com.leviwilkerson.jwtimedev`) bundle
-IDs, prefixed with `APPLE_TEAM_ID`.
+Serves the AASA JSON used by iOS to validate universal links. Lists the prod
+(`com.leviwilkerson.jwtime`), beta (`com.leviwilkerson.jwtimebeta`), and dev
+(`com.leviwilkerson.jwtimedev`) bundle IDs, prefixed with `APPLE_TEAM_ID`.
 
-Matches `/c` with a non-empty fragment (`/c#<payload>`) and, for links shared
-by older app versions, any URL under `/c/*`.
+Matches `/contacts#<payload>`, `/buddies/invite#1…`, and
+`/accounts/handoff#1…`, plus the short paths older app versions put in links
+(`/c#<payload>`, any URL under `/c/*`, `/b#1…`, `/h#1…`). Those links are
+already in people's messages, so the short paths stay listed and served for
+good; dropping one would open its links in Safari instead of the app.
 
-### `/c`
+### `/contacts` (and the short `/c`)
 
 Universal-link landing page for shared WitnessWork contacts
-(`/c#<payload>`). iOS hands the link off to the WitnessWork app when
+(`/contacts#<payload>`). iOS hands the link off to the WitnessWork app when
 installed; otherwise this endpoint serves a fallback HTML page with an App
-Store CTA.
+Store CTA. `/c` serves the same page for links older app versions shared.
 
 The page, accessibility labels, and Open Graph/Twitter preview strings support
 the same 18 locales as `witness-work/src/lib/locales.ts`. Pass `?lang=pt-pt`
-before the fragment (`/c?lang=pt-pt#<payload>`) to choose a language explicitly;
+before the fragment (`/contacts?lang=pt-pt#<payload>`) to choose a language explicitly;
 otherwise the worker uses `Accept-Language` preferences, including quality
 weights, and defaults to English (`en-us`). Unsupported or malformed `lang`
 values fall back to browser preferences. Regional variants fall back to the
@@ -178,7 +180,8 @@ same language; Portuguese defaults to `pt-br`, and Chinese uses Simplified
 unless Traditional script or a Taiwan/Hong Kong/Macau region is requested.
 Responses include `Content-Language` and `Vary: Accept-Language`. Preview
 crawlers without a language preference receive English unless `lang` is set.
-The canonical `og:url` remains the bare `/c`, without language or contact data.
+The `og:url` is the bare page path (`/contacts` or `/c`), without language or
+contact data.
 The same localization rules apply to legacy `/c/:payload` links.
 
 The payload is an opaque gzip + base64url–encoded contact export produced by
@@ -192,6 +195,36 @@ Legacy links from older app versions, with the payload in the path. Serves the
 same page with a server-rendered "Open app" link; the payload stays out of
 `og:url` and the other meta tags, and Sentry events redact it to
 `/c/[redacted]`. The worker never decodes it.
+
+### Attestation (`/attestation/v1/*`)
+
+Device attestation for the whole API: App Attest on iOS, Play Integrity on
+Android. Code in `src/attestation/`.
+
+- **`POST /attestation/v1/challenge`** issues a one-time challenge: App Attest
+  v1 (empty body), App Attest v2 (`bind`, `enroll`, or `assert`), or Play
+  Integrity. v2 and Play Integrity challenges are bound to one protected
+  request: its `purpose`, ids, and hashes.
+- **`POST /attestation/v1/register`** binds an App Attest key to the install
+  id, or enrolls a v2 recovery token. Play Integrity has no registration step.
+- **`POST /attestation/v1/verify`** is an attested no-op for the app's
+  developer tools (purpose `attestation-verify`; the older
+  `notes-import-verify` is accepted too).
+- **`GET /attestation/v1/status`** lists the accepted providers (App Attest
+  always; Play Integrity once configured).
+
+Each protected route verifies an assertion signed for its own `purpose`
+(registry: `src/attestation/purposes.ts`). New routes call
+`requireAttestation` (`src/attestation/http.ts`), which takes App Attest v2 or
+Play Integrity. Purposes are signed by installed apps, so a shipped one is
+never renamed.
+
+The old paths `POST /notes-import/challenge`, `/notes-import/attest`, and
+`/notes-import/verify` run the same handlers for deployed apps, adding
+`Deprecation: @1792022400` (2026-10-15) and
+`Link: </attestation/v1/…>; rel="successor-version"`. Each hit logs
+`deprecated path: <old> -> <new>` (route names only). Remove them once the
+minimum app version uses the new paths and those logs go quiet.
 
 ### Notes Import (`/notes-import*`)
 
@@ -221,10 +254,11 @@ prevent fuzzy-name merges, and unnamed people identified by address retain
 their visits. Model logs include only routing, finish reason, and token/cache
 counts.
 
-Core routes (all rate-limited):
+Core routes (all rate-limited). Attestation (challenge, App Attest key
+registration, the verify probe) lives under `/attestation/v1/` (below); the
+old `POST /notes-import/challenge`, `/attest`, and `/verify` still serve the
+same handlers for deployed apps.
 
-- **`POST /notes-import/challenge`** → `{ challenge }`. One-time App Attest nonce.
-- **`POST /notes-import/attest`** performs the App Attest handshake.
 - **`POST /notes-import/kickoff`** starts a streaming run and returns its handle,
   capability token, and strict `credits` preview; `GET .../events` / `.../result`
   carry the terminal result and authoritative `credits` snapshot.
@@ -358,8 +392,8 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
 ```
 
 - `code` is always the stable, machine-readable code; read it first.
-- `error` is the same code everywhere except Notes Import and route planning,
-  where it stays a human-readable message for shipped builds.
+- `error` is the same code everywhere except attestation, Notes Import, and
+  route planning, where it stays a human-readable message for shipped builds.
 - Every 429 and 503 sends `Retry-After` (seconds) and repeats it as
   `retryAfter`, except quotas no wait can free (Notes Import's
   `limit_reached` and `refinement_limit`, Buddies' `limit`).
@@ -369,14 +403,16 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   keeps its fields and gains the envelope (`bad_request`, `not_found`,
   `rate_limited`, `upstream_error`). HERE unreachable or answering non-JSON is
   502 `upstream_error`.
-- The HTML pages (`/c`, `/c/:payload`, `/b`) are for browsers and always
+- The HTML pages (`/contacts`, `/buddies/invite`, `/accounts/handoff`, and
+  the short `/c`, `/c/:payload`, `/b`, `/h`) are for browsers and always
   answer 200.
 - `POST /buddies/v1/blob/get` answers a Buddies photo blob's raw bytes
   (`application/octet-stream`) on success; its errors use the envelope.
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
 bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
-`route-planning`, `admin` (`src/rateLimit.ts`). Refusals are 429
+`attestation`, `route-planning`, `admin` (`src/rateLimit.ts`). The old
+`/notes-import/*` attestation paths still count in `notes-import`. Refusals are 429
 `rate_limited` with `Retry-After: 60`.
 
 Unexpected errors are 500 `server_error` and are reported to Sentry.

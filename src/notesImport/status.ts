@@ -6,9 +6,10 @@ import {
   type NotesImportLimits,
 } from './config'
 import type { Environment } from '../types'
-import { APP_ATTEST_PROTOCOL_VERSION } from '../appAttest/protocol'
-import { playIntegrityConfig } from '../playIntegrity/config'
-import { PLAY_INTEGRITY_PROTOCOL_VERSION } from '../playIntegrity/protocol'
+import {
+  attestationProviders,
+  type AttestationProviders,
+} from '../attestation/providers'
 
 /** The KV subset this module uses — keeps it trivially mockable in tests. */
 export type StatusKv = Pick<KVNamespace, 'get' | 'put'>
@@ -63,18 +64,7 @@ type NotesImportStatusState =
   | { available: true; limits?: PublicNotesImportLimits }
   | { available: false; reason?: string }
 
-export interface NotesImportCapabilities {
-  appAttest: {
-    protocolVersions: readonly [1, typeof APP_ATTEST_PROTOCOL_VERSION]
-  }
-  /**
-   * Present only when this worker can verify Android requests (ADR 0017).
-   * Android keeps Notes Import closed while it is absent.
-   */
-  playIntegrity?: {
-    protocolVersions: readonly [typeof PLAY_INTEGRITY_PROTOCOL_VERSION]
-    cloudProjectNumber: string
-  }
+export interface NotesImportCapabilities extends AttestationProviders {
   /**
    * Import from Paper: `POST /notes-import/transcribe` reads one page image.
    * The app picks at most `maxPages` per batch and resizes each page to fit
@@ -96,24 +86,14 @@ export type NotesImportStatusResponse = NotesImportStatusState & {
   minAppVersion?: string
 }
 
-const notesImportCapabilities = (env: Environment): NotesImportCapabilities => {
-  const playIntegrity = playIntegrityConfig(env)
-  return {
-    appAttest: { protocolVersions: [1, APP_ATTEST_PROTOCOL_VERSION] },
-    transcribe: {
-      maxPages: TRANSCRIBE_MAX_PAGES,
-      maxBytes: resolveTranscribeMaxBytes(env),
-    },
-    ...(playIntegrity
-      ? {
-          playIntegrity: {
-            protocolVersions: [PLAY_INTEGRITY_PROTOCOL_VERSION],
-            cloudProjectNumber: playIntegrity.cloudProjectNumber,
-          },
-        }
-      : {}),
-  }
-}
+const notesImportCapabilities = (env: Environment): NotesImportCapabilities => ({
+  // Also at GET /attestation/v1/status; kept here for deployed apps.
+  ...attestationProviders(env),
+  transcribe: {
+    maxPages: TRANSCRIBE_MAX_PAGES,
+    maxBytes: resolveTranscribeMaxBytes(env),
+  },
+})
 
 const ENABLED_KEY = 'notes-import:enabled'
 const PROVIDER_CACHE_KEY = 'notes-import:provider-health'

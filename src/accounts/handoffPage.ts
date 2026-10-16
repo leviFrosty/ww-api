@@ -7,14 +7,15 @@ import {
 import { handoffPageTranslations } from './handoffPageLocales'
 
 /**
- * `GET /h`: the page a phone's camera opens for a Set Up Another Device QR
- * code (`https://ww-proxy.leviwilkerson.com/h#1<channel, key, secret>`)
+ * `GET /accounts/handoff` (and the short `/h`): the page a phone's camera
+ * opens for a Set Up Another Device QR code
+ * (`https://ww-proxy.leviwilkerson.com/accounts/handoff#1<channel, key, secret>`)
  * when WitnessWork doesn't catch the link. It says to install or open the app
  * on the new phone and scan the code from inside it.
  *
  * The handoff secret lives in the fragment, which browsers never send. The
  * page reads nothing from the request but the language (`?lang=` or
- * `Accept-Language`, as on `/c`), runs no script, and its CSP lets it load
+ * `Accept-Language`, as on `/contacts`), runs no script, and its CSP lets it load
  * nothing but its own icon, so it can't send the fragment anywhere.
  */
 
@@ -42,7 +43,13 @@ const escapeHtml = (value: string): string =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
 
-const renderPage = (locale: ContactLinkLocale): string => {
+const HANDOFF_PATH = '/accounts/handoff'
+const SHORT_HANDOFF_PATH = '/h'
+
+const renderPage = (
+  locale: ContactLinkLocale,
+  path: typeof HANDOFF_PATH | typeof SHORT_HANDOFF_PATH
+): string => {
   const messages = handoffPageTranslations[locale]
   const title = escapeHtml(messages.title)
   const description = escapeHtml(messages.description)
@@ -63,7 +70,7 @@ const renderPage = (locale: ContactLinkLocale): string => {
   <meta property="og:site_name" content="WitnessWork">
   <meta property="og:title" content="${title}">
   <meta property="og:description" content="${description}">
-  <meta property="og:url" content="${SITE_ORIGIN}/h">
+  <meta property="og:url" content="${SITE_ORIGIN}${path}">
   <meta property="og:image" content="${OG_IMAGE_URL}">
   <meta property="og:image:alt" content="${imageAlt}">
   <meta name="twitter:card" content="summary">
@@ -130,7 +137,9 @@ export const handleHandoffPage = (context: AppContext): Response => {
     context.req.query('lang'),
     context.req.header('Accept-Language')
   )
-  return context.html(renderPage(locale), 200, {
+  const path =
+    context.req.path === SHORT_HANDOFF_PATH ? SHORT_HANDOFF_PATH : HANDOFF_PATH
+  return context.html(renderPage(locale, path), 200, {
     'Cache-Control': 'public, max-age=3600',
     'Content-Language': locale,
     Vary: 'Accept-Language',

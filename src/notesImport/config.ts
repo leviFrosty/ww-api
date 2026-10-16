@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { Environment } from '../types'
+import { resolveDevBypassToken } from '../devBypass'
 
 /**
  * Environment-only Notes Import controls (model/provider, abuse ceilings,
@@ -421,21 +422,10 @@ export const limitsWindowDurationMs = (limits: NotesImportLimits): number => {
 
 const appAttestConfig = (
   env: Environment
-): Pick<NotesImportConfig, 'devBypassToken' | 'requireProduction'> => {
-  const token = env.NOTES_IMPORT_DEV_BYPASS_TOKEN?.trim() || null
-  if (env.APP_ATTEST_ENVIRONMENT === 'production') {
-    if (token) {
-      throw new Error(
-        'NOTES_IMPORT_DEV_BYPASS_TOKEN cannot be set in production'
-      )
-    }
-    return { devBypassToken: null, requireProduction: true }
-  }
-  if (env.APP_ATTEST_ENVIRONMENT === 'development') {
-    return { devBypassToken: token, requireProduction: false }
-  }
-  throw new Error('APP_ATTEST_ENVIRONMENT must be explicitly configured')
-}
+): Pick<NotesImportConfig, 'devBypassToken' | 'requireProduction'> => ({
+  devBypassToken: resolveDevBypassToken(env),
+  requireProduction: env.APP_ATTEST_ENVIRONMENT === 'production',
+})
 
 /** Read alone by the public status probe, which has no App Attest config. */
 export const resolveTranscribeMaxBytes = (env: Environment): number =>
