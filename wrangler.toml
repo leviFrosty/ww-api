@@ -291,7 +291,7 @@ NOTES_IMPORT_WINDOW_DAYS = "30"
 BUDDIES_ENABLED = "false"
 # Buddies photo blobs stay off in prod unless KV `buddies:photos` is "on"
 # (no BUDDIES_PHOTOS fallback here). Not inherited by [env.dev].
-# Android Notes Import via Play Integrity (witness-work ADR 0017; setup steps in
+# Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
 # endpoint advertises `capabilities.playIntegrity` only then. Not inherited by
