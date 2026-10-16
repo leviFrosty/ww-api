@@ -87,6 +87,34 @@ const niError = (description: string, codes: readonly string[]) =>
 const killSwitchUnavailable =
   '`unavailable`: the kill switch is off or no allowlisted model host is healthy (`detail` says which; `Retry-After: 60`). '
 
+// --- Bearer tokens and the legacy switch -----------------------------------
+
+/** A bearer token, or (while the legacy switch is on) none: the legacy form. */
+const bearerOrLegacy: Record<string, string[]>[] = [{ bearerAuth: [] }, {}]
+
+const BEARER_FORM =
+  '**Bearer** (`Authorization: Bearer <accessToken>`, from `POST /accounts/v1/sessions`): the session attested once, so the body carries no attestation fields and no hashes, and usage is metered by the token’s account (a fresh allowance: usage under an install id or shared account id doesn’t carry over). A request with an `Authorization` header is always a bearer request: a bad token is 401 `unauthorized`, never a fallback to the legacy form.'
+
+const LEGACY_FORM =
+  '**Legacy** (no `Authorization` header; app versions before sessions): the attested forms, metered by `accountId` or `uuid`. They work while the legacy switch (KV `auth:legacy`) is on and are 426 `upgrade_required` once it’s off.'
+
+const revenueCatAppUserId = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{8,64}$/)
+  .optional()
+  .meta({
+    description:
+      'Bearer only: the app’s RevenueCat app user id, checked with RevenueCat for Supporter status. Absent: not a Supporter. Temporary, until RevenueCat is linked to the account; a malformed value is a 400.',
+  })
+
+const upgradeRequired = niError(
+  'A legacy request (no `Authorization` header) after the legacy switch was turned off. No `Retry-After`: only updating the app helps.',
+  ['upgrade_required']
+)
+
+const accountsDisabled =
+  '`disabled`: account sessions are off on this worker (`Retry-After: 60`). '
+
 // --- GET /notes-import/status --------------------------------------------
 
 const allowancePair = z.object({
@@ -155,7 +183,7 @@ export const statusDocs = describeRoute({
 
 Availability checks the KV kill switch (\`notes-import:enabled\`) first, then whether any allowlisted model host is healthy on OpenRouter (a free metadata call, cached 60 seconds). Fails open: if the probe itself errors, the response says available without \`limits\`.
 
-Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`.`,
+Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`. Public and the same for everyone: it ignores \`Authorization\` and never reports one account’s allowance (kickoff’s \`credits\` does).`,
   responses: {
     200: jsonResponse('The current status.', statusSchema),
     ...rateLimitedResponse,
@@ -252,7 +280,19 @@ const v1ImportFields = {
   contentHash: notesContentHash.optional(),
 }
 
+const bearerImportFields = {
+  notesText: importBaseFields.notesText,
+  context: contextSchema,
+  refinement: refinementSchema,
+  revenueCatAppUserId,
+}
+
+const bearerImportSchema = z
+  .object(bearerImportFields)
+  .meta({ title: 'Bearer' })
+
 const kickoffRequestSchema = z.union([
+  bearerImportSchema,
   z
     .object({ ...importBaseFields, ...v1ImportFields })
     .meta({ title: 'App Attest v1 (legacy)' }),
@@ -263,7 +303,7 @@ const kickoffRequestSchema = z.union([
       contentHash: notesContentHash,
       requestHash: notesRequestHash,
     })
-    .meta({ title: 'App Attest v2' }),
+    .meta({ title: 'App Attest v2 (legacy)' }),
   z
     .object({
       ...importBaseFields,
@@ -271,7 +311,7 @@ const kickoffRequestSchema = z.union([
       contentHash: notesContentHash,
       requestHash: notesRequestHash,
     })
-    .meta({ title: 'Play Integrity' }),
+    .meta({ title: 'Play Integrity (legacy)' }),
 ])
 
 const successSchema = z
@@ -299,44 +339,53 @@ const successSchema = z
 
 const importGateErrors = (legacy: boolean) => ({
   400: niError(
-    legacy
-      ? 'Invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
-      : 'Invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).',
+    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, or an invalid \`revenueCatAppUserId\`. Legacy: ${
+      legacy
+        ? 'invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
+        : 'invalid JSON; missing `uuid`, `notesText`, or `context`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).'
+    }`,
     ['bad_request', 'attestation_failed']
   ),
   401: niError(
-    `No App Attest credentials (\`attestation_required\`, \`action: bind\`), or attestation failed. ${ATTESTATION_NOTE}`,
-    ['attestation_required', 'attestation_failed', ...V1_CODES]
+    `Bearer: the access token is missing, expired, or invalid (\`unauthorized\`, with \`WWW-Authenticate: Bearer error="invalid_token"\`; refresh once and retry). Legacy: no App Attest credentials (\`attestation_required\`, \`action: bind\`), or attestation failed. ${ATTESTATION_NOTE}`,
+    ['unauthorized', 'attestation_required', 'attestation_failed', ...V1_CODES]
   ),
   402: niError(
     'The import allowance for this window is used up. `credits` says when it resets; no `Retry-After`. Replays of already-imported content are free and never get this.',
     ['limit_reached']
   ),
-  ...(legacy
-    ? {}
-    : {
-        403: attestationResponses[403],
-        409: attestationResponses[409],
-      }),
+  403: niError(
+    legacy
+      ? 'Bearer: the account is suspended.'
+      : 'Bearer: the account is suspended (`suspended`). Legacy, Play Integrity only: the app isn’t the Play-distributed build (`app_not_recognized`) or the device fails the required integrity verdict (`device_integrity_failed`).',
+    legacy ? ['suspended'] : ['suspended', 'attestation_failed']
+  ),
+  ...(legacy ? {} : { 409: attestationResponses[409] }),
   413: niError('`notesText` is over the character limit.', ['too_large']),
   429: niError(
     'Too many requests from this IP (`rate_limited`, `Retry-After: 60`); this content’s refinement allowance is used up (`refinement_limit`, with `credits`, no `Retry-After`; it never resets); or this user already has the maximum imports running (`active_cap`, 2 free / 5 Supporter by default, `Retry-After: 15`).',
     ['rate_limited', 'refinement_limit', 'active_cap']
   ),
+  426: upgradeRequired,
 })
 
-const GATE_DESCRIPTION = `**Gate**, in order: the kill switch and provider health (503 \`unavailable\`), body checks, the content and request hashes, attestation (or the dev bypass), Supporter status from RevenueCat on \`accountId\` or \`uuid\` (an outage counts as free), then the allowance. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.`
+const GATE_DESCRIPTION = `**Gate**, in order: the access token and account (bearer) or the legacy switch (legacy), the kill switch and provider health (503 \`unavailable\`), body checks, then for legacy requests the content and request hashes and attestation (or the dev bypass), Supporter status from RevenueCat (an outage counts as free), then the allowance. Bearer requests ask RevenueCat about \`revenueCatAppUserId\` (none: free); legacy requests about \`accountId\` or \`uuid\`. A bearer \`dev\` session (dev worker only) gets the dev bypass’s unlimited allowances. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.
+
+${BEARER_FORM}
+
+${LEGACY_FORM}`
 
 export const kickoffDocs = describeRoute({
   tags: [TAG],
   summary: 'Start a streaming import',
-  description: `The attested, metered entry point. Starts the model run in a per-import Durable Object and returns at once with an \`importId\` and a \`subscribeToken\` for \`GET /notes-import/{importId}/events\`, \`/result\`, \`/cancel\`, and \`/destroy\`.
+  description: `The authenticated, metered entry point. Starts the model run in a per-import Durable Object and returns at once with an \`importId\` for \`GET /notes-import/{importId}/events\`, \`/result\`, \`/cancel\`, and \`/destroy\`. A bearer request calls those with the same access token; a legacy request gets a \`subscribeToken\` for them.
 
 ${GATE_DESCRIPTION}
 
-The \`importId\` is derived from the user and the content (plus the refinement instruction), so kicking off the same notes again reconnects to the same run instead of starting another; a run that failed restarts. The subscribe token lasts 1 hour, and a finished result is kept for 1 hour.
+The \`importId\` is derived from the user (the account, on bearer requests) and the content (plus the refinement instruction), so kicking off the same notes again reconnects to the same run instead of starting another; a run that failed restarts. The subscribe token lasts 1 hour, and a finished result is kept for 1 hour.
 
 \`credits\` is a point-in-time preview and may differ from the terminal snapshot on \`done\`.`,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(kickoffRequestSchema),
   responses: {
@@ -349,9 +398,9 @@ The \`importId\` is derived from the user and the content (plus the refinement i
           .meta({
             description: 'The run’s id, stable per user and content.',
           }),
-        subscribeToken: z.string().meta({
+        subscribeToken: z.string().optional().meta({
           description:
-            'Capability for this import’s stream, result, cancel, and destroy routes (`?token=`). Expires after 1 hour.',
+            'Legacy requests only: the capability for this import’s stream, result, cancel, and destroy routes (`?token=`). Expires after 1 hour. A bearer response has none; those routes take the access token.',
         }),
         refinement: z.boolean(),
         credits: creditsSchema,
@@ -359,25 +408,29 @@ The \`importId\` is derived from the user and the content (plus the refinement i
     ),
     ...importGateErrors(false),
     500: niError('The run could not be started.', ['server_error']),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
 export const legacyImportDocs = describeRoute({
   tags: [TAG],
   summary: 'Import notes synchronously (legacy)',
-  description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
+  description: `The original path, kept as a fallback: holds the request open for the whole model run (often over a minute) and returns the result in one response. Bearer requests take the same body as kickoff’s. Legacy requests are App Attest v1 only; v2 and Play Integrity bodies are refused (use \`POST /notes-import/kickoff\`).
 
 ${GATE_DESCRIPTION} The same concurrency cap as kickoff applies.`,
   deprecated: true,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(
-    z
-      .object({ ...importBaseFields, ...v1ImportFields })
-      .meta({ title: 'App Attest v1' })
+    z.union([
+      bearerImportSchema,
+      z
+        .object({ ...importBaseFields, ...v1ImportFields })
+        .meta({ title: 'App Attest v1 (legacy)' }),
+    ])
   ),
   responses: {
     200: jsonResponse('The finished import.', successSchema),
@@ -386,10 +439,10 @@ ${GATE_DESCRIPTION} The same concurrency cap as kickoff applies.`,
     502: niError('The model failed or returned an invalid result.', [
       'model_error',
     ]),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
@@ -414,22 +467,34 @@ export const transcribeDocs = describeRoute({
   summary: 'Read a photographed page',
   description: `Import from Paper: reads one page image into plain text with a vision model on the zero-data-retention allowlist. Nothing is stored. The app shows the text for editing, then imports it through \`POST /notes-import/kickoff\`, which is where an import is used.
 
-App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.`,
+Bearer requests send just \`image\`, \`mimeType\`, and optionally \`revenueCatAppUserId\`, and are metered by the token’s account. Legacy requests take App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.
+
+${BEARER_FORM}
+
+${LEGACY_FORM}`,
+  security: bearerOrLegacy,
   parameters: [devBypassHeader],
   requestBody: jsonBody(
     z.union([
       z
         .object({
+          image: transcribeBaseFields.image,
+          mimeType: transcribeBaseFields.mimeType,
+          revenueCatAppUserId,
+        })
+        .meta({ title: 'Bearer' }),
+      z
+        .object({
           ...transcribeBaseFields,
           ...appAttestV2AssertionFields('notes-import-transcribe'),
         })
-        .meta({ title: 'App Attest v2' }),
+        .meta({ title: 'App Attest v2 (legacy)' }),
       z
         .object({
           ...transcribeBaseFields,
           ...playIntegrityFields('notes-import-transcribe'),
         })
-        .meta({ title: 'Play Integrity' }),
+        .meta({ title: 'Play Integrity (legacy)' }),
     ])
   ),
   responses: {
@@ -447,33 +512,38 @@ App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 i
       })
     ),
     400: niError(
-      'Invalid JSON; missing `uuid` or `image`; an unsupported `mimeType`; an invalid `accountId`; an image that isn’t base64 of the declared type; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
+      'Invalid JSON; missing `image`; an unsupported `mimeType`; an image that isn’t base64 of the declared type. Bearer: an invalid `revenueCatAppUserId`. Legacy: missing `uuid`; an invalid `accountId`; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
       ['bad_request', 'attestation_failed']
     ),
-    401: niError(`Attestation failed. ${ATTESTATION_NOTE}`, [
-      'attestation_failed',
-    ]),
+    401: niError(
+      `Bearer: the access token is missing, expired, or invalid (\`unauthorized\`, with \`WWW-Authenticate\`). Legacy: attestation failed. ${ATTESTATION_NOTE}`,
+      ['unauthorized', 'attestation_failed']
+    ),
     402: niError(
       'A free user with no imports left in this window (with `credits`).',
       ['limit_reached']
     ),
-    403: attestationResponses[403],
+    403: niError(
+      'Bearer: the account is suspended (`suspended`). Legacy, Play Integrity only: the app isn’t the Play-distributed build or the device fails the required integrity verdict.',
+      ['suspended', 'attestation_failed']
+    ),
     409: attestationResponses[409],
     413: niError('The decoded image is over the byte limit.', ['too_large']),
     429: niError(
       'Too many requests from this IP (`rate_limited`, `Retry-After: 60`), or the daily page limit is reached (`transcribe_limit`, `Retry-After` until the oldest page ages out).',
       ['rate_limited', 'transcribe_limit']
     ),
+    426: upgradeRequired,
     500: niError('Unexpected failure.', ['server_error']),
     502: niError('The vision model couldn’t read the page.', ['model_error']),
-    503: niError(`${killSwitchUnavailable}${storageUnavailable}`, [
-      'unavailable',
-      'server_error',
-    ]),
+    503: niError(
+      `${killSwitchUnavailable}${accountsDisabled}${storageUnavailable}`,
+      ['unavailable', 'disabled', 'server_error']
+    ),
   },
 })
 
-// --- Run routes (subscribe-token capability) ---------------------------------
+// --- Run routes (bearer token, or the legacy subscribe token) ---------------
 
 const importIdParameter = {
   name: 'importId',
@@ -486,23 +556,29 @@ const importIdParameter = {
 const tokenParameter = {
   name: 'token',
   in: 'query' as const,
-  required: true,
+  required: false,
   schema: { type: 'string' as const },
   description:
-    'The `subscribeToken` from kickoff. It must have been issued for this `importId`; it expires after 1 hour.',
+    'Legacy requests only (required there): the `subscribeToken` from kickoff. It must have been issued for this `importId`; it expires after 1 hour. A bearer request never reads it.',
 }
 
 const runAuthErrors = {
-  400: niError('Missing `token`.', ['bad_request']),
+  400: niError('Legacy: missing `token`.', ['bad_request']),
   401: niError(
-    'The token is unknown, expired, or for another import. Kick off again for a fresh one.',
-    ['attestation_required']
+    'Bearer: the access token is missing, expired, or invalid (`unauthorized`, with `WWW-Authenticate`; refresh once and retry). Legacy: the subscribe token is unknown, expired, or for another import (`attestation_required`); kick off again for a fresh one.',
+    ['unauthorized', 'attestation_required']
   ),
+  404: niError(
+    'Bearer: no import with this id belongs to the token’s account. Another account’s import, an unknown id, and one deleted or past its 1-hour retention all get this same answer. Kick off again to run the notes anew.',
+    ['not_found']
+  ),
+  426: upgradeRequired,
   ...rateLimitedResponse,
+  503: niError(accountsDisabled, ['disabled']),
 }
 
 const RUN_AUTH =
-  'Authorized by the kickoff’s `subscribeToken` instead of attestation: this route can’t spend inference.'
+  'This route can’t spend inference, so it needs no attestation. **Bearer:** the access token of the account that kicked the import off (a suspended account still may). **Legacy:** the kickoff’s `subscribeToken` as `?token=`, while the legacy switch is on.'
 
 const importStatus = z
   .enum([
@@ -559,6 +635,7 @@ Each frame has an \`event:\` line naming the type and a \`data:\` line with the 
 | \`cancelled\` | \`{ "type": "cancelled" }\` (never charged) | yes, terminal |
 
 The stream is for showing progress; the result is read only from \`done\` or \`GET /notes-import/{importId}/result\`.`,
+  security: bearerOrLegacy,
   parameters: [
     importIdParameter,
     tokenParameter,
@@ -598,6 +675,7 @@ export const resultDocs = describeRoute({
   tags: [TAG],
   summary: 'Get an import’s result',
   description: `The run’s current state and, once finished, its result, for a client that reconnects after the stream closed or missed the terminal event. ${RUN_AUTH} Results are kept for 1 hour after the run ends.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('The run’s snapshot.', snapshotSchema),
@@ -611,6 +689,7 @@ export const cancelDocs = describeRoute({
   description: `Stops a queued or running import: aborts the model call, frees the concurrency slot, and ends the stream with \`cancelled\`. A cancelled run is never charged. ${RUN_AUTH}
 
 No-op once the run has ended. If the run is already settling its result, cancel waits and returns \`done\` instead. Used by the app’s “edit & resend” flow.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('The run’s snapshot after the cancel.', snapshotSchema),
@@ -621,7 +700,8 @@ No-op once the run has ended. If the run is already settling its result, cancel 
 export const destroyDocs = describeRoute({
   tags: [TAG],
   summary: 'Delete an import',
-  description: `Forgets a run now instead of after its retention: aborts any model call (uncharged), frees the concurrency slot, closes the stream, and deletes all stored state, the result included. Idempotent. ${RUN_AUTH} Backs the history view’s delete.`,
+  description: `Forgets a run now instead of after its retention: aborts any model call (uncharged), frees the concurrency slot, closes the stream, and deletes all stored state, the result included. Idempotent for legacy requests; a bearer request for an import already deleted is 404 \`not_found\`, which means the same thing. ${RUN_AUTH} Backs the history view’s delete.`,
+  security: bearerOrLegacy,
   parameters: [importIdParameter, tokenParameter],
   responses: {
     200: jsonResponse('Deleted.', z.object({ ok: z.literal(true) })),
