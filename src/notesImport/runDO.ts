@@ -38,10 +38,11 @@ import {
 export interface StartImportInput {
   importId: string
   /**
-   * The METER identity, not necessarily the device's install uuid: the shared
-   * account id when the client sent one (ADR 0011), else the install uuid.
-   * Only ever used to name the per-user index DO (slot release + credit
-   * commit), so it must match whatever identity the kickoff acquired under.
+   * The METER identity, not necessarily the device's install uuid: the
+   * session's account id on a bearer run, else the shared account id when the
+   * client sent one (ADR 0011), else the install uuid. Names the per-user
+   * index DO (slot release + credit commit), so it must match whatever
+   * identity the kickoff acquired under.
    */
   uuid: string
   contentHash: string
@@ -55,6 +56,16 @@ export interface StartImportInput {
   decision: CreditDecision
   /** Usage-event context; absent on runs kicked off before analytics shipped. */
   analytics?: NotesImportAnalyticsContext
+  /**
+   * Set on runs started with an account session's bearer token; absent on
+   * legacy runs. `uuid` is then the account id.
+   */
+  account?: {
+    /** `importOwnerKey(accountId)`, kept as the run's owner until it's deleted. */
+    ownerKey: string
+    /** The RevenueCat app user id the kickoff named, or null (not a Supporter). */
+    revenueCatAppUserId: string | null
+  }
 }
 
 export interface RunResultSnapshot {
@@ -156,11 +167,25 @@ export class NotesImportRun extends DurableObject<Environment> {
     this.#ensureSchema()
     this.ctx.storage.sql.exec('DELETE FROM events')
     this.#metaSet('input', JSON.stringify(input))
+    // The owner outlives `input` (dropped once terminal): bearer routes check
+    // it for as long as the result is kept.
+    if (input.account) this.#metaSet('owner', input.account.ownerKey)
+    else this.#metaDel('owner')
     this.#metaDel('result')
     this.#metaDel('error')
     this.#setStatus('queued')
     await this.ctx.storage.setAlarm(Date.now())
     return 'started'
+  }
+
+  /**
+   * Whether a bearer request for `ownerKey`'s account may use this import:
+   * only a run that account started, until the run is deleted. A read, so
+   * asking about an unknown import stores nothing.
+   */
+  isOwnedBy(ownerKey: string): boolean {
+    const owner = this.#metaGet('owner')
+    return owner != null && owner === ownerKey
   }
 
   /** Snapshot for a client that reconnects after the live stream has closed. */
@@ -339,6 +364,10 @@ export class NotesImportRun extends DurableObject<Environment> {
         apiKey: this.env.REVENUECAT_API_KEY,
         appUserId: input.uuid,
         entitlementId: config.entitlementId,
+        account: input.account && {
+          accountId: input.uuid,
+          revenueCatAppUserId: input.account.revenueCatAppUserId,
+        },
       })
       const limits = await resolveNotesImportLimits(this.env, this.env.NOTES_KV)
       const allowances = selectEffectiveAllowances(

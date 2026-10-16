@@ -89,9 +89,34 @@ describe('admin Notes Import usage reset', () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain(VALID_METER)
     log.mockRestore()
   })
+
+  it('takes an account id, the meter of bearer requests', async () => {
+    const { deps, indexFor } = makeDeps()
+    // A server account id: 22 base64url characters, `-` and `_` included.
+    const accountId = 'Ab-9_xYz01234567890aBc'
+    await expect(
+      handleAdminResetRequest(
+        request('correct-token', { meterId: accountId }),
+        deps
+      ).then(responseBody)
+    ).resolves.toEqual({ status: 200, body: { ok: true } })
+    expect(indexFor).toHaveBeenCalledWith(accountId)
+    vi.restoreAllMocks()
+  })
 })
 
 describe('admin reset CLI target selection', () => {
+  it('accepts an account id', async () => {
+    const { resolveResetCommand } = await import(
+      '../../scripts/reset-notes-import-usage.mjs'
+    )
+    expect(
+      resolveResetCommand(['Ab-9_xYz01234567890aBc'], {
+        ADMIN_API_TOKEN: 'prod-token',
+      }).meterId
+    ).toBe('Ab-9_xYz01234567890aBc')
+  })
+
   it('selects production URL and token by default', async () => {
     const { resolveResetCommand } = await import(
       '../../scripts/reset-notes-import-usage.mjs'
