@@ -5,12 +5,18 @@ import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
 import { retryAfterHeaders } from '../errors'
 import { isSupporter, RevenueCatError } from '../revenuecat'
+import { authenticateAccount, hasAuthorization } from '../accounts/auth'
+import { isLegacyAuthEnabled } from '../accounts/legacySwitch'
+import { BEARER_CHALLENGE } from '../buddies/errorResponse'
+import { isAccountSupporter } from '../accounts/supporter'
 import {
   ROUTE_PLANNING_LIMITS as LIMITS,
   isRouteDevBypass,
   isRoutePlanningEnabled,
 } from './config'
 import {
+  type Coordinate,
+  routeOptimizeBearerRequestSchema,
   routeOptimizeRequestSchema,
   type RouteOptimizeErrorCode,
   type RouteOptimizeErrorResponse,
@@ -24,8 +30,15 @@ import { routeOptimizeDocs } from './openapi'
  * today's stops. Fails closed: a non-Supporter, an unknown account, or a failed
  * RevenueCat check never reaches HERE.
  *
- * Privacy: the body holds an account id and bare coordinates. Nothing here
- * logs or reports either; HERE receives only the coordinates.
+ * A bearer request (witness-work ADR 0029) is the token's account: Supporter
+ * status is the account's (`isAccountSupporter`), limits are the account's,
+ * and a suspended account is refused. Without an `Authorization` header it's
+ * the legacy form, whose body names the RevenueCat app user id, served while
+ * the legacy switch is on and 426 `upgrade_required` once it's off.
+ *
+ * Privacy: the body holds bare coordinates (and, legacy, an app user id).
+ * Nothing here logs or reports them, the token, or the account id; HERE
+ * receives only the coordinates.
  */
 
 /**
@@ -38,12 +51,14 @@ const uninstrumentedFetch: typeof fetch = globalThis.fetch.bind(globalThis)
 export interface RoutePlanningDependencies {
   fetch: typeof fetch
   checkSupporter: typeof isSupporter
+  checkAccountSupporter: typeof isAccountSupporter
   now: () => number
 }
 
 const defaultDependencies: RoutePlanningDependencies = {
   fetch: uninstrumentedFetch,
   checkSupporter: isSupporter,
+  checkAccountSupporter: isAccountSupporter,
   now: () => Date.now(),
 }
 
@@ -67,8 +82,24 @@ const fail = (
   return ctx.json(body, status, retryAfterHeaders(retryAfterSeconds))
 }
 
-const quota = (env: Environment, accountId: string) =>
-  env.ROUTE_PLANNING_QUOTA.get(env.ROUTE_PLANNING_QUOTA.idFromName(accountId))
+/**
+ * One quota object per caller: `account:<accountId>` for a bearer request
+ * (so no app user id can share it), the app user id for a legacy one.
+ */
+const quota = (env: Environment, name: string) =>
+  env.ROUTE_PLANNING_QUOTA.get(env.ROUTE_PLANNING_QUOTA.idFromName(name))
+
+const AUTH_REFUSALS = {
+  unauthorized: [HTTP_STATUS.UNAUTHORIZED, 'Sign in again'],
+  suspended: [HTTP_STATUS.FORBIDDEN, 'This account is suspended'],
+  disabled: [HTTP_STATUS.SERVICE_UNAVAILABLE, 'Accounts are unavailable'],
+  internal: [HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Something went wrong'],
+} as const
+
+/** Who's asking: the session's account, or a legacy request's app user id. */
+type Caller =
+  | { kind: 'bearer'; accountId: string; devSession: boolean }
+  | { kind: 'legacy' }
 
 export const createRoutePlanningRoutes = (
   overrides: Partial<RoutePlanningDependencies> = {}
@@ -85,6 +116,46 @@ export const createRoutePlanningRoutes = (
         'Route planning is unavailable',
         UNAVAILABLE_RETRY_AFTER_SECONDS
       )
+    }
+
+    let caller: Caller
+    if (hasAuthorization(ctx)) {
+      const auth = await authenticateAccount(ctx, { requireActive: true })
+      if (!auth.ok) {
+        const [status, message] = AUTH_REFUSALS[auth.error]
+        const response = fail(
+          ctx,
+          status,
+          auth.error,
+          message,
+          auth.error === 'disabled'
+            ? UNAVAILABLE_RETRY_AFTER_SECONDS
+            : undefined
+        )
+        if (auth.error === 'unauthorized')
+          response.headers.set('WWW-Authenticate', BEARER_CHALLENGE)
+        return response
+      }
+      caller = {
+        kind: 'bearer',
+        accountId: auth.account.accountId,
+        // A `dev` session (dev worker, bypass token set) skips the Supporter
+        // check, as the legacy bypass header does; production has none.
+        devSession:
+          auth.account.platform === 'dev' &&
+          ctx.env.APP_ATTEST_ENVIRONMENT === 'development' &&
+          !!ctx.env.NOTES_IMPORT_DEV_BYPASS_TOKEN?.trim(),
+      }
+    } else {
+      if (!(await isLegacyAuthEnabled(ctx.env))) {
+        return fail(
+          ctx,
+          426 as ContentfulStatusCode,
+          'upgrade_required',
+          'Update WitnessWork to plan routes'
+        )
+      }
+      caller = { kind: 'legacy' }
     }
 
     const declaredLength = Number(ctx.req.header('content-length') ?? 0)
@@ -111,20 +182,51 @@ export const createRoutePlanningRoutes = (
     } catch {
       return fail(ctx, HTTP_STATUS.BAD_REQUEST, 'bad_request', 'Invalid JSON')
     }
-    const parsed = routeOptimizeRequestSchema.safeParse(json)
-    if (!parsed.success) {
-      return fail(ctx, HTTP_STATUS.BAD_REQUEST, 'bad_request', 'Invalid request')
+    let request: { start: Coordinate; stops: Coordinate[]; quotaName: string }
+    if (caller.kind === 'bearer') {
+      const parsed = routeOptimizeBearerRequestSchema.safeParse(json)
+      if (!parsed.success) {
+        return fail(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'bad_request',
+          'Invalid request'
+        )
+      }
+      request = { ...parsed.data, quotaName: `account:${caller.accountId}` }
+    } else {
+      const parsed = routeOptimizeRequestSchema.safeParse(json)
+      if (!parsed.success) {
+        return fail(
+          ctx,
+          HTTP_STATUS.BAD_REQUEST,
+          'bad_request',
+          'Invalid request'
+        )
+      }
+      const { accountId, ...route } = parsed.data
+      request = { ...route, quotaName: accountId }
     }
-    const { accountId, start, stops } = parsed.data
+    const { start, stops, quotaName } = request
 
-    if (!isRouteDevBypass(ctx.env, ctx.req.header('x-ww-dev-bypass'))) {
+    const bypass =
+      caller.kind === 'bearer'
+        ? caller.devSession
+        : isRouteDevBypass(ctx.env, ctx.req.header('x-ww-dev-bypass'))
+    if (!bypass) {
       let supporter: boolean
       try {
-        supporter = await deps.checkSupporter({
-          apiKey: ctx.env.REVENUECAT_API_KEY,
-          appUserId: accountId,
-          fetchImpl: deps.fetch,
-        })
+        supporter =
+          caller.kind === 'bearer'
+            ? await deps.checkAccountSupporter(ctx.env, caller.accountId, {
+                fetch: deps.fetch,
+                now: deps.now,
+              })
+            : await deps.checkSupporter({
+                apiKey: ctx.env.REVENUECAT_API_KEY,
+                appUserId: quotaName,
+                fetchImpl: deps.fetch,
+              })
       } catch (error) {
         if (!(error instanceof RevenueCatError)) Sentry.captureException(error)
         return fail(
@@ -145,7 +247,7 @@ export const createRoutePlanningRoutes = (
       }
     }
 
-    const decision = await quota(ctx.env, accountId).consume({
+    const decision = await quota(ctx.env, quotaName).consume({
       nowMs: deps.now(),
       dailyLimit: LIMITS.dailyLimit,
       minuteLimit: LIMITS.minuteLimit,
