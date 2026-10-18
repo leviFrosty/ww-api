@@ -138,6 +138,18 @@ export const BUDDIES_ALWAYS_ALLOWED_OPS: ReadonlySet<BuddiesOp> = new Set([
   'slot/leave',
 ])
 
+/**
+ * Ops that reach someone else's inbox, refused with 403 `suspended` on a
+ * bearer request from a suspended account: the Worker checks the token's
+ * account status (cached 30 seconds per isolate), so no inbox learns which
+ * account holds which slot. Leaving (`slot/leave`) and reads stay open. The
+ * account's own inbox refuses its owner ops by its copy of the status, and
+ * `inbox/register` checks the database. A legacy request carries no account,
+ * so its writer ops can't be refused.
+ */
+export const BUDDIES_SUSPENDED_REFUSED_OPS: ReadonlySet<BuddiesRouteOp> =
+  new Set(['card/put', 'event/put', 'invite/claim'])
+
 export const BUDDIES_ERROR_STATUS = {
   bad_request: 400,
   bad_signature: 401,
@@ -164,7 +176,10 @@ export const BUDDIES_ERROR_STATUS = {
   photos_disabled: 503,
   /** `blob/put` from an inbox with no buddies: nobody could read the photo. */
   no_buddies: 403,
-  /** The inbox's account is suspended: every owner op is refused. */
+  /**
+   * The inbox's account is suspended (every owner op but leaving is refused),
+   * or a bearer request's own account is (`BUDDIES_SUSPENDED_REFUSED_OPS`).
+   */
   suspended: 403,
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,

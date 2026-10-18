@@ -45,9 +45,15 @@ export type AccountAuthError =
   | 'disabled'
   | 'internal'
 
+export type AccountAuthRefusal = {
+  ok: false
+  error: AccountAuthError
+  response: Response
+}
+
 export type AccountAuthResult =
   | { ok: true; account: AccountAuth }
-  | { ok: false; error: AccountAuthError; response: Response }
+  | AccountAuthRefusal
 
 export interface RequireAccountOptions {
   /**
@@ -77,6 +83,15 @@ const statusCache = new Map<string, { status: AccountStatus; at: number }>()
 /** Clears the per-isolate status cache (tests). */
 export const resetAccountStatusCache = (): void => statusCache.clear()
 
+/**
+ * Drops one account's cached status, so a change the admin route just made
+ * applies at once in this isolate (others catch up within the cache's 30
+ * seconds).
+ */
+export const forgetAccountStatus = (accountId: string): void => {
+  statusCache.delete(accountId)
+}
+
 /** The account's status, or null when it no longer exists. */
 const accountStatus = async (
   env: Environment,
@@ -94,7 +109,9 @@ const accountStatus = async (
   return account.status
 }
 
-const refuse = (error: AccountAuthError): AccountAuthResult => ({
+const refuse = (
+  error: AccountAuthError
+): AccountAuthRefusal => ({
   ok: false,
   error,
   response:
@@ -102,6 +119,31 @@ const refuse = (error: AccountAuthError): AccountAuthResult => ({
       ? buddiesInternalError()
       : buddiesErrorResponse(error),
 })
+
+/**
+ * `requireActive` on its own, for a caller `authenticateAccount` already
+ * verified: null for an active account, else the refusal (403 `suspended`,
+ * 401 `unauthorized` for an account that no longer exists, 503 `disabled`
+ * without the accounts database, or 500 `internal`). Buddies uses it for the
+ * ops that reach other people's inboxes.
+ */
+export const refuseInactiveAccount = async (
+  env: Environment,
+  account: AccountAuth
+): Promise<AccountAuthRefusal | null> => {
+  if (!env.ACCOUNTS_DB) return refuse('disabled')
+  let status: AccountStatus | null
+  try {
+    status = await accountStatus(env, account.accountId, Date.now())
+  } catch (error) {
+    console.error('accounts: status read failed')
+    captureFailure(error, 'account status')
+    return refuse('internal')
+  }
+  if (status == null) return refuse('unauthorized')
+  if (status === 'suspended') return refuse('suspended')
+  return null
+}
 
 /** True when the request has an `Authorization` header: a bearer request. */
 export const hasAuthorization = (c: AppContext): boolean =>
@@ -147,17 +189,8 @@ export const authenticateAccount = async (
     if (!live) return refuse('unauthorized')
   }
   if (options.requireActive) {
-    if (!c.env.ACCOUNTS_DB) return refuse('disabled')
-    let status: AccountStatus | null
-    try {
-      status = await accountStatus(c.env, account.accountId, Date.now())
-    } catch (error) {
-      console.error('accounts: status read failed')
-      captureFailure(error, 'account status')
-      return refuse('internal')
-    }
-    if (status == null) return refuse('unauthorized')
-    if (status === 'suspended') return refuse('suspended')
+    const refused = await refuseInactiveAccount(c.env, account)
+    if (refused) return refused
   }
   c.set('account', account)
   return { ok: true, account }

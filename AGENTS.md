@@ -353,8 +353,18 @@ Links. Clients are iOS and Android
   on or on a bearer request. Nothing logs it. The live
   upgrade reaches the inbox DO with the token's account in the internal
   `x-buddies-session-account` header, which the Worker always strips from
-  client requests (the DO trusts it). Suspension and both switches work as
-  before in both forms; `owner_account` needs no migration (created in
+  client requests (the DO trusts it). Both switches work as before in both
+  forms, and so does suspension of the account's own inbox (its owner ops).
+  A bearer op that reaches someone else's inbox (`card/put`, `event/put`,
+  `invite/claim`: `BUDDIES_SUSPENDED_REFUSED_OPS`) is also refused with 403
+  `suspended` when the token's account is suspended, in `admitCaller` after
+  the edge limit, from the cached `requireActive` status
+  (`refuseInactiveAccount`, 30 s per isolate; the admin route drops its own
+  isolate's entry). The target inbox never sees which account wrote, and
+  nothing logs or stores it. `slot/leave` and reads stay open. A legacy
+  writer op names no account, so a suspended User's legacy writes still get
+  through: one more reason to turn `auth:legacy` off before relying on
+  suspension. `owner_account` needs no migration (created in
   place at registration, `confirmed` added in place).
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
@@ -551,7 +561,9 @@ versions from before sessions.
 - A suspended account's inboxes refuse every owner op except `inbox/delete`
   and `slot/remove` with `403 suspended`, and its live sockets close with
   4003. The database is the authority (registration checks it); each inbox
-  keeps a copy so its hot path never reads D1.
+  keeps a copy so its hot path never reads D1. Its bearer writes into
+  buddies' inboxes and invite claims are refused too, by the Worker from the
+  token's account (Buddies → Authentication); legacy ones can't be.
 
 Without the `ACCOUNTS_DB` binding, accounts are off: every accounts route
 answers `disabled` and proofs are ignored. Prod uses `ww-accounts`, dev
@@ -582,8 +594,9 @@ curl -sX POST "$BASE/admin/accounts/status" -H "x-ww-admin-token: $TOKEN" \
 `/status` records every change in `account_status_events` and updates each
 of the account's inboxes. If `inboxesFailed` is above 0, send the same
 request again. Routes that refuse suspended accounts through
-`requireAccount({ requireActive: true })` see the change within 30 seconds
-(per-isolate cache).
+`requireAccount({ requireActive: true })` (and Buddies' bearer writer ops)
+see the change within 30 seconds (per-isolate cache), at once in the
+isolate that served `/status`.
 
 ### Sessions and bearer tokens
 

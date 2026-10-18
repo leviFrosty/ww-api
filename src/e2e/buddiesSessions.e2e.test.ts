@@ -11,6 +11,7 @@ import {
   type SigningKey,
 } from '../test/buddiesClient'
 import {
+  ADMIN_TOKEN,
   BearerRelayOwner,
   DEV_BYPASS_TOKEN,
   LOCAL_LAUNCHER,
@@ -173,6 +174,62 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Buddies with bearer tokens (dev bypass)', ()
       await owner.register({ account: await owner.proof(other) })
     ).toMatchObject({ status: 403, body: relayError('forbidden') })
     expect((await owner.sync()).status).toBe(200)
+    await owner.op('inbox/delete')
+  })
+
+  it.skipIf(!ADMIN_TOKEN)("refuses a suspended account's writes into a buddy's inbox, but lets it leave", async () => {
+    const owner = await BearerRelayOwner.create()
+    const buddy = await openSession()
+    const as = bearerHeaders(buddy)
+    const writer = await owner.addWriter()
+    const invite = await inviteSecrets()
+    await owner.op('invite/create', {
+      inviteId: invite.inviteId,
+      claimVerifier: invite.claimVerifier,
+      blob: blobOfSize(100),
+      expiresAt: Date.now() + DAY_MS,
+    })
+    const card = () => sendWriter(writer, 'card/put', { blob: blobOfSize(64) }, as)
+    const event = () =>
+      sendWriter(
+        writer,
+        'event/put',
+        { eventId: randomId(), kind: 'plan.invite', blob: blobOfSize(48), push: false },
+        as
+      )
+    const claim = () =>
+      http('POST', '/buddies/v1/invite/claim', {
+        headers: as,
+        body: unsignedEnvelope({
+          inviteId: invite.inviteId,
+          claimSecret: invite.claimSecret,
+          blob: blobOfSize(80),
+        }),
+      })
+    const setStatus = async (status: string) => {
+      const res = await http('POST', '/admin/accounts/status', {
+        headers: { 'x-ww-admin-token': ADMIN_TOKEN ?? '' },
+        body: { accountId: buddy.accountId, status, reason: 'report' },
+      })
+      expect(res.status).toBe(200)
+    }
+
+    expect((await card()).body).toEqual({ ok: true, seq: 1 })
+    expect((await event()).body).toEqual({ ok: true, seq: 2 })
+    await setStatus('suspended')
+    for (const refused of [await card(), await event(), await claim()]) {
+      expect(refused.status).toBe(403)
+      expect(refused.body).toEqual(relayError('suspended'))
+    }
+    const synced = await owner.sync()
+    expect(synced.body).toMatchObject({ cards: [{ seq: 1 }], events: [{ seq: 2 }] })
+
+    await setStatus('active')
+    expect((await card()).body).toEqual({ ok: true, seq: 3 })
+    expect((await claim()).status).toBe(200)
+
+    await setStatus('suspended')
+    expect((await sendWriter(writer, 'slot/leave', {}, as)).body).toEqual({ ok: true })
     await owner.op('inbox/delete')
   })
 
