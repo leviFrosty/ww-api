@@ -217,6 +217,23 @@ describe('linking a RevenueCat customer', () => {
     expect(revenueCat).not.toHaveBeenCalled()
   })
 
+  it('limits each account’s links, which each read RevenueCat, to the register tier', async () => {
+    customers.set(RC_A, free)
+    const session = await openTestSession(app, h.env)
+    const other = await openTestSession(app, h.env)
+    // One limiter window throughout (the fake counts per wall-clock minute).
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+    for (let i = 0; i < 60; i++)
+      expect((await link(session, RC_A)).status).toBe(200)
+    const refused = await link(session, RC_A)
+    expect(refused.status).toBe(429)
+    expect(refused.body.code).toBe('rate_limited')
+    expect(refused.headers.get('retry-after')).toBe('60')
+    expect(revenueCat).toHaveBeenCalledTimes(60)
+    // Another account (same IP) has its own budget.
+    expect((await link(other, RC_A)).status).toBe(200)
+  })
+
   it('answers 503 unavailable with Retry-After when RevenueCat is down, changing nothing', async () => {
     customers.set(RC_A, 503)
     const session = await openTestSession(app, h.env)
@@ -311,14 +328,47 @@ describe('answering Supporter status', () => {
     expect(revenueCat).not.toHaveBeenCalled()
   })
 
-  it('ends at the stored expiry with no webhook', async () => {
+  it('ends at the stored expiry with no webhook, after one read', async () => {
     customers.set(RC_A, monthly(T0 + 2 * 60 * 60_000))
     const session = await openTestSession(app, h.env)
     await link(session, RC_A)
     now = T0 + 3 * 60 * 60_000
     expect(await isAccountSupporter(h.env, session.accountId)).toBe(false)
-    // Still fresh, so RevenueCat wasn't asked again.
-    expect(askedAbout()).toEqual([RC_A])
+    // The end passed since the read: asked once whether it renewed.
+    expect(askedAbout()).toEqual([RC_A, RC_A])
+    // That read was after the end, so it stands until it's a day old.
+    now += 60 * 60_000
+    expect(await isAccountSupporter(h.env, session.accountId)).toBe(false)
+    expect(askedAbout()).toEqual([RC_A, RC_A])
+  })
+
+  it('keeps a Supporter whose subscription renewed at its end, with no webhook', async () => {
+    customers.set(RC_A, monthly(T0 + 2 * 60 * 60_000))
+    const session = await openTestSession(app, h.env)
+    await link(session, RC_A)
+    customers.set(RC_A, monthly(T0 + 31 * DAY))
+    now = T0 + 2 * 60 * 60_000 + 1
+    expect(await isAccountSupporter(h.env, session.accountId)).toBe(true)
+    now += 60 * 60_000
+    expect(await isAccountSupporter(h.env, session.accountId)).toBe(true)
+    expect(askedAbout()).toEqual([RC_A, RC_A])
+  })
+
+  it('is a Supporter when one stale read finds one, though another fails', async () => {
+    customers.set(RC_A, free)
+    customers.set(RC_B, free)
+    const session = await openTestSession(app, h.env)
+    await link(session, RC_A)
+    await link(session, RC_B)
+    customers.set(RC_A, 500)
+    customers.set(RC_B, lifetime)
+    now = T0 + 2 * DAY
+    expect(await isAccountSupporter(h.env, session.accountId)).toBe(true)
+    customers.set(RC_B, free)
+    now = T0 + 4 * DAY
+    await expect(
+      isAccountSupporter(h.env, session.accountId)
+    ).rejects.toMatchObject({ name: 'RevenueCatError' })
   })
 
   it('reads a record over a day old from RevenueCat again', async () => {

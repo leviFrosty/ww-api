@@ -490,7 +490,8 @@ RevenueCat's webhook. Who counts is ADR 0014's rule (`src/revenuecat.ts`).
   account's status. Repeating it reads RevenueCat again. A customer RevenueCat
   has never seen isn't linked. At most 5 customers an account and 5 accounts a
   customer; a new link past either replaces the least recently linked.
-  RevenueCat unreachable is 503 `unavailable`.
+  RevenueCat unreachable is 503 `unavailable`. Besides the read tier per IP,
+  links count against the register tier (60 a minute) per account.
 - `GET /accounts/v1/supporter` (Bearer) → `{ ok, supporter, expiresAt,
   customers }`.
 - `POST /revenuecat/v1/webhook`: RevenueCat's servers only, with the
@@ -499,7 +500,9 @@ RevenueCat's webhook. Who counts is ADR 0014's rule (`src/revenuecat.ts`).
   RevenueCat's REST API; unlinked customers are ignored. Idempotent by event
   id; RevenueCat trouble is 503 so RevenueCat retries.
 - A record read within the last day is the answer until its expiry; an older
-  one is read again first. RevenueCat unreachable then: route planning answers
+  one is read again first, as is a Supporter whose expiry passed since it was
+  read (one read tells a renewal from a lapse). Each RevenueCat read gives up
+  after 5 seconds. RevenueCat unreachable then: route planning answers
   503 `supporter_check_failed`, Notes Import counts the User as free.
 
 ### `POST /route-planning/optimize`

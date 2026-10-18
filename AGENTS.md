@@ -829,8 +829,10 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   Repeating a link reads RevenueCat again (the app does after purchases and
   restores). At most 5 customers an account, 5 accounts a customer
   (`SUPPORTER_LINK_LIMITS`); past either, the least recently linked goes.
-  Read edge tier; works for a suspended account; RevenueCat unreachable is 503
-  `unavailable` (`Retry-After: 30`).
+  Read edge tier per IP, plus the register tier (60 a minute) per account,
+  since every link reads RevenueCat and the worker's RevenueCat key has one
+  rate limit for everyone; works for a suspended account; RevenueCat
+  unreachable is 503 `unavailable` (`Retry-After: 30`).
 - **Threat model**: RevenueCat's SDK treats the app user id as the
   customer's capability (anyone with it can log in as it), so ours does too.
   Claiming someone else's purchases takes their id (122 random bits, never
@@ -838,14 +840,19 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   (ADR 0029 §2).
 - **Answering** (`isAccountSupporter`): any linked customer active. A record
   read within 24 hours is the answer until its expiry; an older one is read
-  again first, and a failed read throws `RevenueCatError` (route planning
-  503, Notes Import free). No link: false, no RevenueCat call.
+  again first, and so is a Supporter whose expiry passed since its read (a
+  subscription renews at its end, and the webhook can be late), once. Reads
+  run together; one that finds a Supporter answers, else a failed read throws
+  `RevenueCatError` (route planning 503, Notes Import free). No link: false,
+  no RevenueCat call. Every RevenueCat read has a 5-second deadline
+  (`REVENUECAT_TIMEOUT_MS`), legacy checks included.
 - **Webhook**: constant-time compare of the whole Authorization header (401
   otherwise; 503 `disabled` without the secret). The body is read only for
   `event.id` and the customers it names (`app_user_id`,
   `original_app_user_id`, `aliases`, `transferred_from`, `transferred_to`);
-  each one some account links is read again from RevenueCat, so order and
-  type don't matter, and a read only overwrites an older one (`checked_at`).
+  each one some account links is read again from RevenueCat, all at once, so
+  order and type don't matter, and a read only overwrites an older one
+  (`checked_at`).
   Unlinked customers are ignored and never stored. Event ids are recorded
   after the reads (30 days) and a repeat is 200 `duplicate`. RevenueCat
   trouble is 503, so RevenueCat retries (5 times over ~80 minutes).

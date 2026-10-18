@@ -164,7 +164,16 @@ export const refreshCustomer = async (
   db: AccountsDb,
   appUserId: string,
   overrides: Partial<SupporterDependencies> = {}
-): Promise<SupporterStatus> => {
+): Promise<SupporterStatus> =>
+  (await readCustomer(env, db, appUserId, overrides)).status
+
+/** `refreshCustomer`, also answering when its read started. */
+const readCustomer = async (
+  env: SupporterEnv,
+  db: AccountsDb,
+  appUserId: string,
+  overrides: Partial<SupporterDependencies> = {}
+): Promise<{ status: SupporterStatus; startedAt: number }> => {
   const { fetch, now } = deps(overrides)
   const startedAt = now()
   const status = await fetchSupporterStatus({
@@ -175,7 +184,7 @@ export const refreshCustomer = async (
     apiOrigin: revenueCatOrigin(env),
   })
   await storeRead(db, appUserId, status, startedAt)
-  return status
+  return { status, startedAt }
 }
 
 /** The account's linked customers' records. */
@@ -209,7 +218,12 @@ export const linkCustomer = async (
   overrides: Partial<SupporterDependencies> = {}
 ): Promise<AccountSupporterStatus> => {
   const resolved = deps(overrides)
-  const status = await refreshCustomer(env, db, appUserId, resolved)
+  const { status, startedAt } = await readCustomer(
+    env,
+    db,
+    appUserId,
+    resolved
+  )
   const now = resolved.now()
   if (status.known) {
     const links = accountRevenueCatCustomers
@@ -237,6 +251,18 @@ export const linkCustomer = async (
         )
     }
     await db.batch([
+      // The read above stored the customer; the hourly prune can delete it
+      // again before this batch (nothing linked it yet), so put it back.
+      db
+        .insert(revenueCatCustomers)
+        .values({
+          appUserId,
+          supporter: status.supporter,
+          supporterExpiresAt:
+            status.expiresAt == null ? null : new Date(status.expiresAt),
+          checkedAt: new Date(startedAt),
+        })
+        .onConflictDoNothing(),
       db
         .insert(links)
         .values({ accountId, appUserId, linkedAt: new Date(now) })
@@ -252,11 +278,26 @@ export const linkCustomer = async (
 }
 
 /**
+ * Whether a record has to be read from RevenueCat again before it's an
+ * answer: it's over `freshMs` old, or it was a Supporter whose end has passed
+ * since it was read. A subscription renews at its end, and the webhook saying
+ * so can come late or not at all; one read then tells a renewal from a lapse
+ * (and is itself read after the end, so it's fresh until the next one).
+ */
+const needsRead = (record: CustomerRecord, now: number) => {
+  const checkedAt = record.checkedAt.getTime()
+  if (now - checkedAt >= SUPPORTER_LINK_LIMITS.freshMs) return true
+  const end = record.supporterExpiresAt?.getTime()
+  return record.supporter && end != null && end <= now && checkedAt < end
+}
+
+/**
  * The account's status: from records read within `freshMs`, else read from
- * RevenueCat again first. An account with an active, fresh record answers at
- * once. Throws `RevenueCatError` when a stale record can't be read again:
- * callers fail closed (route planning refuses, Notes Import counts the User
- * as free).
+ * RevenueCat again first (`needsRead`). An account with an active, fresh
+ * record answers at once. The reads run together; one that finds a Supporter
+ * is the answer even if another failed. Otherwise throws `RevenueCatError`
+ * when any read failed: callers fail closed (route planning refuses, Notes
+ * Import counts the User as free).
  */
 export const accountSupporterStatus = async (
   env: SupporterEnv,
@@ -267,19 +308,32 @@ export const accountSupporterStatus = async (
   const resolved = deps(overrides)
   const records = await linkedRecords(db, accountId)
   const now = resolved.now()
-  const fresh = (record: CustomerRecord) =>
-    now - record.checkedAt.getTime() < SUPPORTER_LINK_LIMITS.freshMs
-  if (records.some((record) => fresh(record) && isActive(record, now)))
-    return combine(records, now)
-  const stale = records.filter((record) => !fresh(record))
+  const settled = records.filter((record) => !needsRead(record, now))
+  if (settled.some((record) => isActive(record, now)))
+    return { ...combine(settled, now), customers: records.length }
+  const stale = records.filter((record) => needsRead(record, now))
   if (!stale.length) return combine(records, now)
-  for (const record of stale) {
-    const status = await refreshCustomer(env, db, record.appUserId, resolved)
-    record.supporter = status.supporter
-    record.supporterExpiresAt =
-      status.expiresAt == null ? null : new Date(status.expiresAt)
-  }
-  return combine(records, resolved.now())
+  const reads = await Promise.allSettled(
+    stale.map(async (record) => {
+      const status = await refreshCustomer(env, db, record.appUserId, resolved)
+      record.supporter = status.supporter
+      record.supporterExpiresAt =
+        status.expiresAt == null ? null : new Date(status.expiresAt)
+      record.checkedAt = new Date(now)
+    })
+  )
+  // A record whose read failed says nothing: it's left out of the answer.
+  const failures = reads.filter(
+    (read): read is PromiseRejectedResult => read.status === 'rejected'
+  )
+  const failed = stale.filter((_, i) => reads[i].status === 'rejected')
+  const answer = combine(
+    records.filter((record) => !failed.includes(record)),
+    resolved.now()
+  )
+  if (answer.supporter || !failures.length)
+    return { ...answer, customers: records.length }
+  throw failures[0].reason
 }
 
 /**
