@@ -8,18 +8,20 @@ import {
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import {
   ACCOUNT_LIMITS,
+  type AccountFields,
   handoffBlobTooLarge,
   parseHandoffClaimRequest,
   parseHandoffTokenRequest,
 } from './contracts'
+import { hasAuthorization, parseJsonOrNull, readPlainJson } from './auth'
 import {
-  accountForKey,
+  accountCall,
   guarded,
+  plainFields,
   quotaName,
   refuseAtEdge,
   refuseOverDailyQuota,
   replyWith,
-  verifiedBody,
   verifyEnvelope,
 } from './signed'
 
@@ -28,8 +30,10 @@ import {
  * the old phone opens a channel and the new phone claims it with the token
  * from the QR code; the server relays a sealed hello one way and the sealed
  * account key the other, through one `AccountHandoff` Durable Object per
- * channel. Old-phone ops are signed by the account key and need a registered
- * account; new-phone ops are plain JSON authorized by `claimToken`.
+ * channel. Old-phone ops are bearer requests with plain JSON fields (or,
+ * while the legacy switch is on, envelopes signed by the account key of a
+ * registered account); new-phone ops are plain JSON authorized by
+ * `claimToken`, with or without a session.
  *
  * `handoff/open` counts against the register edge tier and 20 opens per
  * account a rolling day; every other op against the read tier.
@@ -37,6 +41,8 @@ import {
  * Privacy: nothing here logs or reports bodies, keys, tokens, account ids, or
  * channel ids.
  */
+
+type OldPhoneOp = 'handoff/open' | 'handoff/status' | 'handoff/send' | 'handoff/cancel'
 
 const channel = (env: Environment, channelId: string) =>
   env.ACCOUNT_HANDOFF.get(env.ACCOUNT_HANDOFF.idFromName(channelId))
@@ -50,76 +56,81 @@ const precheck = async (
   return refuseAtEdge(c, tier)
 }
 
-/** The new phone's JSON body, or null for `bad_request`. */
-const readJson = async (c: AppContext): Promise<unknown> => {
-  const text = await readEnvelopeText(c.req.raw)
-  if (text == null) return null
-  try {
-    return JSON.parse(text)
-  } catch {
-    // Never surface the parser message: V8 quotes the offending input.
-    return null
-  }
-}
+/**
+ * The old phone's account and fields for `op`, from the token and the JSON
+ * body `text`, or from the envelope `text` holds (legacy).
+ */
+const oldPhone = <K extends OldPhoneOp>(
+  c: AppContext,
+  op: K,
+  text: string | null,
+  run: (accountId: string, fields: AccountFields<K>) => Promise<Response>
+): Promise<Response> =>
+  accountCall(
+    c,
+    {
+      bearer: async () => {
+        const body = parseJsonOrNull(text)
+        if (handoffBlobTooLarge(body))
+          return { refusal: buddiesErrorResponse('too_large') }
+        return plainFields(op, body)
+      },
+      legacy: () =>
+        verifyEnvelope(op, text == null ? null : parseEnvelope(text)),
+    },
+    run
+  )
 
 const handleOpen = guarded('handoff/open', async (c) => {
   const refused = await precheck(c, 'inbox/register')
   if (refused) return refused
-  const verified = await verifiedBody(c, 'handoff/open')
-  if ('refusal' in verified) return verified.refusal
-  const found = await accountForKey(c.env, verified.payload.accountPub)
-  if ('refusal' in found) return found.refusal
-  const overQuota = await refuseOverDailyQuota(
-    c.env,
-    await quotaName('handoff-open', found.account.id),
-    ACCOUNT_LIMITS.handoffOpensPerDay,
-    'handoff/open',
-    'handoffOpensPerDay'
-  )
-  if (overQuota) return overQuota
-  const { channelId, verifier } = verified.fields
-  return replyWith(
-    c,
-    await channel(c.env, channelId).open({
-      channelId,
-      accountId: found.account.id,
-      verifier,
-    })
-  )
+  const text = await readEnvelopeText(c.req.raw)
+  return oldPhone(c, 'handoff/open', text, async (accountId, fields) => {
+    const overQuota = await refuseOverDailyQuota(
+      c.env,
+      await quotaName('handoff-open', accountId),
+      ACCOUNT_LIMITS.handoffOpensPerDay,
+      'handoff/open',
+      'handoffOpensPerDay'
+    )
+    if (overQuota) return overQuota
+    const { channelId, verifier } = fields
+    return replyWith(
+      c,
+      await channel(c.env, channelId).open({ channelId, accountId, verifier })
+    )
+  })
 })
 
 const handleStatus = guarded('handoff/status', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
-  const verified = await verifiedBody(c, 'handoff/status')
-  if ('refusal' in verified) return verified.refusal
-  const found = await accountForKey(c.env, verified.payload.accountPub)
-  if ('refusal' in found) return found.refusal
-  const { channelId } = verified.fields
-  return replyWith(
-    c,
-    await channel(c.env, channelId).status(channelId, found.account.id)
+  const text = await readEnvelopeText(c.req.raw)
+  return oldPhone(c, 'handoff/status', text, async (accountId, { channelId }) =>
+    replyWith(c, await channel(c.env, channelId).status(channelId, accountId))
   )
 })
 
 const handleSend = guarded('handoff/send', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
-  const verified = await verifiedBody(c, 'handoff/send')
-  if ('refusal' in verified) return verified.refusal
-  const found = await accountForKey(c.env, verified.payload.accountPub)
-  if ('refusal' in found) return found.refusal
-  const { channelId, key } = verified.fields
-  return replyWith(
-    c,
-    await channel(c.env, channelId).send(channelId, found.account.id, key)
+  const text = await readEnvelopeText(c.req.raw)
+  return oldPhone(c, 'handoff/send', text, async (accountId, fields) =>
+    replyWith(
+      c,
+      await channel(c.env, fields.channelId).send(
+        fields.channelId,
+        accountId,
+        fields.key
+      )
+    )
   )
 })
 
 const handleClaim = guarded('handoff/claim', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
-  const body = await readJson(c)
+  const body = await readPlainJson(c)
   if (handoffBlobTooLarge(body)) return buddiesErrorResponse('too_large')
   const request = parseHandoffClaimRequest(body)
   if (!request) return buddiesErrorResponse('bad_request')
@@ -129,7 +140,7 @@ const handleClaim = guarded('handoff/claim', async (c) => {
 const handleReceive = guarded('handoff/receive', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
-  const request = parseHandoffTokenRequest(await readJson(c))
+  const request = parseHandoffTokenRequest(await readPlainJson(c))
   if (!request) return buddiesErrorResponse('bad_request')
   return replyWith(c, await channel(c.env, request.channelId).receive(request))
 })
@@ -137,42 +148,31 @@ const handleReceive = guarded('handoff/receive', async (c) => {
 const handleDone = guarded('handoff/done', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
-  const request = parseHandoffTokenRequest(await readJson(c))
+  const request = parseHandoffTokenRequest(await readPlainJson(c))
   if (!request) return buddiesErrorResponse('bad_request')
   return replyWith(c, await channel(c.env, request.channelId).done(request))
 })
 
 /**
- * Either phone: a signed envelope (`payload`, `signature`) is the old phone, anything else
- * must be the new phone's `channelId` and `claimToken`.
+ * Either phone. A body with `claimToken` (and no envelope `payload`) is the new
+ * phone's; otherwise a bearer request, or a signed envelope (legacy), is the
+ * old phone's. Anything else must be the new phone's `channelId` and
+ * `claimToken`.
  */
 const handleCancel = guarded('handoff/cancel', async (c) => {
   const refused = await precheck(c, 'inbox/sync')
   if (refused) return refused
   const text = await readEnvelopeText(c.req.raw)
-  let body: unknown = null
-  try {
-    body = text == null ? null : JSON.parse(text)
-  } catch {
-    body = null
-  }
-  if (isPlainObject(body) && isEnvelopeBody(body)) {
-    const verified = await verifyEnvelope(
-      'handoff/cancel',
-      text == null ? null : parseEnvelope(text)
-    )
-    if ('refusal' in verified) return verified.refusal
-    const found = await accountForKey(c.env, verified.payload.accountPub)
-    if ('refusal' in found) return found.refusal
-    const { channelId } = verified.fields
-    return replyWith(
-      c,
-      await channel(c.env, channelId).cancelByAccount(
-        channelId,
-        found.account.id
+  const body = parseJsonOrNull(text)
+  const signed = isPlainObject(body) && isEnvelopeBody(body)
+  const newPhone = isPlainObject(body) && 'claimToken' in body && !signed
+  if (!newPhone && (signed || hasAuthorization(c)))
+    return oldPhone(c, 'handoff/cancel', text, async (accountId, { channelId }) =>
+      replyWith(
+        c,
+        await channel(c.env, channelId).cancelByAccount(channelId, accountId)
       )
     )
-  }
   const request = parseHandoffTokenRequest(body)
   if (!request) return buddiesErrorResponse('bad_request')
   return replyWith(

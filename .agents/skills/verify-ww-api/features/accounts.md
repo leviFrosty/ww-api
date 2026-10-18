@@ -1,0 +1,36 @@
+# Accounts and sessions
+
+The app proves it's WitnessWork once per session (`POST /accounts/v1/sessions`, attested through `/attestation/v1/challenge`; the dev bypass locally) and then calls account routes with a 15-minute bearer token it renews with `POST /accounts/v1/sessions/refresh`. Settings → Account reads the account, Set Up Another Device hands the key to a new phone, and backups go to R2. Older app versions keep using signed envelopes until the legacy switch is turned off, and `/app/v1/config` tells every new version its minimum.
+
+## Sub-features
+
+- `session-open` (`POST /accounts/v1/sessions`) answers 201 with `Location: /accounts/v1/sessions/current` and `{ok, accountId, status, sessionId, accessToken, accessExpiresAt, refreshToken, sessionExpiresAt}` for a self-signed envelope plus the dev bypass.
+- `bearer-info` returns the token's account from `GET /accounts/v1/account` (and, for older builds, `POST /accounts/v1/account/info` with no body).
+- `refresh` (`POST /accounts/v1/sessions/refresh`) replaces both tokens; `sessionExpiresAt` never moves.
+- `close` (`DELETE /accounts/v1/sessions/current`) ends the session; its refresh token then gets 401 `unauthorized` with `WWW-Authenticate: Bearer error="invalid_token"`.
+- `bearer-backup` puts with `x-ww-slot-id`/`x-ww-sha256`, gets the bytes back, and deletes only with the account key's envelope too.
+- `bearer-handoff` opens and reads a channel with the token.
+- `legacy-off` answers envelope-authenticated requests with 426 `upgrade_required` once KV `auth:legacy` is `off`, while bearer requests and opening sessions keep working.
+- `app-config` returns `{ok}` or `{ok, minAppVersion}` from KV `app:min-version`, uncached.
+
+## How to get to it (user POV)
+
+- Opening the app (with an account) opens or refreshes a session.
+- Settings → Account reads the account; Set Up Another Device and Back Up to WitnessWork use handoff and backup.
+- Every launch and return to the foreground reads `/app/v1/config`.
+
+## Driving it with verify-ww-api
+
+Preconditions:
+
+- `node scripts/verify/dev.mjs doctor` passes, including `account sessions enabled`.
+
+- **Whole flow.** Run `pnpm test:e2e src/e2e/accounts.e2e.test.ts`. Vitest reports `/accounts/v1/sessions (dev bypass)`, `the legacy switch (local KV)`, and `GET /app/v1/config` as passed, and `.verify/artifacts/e2e-accounts-*.json` holds the exchanges.
+- **Sessions on.** Run `curl -s -X POST $URL/accounts/v1/sessions/refresh -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.4.1" -d '{"refreshToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'`. The body is `{"ok":false,"error":"unauthorized","code":"unauthorized"}`; `disabled` means no `ACCOUNT_TOKEN_SECRET`.
+- **App config.** Run `node scripts/verify/dev.mjs kv put app:min-version '{"minVersion":"9.8.7"}'`, then `curl -si $URL/app/v1/config`. You get 200, `cache-control: no-store`, and `{"ok":true,"minAppVersion":"9.8.7"}`. Restore it with `node scripts/verify/dev.mjs kv delete app:min-version`.
+
+## Gotchas
+
+- Session envelopes (op `session/open`) are Ed25519-signed; use the e2e helpers, not hand-built curl.
+- Restore `auth:legacy` (`kv delete auth:legacy`) after flipping it, or every legacy accounts and handoff test after it gets 426.
+- Real attestations need a device and the deployed dev worker. Locally only the dev bypass opens sessions, and it reports platform `dev`.

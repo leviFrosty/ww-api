@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
-import type { AppContext, Environment } from '../types'
+import type { AppContext, AppEnv, Environment } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
 import { retryAfterHeaders } from '../errors'
@@ -74,7 +74,7 @@ export const createRoutePlanningRoutes = (
   overrides: Partial<RoutePlanningDependencies> = {}
 ) => {
   const deps = { ...defaultDependencies, ...overrides }
-  const routes = new Hono<{ Bindings: Environment }>()
+  const routes = new Hono<AppEnv>()
 
   routes.post('/optimize', routeOptimizeDocs, async (ctx) => {
     if (!(await isRoutePlanningEnabled(ctx.env))) {

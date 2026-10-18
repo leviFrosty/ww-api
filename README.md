@@ -20,8 +20,10 @@ to read:
 - **Standard HTTP.** The right methods and status codes, JSON bodies, one
   error envelope (`{ "ok": false, "error", "code" }`), and `Retry-After` on
   every 429 and 503. Where a route departs from REST on purpose, its docs say
-  why. For example, the Buddies and accounts relays use `POST /{op}` so ids
-  stay out of URLs, which production logs.
+  why. For example, the Buddies relay and the accounts handoff and backup
+  ops use `POST /{op}` so ids stay out of URLs, which production logs, while
+  account sessions are plain resources (`POST /accounts/v1/sessions`,
+  `DELETE /accounts/v1/sessions/current`).
 - **Documented.** Every route and field is described in `/docs`, generated
   from the routes, so you can call the API without reading the source.
 
@@ -162,6 +164,39 @@ live WebSocket), send the same two values in `x-buddies-payload` /
 `x-buddies-signature` or `x-ww-payload` / `x-ww-signature`. Each op in `/docs`
 lists its decoded `payload` fields. The wire contract is
 [`docs/buddies-protocol.md`](docs/buddies-protocol.md).
+
+App versions with account sessions sign far less: they sign only to open a
+session (and to delete backups), and call every other accounts route with
+`Authorization: Bearer <accessToken>` (below).
+
+### Accounts and sessions (`/accounts/v1/*`)
+
+Anonymous accounts (a random id and a public key). An app proves it's
+WitnessWork once per session and then calls with short-lived bearer tokens:
+
+- **`POST /accounts/v1/sessions`** opens a session: an envelope self-signed
+  by the account key (op `session/open`) carrying an attestation from
+  `POST /attestation/v1/challenge` (purpose `account-session`, both hashes
+  `hex(SHA-256("ww-account/v1/session\n" + accountPub))`). Answers 201 with
+  an access token (a 15-minute JWT), a refresh token, and `Location:
+  /accounts/v1/sessions/current`. Sessions last 90 days.
+- **`POST /accounts/v1/sessions/refresh`** trades `{ refreshToken }` for a
+  new pair; each refresh token works once (plus a 60-second grace for a lost
+  response, which gets the same new refresh token again), and presenting an
+  older one ends the session. Refresh tokens are opaque strings
+  (`<sessionId>.<secret>.<mac>`); one the worker didn't issue is 401 and
+  never ends a session.
+- **`DELETE /accounts/v1/sessions/current`** ends the token's session.
+- **`GET /accounts/v1/account`** reads the token's account.
+- Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
+  take the bearer token too, as `POST /{op}` with ids in bodies.
+
+Older app versions authenticate the pre-session way (signed envelopes,
+`account/register`, `account/info`) while the legacy switch (KV
+`auth:legacy`) is on; once it's off they get 426 `upgrade_required`.
+`GET /app/v1/config` (no auth) tells the app its minimum version, so it can
+show Update Required first. The runbook is in `AGENTS.md`, "Turning off
+backward compatibility".
 
 ### `/autocomplete`
 
@@ -307,30 +342,92 @@ registration, the verify probe) lives under `/attestation/v1/` (below); the
 old `POST /notes-import/challenge`, `/attest`, and `/verify` still serve the
 same handlers for deployed apps.
 
-- **`POST /notes-import/kickoff`** starts a streaming run and returns its handle,
-  capability token, and strict `credits` preview; `GET .../events` / `.../result`
-  carry the terminal result and authoritative `credits` snapshot.
+- **`POST /notes-import/kickoff`** starts a streaming run and returns its handle
+  (and, for legacy requests, a capability token) and strict `credits` preview;
+  `GET .../events` / `.../result` carry the terminal result and authoritative
+  `credits` snapshot.
 - **`POST /notes-import/transcribe`** (Import from Paper) reads one page image
   (base64 JPEG or PNG, ≤ `NOTES_IMPORT_TRANSCRIBE_MAX_BYTES`) into plain text
   with `NOTES_IMPORT_TRANSCRIBE_MODEL` on the same ZDR allowlist, and returns
-  `{ text, truncated, pagesRemaining }`. Attested with App Attest v2 or Play
-  Integrity under purpose `notes-import-transcribe`: the content hash is the
-  SHA-256 of the base64 string, and the request hash covers
-  `{ imageHash, mimeType }`. The image is never stored or logged. Pages spend
-  no credit (the app sends the edited text through kickoff), but a free user
-  with no imports left is refused, and each identity gets
+  `{ text, truncated, pagesRemaining }`. Legacy requests are attested with
+  App Attest v2 or Play Integrity under purpose `notes-import-transcribe`: the
+  content hash is the SHA-256 of the base64 string, and the request hash
+  covers `{ imageHash, mimeType }`. The image is never stored or logged.
+  Pages spend no credit (the app sends the edited text through kickoff), but a
+  free user with no imports left is refused, and each identity gets
   `NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY` pages per rolling day (`…_SUPPORTER`
   for Supporters); over it → 429 `transcribe_limit` with `Retry-After`.
   `GET /notes-import/status` advertises `capabilities.transcribe`.
 - **`POST /notes-import`** is the synchronous fallback under identical rules.
+- Both import routes refuse empty or whitespace-only `notesText` with 400
+  `bad_request`, bearer and legacy alike, before attestation, the allowance,
+  or the model.
 - **`GET /notes-import/status`** is public and supplies a fresh allowance
   schedule only when availability is confirmed.
 
-Auth is enforced by Apple **App Attest** on every inference kickoff. A dev worker
+#### Who's calling: account sessions (bearer) or legacy
+
+App versions with account sessions call every Notes Import route with
+`Authorization: Bearer <accessToken>` (from `POST /accounts/v1/sessions`, see
+[Accounts and sessions](#accounts-and-sessions-accountsv1)). The session
+attested once, so these requests carry no attestation fields and no hashes, and
+the token's account is the meter: allowances, replays, the concurrency cap, and
+Import from Paper's page limit all key on it. A request with an `Authorization`
+header is always a bearer request; a bad token is never a fallback to the old
+way. Older app versions send no `Authorization` header and authenticate per
+request (below) while the legacy switch (KV `auth:legacy`) is on.
+
+**Bearer contract.** JSON bodies; any field not listed is ignored (`uuid`,
+`accountId`, `contentHash`, `requestHash`, and every attestation field
+included).
+
+| Route | Body | 200 |
+| --- | --- | --- |
+| `POST /notes-import/kickoff` | `{ notesText, context, refinement?, revenueCatAppUserId? }` | `{ importId, refinement, credits }` (no `subscribeToken`) |
+| `POST /notes-import` (synchronous fallback) | the same | `{ result, contentHash, refinement, emptyCharged, credits }` |
+| `POST /notes-import/transcribe` | `{ image, mimeType, revenueCatAppUserId? }` | `{ ok, text, truncated, pagesRemaining }` |
+| `GET /notes-import/{importId}/events` | none; `Last-Event-ID` header to resume | the SSE stream |
+| `GET /notes-import/{importId}/result` | none | `{ status, payload?, error? }` |
+| `POST /notes-import/{importId}/cancel` | none | `{ status, payload?, error? }` |
+| `POST /notes-import/{importId}/destroy` | none | `{ ok: true }` |
+
+- `revenueCatAppUserId` (optional, 8-64 of `A-Z a-z 0-9 _ -`): the app's
+  RevenueCat app user id. The server asks RevenueCat whether it's a Supporter,
+  at kickoff and again when the run settles; absent means not a Supporter.
+  It's a stopgap until RevenueCat is linked to the account, when the server
+  will use the account's own id and ignore this field.
+- **Run routes** take the access token instead of `?token=` (a bearer request
+  never reads it) and serve only imports the token's account kicked off.
+  Another account's import, an unknown id, and one deleted or past its 1-hour
+  retention are all 404 `not_found`, so a response never says whether an
+  import exists. A destroy of an import already deleted is that same 404.
+- **Errors** keep Notes Import's shape, `{ ok: false, error: <message>, code }`,
+  on both kinds of request: 401 `unauthorized` (missing, expired, or invalid
+  token, with `WWW-Authenticate: Bearer error="invalid_token"`: refresh once
+  and retry), 403 `suspended` on the metered routes (a suspended account can
+  still read and delete its runs), 404 `not_found` (run routes), 503 `disabled`
+  (sessions off on this worker), and every existing code (`limit_reached`,
+  `refinement_limit`, `active_cap`, `transcribe_limit`, `unavailable`,
+  `too_large`, `bad_request`, `model_error`, `server_error`).
+- **Allowances start fresh.** Usage recorded under an install id or shared
+  account id doesn't carry over to the account: each account gets a new
+  window (decided in witness-work ADR 0027).
+- **Dev sessions** (opened with the dev bypass on the dev worker) get the
+  bypass's unlimited allowances and never Supporter status; production never
+  verifies a `dev` token.
+- `GET /notes-import/status` stays public and the same for everyone; it
+  ignores `Authorization`. The account's balance is in kickoff's `credits`.
+
+**Legacy** (no `Authorization` header). Inference is attested per request:
+App Attest on iOS, Play Integrity on Android, with the body fields in `/docs`.
+Run routes take the kickoff's `subscribeToken` as `?token=`. Once the legacy
+switch is off, every legacy Notes Import request is 426 `upgrade_required` in
+Notes Import's shape (message in `error`), with no `Retry-After`. A dev worker
 may set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the simulator can send
 `x-ww-dev-bypass: <token>` to skip attestation. It overrides both effective usage
 allowances to unlimited while keeping real Supporter status false and retaining
 hash/refinement accounting. Existing active-concurrency behavior is unchanged.
+On a bearer request the header is ignored: the session's platform decides.
 **Never set this token in production.**
 
 **One-time setup** (beyond HERE/Sentry):
@@ -370,6 +467,10 @@ matching local tokens plus the dev Worker URL. Then run:
 pnpm run admin:reset-usage <meterId>         # production
 pnpm run admin:reset-usage --dev <meterId>   # development
 ```
+
+The meter id is the account id for app versions with account sessions (find it
+from a Buddies inbox with `POST /admin/accounts/lookup`), and the shared
+account id or install uuid for older ones.
 
 The secret route clears only the aggregate import window and Empty Import rows;
 permanent hash replay and refinement records survive. Missing configuration or
@@ -447,6 +548,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   `limit_reached` and `refinement_limit`, Buddies' `limit`).
 - Routes add their own fields beside these (`reason`, `action`, `credits`,
   `serverTime`, HERE's own error fields on the place-search proxy).
+- A bearer route's missing, expired, or invalid token is 401 `unauthorized`
+  with `WWW-Authenticate: Bearer error="invalid_token"`: refresh once and
+  retry. A request authenticated the pre-session way after the legacy switch
+  is off is 426 `upgrade_required`, without `Retry-After`.
 - `/geocode` and `/autocomplete` pass HERE's status through; a HERE error body
   keeps its fields and gains the envelope (`bad_request`, `not_found`,
   `rate_limited`, `upstream_error`). HERE unreachable or answering non-JSON is
@@ -459,9 +564,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
 bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
-`attestation`, `route-planning`, `admin` (`src/rateLimit.ts`). The old
-`/notes-import/*` attestation paths still count in `notes-import`. Refusals are 429
-`rate_limited` with `Retry-After: 60`.
+`attestation`, `route-planning`, `admin`, and `app` (`/app/v1/*`)
+(`src/rateLimit.ts`). The old `/notes-import/*` attestation paths still
+count in `notes-import`. Refusals are 429 `rate_limited` with
+`Retry-After: 60`. Buddies and accounts have their own per-caller tiers.
 
 Unexpected errors are 500 `server_error` and are reported to Sentry.
 

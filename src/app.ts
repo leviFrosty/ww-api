@@ -3,7 +3,8 @@
  * with Sentry and the cron handler, and re-exports the Durable Objects.
  */
 import { Hono } from "hono";
-import type { Environment, AppContext, HealthCheckResponse } from "./types";
+import { routePath } from "hono/route";
+import type { AppEnv, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { apiError, dateHeader } from "./errors";
 import { rateLimit } from "./rateLimit";
@@ -52,7 +53,8 @@ import {
   verifyDocs as attestationVerifyDocs,
 } from "./attestation/openapi";
 import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
-import { Sentry } from "./sentry";
+import { handleAppConfigRequest } from "./appConfig";
+import { Sentry, reportableError } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { createAccountsRoutes } from "./accounts/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
@@ -62,6 +64,7 @@ import { createRoutePlanningRoutes } from "./routePlanning/route";
 import { mountApiDocs } from "./openapi/route";
 import {
   aasaDocs,
+  appConfigDocs,
   appStoreRatingsDocs,
   autocompleteDocs,
   buddyInvitePageDocs,
@@ -76,7 +79,7 @@ import {
   notesImportAdminResetDocs,
 } from "./openapi/coreDocs";
 
-export const app = new Hono<{ Bindings: Environment }>();
+export const app = new Hono<AppEnv>();
 
 async function handleGeocodeRequest(context: AppContext) {
   return proxyRequestToHereApi(context, HERE_API.GEOCODE_URL);
@@ -112,9 +115,17 @@ function handleNotFound() {
   return apiError(HTTP_STATUS.NOT_FOUND, "not_found");
 }
 
-function handleApplicationError(error: Error) {
-  Sentry.captureException(error);
-  console.error("Application error:", error);
+/**
+ * A route that threw. A database error is reported and logged as the route
+ * alone (`reportableError`), since its message quotes the query's parameters.
+ */
+function handleApplicationError(error: Error, context: AppContext) {
+  const reported = reportableError(
+    error,
+    `${context.req.method} ${routePath(context)}`
+  );
+  Sentry.captureException(reported);
+  console.error("Application error:", reported);
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 
@@ -126,10 +137,13 @@ app.use("/notes-import/*", rateLimit("notes-import"));
 app.use("/attestation/*", rateLimit("attestation"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
+app.use("/app/v1/*", rateLimit("app"));
 
 app.get("/geocode", geocodeDocs, handleGeocodeRequest);
 app.get("/autocomplete", autocompleteDocs, handleAutocompleteRequest);
 app.get("/health", healthDocs, handleHealthCheckRequest);
+// The app's minimum version (Update Required), read at launch and foreground.
+app.get("/app/v1/config", appConfigDocs, handleAppConfigRequest);
 // Paywall social proof (App Store ratings), edge-cached; refreshed by cron.
 app.get(
   "/app-store/ratings",
@@ -239,9 +253,12 @@ app.get("/c/:payload", legacyContactLinkDocs, handleLegacyContactLinkRequest);
 // Buddies relay: POST /buddies/v1/{op}, ids only in bodies. Every op is
 // rate-limited per caller inside the handler (src/buddies/limits.ts).
 app.route("/buddies/v1", createBuddiesRoutes());
-// Anonymous accounts (witness-work ADR 0024, 0026): POST /accounts/v1/{op},
-// signed like Buddies ops (handoff's new-phone ops carry a claim token
-// instead) and rate-limited per caller inside the handler.
+// Anonymous accounts (witness-work ADR 0024, 0026, 0027): sessions
+// (`/accounts/v1/sessions`, attested once through /attestation/v1) hand out
+// bearer tokens for `GET /accounts/v1/account` and the `POST
+// /accounts/v1/{op}` handoff and backup ops; ops from before sessions still
+// take signed envelopes while the legacy switch is on (handoff's new-phone ops
+// carry a claim token instead). Rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 // `/b` is the short path in invites already sent.

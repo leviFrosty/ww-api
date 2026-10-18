@@ -22,7 +22,11 @@ export const NOTES_IMPORT_EVENTS = {
   limitReached: 'api_notes_import_limit_reached',
 } as const
 
-/** `dev` is the dev-bypass token (simulator / dev worker only). */
+/**
+ * A bearer request's session platform. Legacy: `ios` (App Attest), `android`
+ * (Play Integrity), or `dev` for the dev-bypass header. `dev` exists on the
+ * dev worker only.
+ */
 export type NotesImportPlatform = 'ios' | 'android' | 'dev'
 
 export type NotesImportTransport = 'stream' | 'legacy'
@@ -40,14 +44,20 @@ export type NotesImportLimit = 'imports' | 'refinements' | 'active_cap'
  * terminal event shares the kickoff's breakdowns. Structured-clone-safe.
  */
 export interface NotesImportAnalyticsContext {
-  /** `analyticsDistinctId(meterId)`; never the meter id itself. */
+  /**
+   * `analyticsDistinctId(meterId)`, the session's account id on bearer
+   * requests; never the meter id itself.
+   */
   distinctId: string
   platform: NotesImportPlatform
   transport: NotesImportTransport
   refinement: boolean
   /** Real entitlement at kickoff (the dev bypass never implies it). */
   supporter: boolean
-  /** The client sent a shared account id (ADR 0011), not just an install uuid. */
+  /**
+   * A bearer request (an account session), or a legacy client that sent a
+   * shared account id (ADR 0011), not just an install uuid.
+   */
   hasAccount: boolean
   notesChars: number
   /** Epoch ms when the run started; `duration_ms` is measured from here. */

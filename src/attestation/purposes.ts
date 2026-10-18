@@ -18,6 +18,9 @@ export const ATTESTATION_PURPOSES = [
   // The verify probe's purpose from when it lived at /notes-import/verify;
   // the deployed apps still sign it, so verify accepts it on both paths.
   'notes-import-verify',
+  // Opening an account session, POST /accounts/v1/sessions
+  // (src/accounts/attestation.ts): both hashes cover the account key.
+  'account-session',
 ] as const
 
 export type AttestationPurpose = (typeof ATTESTATION_PURPOSES)[number]
@@ -26,6 +29,7 @@ export const ATTESTATION_VERIFY_PURPOSE = 'attestation-verify'
 export const NOTES_IMPORT_KICKOFF_PURPOSE = 'notes-import-kickoff'
 export const NOTES_IMPORT_TRANSCRIBE_PURPOSE = 'notes-import-transcribe'
 export const NOTES_IMPORT_VERIFY_PURPOSE = 'notes-import-verify'
+export const ACCOUNT_SESSION_PURPOSE = 'account-session'
 
 const PURPOSES: ReadonlySet<string> = new Set(ATTESTATION_PURPOSES)
 

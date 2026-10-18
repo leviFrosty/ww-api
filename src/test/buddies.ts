@@ -114,7 +114,16 @@ export interface HarnessOptions {
   accountsDb?: boolean
   /** Bind the account backup bucket (default true). */
   backupBucket?: boolean
+  /**
+   * Account sessions as on the dev worker (default true): a token secret,
+   * `APP_ATTEST_ENVIRONMENT` development, and the dev bypass token.
+   */
+  sessions?: boolean
 }
+
+/** The harness's `ACCOUNT_TOKEN_SECRET` and dev bypass token. */
+export const TEST_TOKEN_SECRET = 'test-account-token-secret-0123456789abcdef'
+export const TEST_DEV_BYPASS = 'test-dev-bypass-token'
 
 export interface Harness {
   env: Environment
@@ -239,6 +248,13 @@ export const createHarness = async (
     ...(options.blobBucket === false ? {} : { BUDDY_BLOBS: r2 }),
     ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
+    ...(options.sessions === false
+      ? {}
+      : {
+          ACCOUNT_TOKEN_SECRET: TEST_TOKEN_SECRET,
+          APP_ATTEST_ENVIRONMENT: 'development',
+          NOTES_IMPORT_DEV_BYPASS_TOKEN: TEST_DEV_BYPASS,
+        }),
     ...limiters,
     ...(options.apnsConfigured === false
       ? {}

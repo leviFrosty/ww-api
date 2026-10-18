@@ -4,19 +4,24 @@ import { readBlobBody } from '../buddies/envelope'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import {
   ACCOUNT_LIMITS,
+  type AccountFields,
+  type AccountsOp,
   backupObjectKey,
   backupPrefix,
-  type AccountsOp,
 } from './contracts'
+import { readPlainJson } from './auth'
 import {
+  accountCall,
   accountForKey,
   guarded,
+  plainFields,
   refuseAtEdge,
   verifiedBody,
   verifiedHeaders,
+  type AccountCallRead,
+  type BearerFields,
   type Verified,
 } from './signed'
-import type { AccountRecord } from './store'
 
 /**
  * End-to-end encrypted backups (witness-work `docs/accounts-protocol.md`,
@@ -26,6 +31,11 @@ import type { AccountRecord } from './store'
  * back up. R2's lifecycle rule deletes a slot 400 days after its last upload
  * (`scripts/r2-lifecycle.mjs`).
  *
+ * `put`, `list`, and `get` are bearer requests; `delete` is a bearer request
+ * that also carries the account key's envelope, signed by the token's own
+ * account, so a leaked token alone can't delete backups. While the legacy
+ * switch is on, each also takes the envelope alone, as before sessions.
+ *
  * `backup/put` counts against the Buddies photo-upload edge tier, the rest
  * against the read tier.
  *
@@ -34,6 +44,12 @@ import type { AccountRecord } from './store'
  */
 
 const { backupBytes, backupSlots, backupPutIntervalMs } = ACCOUNT_LIMITS
+
+/** `backup/put`'s bearer form names its slot and digest in these headers. */
+export const BACKUP_PUT_HEADERS = {
+  slotId: 'x-ww-slot-id',
+  sha256: 'x-ww-sha256',
+} as const
 
 interface Slot {
   slotId: string
@@ -73,40 +89,43 @@ const listSlots = async (
 }
 
 /**
- * The bucket, the verified call, and its registered account; or the refusal.
- * Off (`disabled`) without the bucket or the accounts database.
+ * Runs a backup op for its account: off (`disabled`) without the bucket or
+ * the accounts database, then the edge tier, then `accountCall`.
  */
-const authorized = async <K extends AccountsOp>(
+const backupCall = async <K extends AccountsOp>(
   c: AppContext,
   edgeAs: 'blob/put' | 'inbox/sync',
-  verify: () => Promise<Verified<K>>
-): Promise<
-  | {
-      bucket: R2Bucket
-      verified: Exclude<Verified<K>, { refusal: Response }>
-      account: AccountRecord
-    }
-  | { refusal: Response }
-> => {
+  read: AccountCallRead<K>,
+  run: (
+    bucket: R2Bucket,
+    accountId: string,
+    fields: AccountFields<K>
+  ) => Promise<Response>
+): Promise<Response> => {
   const bucket = c.env.ACCOUNT_BACKUPS
-  if (!bucket || !c.env.ACCOUNTS_DB)
-    return { refusal: buddiesErrorResponse('disabled') }
+  if (!bucket || !c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
   const limited = await refuseAtEdge(c, edgeAs)
-  if (limited) return { refusal: limited }
-  const verified = await verify()
-  if ('refusal' in verified) return verified
-  const found = await accountForKey(c.env, verified.payload.accountPub)
-  if ('refusal' in found) return found
-  return { bucket, verified, account: found.account }
+  if (limited) return limited
+  return accountCall(c, read, (accountId, fields) =>
+    run(bucket, accountId, fields)
+  )
 }
+
+/** A bearer request's fields from its JSON body. */
+const jsonFields =
+  <K extends AccountsOp>(c: AppContext, op: K) =>
+  async (): Promise<BearerFields<K>> =>
+    plainFields(op, await readPlainJson(c))
 
 const hex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 
 /**
- * `backup/put`: the envelope in `x-ww-payload`/`x-ww-signature`, the blob as the raw body.
- * A declared `Content-Length` over the cap is refused before anything is
- * read; otherwise the body is read up to the signed `size` and checked
+ * `backup/put`: the blob as the raw body, with `x-ww-slot-id`, `x-ww-sha256`,
+ * and `Content-Length` (bearer) or the envelope in `x-ww-payload`/
+ * `x-ww-signature` (legacy; older builds send `x-ww-p`/`x-ww-s`). A declared
+ * `Content-Length` over the cap is refused before anything is read;
+ * otherwise the body is read up to `size` and checked
  * against `size` and `sha256` before it replaces the slot.
  */
 const handlePut = guarded('backup/put', async (c) => {
@@ -115,89 +134,130 @@ const handlePut = guarded('backup/put', async (c) => {
     return c.env.ACCOUNT_BACKUPS && c.env.ACCOUNTS_DB
       ? buddiesErrorResponse('too_large')
       : buddiesErrorResponse('disabled')
-  const call = await authorized(c, 'blob/put', () =>
-    verifiedHeaders(c, 'backup/put')
-  )
-  if ('refusal' in call) return call.refusal
-  const { bucket, account } = call
-  const { slotId, size, sha256 } = call.verified.fields
-  if (size > backupBytes) return buddiesErrorResponse('too_large')
+  return backupCall(
+    c,
+    'blob/put',
+    {
+      bearer: async () =>
+        plainFields('backup/put', {
+          slotId: c.req.header(BACKUP_PUT_HEADERS.slotId),
+          sha256: c.req.header(BACKUP_PUT_HEADERS.sha256),
+          size: declared == null ? undefined : Number(declared),
+        }),
+      legacy: () => verifiedHeaders(c, 'backup/put'),
+    },
+    async (bucket, accountId, { slotId, size, sha256 }) => {
+      if (size > backupBytes) return buddiesErrorResponse('too_large')
 
-  const now = Date.now()
-  const slots = await listSlots(bucket, account.id)
-  const existing = slots.find((slot) => slot.slotId === slotId)
-  if (existing) {
-    const wait = existing.uploadedAt + backupPutIntervalMs - now
-    if (wait > 0)
-      return buddiesErrorResponse('rate_limited', {
-        retryAfterSeconds: Math.max(1, Math.ceil(wait / 1_000)),
+      const now = Date.now()
+      const slots = await listSlots(bucket, accountId)
+      const existing = slots.find((slot) => slot.slotId === slotId)
+      if (existing) {
+        const wait = existing.uploadedAt + backupPutIntervalMs - now
+        if (wait > 0)
+          return buddiesErrorResponse('rate_limited', {
+            retryAfterSeconds: Math.max(1, Math.ceil(wait / 1_000)),
+          })
+      } else if (slots.length >= backupSlots) {
+        return buddiesErrorResponse('limit')
+      }
+
+      const body = await readBlobBody(c.req.raw, size, backupBytes)
+      if (!body.ok) return buddiesErrorResponse(body.error)
+      const digest = await sha256Bytes(body.value)
+      if (!timingSafeEqual(bytesToBase64Url(digest), sha256))
+        return buddiesErrorResponse('bad_request')
+
+      await bucket.put(backupObjectKey(accountId, slotId), body.value, {
+        sha256: hex(digest),
+        httpMetadata: { contentType: 'application/octet-stream' },
+        customMetadata: { uploadedAt: String(now) },
       })
-  } else if (slots.length >= backupSlots) {
-    return buddiesErrorResponse('limit')
-  }
-
-  const body = await readBlobBody(c.req.raw, size, backupBytes)
-  if (!body.ok) return buddiesErrorResponse(body.error)
-  const digest = await sha256Bytes(body.value)
-  if (!timingSafeEqual(bytesToBase64Url(digest), sha256))
-    return buddiesErrorResponse('bad_request')
-
-  await bucket.put(backupObjectKey(account.id, slotId), body.value, {
-    sha256: hex(digest),
-    httpMetadata: { contentType: 'application/octet-stream' },
-    customMetadata: { uploadedAt: String(now) },
-  })
-  return c.json({ ok: true, uploadedAt: now })
-})
-
-const handleList = guarded('backup/list', async (c) => {
-  const call = await authorized(c, 'inbox/sync', () =>
-    verifiedBody(c, 'backup/list')
+      return c.json({ ok: true, uploadedAt: now })
+    }
   )
-  if ('refusal' in call) return call.refusal
-  const slots = await listSlots(call.bucket, call.account.id)
-  return c.json({ ok: true, slots })
 })
+
+const handleList = guarded('backup/list', async (c) =>
+  backupCall(
+    c,
+    'inbox/sync',
+    {
+      bearer: async () => ({ fields: {} }),
+      legacy: () => verifiedBody(c, 'backup/list'),
+    },
+    async (bucket, accountId) =>
+      c.json({ ok: true, slots: await listSlots(bucket, accountId) })
+  )
+)
 
 /** Streams the slot's bytes back exactly as put. */
-const handleGet = guarded('backup/get', async (c) => {
-  const call = await authorized(c, 'inbox/sync', () =>
-    verifiedBody(c, 'backup/get')
-  )
-  if ('refusal' in call) return call.refusal
-  const object = await call.bucket.get(
-    backupObjectKey(call.account.id, call.verified.fields.slotId)
-  )
-  if (!object) return buddiesErrorResponse('not_found')
-  return new Response(object.body, {
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': String(object.size),
-      'Cache-Control': 'no-store',
-      'X-Content-Type-Options': 'nosniff',
+const handleGet = guarded('backup/get', async (c) =>
+  backupCall(
+    c,
+    'inbox/sync',
+    {
+      bearer: jsonFields(c, 'backup/get'),
+      legacy: () => verifiedBody(c, 'backup/get'),
     },
-  })
-})
+    async (bucket, accountId, { slotId }) => {
+      const object = await bucket.get(backupObjectKey(accountId, slotId))
+      if (!object) return buddiesErrorResponse('not_found')
+      return new Response(object.body, {
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(object.size),
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        },
+      })
+    }
+  )
+)
+
+/**
+ * The bearer form of `backup/delete`: the envelope must verify and be signed
+ * by the token's own account (`forbidden` otherwise).
+ */
+const stepUp = async (
+  c: AppContext,
+  accountId: string
+): Promise<BearerFields<'backup/delete'>> => {
+  const verified: Verified<'backup/delete'> = await verifiedBody(
+    c,
+    'backup/delete'
+  )
+  if ('refusal' in verified) return verified
+  const found = await accountForKey(c.env, verified.payload.accountPub)
+  if ('refusal' in found) return found
+  return found.account.id === accountId
+    ? { fields: verified.fields }
+    : { refusal: buddiesErrorResponse('forbidden') }
+}
 
 /** One slot, or every slot without `slotId`. Idempotent. */
-const handleDelete = guarded('backup/delete', async (c) => {
-  const call = await authorized(c, 'inbox/sync', () =>
-    verifiedBody(c, 'backup/delete')
+const handleDelete = guarded('backup/delete', async (c) =>
+  backupCall(
+    c,
+    'inbox/sync',
+    {
+      bearer: (account) => stepUp(c, account.accountId),
+      legacy: () => verifiedBody(c, 'backup/delete'),
+    },
+    async (bucket, accountId, { slotId }) => {
+      const keys =
+        slotId != null
+          ? [backupObjectKey(accountId, slotId)]
+          : (await listSlots(bucket, accountId)).map((slot) =>
+              backupObjectKey(accountId, slot.slotId)
+            )
+      // R2 deletes at most 1,000 keys a call.
+      for (let start = 0; start < keys.length; start += 1_000)
+        await bucket.delete(keys.slice(start, start + 1_000))
+      return c.json({ ok: true })
+    }
   )
-  if ('refusal' in call) return call.refusal
-  const { bucket, account } = call
-  const { slotId } = call.verified.fields
-  const keys =
-    slotId != null
-      ? [backupObjectKey(account.id, slotId)]
-      : (await listSlots(bucket, account.id)).map((slot) =>
-          backupObjectKey(account.id, slot.slotId)
-        )
-  // R2 deletes at most 1,000 keys a call.
-  for (let start = 0; start < keys.length; start += 1_000)
-    await bucket.delete(keys.slice(start, start + 1_000))
-  return c.json({ ok: true })
-})
+)
 
 export const backupHandlers = {
   put: handlePut,

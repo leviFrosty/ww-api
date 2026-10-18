@@ -34,6 +34,7 @@ export type RateLimitFamily =
   | 'attestation'
   | 'route-planning'
   | 'admin'
+  | 'app'
 
 /** The bucket key for one family and caller. */
 export const rateLimitKey = (

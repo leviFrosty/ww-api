@@ -52,6 +52,30 @@ export const healthDocs = describeRoute({
   },
 })
 
+export const appConfigDocs = describeRoute({
+  tags: ['Service'],
+  summary: 'App configuration',
+  description:
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. No authentication.',
+  responses: {
+    200: jsonResponse(
+      'The configuration.',
+      z.object({
+        ok: z.literal(true),
+        minAppVersion: z
+          .string()
+          .regex(/^\d+\.\d+\.\d+$/)
+          .optional()
+          .meta({
+            description:
+              'The oldest app version (`major.minor.patch`) the API still supports. Absent without a floor.',
+          }),
+      })
+    ),
+    ...rateLimitedResponse,
+  },
+})
+
 const hereQuery = (extra: string) => [
   {
     name: 'q',
