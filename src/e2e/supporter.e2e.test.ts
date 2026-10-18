@@ -32,6 +32,17 @@ const lifetime = {
   subscriber: { entitlements: { 'Lifetime Supporter': { expires_date: null } } },
 }
 const free = { subscriber: { entitlements: {}, subscriptions: {} } }
+const monthly = (expiresMs: number) => {
+  const expires_date = new Date(expiresMs).toISOString()
+  return {
+    subscriber: {
+      entitlements: { 'Monthly Donator': { expires_date, product_identifier: 'monthly' } },
+      subscriptions: { monthly: { expires_date } },
+    },
+  }
+}
+/** The fake never answers for this id (a hung RevenueCat). */
+const HANG = 'hang'
 
 /** What the fake answers per app user id; absent is 404. */
 const customers = new Map<string, unknown>()
@@ -45,6 +56,7 @@ beforeAll(async () => {
     const id = decodeURIComponent((request.url ?? '').split('/').pop() ?? '')
     reads.push(id)
     const body = customers.get(id)
+    if (body === HANG) return
     const authorized = (request.headers.authorization ?? '').startsWith('Bearer ')
     response.writeHead(!authorized ? 401 : body ? 200 : 404, {
       'content-type': 'application/json',
@@ -55,6 +67,7 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
+  fake?.closeAllConnections()
   await new Promise<void>((resolve) => (fake ? fake.close(() => resolve()) : resolve()))
 })
 
@@ -156,9 +169,46 @@ describe.skipIf(
     expect(refused.body.code).toBe('supporter_required')
   })
 
+  it('keeps a Supporter whose subscription renewed at its end, with no webhook', async () => {
+    const id = `e2e-${crypto.randomUUID()}`
+    const end = Date.now() + 1_500
+    customers.set(id, monthly(end))
+    const session = await openSession()
+    const linked = await http('POST', '/accounts/v1/revenuecat-customers', {
+      headers: bearerHeaders(session),
+      body: { appUserId: id },
+    })
+    expect(linked.body).toEqual({ ok: true, supporter: true, expiresAt: end })
+
+    // It renews at its end; no webhook comes.
+    const renewed = end + 30 * 24 * 60 * 60_000
+    customers.set(id, monthly(renewed))
+    await new Promise((resolve) => setTimeout(resolve, end - Date.now() + 500))
+    const before = reads.filter((read) => read === id).length
+    const status = await http('GET', '/accounts/v1/supporter', { headers: bearerHeaders(session) })
+    expect(status.body).toEqual({ ok: true, supporter: true, expiresAt: renewed, customers: 1 })
+    expect(reads.filter((read) => read === id).length).toBe(before + 1)
+  })
+
+  it('gives up on a RevenueCat that never answers', async () => {
+    const id = `e2e-${crypto.randomUUID()}`
+    customers.set(id, HANG)
+    const session = await openSession()
+    const started = Date.now()
+    const response = await http('POST', '/accounts/v1/revenuecat-customers', {
+      headers: bearerHeaders(session),
+      body: { appUserId: id },
+    })
+    expect(response.status).toBe(503)
+    expect(response.body.code).toBe('unavailable')
+    expect(Date.now() - started).toBeLessThan(9_000)
+  }, 15_000)
+
   it('answers unavailable while RevenueCat is unreachable', async () => {
     const session = await openSession()
     // Stop the fake for the call: RevenueCat is down.
+    // A hung request (above) mustn't keep it open.
+    fake!.closeAllConnections()
     await new Promise<void>((resolve) => fake!.close(() => resolve()))
     try {
       const response = await http('POST', '/accounts/v1/revenuecat-customers', {
