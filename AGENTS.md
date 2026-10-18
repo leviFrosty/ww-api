@@ -264,6 +264,21 @@ Notes Import identifies the caller by the session's account (witness-work ADR
   account id stays on that meter; each account starts a fresh window.
 - `GET /notes-import/status` is unchanged: public, the same for everyone, and
   cached per isolate as below. It never reads `Authorization`.
+- **Usage**: `GET /notes-import/usage` (bearer only, read-only) is the
+  account's allowance for the app's composer and credits sheet: `imports`
+  (`limit`, `used`, `remaining`, `resetsAt`), `refinements.limitPerImport`,
+  `windowDays`, `supporter`, `supporterCheckFailed`, and `accountStatus`.
+  It runs kickoff's own code (`resolveAccountSupporter`,
+  `resolveMeterAllowances`, then `NotesImportIndex.usage`, built on the
+  same `normalizeImportWindow`/`computeCreditsSnapshot`), so it can't
+  disagree with kickoff; change those together. It charges nothing, holds
+  no slot, and emits no operational event. RevenueCat unreachable answers
+  free with `supporterCheckFailed: true` (kickoff meters it free too), never
+  a 5xx. A suspended account still reads it (`accountStatus: "suspended"`).
+  It counts in the read edge tier per IP (`BUDDIES_READ_LIMITER`, 600/min),
+  not the `notes-import` bucket (`rateLimit`'s `except`), so every device
+  opening the composer never spends the imports' budget. Refinements are
+  per notes text, so there's no account-wide refinement balance.
 
 ## Status caching and trace sampling
 

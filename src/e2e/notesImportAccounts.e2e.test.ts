@@ -13,8 +13,9 @@ import {
 /**
  * Notes Import on account sessions: a dev-bypass session's bearer token runs
  * kickoff → SSE events → result → destroy, another account gets 404 for that
- * import, empty notes are a 400, and legacy requests get 426 once the legacy
- * switch is off.
+ * import, empty notes are a 400, the account's allowance reads the same on
+ * each of its devices, and legacy requests get 426 once the legacy switch is
+ * off.
  *
  * The lifecycle runs only against the local launcher without an OpenRouter
  * key, where the run fails at the model call (free) and still walks every
@@ -38,9 +39,14 @@ interface Session {
   accessToken: string
 }
 
-/** Opens a session with the dev bypass in place of attestation. */
-const openSession = async (): Promise<Session> => {
-  const key = await SigningKey.generate()
+/**
+ * Opens a session with the dev bypass in place of attestation; `key` opens
+ * another session on that key's account (a second device).
+ */
+const openSession = async (
+  existing?: SigningKey
+): Promise<Session & { key: SigningKey }> => {
+  const key = existing ?? (await SigningKey.generate())
   const bytes = encoder.encode(
     JSON.stringify({ accountPub: key.publicKey, ts: Date.now(), nonce: randomId() })
   )
@@ -52,7 +58,7 @@ const openSession = async (): Promise<Session> => {
     },
   })
   expect(res.status).toBe(201)
-  return res.body
+  return { ...res.body, key }
 }
 
 const bearer = (session: Session) => ({
@@ -175,6 +181,66 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Notes Import with a bearer token', () => {
       expect(again.body.importId).toBe(importId)
       expect(TERMINAL).toContain((await waitForTerminal(importId, owner)).body.status)
       await runRoute(importId, 'destroy', owner)
+    }
+  )
+})
+
+describe.skipIf(!DEV_BYPASS_TOKEN)('GET /notes-import/usage', () => {
+  it('reads the account’s allowance, the same on each of its devices', async () => {
+    const phone = await openSession()
+    const tablet = await openSession(phone.key)
+    expect(tablet.accountId).toBe(phone.accountId)
+    const answers = [
+      await http('GET', '/notes-import/usage', { headers: bearer(phone) }),
+      await http('GET', '/notes-import/usage', { headers: bearer(tablet) }),
+    ]
+    for (const res of answers) {
+      expect(res.status).toBe(200)
+      expect(res.headers.get('cache-control')).toBe('no-store')
+      // A dev session gets the bypass's unlimited allowances, never Supporter.
+      expect(res.body).toEqual({
+        ok: true,
+        accountStatus: 'active',
+        supporter: false,
+        supporterCheckFailed: false,
+        imports: { limit: null, used: 0, remaining: null, resetsAt: null },
+        refinements: { limitPerImport: null },
+        windowDays: expect.any(Number),
+      })
+    }
+    expect(answers[1].body).toEqual(answers[0].body)
+  })
+
+  it('needs a bearer token, in Notes Import’s error shape', async () => {
+    for (const headers of [{}, { authorization: 'Bearer not.a.token' }]) {
+      const res = await http('GET', '/notes-import/usage', { headers })
+      expect(res.status).toBe(401)
+      expect(res.body).toEqual({
+        ok: false,
+        error: 'The access token is missing, expired, or invalid',
+        code: 'unauthorized',
+      })
+      expect(res.headers.get('www-authenticate')).toBe('Bearer error="invalid_token"')
+    }
+  })
+
+  it.skipIf(!LOCAL_LAUNCHER)(
+    'never spends the imports’ per-IP bucket',
+    { timeout: 30_000 },
+    async () => {
+      const session = await openSession()
+      // One caller IP: past the `notes-import` bucket's 60 a minute.
+      const ip = `198.18.250.${Math.floor(Math.random() * 250) + 1}`
+      for (let i = 0; i < 61; i++) {
+        const res = await http('GET', '/notes-import/usage', {
+          headers: { ...bearer(session), 'cf-connecting-ip': ip },
+        })
+        expect(res.status).toBe(200)
+      }
+      const status = await http('GET', '/notes-import/status', {
+        headers: { 'cf-connecting-ip': ip },
+      })
+      expect(status.status).toBe(200)
     }
   )
 })

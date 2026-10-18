@@ -1,6 +1,6 @@
 import type { AppContext, ErrorResponse } from '../types'
 import { HTTP_STATUS } from '../config'
-import { Sentry } from '../sentry'
+import { Sentry, captureFailure } from '../sentry'
 import { retryAfterHeaders } from '../errors'
 import { sha256Hex, timingSafeEqual, randomToken } from '../crypto'
 import {
@@ -58,6 +58,7 @@ import { isEmptyImportResult, type NotesImportContext } from './schema'
 import {
   authenticateAccount,
   hasAuthorization,
+  refuseInactiveAccount,
   type AccountAuth,
   type AccountAuthError,
   type RequireAccountOptions,
@@ -65,6 +66,11 @@ import {
 import { isLegacyAuthEnabled } from '../accounts/legacySwitch'
 import { isAccountSupporter } from '../accounts/supporter'
 import { BEARER_CHALLENGE } from '../buddies/errorResponse'
+import {
+  EDGE_RETRY_AFTER_SECONDS,
+  allowBuddiesCaller,
+  buddiesCallerKey,
+} from '../buddies/limits'
 import { handleAdminResetRequest } from './admin'
 import {
   buildAllowanceDenial,
@@ -214,6 +220,25 @@ const ACCOUNT_REFUSALS: Record<
   },
 }
 
+/** An account refusal in Notes Import's shape; a 401 also sends `WWW-Authenticate`. */
+const accountRefusal = (ctx: AppContext, error: AccountAuthError): Response => {
+  const refusal = ACCOUNT_REFUSALS[error]
+  const response = err(
+    ctx,
+    refusal.status,
+    refusal.message,
+    refusal.code,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    refusal.retryAfter
+  )
+  if (error === 'unauthorized')
+    response.headers.set('WWW-Authenticate', BEARER_CHALLENGE)
+  return response
+}
+
 async function resolveCaller(
   ctx: AppContext,
   options: RequireAccountOptions = {}
@@ -221,21 +246,7 @@ async function resolveCaller(
   if (hasAuthorization(ctx)) {
     const result = await authenticateAccount(ctx, options)
     if (result.ok) return { account: result.account }
-    const refusal = ACCOUNT_REFUSALS[result.error]
-    const response = err(
-      ctx,
-      refusal.status,
-      refusal.message,
-      refusal.code,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      refusal.retryAfter
-    )
-    if (result.error === 'unauthorized')
-      response.headers.set('WWW-Authenticate', BEARER_CHALLENGE)
-    return { response }
+    return { response: accountRefusal(ctx, result.error) }
   }
   if (await isLegacyAuthEnabled(ctx.env)) return { account: null }
   // No Retry-After: only updating the app helps.
@@ -277,6 +288,127 @@ export async function handleNotesImportStatusRequest(ctx: AppContext) {
   const status = await getPublicNotesImportStatus(ctx.env, waitUntilOf(ctx))
   // Keep intermediary/browser caches from adding another freshness window.
   return ctx.json(status, 200, { 'Cache-Control': 'no-store' })
+}
+
+// --- Supporter status and allowances ----------------------------------------
+
+/** A Supporter check's answer, and whether it could be made at all. */
+interface SupporterCheck {
+  supporter: boolean
+  /** RevenueCat (or the store) couldn't answer, so the meter counts as free. */
+  checkFailed: boolean
+}
+
+/**
+ * Runs a Supporter check, failing closed to free: the free meter still lets
+ * them import. Real entitlement stays distinct from the dev bypass, which
+ * overrides allowance values only (only an actual Supporter suppresses
+ * Supporter CTAs), so a bypassed request asks no one.
+ */
+async function checkSupporter(
+  devBypass: boolean,
+  lookup: () => Promise<boolean>
+): Promise<SupporterCheck> {
+  if (devBypass) return { supporter: false, checkFailed: false }
+  try {
+    return { supporter: await lookup(), checkFailed: false }
+  } catch (e) {
+    if (!(e instanceof RevenueCatError)) captureFailure(e, 'notes-import supporter')
+    return { supporter: false, checkFailed: true }
+  }
+}
+
+/** A bearer meter's Supporter status: the account's own (ADR 0029). */
+const resolveAccountSupporter = (
+  ctx: AppContext,
+  accountId: string,
+  devBypass: boolean
+): Promise<SupporterCheck> =>
+  checkSupporter(devBypass, () => isAccountSupporter(ctx.env, accountId))
+
+/** The allowances a meter gets, from the runtime limits (KV, vars, defaults). */
+async function resolveMeterAllowances(
+  ctx: AppContext,
+  supporter: boolean,
+  devBypass: boolean
+) {
+  const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
+  return {
+    allowances: selectEffectiveAllowances(limits, supporter, devBypass),
+    windowDurationMs: limitsWindowDurationMs(limits),
+    windowDays: limits.windowDays,
+  }
+}
+
+/**
+ * GET /notes-import/usage — the bearer token's account's Notes Import
+ * allowance right now, so every device shows the same balance (an import on
+ * one counts on the others). Read-only: it counts as no import, records
+ * nothing, and touches no run or slot.
+ *
+ * It answers through the code kickoff gates with: the account's Supporter
+ * status (`isAccountSupporter`, or a dev session's bypass), the runtime
+ * limits, and the account's `NotesImportIndex` window, so the number can't
+ * drift from what kickoff enforces. RevenueCat unreachable answers free with
+ * `supporterCheckFailed`, as kickoff meters it, never a 5xx. A suspended
+ * account still reads its allowance (`accountStatus: "suspended"`); kickoff
+ * refuses it. Counts against the read edge tier per IP (not the
+ * `notes-import` bucket, which the imports themselves need).
+ *
+ * Privacy: nothing here logs or reports the token or the account id.
+ */
+export async function handleNotesImportUsageRequest(ctx: AppContext) {
+  const callerKey = buddiesCallerKey(ctx.req.header('CF-Connecting-IP'))
+  if (!(await allowBuddiesCaller(ctx.env, 'inbox/sync', callerKey))) {
+    return err(
+      ctx,
+      HTTP_STATUS.TOO_MANY_REQUESTS,
+      'Too many requests',
+      'rate_limited',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      EDGE_RETRY_AFTER_SECONDS
+    )
+  }
+  // Bearer only: it's newer than sessions, so there's no legacy form.
+  const auth = await authenticateAccount(ctx)
+  if (!auth.ok) return accountRefusal(ctx, auth.error)
+  const { account } = auth
+  const inactive = await refuseInactiveAccount(ctx.env, account)
+  if (inactive && inactive.error !== 'suspended')
+    return accountRefusal(ctx, inactive.error)
+
+  const config = getNotesImportConfig(ctx.env)
+  const devBypass = isDevSession(config, account)
+  const { supporter, checkFailed } = await resolveAccountSupporter(
+    ctx,
+    account.accountId,
+    devBypass
+  )
+  const { allowances, windowDurationMs, windowDays } =
+    await resolveMeterAllowances(ctx, supporter, devBypass)
+  const imports = await ctx.env.NOTES_IMPORT_INDEX.get(
+    ctx.env.NOTES_IMPORT_INDEX.idFromName(account.accountId)
+  ).usage({ importLimit: allowances.imports, windowDurationMs })
+
+  return ctx.json(
+    {
+      ok: true as const,
+      accountStatus: inactive ? ('suspended' as const) : ('active' as const),
+      supporter,
+      supporterCheckFailed: checkFailed,
+      imports,
+      refinements: {
+        limitPerImport:
+          allowances.refinements === -1 ? null : allowances.refinements,
+      },
+      windowDays,
+    },
+    200,
+    { 'Cache-Control': 'no-store' }
+  )
 }
 
 interface NotesImportBody {
@@ -498,24 +630,15 @@ async function authenticateAndGate(
       }
     : null
 
-  // Keep real entitlement distinct from dev bypass: bypass overrides allowance
-  // values only, while only an actual Supporter suppresses Supporter CTAs.
-  let supporter = false
-  if (!devBypass) {
-    try {
-      supporter = gateAccount
-        ? await isAccountSupporter(ctx.env, gateAccount.accountId)
-        : await isSupporter({
-            apiKey: ctx.env.REVENUECAT_API_KEY,
-            appUserId: meterId,
-            entitlementId: config.entitlementId,
-          })
-    } catch (e) {
-      if (!(e instanceof RevenueCatError)) Sentry.captureException(e)
-      // Fail closed to non-Supporter — the free meter still lets them import.
-      supporter = false
-    }
-  }
+  const { supporter } = gateAccount
+    ? await resolveAccountSupporter(ctx, gateAccount.accountId, devBypass)
+    : await checkSupporter(devBypass, () =>
+        isSupporter({
+          apiKey: ctx.env.REVENUECAT_API_KEY,
+          appUserId: meterId,
+          entitlementId: config.entitlementId,
+        })
+      )
   const supporterConcurrency = supporter || devBypass
   const isRefinement = !!body.refinement
   const analytics: GateOk['analytics'] = {
@@ -533,9 +656,11 @@ async function authenticateAndGate(
     hasAccount: account != null || accountId != null,
     notesChars: notesText.length,
   }
-  const limits = await resolveNotesImportLimits(ctx.env, ctx.env.NOTES_KV)
-  const allowances = selectEffectiveAllowances(limits, supporter, devBypass)
-  const windowDurationMs = limitsWindowDurationMs(limits)
+  const { allowances, windowDurationMs } = await resolveMeterAllowances(
+    ctx,
+    supporter,
+    devBypass
+  )
 
   // Pre-flight the credit gate in the per-user index DO (single-threaded →
   // strongly consistent, unlike the old KV read). The commit after a successful

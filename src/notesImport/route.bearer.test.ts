@@ -1087,6 +1087,198 @@ describe('legacy requests', () => {
   })
 })
 
+describe('GET /notes-import/usage', () => {
+  const usage = (token?: string, headers: Record<string, string> = {}) =>
+    call('GET', '/notes-import/usage', {
+      headers: { ...(token ? bearer(token) : {}), ...headers },
+    })
+
+  const FRESH = {
+    ok: true,
+    accountStatus: 'active',
+    supporter: false,
+    supporterCheckFailed: false,
+    imports: { limit: 3, used: 0, remaining: 3, resetsAt: null },
+    refinements: { limitPerImport: 5 },
+    windowDays: 30,
+  }
+
+  it('reports a fresh account’s full allowance, uncached', async () => {
+    const session = await devSession()
+    const response = await usage(await iosToken(session))
+    expect(response.status).toBe(200)
+    expect(response.body).toEqual(FRESH)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    // No Supporter id linked, so RevenueCat was never asked.
+    expect(revenueCatIds()).toEqual([])
+  })
+
+  it('shows an import on one device to the account’s other devices', async () => {
+    const phone = await devSession()
+    const tablet = await openTestSession(accountsApp, h.env, phone.key)
+    expect(tablet.accountId).toBe(phone.accountId)
+    await importNotes(await iosToken(phone))
+
+    const response = await usage(await iosToken(tablet))
+    expect(response.body.imports).toEqual({
+      limit: 3,
+      used: 1,
+      remaining: 2,
+      resetsAt: new Date(START + 30 * 24 * 60 * 60_000).toISOString(),
+    })
+    // Another account's meter is its own.
+    const stranger = await devSession()
+    expect((await usage(await iosToken(stranger))).body.imports).toEqual(
+      FRESH.imports
+    )
+  })
+
+  it('agrees with what kickoff admits and refuses, and spends nothing', async () => {
+    const session = await devSession()
+    const token = await iosToken(session)
+    for (const notesText of ['One', 'Two']) await importNotes(token, { notesText })
+    const before = await usage(token)
+    expect(before.body.imports).toMatchObject({ used: 2, remaining: 1 })
+    // Reading again changes nothing, holds no slot, and records no content.
+    expect((await usage(token)).body).toEqual(before.body)
+    expect(
+      indexes.storage(session.accountId).query('SELECT COUNT(*) AS n FROM active')
+    ).toEqual([{ n: 0 }])
+    expect(
+      indexes.storage(session.accountId).query('SELECT COUNT(*) AS n FROM hash_record')
+    ).toEqual([{ n: 2 }])
+
+    const started = await kickoff(token, { notesText: 'Three' })
+    expect(started.body.credits.remaining).toBe(0)
+    await runs.fireAlarm(started.body.importId)
+    await flush()
+    const spent = await usage(token)
+    expect(spent.body.imports).toMatchObject({ used: 3, remaining: 0 })
+    const refused = await kickoff(token, { notesText: 'Four' })
+    expect(refused.status).toBe(402)
+    expect(refused.body).toMatchObject({ code: 'limit_reached' })
+    expect(refused.body.credits.resetsAt).toBe(spent.body.imports.resetsAt)
+  })
+
+  it('frees the allowance when the window ends', async () => {
+    const session = await devSession()
+    await importNotes(await iosToken(session))
+    vi.setSystemTime(START + 30 * 24 * 60 * 60_000)
+    expect((await usage(await iosToken(session))).body.imports).toEqual(
+      FRESH.imports
+    )
+  })
+
+  it('follows the runtime limits in KV, as kickoff does', async () => {
+    await h.kv.put(
+      'notes-import:limits',
+      JSON.stringify({ importsFree: 10, refinementsFree: -1, windowDays: 7 })
+    )
+    const session = await devSession()
+    expect((await usage(await iosToken(session))).body).toMatchObject({
+      imports: { limit: 10, remaining: 10 },
+      refinements: { limitPerImport: null },
+      windowDays: 7,
+    })
+  })
+
+  it('reports a Supporter from the account’s linked customer as unlimited', async () => {
+    fetchMock.mockImplementation(async () => Response.json(LIFETIME))
+    const session = await devSession()
+    const token = await iosToken(session)
+    await linkCustomer(token)
+    expect((await usage(token)).body).toMatchObject({
+      supporter: true,
+      supporterCheckFailed: false,
+      imports: { limit: null, remaining: null, resetsAt: null },
+      refinements: { limitPerImport: null },
+    })
+  })
+
+  it('answers free with a flag when RevenueCat can’t be reached, never a 5xx', async () => {
+    fetchMock.mockImplementation(async () => Response.json(LIFETIME))
+    const session = await devSession()
+    const token = await iosToken(session)
+    await linkCustomer(token)
+    vi.setSystemTime(START + 25 * 60 * 60_000)
+    fetchMock.mockImplementation(async () => new Response(null, { status: 503 }))
+    const response = await usage(await iosToken(session))
+    expect(response.status).toBe(200)
+    expect(response.body).toMatchObject({
+      supporter: false,
+      supporterCheckFailed: true,
+      imports: { limit: 3, remaining: 3 },
+    })
+    // Kickoff meters it the same way meanwhile.
+    const started = await kickoff(await iosToken(session))
+    expect(started.body.credits).toMatchObject({ isSupporter: false, limit: 3 })
+  })
+
+  it('still answers a suspended account, saying so', async () => {
+    const session = await devSession()
+    await setAccountStatus(
+      accountsDb(h.env.ACCOUNTS_DB!),
+      session.accountId,
+      'suspended',
+      'report'
+    )
+    const response = await usage(await iosToken(session))
+    expect(response.status).toBe(200)
+    expect(response.body).toMatchObject({
+      accountStatus: 'suspended',
+      imports: FRESH.imports,
+    })
+  })
+
+  it('gives a dev session the bypass’s allowances, never Supporter status', async () => {
+    const session = await devSession()
+    expect((await usage(session.accessToken)).body).toMatchObject({
+      supporter: false,
+      imports: { limit: null, remaining: null },
+    })
+  })
+
+  it('needs a bearer token: no legacy form', async () => {
+    for (const response of [
+      await usage(undefined, legacyHeaders),
+      await usage('forged.token.value'),
+    ]) {
+      expect(response.status).toBe(401)
+      expect(response.body).toEqual({
+        ok: false,
+        error: 'The access token is missing, expired, or invalid',
+        code: 'unauthorized',
+      })
+      expect(response.headers.get('www-authenticate')).toBe(
+        'Bearer error="invalid_token"'
+      )
+    }
+  })
+
+  it('counts in the read edge tier, not the imports’ bucket', async () => {
+    const env = h.env as Environment & Record<string, unknown>
+    const importBucket = vi.fn(async () => ({ success: true }))
+    env.RATE_LIMITER = { limit: importBucket }
+    const readTier = vi.fn(async () => ({ success: true }))
+    env.BUDDIES_READ_LIMITER = { limit: readTier }
+    const session = await devSession()
+    expect((await usage(await iosToken(session))).status).toBe(200)
+    expect(importBucket).not.toHaveBeenCalled()
+    expect(readTier).toHaveBeenCalledTimes(1)
+
+    readTier.mockResolvedValue({ success: false })
+    const limited = await usage(await iosToken(session))
+    expect(limited.status).toBe(429)
+    expect(limited.body).toMatchObject({
+      ok: false,
+      code: 'rate_limited',
+      retryAfter: 60,
+    })
+    expect(typeof limited.body.error).toBe('string')
+    expect(limited.headers.get('retry-after')).toBe('60')
+  })
+})
+
 describe('GET /notes-import/status', () => {
   it('answers a bearer request with the same public body', async () => {
     const session = await devSession()

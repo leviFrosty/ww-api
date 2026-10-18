@@ -178,10 +178,83 @@ export const statusDocs = describeRoute({
 
 Availability checks the KV kill switch (\`notes-import:enabled\`) first, then whether any allowlisted model host is healthy on OpenRouter (a free metadata call, cached 60 seconds). Fails open: if the probe itself errors, the response says available without \`limits\`.
 
-Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`. Public and the same for everyone: it ignores \`Authorization\` and never reports one account’s allowance (kickoff’s \`credits\` does).`,
+Completed responses are reused in each Worker isolate for up to 30 seconds (KV reads add up to 60 seconds more); the response itself is \`Cache-Control: no-store\`. Public and the same for everyone: it ignores \`Authorization\` and never reports one account’s allowance (\`GET /notes-import/usage\` and kickoff’s \`credits\` do).`,
   responses: {
     200: jsonResponse('The current status.', statusSchema),
     ...rateLimitedResponse,
+  },
+})
+
+// --- GET /notes-import/usage ------------------------------------------------
+
+const usageSchema = z.object({
+  ok: z.literal(true),
+  accountStatus: z.enum(['active', 'suspended']).meta({
+    description:
+      'The account’s status. A suspended account can read its allowance, but kickoff refuses it with 403 `suspended`.',
+  }),
+  supporter: z.boolean().meta({
+    description:
+      'Whether the account counts as a Supporter right now, as kickoff would meter it: its own linked RevenueCat customers (see `GET /accounts/v1/supporter`). A dev session is never a Supporter.',
+  }),
+  supporterCheckFailed: z.boolean().meta({
+    description:
+      'RevenueCat couldn’t be reached, so the account is answered as free, which is also how kickoff meters it until RevenueCat answers again. Show the free allowance; don’t tell a Supporter they lost their status.',
+  }),
+  imports: z
+    .object({
+      limit: z.number().int().nullable().meta({
+        description: 'Imports allowed per window; `null` is unlimited.',
+      }),
+      used: z.number().int().meta({
+        description:
+          'New imports charged in the current window, on every device of the account. `0` when no window is active. Can exceed `limit` by imports that were already running when the last one was charged.',
+      }),
+      remaining: z.number().int().nullable().meta({
+        description:
+          'Imports left in the current window (never below 0); `null` is unlimited. Kickoff admits a new import while this is above 0. Replaying notes already imported and refining them don’t spend it.',
+      }),
+      resetsAt: z.string().nullable().meta({
+        description:
+          'When the current window ends and `remaining` returns to `limit` (ISO 8601). `null` when no window is active (the next charged import starts one) or when unlimited.',
+        format: 'date-time',
+      }),
+    })
+    .meta({ description: 'The account’s import allowance.' }),
+  refinements: z
+    .object({
+      limitPerImport: z.number().int().nullable().meta({
+        description:
+          'Refinements allowed for each imported notes text over its lifetime; `null` is unlimited. Counted per notes text, not per account, so there is no account-wide balance (kickoff’s `credits.refinements` has one text’s).',
+      }),
+    })
+    .meta({ description: 'The account’s refinement allowance.' }),
+  windowDays: z.number().meta({
+    description:
+      'Length of the import window in days (may be fractional). A window starts with its first charged import.',
+  }),
+})
+
+export const usageDocs = describeRoute({
+  tags: [TAG],
+  summary: 'The account’s allowance',
+  description: `The bearer token’s account’s Notes Import allowance right now: how many imports it has used and has left in the current window, and when the window ends. Every device on the account sees the same numbers, so an import on one shows on the others. Read-only: it counts as no import and touches no run.
+
+It answers through the code kickoff gates with (the account’s Supporter status, the runtime limits, and the account’s meter), so it can’t disagree with what kickoff enforces at that moment. It doesn’t check availability (\`GET /notes-import/status\`). The response is \`Cache-Control: no-store\`.
+
+Bearer only (\`Authorization: Bearer <accessToken>\`, from \`POST /accounts/v1/sessions\`); there is no legacy form. Counts against the read edge tier (600 a minute per IP), not the \`notes-import\` bucket.`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse('The account’s allowance.', usageSchema),
+    401: niError(
+      'A missing, expired, or invalid access token, or an account that no longer exists. Sends `WWW-Authenticate: Bearer error="invalid_token"`: refresh once and retry.',
+      ['unauthorized']
+    ),
+    429: niError(
+      'Too many requests from this IP in the last minute. `Retry-After: 60`.',
+      ['rate_limited']
+    ),
+    503: niError(accountsDisabled, ['disabled']),
   },
 })
 
