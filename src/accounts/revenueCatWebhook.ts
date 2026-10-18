@@ -8,6 +8,7 @@ import { guarded } from './signed'
 import { accountsDb } from './store'
 import {
   REVENUECAT_APP_USER_ID,
+  defaultSupporterDependencies,
   linkedCustomerIds,
   recordWebhookEvent,
   refreshCustomer,
@@ -119,7 +120,7 @@ export const createRevenueCatWebhookHandler = (
       })
       return buddiesErrorResponse('unavailable')
     }
-    const now = (overrides.now ?? Date.now)()
+    const now = (overrides.now ?? defaultSupporterDependencies.now)()
     await recordWebhookEvent(db, event.id, now)
     console.log('revenuecat webhook', {
       type: event.type,
