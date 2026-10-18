@@ -6,6 +6,8 @@ import {
   type SessionPlatform,
 } from './schema'
 import type { AccountsDb } from './store'
+import type { ActivityIdKeys } from './tokens'
+import { sealActivityId } from './activityIds'
 
 /**
  * The account activity log (witness-work ADR 0028): a security history the
@@ -122,7 +124,10 @@ export interface ActivitySessionView {
 }
 
 export interface ActivityEntry {
-  /** Opaque to clients; also the next page's cursor. */
+  /**
+   * Opaque to clients, and sealed for the account (src/accounts/activityIds.ts);
+   * also the next page's cursor.
+   */
   id: string
   kind: ActivityKind
   createdAt: number
@@ -144,17 +149,18 @@ const sessionView = (
         ...(device != null ? { device } : {}),
       }
 
-/** A cursor (`before`): an entry id, as a positive decimal integer. */
-export const parseActivityCursor = (value: string): number | null =>
-  /^[1-9][0-9]{0,15}$/.test(value) && Number.isSafeInteger(Number(value))
-    ? Number(value)
-    : null
-
-/** The account's entries, newest first, older than `before` when given. */
+/**
+ * The account's entries, newest first, older than the row id `before` when
+ * given. Ids and the cursor are sealed under `idKeys` (the current secret's).
+ */
 export const listActivity = async (
   db: AccountsDb,
   accountId: string,
-  { before, limit }: { before?: number; limit: number }
+  {
+    before,
+    limit,
+    idKeys,
+  }: { before?: number; limit: number; idKeys: ActivityIdKeys }
 ): Promise<{ activity: ActivityEntry[]; nextCursor: string | null }> => {
   const rows = await db
     .select()
@@ -169,7 +175,10 @@ export const listActivity = async (
     .limit(limit + 1)
     .all()
   const page = rows.slice(0, limit)
-  const activity = page.map((row): ActivityEntry => {
+  const ids = await Promise.all(
+    page.map((row) => sealActivityId(idKeys, accountId, row.id))
+  )
+  const activity = page.map((row, index): ActivityEntry => {
     const session = sessionView(
       row.sessionId,
       row.sessionPlatform,
@@ -181,7 +190,7 @@ export const listActivity = async (
       row.actorDevice
     )
     return {
-      id: String(row.id),
+      id: ids[index],
       kind: row.kind,
       createdAt: row.createdAt.getTime(),
       ...(session ? { session } : {}),
@@ -192,9 +201,7 @@ export const listActivity = async (
   return {
     activity,
     nextCursor:
-      rows.length > limit && page.length > 0
-        ? String(page[page.length - 1].id)
-        : null,
+      rows.length > limit && page.length > 0 ? ids[ids.length - 1] : null,
   }
 }
 

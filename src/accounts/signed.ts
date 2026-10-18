@@ -38,7 +38,11 @@ import {
   sessionDeviceTooLarge,
 } from './contracts'
 import { accountsDb, findAccountByPub, type AccountRecord } from './store'
-import { bearerOrLegacy, type AccountAuth } from './auth'
+import {
+  bearerOrLegacy,
+  type AccountAuth,
+  type RequireAccountOptions,
+} from './auth'
 
 /** A self-signed account op whose envelope, signature, and `ts` check out. */
 export interface VerifiedCall<K extends AccountsOp> {
@@ -137,27 +141,33 @@ export interface AccountCallRead<K extends AccountsOp> {
  * the request (or its refusal). A legacy request, while the legacy switch is
  * on, is the envelope `read.legacy` verifies, whose key must belong to a
  * registered account (`unknown_account`), exactly as before sessions.
+ * `options` check the bearer token's session and account (`requireAccount`).
  */
 export const accountCall = <K extends AccountsOp>(
   c: AppContext,
   read: AccountCallRead<K>,
-  run: (accountId: string, fields: AccountFields<K>) => Promise<Response>
+  run: (accountId: string, fields: AccountFields<K>) => Promise<Response>,
+  options?: RequireAccountOptions
 ): Promise<Response> =>
-  bearerOrLegacy(c, {
-    bearer: async (account) => {
-      const bearer = await read.bearer(account)
-      return 'refusal' in bearer
-        ? bearer.refusal
-        : run(account.accountId, bearer.fields)
+  bearerOrLegacy(
+    c,
+    {
+      bearer: async (account) => {
+        const bearer = await read.bearer(account)
+        return 'refusal' in bearer
+          ? bearer.refusal
+          : run(account.accountId, bearer.fields)
+      },
+      legacy: async () => {
+        const verified = await read.legacy()
+        if ('refusal' in verified) return verified.refusal
+        const found = await accountForKey(c.env, verified.payload.accountPub)
+        if ('refusal' in found) return found.refusal
+        return run(found.account.id, verified.fields)
+      },
     },
-    legacy: async () => {
-      const verified = await read.legacy()
-      if ('refusal' in verified) return verified.refusal
-      const found = await accountForKey(c.env, verified.payload.accountPub)
-      if ('refusal' in found) return found.refusal
-      return run(found.account.id, verified.fields)
-    },
-  })
+    options
+  )
 
 /** A bearer request's fields for `op` from its JSON body, or `bad_request`. */
 export const plainFields = <K extends AccountsOp>(

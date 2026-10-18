@@ -317,9 +317,63 @@ describe('GET /activity', () => {
     const entries = await activity(mine)
     expect(entries.every((e) => e.session == null || e.session.sessionId === mine.sessionId)).toBe(true)
     expect(JSON.stringify(entries)).not.toContain(theirs.sessionId)
-    // Another account's cursor only narrows the caller's own entries.
-    const narrowed = await get(`/activity?before=${Number(entries[0].id) + 100}`, bearer(mine.accessToken))
-    expect(narrowed.body.activity).toEqual(entries)
+    // Another account's cursor is refused, never another account's rows.
+    const [theirNewest] = await activity(theirs)
+    const crossed = await get(`/activity?before=${theirNewest.id}`, bearer(mine.accessToken))
+    expect(crossed).toMatchObject({ status: 400, body: { code: 'bad_request' } })
+  })
+
+  it('hands out ids that are opaque, stable, and say nothing about other accounts', async () => {
+    const mine = await session()
+    const before = await activity(mine)
+    // Other Users act in between; nothing in my ids may reveal it.
+    for (let i = 0; i < 5; i++) await session()
+    await session(mine.key)
+    const after = await activity(mine)
+    expect(after.slice(1)).toEqual(before)
+    for (const entry of after) {
+      expect(entry.id).toMatch(/^[A-Za-z0-9_-]{48}$/)
+      expect(entry.id).not.toMatch(/^[0-9]+$/)
+    }
+    // The row ids behind them aren't consecutive, but the ids can't show it.
+    const rows = await h.env.ACCOUNTS_DB!.prepare(
+      'SELECT id FROM account_activity WHERE account_id = ? ORDER BY id DESC'
+    )
+      .bind(mine.accountId)
+      .all<{ id: number }>()
+    for (const { id: rowId } of rows.results)
+      expect(JSON.stringify(after)).not.toContain(`"${rowId}"`)
+  })
+
+  it('refuses a forged cursor and a bare row id', async () => {
+    const s = await session()
+    await session(s.key)
+    const [newest] = await activity(s)
+    const forged = newest.id.slice(0, 30) + (newest.id[30] === 'A' ? 'B' : 'A') + newest.id.slice(31)
+    for (const before of [forged, '2', '9007199254740991']) {
+      const refused = await get(`/activity?before=${before}`, bearer(s.accessToken))
+      expect(refused, before).toMatchObject({ status: 400, body: { code: 'bad_request' } })
+    }
+  })
+
+  it('pages on with a cursor from before a token secret rotation', async () => {
+    const s = await session()
+    for (let i = 0; i < 3; i++) await session(s.key)
+    const all = await activity(s)
+    const first = await get('/activity?limit=2', bearer(s.accessToken))
+    h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS = h.env.ACCOUNT_TOKEN_SECRET
+    h.env.ACCOUNT_TOKEN_SECRET = 'rotated-account-token-secret-0123456789'
+    const second = await get(`/activity?limit=2&before=${first.body.nextCursor}`, bearer(s.accessToken))
+    expect(second.status).toBe(200)
+    expect(second.body.activity.map((e: Entry) => e.kind)).toEqual(
+      all.slice(2, 4).map((e) => e.kind)
+    )
+    // New ids are sealed under the new secret; the old cursor dies with it.
+    expect(second.body.activity[0].id).not.toBe(all[2].id)
+    delete h.env.ACCOUNT_TOKEN_SECRET_PREVIOUS
+    const fresh = await session(s.key)
+    const gone = await get(`/activity?before=${first.body.nextCursor}`, bearer(fresh.accessToken))
+    expect(gone.status).toBe(400)
   })
 
   it('refuses a malformed limit or cursor', async () => {

@@ -157,6 +157,62 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('account activity and devices (dev bypass)', 
     expect((await http('GET', '/accounts/v1/activity')).status).toBe(401)
   })
 
+  it('refuses a signed-out session on the security surfaces at once', async () => {
+    const key = await SigningKey.generate()
+    const a1 = await openSession(key, 'Phone')
+    const a3 = await openSession(key, 'Other phone')
+    const revoked = await http('POST', '/accounts/v1/sessions/revoke', {
+      headers: bearer(a1),
+      body: { sessionId: a3.sessionId },
+    })
+    expect(revoked).toMatchObject({ status: 200, body: { ok: true } })
+
+    // a3's access token is still unexpired; its session isn't.
+    const calls: [string, string, unknown?][] = [
+      ['POST', '/accounts/v1/sessions/revoke', { sessionId: a1.sessionId }],
+      ['GET', '/accounts/v1/sessions'],
+      ['GET', '/accounts/v1/activity'],
+      ['GET', '/accounts/v1/account'],
+    ]
+    for (const [method, path, body] of calls) {
+      const res = await http(method, path, { headers: bearer(a3), body })
+      expect(res.status, `${method} ${path}`).toBe(401)
+      expect(res.body.code).toBe('unauthorized')
+      expect(res.headers.get('www-authenticate')).toBe('Bearer error="invalid_token"')
+    }
+    const refreshed = await http('POST', '/accounts/v1/sessions/refresh', {
+      body: { refreshToken: a1.refreshToken },
+    })
+    expect(refreshed.status).toBe(200)
+    const listed = await http('GET', '/accounts/v1/sessions', {
+      headers: { authorization: `Bearer ${refreshed.body.accessToken}` },
+    })
+    expect(listed.body.sessions.map((s: { sessionId: string }) => s.sessionId)).toEqual([
+      a1.sessionId,
+    ])
+  })
+
+  it('hands out opaque ids, and refuses another account’s cursor', async () => {
+    const mine = await openSession(await SigningKey.generate(), 'Phone')
+    await openSession(mine.key, 'Tablet')
+    const theirs = await openSession(await SigningKey.generate(), 'Theirs')
+    const page = await http('GET', '/accounts/v1/activity?limit=1', { headers: bearer(mine) })
+    expect(page.status).toBe(200)
+    const [entry] = page.body.activity
+    expect(entry.id).toMatch(/^[A-Za-z0-9_-]{48}$/)
+    expect(page.body.nextCursor).toMatch(/^[A-Za-z0-9_-]{48}$/)
+    const again = await http('GET', '/accounts/v1/activity?limit=1', { headers: bearer(mine) })
+    expect(again.body.activity[0].id).toBe(entry.id)
+
+    for (const before of [page.body.nextCursor, entry.id, '1', '99999999']) {
+      const crossed = await http('GET', `/accounts/v1/activity?before=${before}`, {
+        headers: bearer(theirs),
+      })
+      expect(crossed.status, before).toBe(400)
+      expect(crossed.body.code).toBe('bad_request')
+    }
+  })
+
   it.skipIf(!ADMIN_TOKEN)('logs a suspension and reinstatement without the reason', async () => {
     const session = await openSession(await SigningKey.generate(), 'Phone')
     for (const status of ['suspended', 'active'])

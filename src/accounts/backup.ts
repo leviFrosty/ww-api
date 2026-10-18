@@ -9,7 +9,7 @@ import {
   backupObjectKey,
   backupPrefix,
 } from './contracts'
-import { readPlainJson } from './auth'
+import { readPlainJson, type RequireAccountOptions } from './auth'
 import { recordActivity, recordBackupDownload } from './activity'
 import { accountsDb } from './store'
 import {
@@ -106,14 +106,18 @@ const backupCall = async <K extends AccountsOp>(
     bucket: R2Bucket,
     accountId: string,
     fields: AccountFields<K>
-  ) => Promise<Response>
+  ) => Promise<Response>,
+  options?: RequireAccountOptions
 ): Promise<Response> => {
   const bucket = c.env.ACCOUNT_BACKUPS
   if (!bucket || !c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
   const limited = await refuseAtEdge(c, edgeAs)
   if (limited) return limited
-  return accountCall(c, read, (accountId, fields) =>
-    run(bucket, accountId, fields)
+  return accountCall(
+    c,
+    read,
+    (accountId, fields) => run(bucket, accountId, fields),
+    options
   )
 }
 
@@ -250,7 +254,10 @@ const stepUp = async (
     : { refusal: buddiesErrorResponse('forbidden') }
 }
 
-/** One slot, or every slot without `slotId`. Idempotent. */
+/**
+ * One slot, or every slot without `slotId`. Idempotent. A bearer caller whose
+ * session has ended is 401 (`requireLiveSession`), even with the signature.
+ */
 const handleDelete = guarded('backup/delete', async (c) =>
   backupCall(
     c,
@@ -279,7 +286,8 @@ const handleDelete = guarded('backup/delete', async (c) =>
       for (let start = 0; start < keys.length; start += 1_000)
         await bucket.delete(keys.slice(start, start + 1_000))
       return c.json({ ok: true })
-    }
+    },
+    { requireLiveSession: true }
   )
 )
 

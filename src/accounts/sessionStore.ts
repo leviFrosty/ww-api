@@ -221,7 +221,10 @@ export const createSession = async (
 
 /**
  * Ends a live session and logs why, in one batch. Nothing is logged for a
- * session that had already ended or expired.
+ * session that had already ended or expired. With `actorSessionId`, neither
+ * happens unless that session is live too, checked in the same statements:
+ * of two sessions revoking each other at once, only the first one wins.
+ * Returns how many sessions it ended (0 or 1).
  */
 const endSession = async (
   db: AccountsDb,
@@ -232,11 +235,17 @@ const endSession = async (
     actorSessionId?: string
   },
   now: number
-): Promise<void> => {
-  await db.batch([
+): Promise<number> => {
+  const actorLive =
+    ended.actorSessionId == null
+      ? undefined
+      : sessionIsLive(ended.accountId, ended.actorSessionId, now)
+  const [, update] = await db.batch([
     activityInsert(db, ended, {
       now,
-      onlyIf: sessionIsLive(ended.accountId, ended.sessionId, now),
+      onlyIf: actorLive
+        ? sql`${sessionIsLive(ended.accountId, ended.sessionId, now)} AND ${actorLive}`
+        : sessionIsLive(ended.accountId, ended.sessionId, now),
     }),
     db
       .update(accountSessions)
@@ -245,11 +254,37 @@ const endSession = async (
         and(
           eq(accountSessions.id, ended.sessionId),
           eq(accountSessions.accountId, ended.accountId),
-          isNull(accountSessions.revokedAt)
+          isNull(accountSessions.revokedAt),
+          actorLive
         )
       ),
   ])
+  return changes(update)
 }
+
+/**
+ * Whether the account's session is live: not revoked, not expired, and not
+ * deleted by the cron. One D1 read, never cached, so routes that check it
+ * (`requireLiveSession`, src/accounts/auth.ts) see a revocation at once.
+ */
+export const isSessionLive = async (
+  db: AccountsDb,
+  accountId: string,
+  sessionId: string,
+  now: number = Date.now()
+): Promise<boolean> =>
+  (await db
+    .select({ id: accountSessions.id })
+    .from(accountSessions)
+    .where(
+      and(
+        eq(accountSessions.id, sessionId),
+        eq(accountSessions.accountId, accountId),
+        isNull(accountSessions.revokedAt),
+        gt(accountSessions.expiresAt, new Date(now))
+      )
+    )
+    .get()) != null
 
 const findSession = async (
   db: AccountsDb,
@@ -378,27 +413,37 @@ export const refreshSession = async (
 }
 
 /** Ends the account's session; ending an ended one is a no-op. */
-export const closeSession = (
+export const closeSession = async (
   db: AccountsDb,
   accountId: string,
   sessionId: string,
   now: number = Date.now()
-): Promise<void> =>
-  endSession(db, { accountId, sessionId, kind: 'session.signed_out' }, now)
+): Promise<void> => {
+  await endSession(db, { accountId, sessionId, kind: 'session.signed_out' }, now)
+}
+
+/**
+ * What a revoke came to: done (or the session had already ended), no such
+ * session on the account, or the calling session itself ended first.
+ */
+export type RevokeOutcome = 'revoked' | 'not_found' | 'caller_ended'
 
 /**
  * Ends another of the account's sessions from the calling one
- * (`session.revoked`), or the caller's own (`session.signed_out`). False
- * when the account has no such session; an ended one is `true` (idempotent).
+ * (`session.revoked`), or the caller's own (`session.signed_out`).
+ * `not_found` when the account has no such session; an ended one is
+ * `revoked` (idempotent). Another session is ended only while the caller's
+ * own is live, in the same statements, so two devices revoking each other at
+ * once can't both win: the loser gets `caller_ended` (401).
  */
 export const revokeSession = async (
   db: AccountsDb,
   input: { accountId: string; sessionId: string; bySessionId: string },
   now: number = Date.now()
-): Promise<boolean> => {
+): Promise<RevokeOutcome> => {
   if (input.sessionId === input.bySessionId) {
     await closeSession(db, input.accountId, input.sessionId, now)
-    return true
+    return 'revoked'
   }
   const found = await db
     .select({ id: accountSessions.id })
@@ -410,8 +455,8 @@ export const revokeSession = async (
       )
     )
     .get()
-  if (!found) return false
-  await endSession(
+  if (!found) return 'not_found'
+  const ended = await endSession(
     db,
     {
       accountId: input.accountId,
@@ -421,7 +466,11 @@ export const revokeSession = async (
     },
     now
   )
-  return true
+  if (ended > 0) return 'revoked'
+  // Nothing ended: the session had already, or the caller's had.
+  return (await isSessionLive(db, input.accountId, input.bySessionId, now))
+    ? 'revoked'
+    : 'caller_ended'
 }
 
 /** A live session, as `GET /accounts/v1/sessions` lists it. */

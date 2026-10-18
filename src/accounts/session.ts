@@ -179,13 +179,17 @@ const handleClose = guarded('session/close', async (c) => {
   return c.json({ ok: true })
 })
 
-/** `GET /sessions`: Bearer. The account's live sessions, newest first. */
+/**
+ * `GET /sessions`: Bearer. The account's live sessions, newest first. A
+ * caller whose own session has ended is 401, so it never shows a list
+ * without itself.
+ */
 const handleList = guarded('session/list', async (c) => {
   const setup = await ready(c)
   if ('refusal' in setup) return setup.refusal
   const limited = await refuseAtEdge(c, 'inbox/sync')
   if (limited) return limited
-  const auth = await authenticateAccount(c)
+  const auth = await authenticateAccount(c, { requireLiveSession: true })
   if (!auth.ok) return auth.response
   const { accountId, sessionId } = auth.account
   const sessions = await listLiveSessions(accountsDb(setup.db), accountId)
@@ -201,14 +205,16 @@ const handleList = guarded('session/list', async (c) => {
 /**
  * `POST /sessions/revoke`: Bearer, `{ sessionId }`. Ends one of the account's
  * sessions (the session id stays out of the URL). 404 `not_found` for a
- * session the account doesn't have.
+ * session the account doesn't have. A caller whose own session has ended is
+ * 401, before the body is read or, when two devices revoke each other at
+ * once, in the same statements as the revoke.
  */
 const handleRevoke = guarded('session/revoke', async (c) => {
   const setup = await ready(c)
   if ('refusal' in setup) return setup.refusal
   const limited = await refuseAtEdge(c, 'inbox/sync')
   if (limited) return limited
-  const auth = await authenticateAccount(c)
+  const auth = await authenticateAccount(c, { requireLiveSession: true })
   if (!auth.ok) return auth.response
   const body = await readPlainJson(c)
   if (
@@ -217,12 +223,14 @@ const handleRevoke = guarded('session/revoke', async (c) => {
     !BUDDIES_ID_PATTERN.test(body.sessionId)
   )
     return buddiesErrorResponse('bad_request')
-  const revoked = await revokeSession(accountsDb(setup.db), {
+  const outcome = await revokeSession(accountsDb(setup.db), {
     accountId: auth.account.accountId,
     sessionId: body.sessionId,
     bySessionId: auth.account.sessionId,
   })
-  return revoked ? c.json({ ok: true }) : buddiesErrorResponse('not_found')
+  if (outcome === 'not_found') return buddiesErrorResponse('not_found')
+  if (outcome === 'caller_ended') return buddiesErrorResponse('unauthorized')
+  return c.json({ ok: true })
 })
 
 export const sessionHandlers = {

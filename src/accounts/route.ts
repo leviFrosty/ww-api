@@ -100,7 +100,8 @@ const infoResponse = (c: AppContext, info: AccountInfo | null): Response => {
 /**
  * `GET /accounts/v1/account`: what the database holds for the bearer token's
  * own account, for Settings → Account and the developer tools. Read-only: it
- * never creates an account. Counts against the read edge tier.
+ * never creates an account. Counts against the read edge tier. A caller
+ * whose session has ended is 401 (`requireLiveSession`).
  *
  * Privacy: nothing here logs or reports the token or the account id.
  */
@@ -109,7 +110,7 @@ const handleAccount = guarded('account', async (c) => {
   if (!d1) return buddiesErrorResponse('disabled')
   const limited = await refuseAtEdge(c, 'inbox/sync')
   if (limited) return limited
-  const auth = await authenticateAccount(c)
+  const auth = await authenticateAccount(c, { requireLiveSession: true })
   if (!auth.ok) return auth.response
   const { accountId } = auth.account
   return infoResponse(c, await findAccountInfo(accountsDb(d1), { accountId }))
@@ -120,7 +121,8 @@ const handleAccount = guarded('account', async (c) => {
  * before it. A bearer request with no body names the token's account; while
  * the legacy switch is on, an envelope self-signed by the account key names
  * the key's (an unknown key is 404 `unknown_account`). Read-only. Counts
- * against the read edge tier.
+ * against the read edge tier. A bearer caller whose session has ended is
+ * 401, as on `GET /account`.
  *
  * Privacy: nothing here logs or reports the body, the key, or the account id.
  */
@@ -130,16 +132,20 @@ const handleInfo = guarded('account/info', async (c) => {
   const limited = await refuseAtEdge(c, 'inbox/sync')
   if (limited) return limited
   const db = accountsDb(d1)
-  return bearerOrLegacy(c, {
-    bearer: async ({ accountId }) =>
-      infoResponse(c, await findAccountInfo(db, { accountId })),
-    legacy: async () => {
-      const verified = await verifiedBody(c, 'account/info')
-      if ('refusal' in verified) return verified.refusal
-      const { accountPub } = verified.payload
-      return infoResponse(c, await findAccountInfo(db, { accountPub }))
+  return bearerOrLegacy(
+    c,
+    {
+      bearer: async ({ accountId }) =>
+        infoResponse(c, await findAccountInfo(db, { accountId })),
+      legacy: async () => {
+        const verified = await verifiedBody(c, 'account/info')
+        if ('refusal' in verified) return verified.refusal
+        const { accountPub } = verified.payload
+        return infoResponse(c, await findAccountInfo(db, { accountPub }))
+      },
     },
-  })
+    { requireLiveSession: true }
+  )
 })
 
 /** Mounted at `/accounts/v1` by the Worker entry point. */

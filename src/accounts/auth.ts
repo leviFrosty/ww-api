@@ -9,6 +9,7 @@ import {
 import type { AccountStatus, SessionPlatform } from './schema'
 import { accountsDb, findAccount } from './store'
 import { accessTokenKeys, verifyAccessToken } from './tokens'
+import { isSessionLive } from './sessionStore'
 import { refuseLegacyAuth } from './legacySwitch'
 
 /**
@@ -24,8 +25,8 @@ import { refuseLegacyAuth } from './legacySwitch'
  * Each sets `c.var.account` on success (read it with `accountOf(c)`), and a
  * refusal is a ready `Response` plus its code, for routes with their own
  * error format: 401 `unauthorized` (with `WWW-Authenticate`), 403
- * `suspended`, 503 `disabled` (no token secret, or `requireActive` without
- * the accounts database), or 500 `internal`.
+ * `suspended`, 503 `disabled` (no token secret, or `requireActive` or
+ * `requireLiveSession` without the accounts database), or 500 `internal`.
  *
  * Privacy: nothing here logs or reports a token, an account id, or a session
  * id.
@@ -56,6 +57,17 @@ export interface RequireAccountOptions {
    * suspended account may still use (handoff, backup).
    */
   requireActive?: boolean
+  /**
+   * Also refuse a token whose session has ended (revoked, signed out,
+   * replaced, expired, or deleted) with the 401 `unauthorized` an expired
+   * token gets, so the app refreshes, is refused, and opens a new session.
+   * Costs one D1 read, never cached, so a revocation applies at once. For the
+   * security surfaces a signed-out device must not act on in its token's
+   * last 15 minutes: the device list, revoking, the activity log, the
+   * account, moving the account (handoff), and deleting backups. Elsewhere a
+   * token outlives its session by up to 15 minutes, by design (ADR 0027).
+   */
+  requireLiveSession?: boolean
 }
 
 const STATUS_CACHE_MS = 30_000
@@ -100,8 +112,9 @@ export const bearerToken = (header: string | undefined): string | null =>
   /^Bearer +([A-Za-z0-9._~+/-]+=*) *$/i.exec(header ?? '')?.[1] ?? null
 
 /**
- * Verifies the request's bearer token and, with `requireActive`, the
- * account's status; on success sets `c.var.account`.
+ * Verifies the request's bearer token and, with `requireLiveSession`, its
+ * session, and with `requireActive`, the account's status; on success sets
+ * `c.var.account`.
  */
 export const authenticateAccount = async (
   c: AppContext,
@@ -116,6 +129,22 @@ export const authenticateAccount = async (
     accountId: claims.accountId,
     sessionId: claims.sessionId,
     platform: claims.platform,
+  }
+  if (options.requireLiveSession) {
+    if (!c.env.ACCOUNTS_DB) return refuse('disabled')
+    let live: boolean
+    try {
+      live = await isSessionLive(
+        accountsDb(c.env.ACCOUNTS_DB),
+        account.accountId,
+        account.sessionId
+      )
+    } catch (error) {
+      console.error('accounts: session read failed')
+      captureFailure(error, 'account session')
+      return refuse('internal')
+    }
+    if (!live) return refuse('unauthorized')
   }
   if (options.requireActive) {
     if (!c.env.ACCOUNTS_DB) return refuse('disabled')

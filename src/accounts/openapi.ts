@@ -114,6 +114,13 @@ const bearerErrors = {
   ),
 }
 
+/**
+ * Routes with `requireLiveSession` (src/accounts/auth.ts): a token whose
+ * session ended is refused like an expired one.
+ */
+const ENDED_SESSION =
+  'A token whose session has ended (signed out, signed out by another device, replaced, or expired) is refused the same way at once, even before the token itself expires: refreshing then fails too, and the app opens a new session.'
+
 const upgradeRequired = {
   426: errorResponse(
     'A legacy request after the legacy switch (KV `auth:legacy`) was turned off. Update the app; there’s no `Retry-After`.',
@@ -171,7 +178,7 @@ Limits: the Buddies read tier (600 a minute per caller IP). Answers \`disabled\`
   responses: {
     200: jsonResponse('The token’s account.', accountInfoSchema),
     401: errorResponse(
-      'Missing, expired, or invalid token (`WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry).',
+      `Missing, expired, or invalid token (\`WWW-Authenticate: Bearer error="invalid_token"\`; refresh once and retry). ${ENDED_SESSION}`,
       ['unauthorized']
     ),
     404: errorResponse('The token’s account is gone.', ['unknown_account']),
@@ -184,7 +191,7 @@ Limits: the Buddies read tier (600 a minute per caller IP). Answers \`disabled\`
 export const accountInfoDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Read your account (legacy)',
-  description: `\`GET /accounts/v1/account\`’s answer, for app versions before it. A bearer request with no body reads the token’s account.
+  description: `\`GET /accounts/v1/account\`’s answer, for app versions before it. A bearer request with no body reads the token’s account. ${ENDED_SESSION}
 
 ${LEGACY_FORM('account/info')} An unregistered key is 404 \`unknown_account\`.
 
@@ -330,6 +337,8 @@ export const handoffOpenDocs = describeRoute({
   summary: 'Open a handoff channel (old phone)',
   description: `The phone with the account opens a channel for Set Up Another Device and shows its QR code. The server stores the account, the claim token’s verifier, and nothing else until a new phone claims it. The channel and everything in it is deleted 10 minutes after opening.
 
+A bearer request needs a live session: ${ENDED_SESSION}
+
 Limits: the Buddies register tier (60 a minute per caller IP) and 20 opens per account a rolling day.
 
 ${ID_IN_BODY}`,
@@ -423,6 +432,8 @@ export const handoffSendDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Send the account key (old phone)',
   description: `After the User approves the new phone, the old phone sends the account key sealed with \`keyKey\`. Only while \`claimed\`; the status becomes \`sent\`.
+
+A bearer request needs a live session: ${ENDED_SESSION}
 
 ${readTier}
 
@@ -730,7 +741,7 @@ export const backupDeleteDocs = describeRoute({
   summary: 'Delete backups',
   description: `Deletes one slot, or every slot of the account when \`slotId\` is left out (before Delete Buddies replaces the account key). Gone from storage at once; idempotent.
 
-A bearer request **and** a signed envelope: \`signature\` is the account key’s signature over \`ww-account/v1\\nbackup/delete\\n\` followed by the decoded \`payload\` bytes, and the key must be the token’s own account (\`forbidden\` otherwise), so a leaked token alone can’t delete backups. **Legacy** (no \`Authorization\` header): the envelope alone, while the legacy switch is on.
+A bearer request **and** a signed envelope: \`signature\` is the account key’s signature over \`ww-account/v1\\nbackup/delete\\n\` followed by the decoded \`payload\` bytes, and the key must be the token’s own account (\`forbidden\` otherwise), so a leaked token alone can’t delete backups. ${ENDED_SESSION} **Legacy** (no \`Authorization\` header): the envelope alone, while the legacy switch is on.
 
 ${readTier}
 
@@ -969,6 +980,16 @@ ${readTier}`,
 
 // --- Activity and devices (witness-work ADR 0028) ----------------------------
 
+const liveSessionErrors = {
+  401: errorResponse(
+    `Missing, expired, or invalid token (\`WWW-Authenticate: Bearer error="invalid_token"\`; refresh once and retry). ${ENDED_SESSION}`,
+    ['unauthorized']
+  ),
+  429: errorResponse('Over the per-caller rate.', ['rate_limited']),
+  ...internal,
+  ...sessionsOff,
+}
+
 const bearerReadErrors = {
   401: errorResponse(
     'Missing, expired, or invalid token (`WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry).',
@@ -1012,7 +1033,7 @@ Works for a suspended account. ${readTier}`,
       'The live sessions.',
       z.object({ ok: z.literal(true), sessions: z.array(liveSessionSchema) })
     ),
-    ...bearerReadErrors,
+    ...liveSessionErrors,
   },
 })
 
@@ -1022,6 +1043,8 @@ export const sessionRevokeDocs = describeRoute({
   description: `Ends one of the token’s account’s sessions and logs \`session.revoked\` in its activity, naming the calling session. Its refresh token stops working at once and its access token within 15 minutes. The token’s own session is ended like \`DELETE /sessions/current\` (\`session.signed_out\`). An already ended session is \`ok\`.
 
 This doesn’t take the account key away: a device that still has it opens a new session when it next needs one, which shows up as a new \`session.opened\`.
+
+A device that was signed out can’t sign out another in return, even while its access token lasts: its token is \`unauthorized\` here at once, and of two devices signing each other out at the same moment only the first succeeds.
 
 A \`POST\` with the id in the body rather than \`DELETE /sessions/{sessionId}\`: session ids stay out of URLs, which Cloudflare and Sentry record. Bearer token only, with no step-up signature: signing a device out loses nothing it can’t get back by opening a session.
 
@@ -1034,7 +1057,7 @@ Works for a suspended account. ${readTier}`,
     200: okOnly,
     400: errorResponse('Missing or malformed `sessionId`.', ['bad_request']),
     404: errorResponse('The account has no such session.', ['not_found']),
-    ...bearerReadErrors,
+    ...liveSessionErrors,
   },
 })
 
@@ -1048,7 +1071,7 @@ const activityEntrySchema = z
   .object({
     id: z.string().meta({
       description:
-        'Opaque and unique within the account; pass the last one’s as `before` (`nextCursor` does).',
+        'Opaque, stable, and unique within the account (48 base64url characters today; don’t parse it or rely on its length); pass the last one’s as `before` (`nextCursor` does). Sealed for the account, so it says nothing about other accounts and works as a cursor only for this one.',
     }),
     kind: z.enum(ACTIVITY_KINDS).meta({
       description:
@@ -1108,7 +1131,7 @@ Works for a suspended account. ${readTier}`,
       required: false,
       schema: { type: 'string' as const },
       description:
-        'The previous page’s `nextCursor`: only entries older than it. Absent for the newest page.',
+        'The previous page’s `nextCursor` (or any entry’s `id`): only entries older than it. Absent for the newest page. A cursor from another account, or a made-up one, is 400.',
     },
   ],
   responses: {
@@ -1122,8 +1145,11 @@ Works for a suspended account. ${readTier}`,
         }),
       })
     ),
-    400: errorResponse('A malformed `limit` or `before`.', ['bad_request']),
-    ...bearerReadErrors,
+    400: errorResponse(
+      'A malformed `limit`, or a `before` that isn’t one of this account’s cursors.',
+      ['bad_request']
+    ),
+    ...liveSessionErrors,
   },
 })
 
