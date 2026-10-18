@@ -9,6 +9,7 @@ import {
 import {
   computeCommit,
   computeCreditsSnapshot,
+  computeImportUsage,
   computeKickoffCredits,
   decideCredit,
   normalizeImportWindow,
@@ -17,6 +18,7 @@ import {
   type CreditState,
   type CreditsSnapshot,
   type HashRecord,
+  type ImportUsage,
   type ImportWindow,
 } from '../credits'
 
@@ -74,6 +76,11 @@ export interface KickoffCreditsArgs {
   isSupporter: boolean
   importLimit: Allowance
   refinementLimit: Allowance
+  windowDurationMs: number
+}
+
+export interface UsageArgs {
+  importLimit: Allowance
   windowDurationMs: number
 }
 
@@ -323,6 +330,20 @@ export class NotesImportIndex extends DurableObject<Environment> {
       importLimit: args.importLimit,
       refinementLimit: args.refinementLimit,
       now,
+      windowDurationMs: args.windowDurationMs,
+    })
+  }
+
+  /**
+   * The meter's current import allowance, for `GET /notes-import/usage`.
+   * Read-only: it charges nothing, records no hash, touches no slot, and
+   * emits no operational event.
+   */
+  usage(args: UsageArgs): ImportUsage {
+    return computeImportUsage({
+      window: this.#creditWindow(),
+      importLimit: args.importLimit,
+      now: Date.now(),
       windowDurationMs: args.windowDurationMs,
     })
   }

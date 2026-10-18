@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   computeCommit,
   computeCreditsSnapshot,
+  computeImportUsage,
   computeKickoffCredits,
   decideCredit,
   normalizeImportWindow,
@@ -406,5 +407,78 @@ describe('Empty Import grace', () => {
     })
     expect(commit).toMatchObject({ emptyCharged: false, recordsEmptyRun: false })
     expect(store.records.has('empty')).toBe(true)
+  })
+})
+
+describe('account import usage (GET /notes-import/usage)', () => {
+  const usage = (store: MeterStore, now: number, importLimit: Allowance = DEFAULT_IMPORTS) =>
+    computeImportUsage({
+      window: store.window,
+      importLimit,
+      now,
+      windowDurationMs: WINDOW_MS,
+    })
+
+  it('reports a full allowance and no reset before the first charge', () => {
+    expect(usage(new MeterStore(), JULY_1)).toEqual({
+      limit: DEFAULT_IMPORTS,
+      used: 0,
+      remaining: DEFAULT_IMPORTS,
+      resetsAt: null,
+    })
+  })
+
+  it('agrees with the snapshot and the gate across a window', () => {
+    const store = new MeterStore()
+    settle(store, 'a', JULY_1)
+    settle(store, 'b', JULY_1 + DAY_MS)
+    const now = JULY_1 + 2 * DAY_MS
+    const { remaining, limit, resetsAt } = snapshot(store, 'new', now)
+    expect(usage(store, now)).toEqual({ limit, used: 2, remaining, resetsAt })
+    expect(usage(store, now).resetsAt).toBe(
+      new Date(JULY_1 + WINDOW_MS).toISOString()
+    )
+
+    for (const hash of ['c', 'd', 'e']) settle(store, hash, now)
+    expect(usage(store, now)).toMatchObject({ used: 5, remaining: 0 })
+    expect(decide(store, 'f', now)).toMatchObject({
+      allowed: false,
+      reason: 'limit_reached',
+    })
+  })
+
+  it('frees the window at its end, inclusive', () => {
+    const store = new MeterStore()
+    settle(store, 'a', JULY_1)
+    expect(usage(store, JULY_1 + WINDOW_MS - 1)).toMatchObject({ used: 1, remaining: 4 })
+    expect(usage(store, JULY_1 + WINDOW_MS)).toEqual({
+      limit: DEFAULT_IMPORTS,
+      used: 0,
+      remaining: DEFAULT_IMPORTS,
+      resetsAt: null,
+    })
+  })
+
+  it('reports unlimited without a reset, and a zero allowance as none left', () => {
+    const store = new MeterStore()
+    settle(store, 'a', JULY_1)
+    expect(usage(store, JULY_1, -1)).toEqual({
+      limit: null,
+      used: 1,
+      remaining: null,
+      resetsAt: null,
+    })
+    expect(usage(new MeterStore(), JULY_1, 0)).toEqual({
+      limit: 0,
+      used: 0,
+      remaining: 0,
+      resetsAt: null,
+    })
+  })
+
+  it('reports concurrent overage as used, with nothing left', () => {
+    const store = new MeterStore()
+    store.window = { count: 7, startedAt: JULY_1 }
+    expect(usage(store, JULY_1)).toMatchObject({ used: 7, remaining: 0 })
   })
 })

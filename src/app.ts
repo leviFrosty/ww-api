@@ -17,6 +17,7 @@ import {
 import {
   handleNotesImportRequest,
   handleNotesImportStatusRequest,
+  handleNotesImportUsageRequest,
   handleNotesImportKickoffRequest,
   handleNotesImportTranscribeRequest,
   handleNotesImportEventsRequest,
@@ -34,6 +35,7 @@ import {
   resultDocs as notesImportResultDocs,
   statusDocs as notesImportStatusDocs,
   transcribeDocs as notesImportTranscribeDocs,
+  usageDocs as notesImportUsageDocs,
 } from "./notesImport/openapi";
 import {
   ATTESTATION_BASE_PATH,
@@ -135,7 +137,12 @@ function handleApplicationError(error: Error, context: AppContext) {
 app.use("/geocode", rateLimit("places"));
 app.use("/autocomplete", rateLimit("places"));
 app.use("/notes-import", rateLimit("notes-import"));
-app.use("/notes-import/*", rateLimit("notes-import"));
+// The usage read counts in the read edge tier instead (in its handler), so
+// opening the composer on every device never spends the imports' bucket.
+app.use(
+  "/notes-import/*",
+  rateLimit("notes-import", ["/notes-import/usage"])
+);
 app.use("/attestation/*", rateLimit("attestation"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
@@ -181,6 +188,11 @@ app.get(
   "/notes-import/status",
   notesImportStatusDocs,
   handleNotesImportStatusRequest
+);
+app.get(
+  "/notes-import/usage",
+  notesImportUsageDocs,
+  handleNotesImportUsageRequest
 );
 // The attestation routes' old paths, for deployed apps: same handlers, plus a
 // `Deprecation` header. Remove once the minimum app version uses the new ones.

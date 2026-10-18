@@ -383,6 +383,7 @@ included).
 
 | Route | Body | 200 |
 | --- | --- | --- |
+| `GET /notes-import/usage` | none | the account's allowance (below) |
 | `POST /notes-import/kickoff` | `{ notesText, context, refinement? }` | `{ importId, refinement, credits }` (no `subscribeToken`) |
 | `POST /notes-import` (synchronous fallback) | the same | `{ result, contentHash, refinement, emptyCharged, credits }` |
 | `POST /notes-import/transcribe` | `{ image, mimeType }` | `{ ok, text, truncated, pagesRemaining }` |
@@ -415,8 +416,34 @@ included).
 - **Dev sessions** (opened with the dev bypass on the dev worker) get the
   bypass's unlimited allowances and never Supporter status; production never
   verifies a `dev` token.
+- **Usage** (`GET /notes-import/usage`): the account's allowance right now,
+  the same on every device, computed by kickoff's own code (Supporter
+  status, runtime limits, the account's meter). Read-only: it counts as no
+  import. Bearer only, `Cache-Control: no-store`, and counted in the read
+  edge tier (600 a minute per IP), not the `notes-import` bucket.
+
+  ```json
+  {
+    "ok": true,
+    "accountStatus": "active",
+    "supporter": false,
+    "supporterCheckFailed": false,
+    "imports": { "limit": 3, "used": 1, "remaining": 2, "resetsAt": "2026-11-17T12:00:00.000Z" },
+    "refinements": { "limitPerImport": 5 },
+    "windowDays": 30
+  }
+  ```
+
+  `null` limits and `remaining` are unlimited; `resetsAt` is `null` until a
+  charged import starts a window. `supporterCheckFailed: true` means
+  RevenueCat couldn't be reached and the account is answered (and metered
+  by kickoff) as free. A suspended account still gets its answer, with
+  `accountStatus: "suspended"`; kickoff refuses it. Refinements count per
+  notes text, so only their per-import limit is account-wide. Errors: 401
+  `unauthorized`, 429 `rate_limited`, 503 `disabled`.
 - `GET /notes-import/status` stays public and the same for everyone; it
-  ignores `Authorization`. The account's balance is in kickoff's `credits`.
+  ignores `Authorization`. The account's balance is `GET /notes-import/usage`
+  (and kickoff's `credits`).
 
 **Legacy** (no `Authorization` header). Inference is attested per request:
 App Attest on iOS, Play Integrity on Android, with the body fields in `/docs`.

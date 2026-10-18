@@ -48,8 +48,13 @@ export const rateLimitKey = (
  * doesn't say when its window ends, so that's the longest the caller waits.
  */
 export const rateLimit =
-  (family: RateLimitFamily): MiddlewareHandler<{ Bindings: Environment }> =>
+  (
+    family: RateLimitFamily,
+    /** Paths under the family's prefix that count elsewhere instead. */
+    except: readonly string[] = []
+  ): MiddlewareHandler<{ Bindings: Environment }> =>
   async (context, next) => {
+    if (except.includes(context.req.path)) return next()
     const key = rateLimitKey(family, context.req.header('CF-Connecting-IP'))
     const { success } = await context.env.RATE_LIMITER.limit({ key })
     if (!success) {

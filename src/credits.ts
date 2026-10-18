@@ -194,6 +194,48 @@ export const computeCreditsSnapshot = ({
   }
 }
 
+/** An account's import allowance as `GET /notes-import/usage` reports it. */
+export interface ImportUsage {
+  /** Imports allowed per window; null means unlimited. */
+  limit: number | null
+  /** New imports charged in the current window (0 when none is active). */
+  used: number
+  /** Imports left in the current window; null means unlimited. */
+  remaining: number | null
+  /** When the current window ends; null before its first charge, or unlimited. */
+  resetsAt: string | null
+}
+
+export interface ImportUsageArgs {
+  window: ImportWindow
+  importLimit: Allowance
+  now: number
+  windowDurationMs: number
+}
+
+/**
+ * The import half of the authoritative snapshot, read-only, plus how many
+ * imports the window has charged. The same normalization the gate and
+ * settlement use, so it can't drift from what kickoff enforces.
+ */
+export const computeImportUsage = ({
+  window,
+  importLimit,
+  now,
+  windowDurationMs,
+}: ImportUsageArgs): ImportUsage => {
+  const { remaining, limit, resetsAt } = computeCreditsSnapshot({
+    state: { window, record: null },
+    isSupporter: false,
+    importLimit,
+    refinementLimit: -1,
+    now,
+    windowDurationMs,
+  })
+  const used = normalizeImportWindow(window, now, windowDurationMs).count
+  return { limit, used, remaining, resetsAt }
+}
+
 export interface KickoffCreditsArgs extends CreditsSnapshotArgs {
   decision: CreditDecision
 }
