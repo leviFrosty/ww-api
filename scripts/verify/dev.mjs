@@ -56,6 +56,9 @@ const OPTIONAL_SECRETS = [
   // events; the real project token would send test runs to production PostHog.
   'POSTHOG_PROJECT_TOKEN',
   'POSTHOG_HOST',
+  // Account Supporter status (ADR 0029): point at a local fake RevenueCat
+  // (`pnpm test:e2e` serves one there); development workers only.
+  'REVENUECAT_API_URL',
 ]
 /** Synthetic, verification-only Apple team id when none is provided. */
 const SYNTHETIC_TEAM_ID = 'VERIFY0000'
@@ -220,6 +223,8 @@ const writeVarsFile = (flags, previousTokens) => {
     admin: `verify-admin-${randomBytes(16).toString('hex')}`,
     // Signs session access tokens; tests get theirs from POST /accounts/v1/sessions.
     accountToken: `verify-account-token-${randomBytes(24).toString('hex')}`,
+    // The RevenueCat webhook's Authorization secret.
+    revenueCatWebhook: `verify-revenuecat-${randomBytes(16).toString('hex')}`,
     ...previousTokens,
   }
   const lines = [
@@ -227,6 +232,7 @@ const writeVarsFile = (flags, previousTokens) => {
     `NOTES_IMPORT_DEV_BYPASS_TOKEN=${quoteEnv(tokens.devBypass)}`,
     `ADMIN_API_TOKEN=${quoteEnv(tokens.admin)}`,
     `ACCOUNT_TOKEN_SECRET=${quoteEnv(tokens.accountToken)}`,
+    `REVENUECAT_WEBHOOK_AUTHORIZATION=${quoteEnv(tokens.revenueCatWebhook)}`,
     `APPLE_TEAM_ID=${quoteEnv(optional.APPLE_TEAM_ID ?? SYNTHETIC_TEAM_ID)}`,
     ...OPTIONAL_SECRETS.filter((n) => n !== 'APPLE_TEAM_ID' && optional[n]).map(
       (name) => `${name}=${quoteEnv(optional[name])}`
@@ -236,6 +242,8 @@ const writeVarsFile = (flags, previousTokens) => {
   return {
     tokens,
     configured: Object.fromEntries(OPTIONAL_SECRETS.map((n) => [n, Boolean(optional[n])])),
+    // Not a secret: where `pnpm test:e2e` serves its fake RevenueCat.
+    revenueCatApiUrl: optional.REVENUECAT_API_URL ?? null,
   }
 }
 
@@ -317,7 +325,7 @@ async function up(args) {
 
   const port = await pickPort(HTTP_PORTS)
   const inspectorPort = await pickPort(INSPECTOR_PORTS)
-  const { tokens, configured } = writeVarsFile(flags, existing?.tokens)
+  const { tokens, configured, revenueCatApiUrl } = writeVarsFile(flags, existing?.tokens)
 
   const wranglerArgs = [
     WRANGLER_BIN,
@@ -373,6 +381,7 @@ async function up(args) {
     env: 'dev',
     tokens,
     configured,
+    revenueCatApiUrl,
   }
   writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
 
