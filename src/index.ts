@@ -4,15 +4,26 @@ import { Sentry, captureFailure, createSentryConfig } from "./sentry";
 import { app } from "./app";
 import { accountsDb } from "./accounts/store";
 import { pruneEndedSessions } from "./accounts/sessionStore";
+import { pruneActivity } from "./accounts/activity";
 
-/** Deletes account sessions that ended over a week ago; failures only report. */
+/**
+ * Deletes account sessions that ended over a week ago and activity entries
+ * over 400 days old; failures only report.
+ */
 async function pruneAccountSessions(environment: Environment): Promise<void> {
   if (!environment.ACCOUNTS_DB) return;
+  const db = accountsDb(environment.ACCOUNTS_DB);
   try {
-    await pruneEndedSessions(accountsDb(environment.ACCOUNTS_DB));
+    await pruneEndedSessions(db);
   } catch (error) {
     console.error("accounts: pruning ended sessions failed");
     captureFailure(error, "session prune");
+  }
+  try {
+    await pruneActivity(db);
+  } catch (error) {
+    console.error("accounts: pruning activity failed");
+    Sentry.captureException(error);
   }
 }
 

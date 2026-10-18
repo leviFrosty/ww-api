@@ -1,5 +1,5 @@
 import type { AppContext } from '../types'
-import { isPlainObject } from '../buddies/contracts'
+import { BUDDIES_ID_PATTERN, isPlainObject } from '../buddies/contracts'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import { ACCOUNT_LIMITS, parseRefreshToken } from './contracts'
 import { authenticateAccount, readPlainJson } from './auth'
@@ -12,7 +12,13 @@ import {
   verifiedBody,
 } from './signed'
 import { accountsDb, newAccountId, registerAccount } from './store'
-import { closeSession, createSession, refreshSession } from './sessionStore'
+import {
+  closeSession,
+  createSession,
+  listLiveSessions,
+  refreshSession,
+  revokeSession,
+} from './sessionStore'
 import {
   accessTokenKeys,
   refreshKeys,
@@ -30,8 +36,12 @@ import type { SessionPlatform } from './schema'
  * answers `disabled` without the accounts database or a token secret, so the
  * worker never hands out a session it can't verify.
  *
+ * `GET /sessions` lists the account's live sessions (Settings → Account →
+ * Devices) and `POST /sessions/revoke` ends one from another (ADR 0028);
+ * every session that opens or ends is logged to the account's activity.
+ *
  * Limits: opening counts against the Buddies register edge tier and 20 per
- * account key a rolling day; refreshing and closing against the read tier.
+ * account key a rolling day; everything else against the read tier.
  *
  * Privacy: nothing here logs or reports bodies, keys, tokens, account ids, or
  * session ids.
@@ -169,8 +179,56 @@ const handleClose = guarded('session/close', async (c) => {
   return c.json({ ok: true })
 })
 
+/** `GET /sessions`: Bearer. The account's live sessions, newest first. */
+const handleList = guarded('session/list', async (c) => {
+  const setup = await ready(c)
+  if ('refusal' in setup) return setup.refusal
+  const limited = await refuseAtEdge(c, 'inbox/sync')
+  if (limited) return limited
+  const auth = await authenticateAccount(c)
+  if (!auth.ok) return auth.response
+  const { accountId, sessionId } = auth.account
+  const sessions = await listLiveSessions(accountsDb(setup.db), accountId)
+  return c.json({
+    ok: true,
+    sessions: sessions.map((session) => ({
+      ...session,
+      current: session.sessionId === sessionId,
+    })),
+  })
+})
+
+/**
+ * `POST /sessions/revoke`: Bearer, `{ sessionId }`. Ends one of the account's
+ * sessions (the session id stays out of the URL). 404 `not_found` for a
+ * session the account doesn't have.
+ */
+const handleRevoke = guarded('session/revoke', async (c) => {
+  const setup = await ready(c)
+  if ('refusal' in setup) return setup.refusal
+  const limited = await refuseAtEdge(c, 'inbox/sync')
+  if (limited) return limited
+  const auth = await authenticateAccount(c)
+  if (!auth.ok) return auth.response
+  const body = await readPlainJson(c)
+  if (
+    !isPlainObject(body) ||
+    typeof body.sessionId !== 'string' ||
+    !BUDDIES_ID_PATTERN.test(body.sessionId)
+  )
+    return buddiesErrorResponse('bad_request')
+  const revoked = await revokeSession(accountsDb(setup.db), {
+    accountId: auth.account.accountId,
+    sessionId: body.sessionId,
+    bySessionId: auth.account.sessionId,
+  })
+  return revoked ? c.json({ ok: true }) : buddiesErrorResponse('not_found')
+})
+
 export const sessionHandlers = {
   open: handleOpen,
   refresh: handleRefresh,
   close: handleClose,
+  list: handleList,
+  revoke: handleRevoke,
 }

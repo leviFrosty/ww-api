@@ -19,7 +19,12 @@ import {
   sha256Hex,
 } from '../attestation/openapi'
 import { ACCOUNT_SESSION_PURPOSE } from '../attestation/purposes'
-import { ACCOUNT_STATUS_REASONS, ACCOUNT_STATUSES } from './schema'
+import {
+  ACCOUNT_STATUS_REASONS,
+  ACCOUNT_STATUSES,
+  ACTIVITY_KINDS,
+  SESSION_PLATFORMS,
+} from './schema'
 
 /**
  * OpenAPI descriptions for `/accounts/v1/*` (src/accounts/route.ts) and the
@@ -959,5 +964,165 @@ ${readTier}`,
     429: errorResponse('Over the per-caller rate.', ['rate_limited']),
     ...internal,
     ...sessionsOff,
+  },
+})
+
+// --- Activity and devices (witness-work ADR 0028) ----------------------------
+
+const bearerReadErrors = {
+  401: errorResponse(
+    'Missing, expired, or invalid token (`WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry).',
+    ['unauthorized']
+  ),
+  429: errorResponse('Over the per-caller rate.', ['rate_limited']),
+  ...internal,
+  ...sessionsOff,
+}
+
+const sessionPlatform = z.enum(SESSION_PLATFORMS).meta({
+  description: 'What attested the session; `dev` is the development bypass.',
+})
+const sealedDevice = b64u(
+  'The session’s sealed device label, exactly as `POST /accounts/v1/sessions` received it. Only the account’s devices can open it (see that route)'
+)
+
+const liveSessionSchema = z.object({
+  sessionId: buddiesId('The session (the access token’s `sid`)'),
+  platform: sessionPlatform,
+  device: sealedDevice.optional(),
+  current: z.boolean().meta({
+    description: '`true` for the session the request’s token belongs to.',
+  }),
+  createdAt: epochMs('When it opened'),
+  lastActiveAt: epochMs(
+    'Its last refresh, or when it opened; accurate to about 15 minutes'
+  ),
+  expiresAt: epochMs('When it ends (90 days after it opened)'),
+})
+
+export const sessionListDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'List your devices',
+  description: `The token’s account’s live sessions (not ended, not expired), newest first: one per signed-in device. Settings → Account → Devices shows them, opening each sealed label on the device.
+
+Works for a suspended account. ${readTier}`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse(
+      'The live sessions.',
+      z.object({ ok: z.literal(true), sessions: z.array(liveSessionSchema) })
+    ),
+    ...bearerReadErrors,
+  },
+})
+
+export const sessionRevokeDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Sign out a device',
+  description: `Ends one of the token’s account’s sessions and logs \`session.revoked\` in its activity, naming the calling session. Its refresh token stops working at once and its access token within 15 minutes. The token’s own session is ended like \`DELETE /sessions/current\` (\`session.signed_out\`). An already ended session is \`ok\`.
+
+This doesn’t take the account key away: a device that still has it opens a new session when it next needs one, which shows up as a new \`session.opened\`.
+
+A \`POST\` with the id in the body rather than \`DELETE /sessions/{sessionId}\`: session ids stay out of URLs, which Cloudflare and Sentry record. Bearer token only, with no step-up signature: signing a device out loses nothing it can’t get back by opening a session.
+
+Works for a suspended account. ${readTier}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({ sessionId: buddiesId('The session to end') })
+  ),
+  responses: {
+    200: okOnly,
+    400: errorResponse('Missing or malformed `sessionId`.', ['bad_request']),
+    404: errorResponse('The account has no such session.', ['not_found']),
+    ...bearerReadErrors,
+  },
+})
+
+const activitySessionSchema = z.object({
+  sessionId: buddiesId('The session'),
+  platform: sessionPlatform.optional(),
+  device: sealedDevice.optional(),
+})
+
+const activityEntrySchema = z
+  .object({
+    id: z.string().meta({
+      description:
+        'Opaque and unique within the account; pass the last one’s as `before` (`nextCursor` does).',
+    }),
+    kind: z.enum(ACTIVITY_KINDS).meta({
+      description:
+        'What happened (table above). The server adds kinds over time; skip one you don’t know.',
+    }),
+    createdAt: epochMs('When it happened'),
+    session: activitySessionSchema.optional().meta({
+      description:
+        'The session the entry is about, or that did it. Absent for account-level entries and calls made before sessions.',
+    }),
+    actor: activitySessionSchema.optional().meta({
+      description:
+        '`session.revoked` and `session.replaced`: the session that ended `session`.',
+    }),
+    slotId: buddiesId(
+      '`backup.deleted` (absent when every slot was deleted) and `backup.downloaded`: the backup slot'
+    ).optional(),
+  })
+  .meta({ id: 'AccountActivityEntry' })
+
+export const activityListDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Read your account activity',
+  description: `The token’s account’s security history, newest first: high-level, security-relevant actions only, written by the server (never by a client). Kept 400 days. No IP address, location, user agent, or content.
+
+| \`kind\` | When | \`session\` | \`actor\` |
+| --- | --- | --- | --- |
+| \`account.created\` | The account was created | — | — |
+| \`session.opened\` | A device signed in | The new session | — |
+| \`session.signed_out\` | A device ended its own session | It | — |
+| \`session.revoked\` | Another device signed it out | The one signed out | The one that did it |
+| \`session.replaced\` | An eleventh session ended the oldest | The oldest | The new one |
+| \`session.refresh_reused\` | A replaced refresh token came back after its grace minute (possibly stolen); the session ended | It | — |
+| \`handoff.sent\` | The account key was sent to a new phone | The old phone’s | — |
+| \`backup.deleted\` | A backup slot, or every slot, was deleted | The deleting one | — |
+| \`backup.downloaded\` | A backup slot was downloaded (once per slot, session, and day) | The downloading one | — |
+| \`account.suspended\` | The account was suspended | — | — |
+| \`account.reinstated\` | The account was reinstated | — | — |
+| \`buddies.inbox_linked\` | A Buddies inbox was linked to the account | The linking one | — |
+| \`buddies.deleted\` | The account's Buddies inbox was deleted (Delete My Buddies Data) | The deleting one | — |
+
+\`session\` is absent on handoff, backup, and Buddies entries made with an envelope before sessions. Buddies entries never name a buddy or another account's inbox: only the owner's own link and deletion are logged, never writer ops.
+
+Works for a suspended account. ${readTier}`,
+  security: [{ bearerAuth: [] }],
+  parameters: [
+    {
+      name: 'limit',
+      in: 'query' as const,
+      required: false,
+      schema: { type: 'integer' as const, minimum: 1, maximum: 100 },
+      description: 'Entries per page, 1–100; 50 when absent.',
+    },
+    {
+      name: 'before',
+      in: 'query' as const,
+      required: false,
+      schema: { type: 'string' as const },
+      description:
+        'The previous page’s `nextCursor`: only entries older than it. Absent for the newest page.',
+    },
+  ],
+  responses: {
+    200: jsonResponse(
+      'One page of entries.',
+      z.object({
+        ok: z.literal(true),
+        activity: z.array(activityEntrySchema),
+        nextCursor: z.string().nullable().meta({
+          description: 'The next (older) page’s `before`; `null` on the last page.',
+        }),
+      })
+    ),
+    400: errorResponse('A malformed `limit` or `before`.', ['bad_request']),
+    ...bearerReadErrors,
   },
 })

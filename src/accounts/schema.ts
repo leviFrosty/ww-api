@@ -88,6 +88,57 @@ export const accountSessions = sqliteTable(
 )
 
 /**
+ * The account's security history (witness-work ADR 0028), newest by `id`.
+ * Written only by the server, in the same batch as the action where it can
+ * be (`src/accounts/activity.ts`). Never an IP, location, user agent, or
+ * content; device names stay in their sealed labels. Kept 400 days.
+ */
+export const ACTIVITY_KINDS = [
+  'account.created',
+  'session.opened',
+  'session.signed_out',
+  'session.revoked',
+  'session.replaced',
+  'session.refresh_reused',
+  'handoff.sent',
+  'backup.deleted',
+  'backup.downloaded',
+  'account.suspended',
+  'account.reinstated',
+  'buddies.inbox_linked',
+  'buddies.deleted',
+] as const
+export type ActivityKind = (typeof ACTIVITY_KINDS)[number]
+
+export const accountActivity = sqliteTable(
+  'account_activity',
+  {
+    /** Increasing; the list's cursor. */
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    kind: text('kind', { enum: ACTIVITY_KINDS }).notNull(),
+    /** The session the entry is about, or that did it. */
+    sessionId: text('session_id'),
+    sessionPlatform: text('session_platform', { enum: SESSION_PLATFORMS }),
+    /** That session's sealed device label, copied so it outlives the row. */
+    sessionDevice: text('session_device'),
+    /** The session that ended `sessionId` (`session.revoked`, `.replaced`). */
+    actorSessionId: text('actor_session_id'),
+    actorPlatform: text('actor_platform', { enum: SESSION_PLATFORMS }),
+    actorDevice: text('actor_device'),
+    /** The backup slot (`backup.*`); null for "every slot". */
+    slotId: text('slot_id'),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index('account_activity_account_idx').on(t.accountId, t.id),
+    index('account_activity_created_idx').on(t.createdAt),
+  ]
+)
+
+/**
  * Which account owns each Buddies inbox. Written only after the inbox accepted
  * a registration signed by its owner key that also carried the account key's
  * signature over the same inbox, so neither key alone can link an inbox.

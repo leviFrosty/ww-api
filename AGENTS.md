@@ -597,6 +597,7 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
 | `POST /accounts/v1/sessions/refresh` | `{ refreshToken }` → new token pair |
 | `DELETE /accounts/v1/sessions/current` | Bearer; end the token's session |
 | `GET /accounts/v1/account` | Bearer; the token's account |
+| `GET /accounts/v1/sessions`, `POST …/sessions/revoke` | Bearer; devices ([Activity and devices](#activity-and-devices)) |
 
 - **Attesting**: `POST /attestation/v1/challenge` with purpose
   `account-session`, App Attest v2 `assert` (the install's key, bound
@@ -719,6 +720,51 @@ never `Sentry.captureException`: a database error, or one it caused, goes
 out as a `DatabaseError` naming the operation only. As a backstop,
 `beforeSend` cuts `Failed query:`, `params:`, and `D1_…:` text from every
 string and drops the exceptions chained under it.
+
+### Activity and devices
+
+The account's security history and its signed-in devices (witness-work ADR
+0028; "Activity and devices" in its `docs/accounts-protocol.md`). Code in
+`src/accounts/activity.ts` (recorder, list, prune), `activityRoute.ts`, and
+`session.ts`/`sessionStore.ts` (devices). Table `account_activity`
+(migration `migrations/accounts/0002_account-activity.sql`).
+
+| Route | What |
+| --- | --- |
+| `GET /accounts/v1/activity?limit=&before=` | Bearer; newest first, `nextCursor` |
+| `GET /accounts/v1/sessions` | Bearer; live sessions, `current` marks the caller's |
+| `POST /accounts/v1/sessions/revoke` | Bearer, `{ sessionId }`; signs a device out |
+
+All three count against the read edge tier and work for suspended accounts.
+Revoke is a `POST` so the session id stays out of the URL; another account's
+session (or none) is 404 `not_found`, and the caller's own is signed out.
+
+- **Kinds**: `account.created`, `session.opened`, `session.signed_out`,
+  `session.revoked`, `session.replaced` (the 10-session cap),
+  `session.refresh_reused` (a replaced refresh token after its grace minute;
+  the app flags it), `handoff.sent`, `backup.deleted` (no `slotId` = all),
+  `backup.downloaded` (once per slot, session, and day),
+  `account.suspended`/`.reinstated` (never the reason),
+  `buddies.inbox_linked` (a new link, in `linkInbox`'s batch),
+  `buddies.deleted` (the Worker, after the inbox DO accepted `inbox/delete`;
+  never in the DO). Writer ops log nothing, so nothing ties a writing
+  account to another account's inbox. Expiry, refreshes,
+  reads, and uploads aren't logged. Clients skip unknown kinds, so adding
+  one is safe.
+- **Recording a new action**: add the kind to `ACTIVITY_KINDS`
+  (`schema.ts`; no migration, it's a text column), then put
+  `activityInsert(db, { accountId, kind, sessionId })` in the action's own
+  D1 batch, with `onlyIf` when it should only log a real change. Actions
+  outside D1 call `recordActivity`: before an R2 change (backup), or after
+  a Durable Object accepted it, reporting a failed write (handoff). Pass the
+  bearer session (`c.get('account')?.sessionId`); the platform and sealed
+  device label are copied from that session's row, only within the same
+  account. Document the kind in `activityListDocs` and the protocol.
+- **Retention**: the hourly cron deletes entries over 400 days old
+  (`pruneActivity`, beside `pruneEndedSessions`).
+- **Privacy**: no IP, location, user agent, content, or anything about
+  buddies. Device names stay inside the sealed labels. Never log entries,
+  session ids, or slot ids.
 
 ### Updates and the legacy switch
 
