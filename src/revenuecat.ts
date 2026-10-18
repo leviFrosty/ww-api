@@ -18,6 +18,13 @@ export const LIFETIME_SUPPORTER_ENTITLEMENT = 'Lifetime Supporter'
 
 export const REVENUECAT_API_ORIGIN = 'https://api.revenuecat.com'
 
+/**
+ * How long one read may take, headers and body together. Past it the read
+ * fails like a 5xx, so a hung RevenueCat can't hold a request (or a webhook
+ * delivery) open; every caller already fails closed on that.
+ */
+export const REVENUECAT_TIMEOUT_MS = 5_000
+
 export interface SupporterCheckArgs {
   apiKey: string
   appUserId: string
@@ -35,6 +42,8 @@ export interface SupporterCheckArgs {
   apiOrigin?: string
   /** Injectable clock for tests (epoch ms). Defaults to Date.now(). */
   nowMs?: number
+  /** The read's deadline; `REVENUECAT_TIMEOUT_MS` by default. */
+  timeoutMs?: number
 }
 
 interface RcEntitlement {
@@ -91,21 +100,35 @@ export const fetchSupporterStatus = async ({
   fetchImpl = fetch,
   apiOrigin = REVENUECAT_API_ORIGIN,
   nowMs = Date.now(),
+  timeoutMs = REVENUECAT_TIMEOUT_MS,
 }: SupporterCheckArgs): Promise<SupporterStatus> => {
+  // One deadline for the headers and the body. Raced as well as passed on,
+  // so it holds whatever the fetch does with the signal.
+  const signal = AbortSignal.timeout(timeoutMs)
+  const deadline = new Promise<never>((_, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), {
+      once: true,
+    })
+  })
+  deadline.catch(() => undefined)
   let res: Response
   try {
-    res = await fetchImpl(
-      `${apiOrigin}/v1/subscribers/${encodeURIComponent(appUserId)}`,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
-        },
-      }
-    )
+    res = await Promise.race([
+      fetchImpl(
+        `${apiOrigin}/v1/subscribers/${encodeURIComponent(appUserId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'application/json',
+          },
+          signal,
+        }
+      ),
+      deadline,
+    ])
   } catch {
-    // A network failure is RevenueCat being unreachable, like a 5xx. Its
-    // message would name the URL, which holds the app user id.
+    // A network failure or the deadline is RevenueCat being unreachable,
+    // like a 5xx. Its message would name the URL, which holds the app user id.
     throw new RevenueCatError('RevenueCat unreachable')
   }
 
@@ -120,9 +143,9 @@ export const fetchSupporterStatus = async ({
 
   let body: RcSubscriberResponse
   try {
-    body = (await res.json()) as RcSubscriberResponse
+    body = (await Promise.race([res.json(), deadline])) as RcSubscriberResponse
   } catch {
-    throw new RevenueCatError('RevenueCat answered with invalid JSON')
+    throw new RevenueCatError('RevenueCat answered late or with invalid JSON')
   }
   const entitlements = body.subscriber?.entitlements ?? {}
   const subscriptions = body.subscriber?.subscriptions ?? {}

@@ -100,11 +100,20 @@ export const createRevenueCatWebhookHandler = (
       return c.json({ ok: true, customers: 0, duplicate: true })
 
     const linked = await linkedCustomerIds(db, event.appUserIds)
-    try {
-      for (const appUserId of linked)
-        await refreshCustomer(c.env, db, appUserId, overrides)
-    } catch (error) {
-      if (!(error instanceof RevenueCatError)) throw error
+    // Together, so the deliveries' time is one read's deadline, not the sum.
+    const reads = await Promise.allSettled(
+      linked.map((appUserId) =>
+        refreshCustomer(c.env, db, appUserId, overrides)
+      )
+    )
+    const failures = reads.flatMap((read) =>
+      read.status === 'rejected' ? [read.reason as unknown] : []
+    )
+    const unexpected = failures.find(
+      (error) => !(error instanceof RevenueCatError)
+    )
+    if (unexpected) throw unexpected
+    if (failures.length) {
       console.warn('revenuecat webhook: RevenueCat unreachable', {
         type: event.type,
       })
