@@ -4,20 +4,24 @@ import {
   sha256Bytes,
   sha256Hex,
 } from '../crypto'
+import {
+  isAttestationPurpose,
+  type AttestationPurpose,
+} from '../attestation/purposes'
 
 export const APP_ATTEST_PROTOCOL_VERSION = 2 as const
 export const APP_ATTEST_V2_DOMAIN = 'witnesswork.app-attest'
 export const APP_ATTEST_CHALLENGE_TTL_SECONDS = 300
 
 export type AppAttestOperation = 'bind' | 'enroll' | 'assert'
-export type AppAttestAssertionPurpose =
-  | 'notes-import-kickoff'
-  | 'notes-import-verify'
-  | 'notes-import-transcribe'
+/** The registry in src/attestation/purposes.ts, shared with Play Integrity. */
+export type AppAttestAssertionPurpose = AttestationPurpose
 
-export const NOTES_IMPORT_KICKOFF_PURPOSE = 'notes-import-kickoff'
-export const NOTES_IMPORT_VERIFY_PURPOSE = 'notes-import-verify'
-export const NOTES_IMPORT_TRANSCRIBE_PURPOSE = 'notes-import-transcribe'
+export {
+  NOTES_IMPORT_KICKOFF_PURPOSE,
+  NOTES_IMPORT_VERIFY_PURPOSE,
+  NOTES_IMPORT_TRANSCRIBE_PURPOSE,
+} from '../attestation/purposes'
 
 export interface V2ChallengeRequest {
   protocolVersion: 2
@@ -339,9 +343,4 @@ export const isAppAttestKeyId = (value: string): boolean => {
 export const isAppAttestChallenge = (value: string): boolean =>
   /^[A-Za-z0-9_-]{43}$/.test(value)
 
-export const isAppAttestAssertionPurpose = (
-  value: string
-): value is AppAttestAssertionPurpose =>
-  value === NOTES_IMPORT_KICKOFF_PURPOSE ||
-  value === NOTES_IMPORT_VERIFY_PURPOSE ||
-  value === NOTES_IMPORT_TRANSCRIBE_PURPOSE
+export const isAppAttestAssertionPurpose = isAttestationPurpose

@@ -7,11 +7,26 @@ import { handoffPageTranslations } from './handoffPageLocales'
 
 const app = new Hono<{ Bindings: Environment }>()
 app.get('/h', handleHandoffPage)
+app.get('/accounts/handoff', handleHandoffPage)
 
 const env = { APPLE_TEAM_ID: 'TEAMID1234' } as Environment
 
 const page = (path = '/h', headers: Record<string, string> = {}) =>
   app.request(path, { headers }, env)
+
+describe('GET /accounts/handoff', () => {
+  it('serves the /h page under its own og:url', async () => {
+    const short = await (await page('/h')).text()
+    const readable = await (await page('/accounts/handoff')).text()
+    expect(readable).toContain(
+      'property="og:url" content="https://ww-proxy.leviwilkerson.com/accounts/handoff"'
+    )
+    expect(short).toContain(
+      'property="og:url" content="https://ww-proxy.leviwilkerson.com/h"'
+    )
+    expect(readable.replace('/accounts/handoff"', '/h"')).toBe(short)
+  })
+})
 
 describe('GET /h', () => {
   it('tells someone to scan the code from inside the app, with store links', async () => {

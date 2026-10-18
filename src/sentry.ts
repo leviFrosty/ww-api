@@ -101,7 +101,11 @@ export function createSentryConfig(environment: Environment): CloudflareOptions 
       const isImportOperation =
         path === '/notes-import' ||
         (path?.startsWith('/notes-import/') && path !== '/notes-import/status');
-      return isImportOperation ? 1 : 0.1;
+      // Attestation was part of Notes Import's operation traffic; it stays at
+      // 100% under its own paths.
+      const isAttestationOperation =
+        path?.startsWith('/attestation/') && path !== '/attestation/v1/status';
+      return isImportOperation || isAttestationOperation ? 1 : 0.1;
     },
     sendDefaultPii: false,
     beforeSend: scrubEvent,

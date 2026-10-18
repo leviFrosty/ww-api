@@ -15,19 +15,20 @@ import {
  * Flow: the WitnessWork app encodes a contact (gzip + base64url) into the URL
  * fragment and shares a URL like:
  *
- *   https://ww-proxy.leviwilkerson.com/c#<payload>
+ *   https://ww-proxy.leviwilkerson.com/contacts#<payload>
  *
  * Clients never send a fragment to a server, so link previews and the
- * fallback page only ever request the bare `/c` — the contact stays out of
- * this worker's requests, logs and Sentry.
+ * fallback page only ever request the bare `/contacts` — the contact stays out
+ * of this worker's requests, logs and Sentry.
  *
  * - iOS with the app installed: the OS intercepts the tap via the AASA file
  *   this worker serves and hands the URL to the app, which decodes and imports.
  * - iOS without the app / other platforms: the fallback HTML renders with a
  *   "Get WitnessWork" CTA linking to the App Store.
  *
- * Older app versions put the payload in the path (`/c/<payload>`). Those links
- * are already out in the wild, so they keep working.
+ * Older app versions shared the short `/c#<payload>`, and the oldest put the
+ * payload in the path (`/c/<payload>`). Those links are already out in the
+ * wild, so both keep working for good.
  *
  * The AASA lists the prod, beta (internal TestFlight), and dev bundle IDs so
  * beta and development builds also intercept these links on devices where
@@ -38,10 +39,10 @@ const PROD_BUNDLE_ID = 'com.leviwilkerson.jwtime'
 const BETA_BUNDLE_ID = 'com.leviwilkerson.jwtimebeta'
 const DEV_BUNDLE_ID = 'com.leviwilkerson.jwtimedev'
 const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
-const CONTACT_LINK_PATH = '/c'
-const LEGACY_CONTACT_LINK_PATH_PREFIX = `${CONTACT_LINK_PATH}/`
+const CONTACT_LINK_PATH = '/contacts'
+const SHORT_CONTACT_LINK_PATH = '/c'
+const LEGACY_CONTACT_LINK_PATH_PREFIX = `${SHORT_CONTACT_LINK_PATH}/`
 const SITE_ORIGIN = 'https://ww-proxy.leviwilkerson.com'
-const CANONICAL_URL = `${SITE_ORIGIN}${CONTACT_LINK_PATH}`
 const OG_IMAGE_URL = `${SITE_ORIGIN}/assets/og-image.png`
 const APPLE_TOUCH_ICON_URL = `${SITE_ORIGIN}/assets/apple-touch-icon.png`
 const IMPORT_DEEP_LINK_PREFIX = 'witnesswork://import-contact/'
@@ -81,8 +82,10 @@ const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
 /**
  * Apple strongly recommends `components` over the legacy `paths` array. Both
  * still work, but `components` supports per-pattern exclusions and query and
- * fragment matchers. We match `/c` with a non-empty fragment (`?*` = at least
- * one character), plus any path under `/c/` for links from older app versions.
+ * fragment matchers. Each link page matches with a non-empty fragment (`?*` =
+ * at least one character; `1?*` = link format 1). The short paths (`/c`,
+ * `/c/*`, `/b`, `/h`) are in links already shared, so they stay listed for
+ * good: dropping one would open those links in Safari instead of the app.
  */
 function buildAasaPayload(teamId: string): object {
   const appIDs = [
@@ -97,10 +100,16 @@ function buildAasaPayload(teamId: string): object {
           appIDs,
           components: [
             { '/': CONTACT_LINK_PATH, '#': '?*' },
+            // Buddy invite `/buddies/invite#1<secret>`: the secret stays in
+            // the fragment.
+            { '/': '/buddies/invite', '#': '1?*' },
+            // Set Up Another Device `/accounts/handoff#1<channel, key,
+            // secret>`, likewise.
+            { '/': '/accounts/handoff', '#': '1?*' },
+            // The short paths of links already shared.
+            { '/': SHORT_CONTACT_LINK_PATH, '#': '?*' },
             { '/': `${LEGACY_CONTACT_LINK_PATH_PREFIX}*` },
-            // Buddy invite `/b#1<secret>`: the secret stays in the fragment.
             { '/': '/b', '#': '1?*' },
-            // Set Up Another Device `/h#1<channel, key, secret>`, likewise.
             { '/': '/h', '#': '1?*' },
           ],
         },
@@ -124,14 +133,19 @@ export function handleAasaRequest(context: AppContext) {
 }
 
 /**
- * `/c` — the fallback page for fragment links. The payload never reaches the
- * worker, so the page's inline script builds the "Open app" link instead.
+ * `/contacts` (and the short `/c`) — the fallback page for fragment links.
+ * The payload never reaches the worker, so the page's inline script builds
+ * the "Open app" link instead.
  */
 export function handleContactLinkRequest(context: AppContext) {
   nameTransactionAfterRoute(context)
   const locale = contactLinkLocale(context)
+  const path =
+    context.req.path === SHORT_CONTACT_LINK_PATH
+      ? SHORT_CONTACT_LINK_PATH
+      : CONTACT_LINK_PATH
   return context.html(
-    renderFallbackPage(locale, `<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${escapeHtml(contactLinkTranslations[locale].openApp)}</a>
+    renderFallbackPage(locale, path, `<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${escapeHtml(contactLinkTranslations[locale].openApp)}</a>
     <script>${OPEN_APP_FROM_FRAGMENT_SCRIPT}</script>`)
   )
 }
@@ -148,7 +162,10 @@ export function handleLegacyContactLinkRequest(context: AppContext) {
   const openAppLink = BASE64URL.test(payload)
     ? `<a class="secondary" href="${IMPORT_DEEP_LINK_PREFIX}${payload}">${escapeHtml(contactLinkTranslations[locale].openApp)}</a>`
     : ''
-  return context.html(renderFallbackPage(locale, openAppLink))
+  // Never the request path: it holds the payload.
+  return context.html(
+    renderFallbackPage(locale, SHORT_CONTACT_LINK_PATH, openAppLink)
+  )
 }
 
 function contactLinkLocale(context: AppContext): ContactLinkLocale {
@@ -174,10 +191,14 @@ function escapeHtml(value: string): string {
  * Fallback HTML for taps that reach the worker (app not installed, non-iOS,
  * or Safari address-bar hit). Kept self-contained — no external fonts — so
  * iMessage's rich-link sniffer can render a fast preview. `og:url` is always
- * the bare canonical URL, and `no-referrer` keeps legacy page URLs out of the
- * Referer header of follow-up requests.
+ * a bare page URL (`/contacts` or `/c`, never a payload), and `no-referrer`
+ * keeps legacy page URLs out of the Referer header of follow-up requests.
  */
-function renderFallbackPage(locale: ContactLinkLocale, openAppLink: string): string {
+function renderFallbackPage(
+  locale: ContactLinkLocale,
+  path: typeof CONTACT_LINK_PATH | typeof SHORT_CONTACT_LINK_PATH,
+  openAppLink: string
+): string {
   const messages = contactLinkTranslations[locale]
   const title = escapeHtml(messages.title)
   const description = escapeHtml(messages.description)
@@ -203,7 +224,7 @@ function renderFallbackPage(locale: ContactLinkLocale, openAppLink: string): str
   <meta property="og:locale" content="${language}_${territory}">
   <meta property="og:title" content="${title}">
   <meta property="og:description" content="${description}">
-  <meta property="og:url" content="${CANONICAL_URL}">
+  <meta property="og:url" content="${SITE_ORIGIN}${path}">
   <meta property="og:image" content="${OG_IMAGE_URL}">
   <meta property="og:image:width" content="1024">
   <meta property="og:image:height" content="1024">

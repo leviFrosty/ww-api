@@ -21,7 +21,7 @@ Buddies lets two publishers share upcoming Plans through a blind relay. Each per
 
 ## How to get to it (user POV)
 
-- In the app: Buddies → Invite a buddy creates an invite and shares `https://ww-proxy.leviwilkerson.com/b#1<secret>`.
+- In the app: Buddies → Invite a buddy creates an invite and shares `https://ww-proxy.leviwilkerson.com/b#1<secret>` (`/buddies/invite#1<secret>` once the app generates the readable path).
 - The buddy taps the link. The app opens, fetches and claims the invite, and the inviter confirms.
 - Opening the Buddies tab or the calendar syncs the inbox, and editing Plans writes a card. Removing a buddy runs leave. Deleting Buddies data deletes the inbox.
 

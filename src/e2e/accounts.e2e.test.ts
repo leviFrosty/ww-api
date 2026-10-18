@@ -226,9 +226,9 @@ describe('POST /accounts/v1/backup/*', () => {
   })
 })
 
-describe('GET /h', () => {
-  it('serves the scan-from-the-app page', async () => {
-    const res = await http('GET', '/h')
+describe('GET /accounts/handoff', () => {
+  it.each(['/accounts/handoff', '/h'])('%s serves the scan-from-the-app page', async (path) => {
+    const res = await http('GET', path)
     expect(res.status).toBe(200)
     expect(res.text).toContain('Scan this code in WitnessWork')
   })
