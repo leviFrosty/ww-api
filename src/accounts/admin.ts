@@ -20,6 +20,7 @@ import {
   type AccountRecord,
 } from './store'
 import { accountLookupDocs, accountStatusDocs } from './openapi'
+import { forgetAccountStatus } from './auth'
 
 /**
  * Maintainer-only account moderation, authorized by `x-ww-admin-token`
@@ -104,6 +105,7 @@ const handleStatus = async (c: AppContext): Promise<Response> => {
   const account = await findAccount(db, accountId)
   if (!account) return apiError(404, 'unknown_account')
   await setAccountStatus(db, accountId, status, reason)
+  forgetAccountStatus(accountId)
 
   // The database is the authority (registration checks it); the inboxes keep
   // a copy so their hot path never reads it. A failed inbox is reported, and

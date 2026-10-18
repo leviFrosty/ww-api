@@ -16,6 +16,7 @@ import {
   BUDDIES_OWNER_OPS,
   BUDDIES_PAYLOAD_PARSERS,
   BUDDIES_PHOTO_OPS,
+  BUDDIES_SUSPENDED_REFUSED_OPS,
   BUDDIES_UNSIGNED_OPS,
   buddyBlobKey,
   fail,
@@ -61,6 +62,7 @@ import {
   authenticateAccount,
   hasAuthorization,
   parseJsonOrNull,
+  refuseInactiveAccount,
   type AccountAuth,
 } from '../accounts/auth'
 import {
@@ -99,8 +101,8 @@ import {
  * account the inbox is linked to; `inbox/register` still sends its
  * self-signed envelope, whose `account` proof must name the token's account;
  * writer ops send their writer-signed envelope (the slot capability, never
- * compared with the token's account); invite and blob reads send today's
- * body. A request without the header is a legacy request, served as before
+ * compared with the token's account, though a suspended account's writes and
+ * invite claims are refused); invite and blob reads send today's body. A request without the header is a legacy request, served as before
  * sessions while the legacy switch is on, 426 `upgrade_required` once it's
  * off, except the iOS Notification Service Extension's owner-signed
  * `inbox/sync` for an inbox with a confirmed account link (`admitCaller`).
@@ -172,8 +174,14 @@ type Admission = { ok: true; caller: Caller } | { ok: false; response: Response 
  * `unauthorized`, or 503 `disabled` on a worker without sessions), and it
  * counts against its account. A legacy request is refused with 426
  * `upgrade_required` once the legacy switch is off, and otherwise counts
- * against the client IP. Suspension isn't checked here: the inbox's copy of
- * the account status decides, as before sessions.
+ * against the client IP.
+ *
+ * A bearer request for an op that reaches someone else's inbox
+ * (`BUDDIES_SUSPENDED_REFUSED_OPS`: writing to a buddy, claiming an invite)
+ * is then refused with 403 `suspended` when the token's account is
+ * suspended, from the cached account status, so the target inbox never
+ * learns which account wrote. Other ops leave suspension to the account's
+ * own inbox (its copy of the status), as before sessions.
  *
  * One legacy request outlives the switch: `inbox/sync` from the iOS
  * Notification Service Extension (`x-buddies-client: notification-service`),
@@ -203,9 +211,13 @@ const admitCaller = async (
       linkedOnly: !legacy,
     }
   }
-  return (await allowBuddiesCaller(c.env, op, caller.key))
-    ? { ok: true, caller }
-    : { ok: false, response: edgeLimited() }
+  if (!(await allowBuddiesCaller(c.env, op, caller.key)))
+    return { ok: false, response: edgeLimited() }
+  if (caller.account && BUDDIES_SUSPENDED_REFUSED_OPS.has(op)) {
+    const refused = await refuseInactiveAccount(c.env, caller.account)
+    if (refused) return refused
+  }
+  return { ok: true, caller }
 }
 
 /** The Notification Service Extension's `inbox/sync` (see `admitCaller`). */

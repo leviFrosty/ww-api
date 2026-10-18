@@ -292,6 +292,13 @@ const ownerRefusals = (
   ...(killSwitch ? { disabled: true as const } : {}),
 })
 
+/**
+ * A bearer write into someone else's inbox from a suspended account
+ * (`BUDDIES_SUSPENDED_REFUSED_OPS`).
+ */
+const SENDER_SUSPENDED =
+  'Bearer: the token’s account is suspended, so it can’t reach other people (it can still leave). Checked from the account’s status, cached up to 30 s; the inbox never learns which account wrote. A legacy request names no account and isn’t refused.'
+
 /** The refusals every writer op shares. */
 const writerRefusals = (extraRateLimit = '') => ({
   bad_request: true as const,
@@ -299,6 +306,7 @@ const writerRefusals = (extraRateLimit = '') => ({
     'Signature missing, malformed, or not by the slot’s writer key.',
   stale: true as const,
   ...AUTH_REFUSALS,
+  suspended: SENDER_SUSPENDED,
   not_found: true as const,
   gone: 'The slot doesn’t exist: the inbox owner removed you (or never added you).',
   replay: true as const,
@@ -748,7 +756,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     description: paragraphs(
       'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave.',
       SIGNED_BY.writer,
-      tierLine('write'),
+      `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
     ),
     requestBody: signedBody(
@@ -832,6 +840,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         bad_request: true,
         bad_signature: `Wrong \`claimSecret\`. The ${BUDDIES_LIMITS.badClaims}th wrong one burns the invite.`,
         ...AUTH_REFUSALS,
+        suspended: SENDER_SUSPENDED,
         not_found:
           'Unknown, expired, deleted, or burned invite, or the creator cancelled it while the claim was delivered.',
         conflict:

@@ -837,6 +837,117 @@ describe('bearer writer and capability ops', () => {
     ])
   })
 
+  it('refuses a suspended account’s writes and invite claims, but lets it read and leave', async () => {
+    const owner = await BearerOwner.create()
+    const buddy = await session()
+    const as = bearer(buddy.accessToken)
+    const writer = await owner.addWriter()
+    const invite = await inviteSecrets()
+    await owner.op('invite/create', {
+      inviteId: invite.inviteId,
+      claimVerifier: invite.claimVerifier,
+      blob: blobOfSize(100),
+      expiresAt: Date.now() + DAY_MS,
+    })
+    expect(
+      (await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, as)).body
+    ).toEqual({ ok: true, seq: 1 })
+    await setStatus(buddy.accountId, 'suspended')
+
+    const refused = { status: 403, body: relayError('suspended') }
+    expect(
+      await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, as)
+    ).toEqual(refused)
+    expect(
+      await writerSend(
+        writer,
+        'event/put',
+        { eventId: randomId(), kind: 'plan.invite', blob: blobOfSize(48) },
+        as
+      )
+    ).toEqual(refused)
+    const claim = unsignedEnvelope({
+      inviteId: invite.inviteId,
+      claimSecret: invite.claimSecret,
+      blob: blobOfSize(80),
+    })
+    expect(await h.post('/invite/claim', claim, as)).toEqual(refused)
+    // Reading reaches nobody.
+    expect(
+      (
+        await h.post(
+          '/invite/fetch',
+          unsignedEnvelope({ inviteId: invite.inviteId }),
+          as
+        )
+      ).body
+    ).toMatchObject({ ok: true, status: 'open' })
+
+    let synced = await owner.sync()
+    expect(synced.body.cards).toHaveLength(1)
+    expect(synced.body.events).toEqual([])
+    // The inbox still knows only its owner's account.
+    expect(
+      h.inboxes
+        .storage(owner.inboxId)
+        .query('SELECT account_id AS accountId FROM owner_account')
+    ).toEqual([{ accountId: owner.session.accountId }])
+
+    await setStatus(buddy.accountId, 'active')
+    expect(
+      (await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, as)).body
+    ).toEqual({ ok: true, seq: 2 })
+    expect((await h.post('/invite/claim', claim, as)).status).toBe(200)
+
+    await setStatus(buddy.accountId, 'suspended')
+    expect((await writerSend(writer, 'slot/leave', {}, as)).body).toEqual({
+      ok: true,
+    })
+    synced = await owner.sync()
+    expect(synced.body.slots).toEqual([])
+  })
+
+  it('applies a suspension at once in the isolate that made it', async () => {
+    const owner = await BearerOwner.create()
+    const buddy = await session()
+    const as = bearer(buddy.accessToken)
+    const writer = await owner.addWriter()
+    expect(
+      (await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, as)).status
+    ).toBe(200)
+    // The admin route, without the test helper's cache reset.
+    const response = await adminApp.request(
+      '/status',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-ww-admin-token': ADMIN_TOKEN,
+        },
+        body: JSON.stringify({
+          accountId: buddy.accountId,
+          status: 'suspended',
+          reason: 'report',
+        }),
+      },
+      h.env
+    )
+    expect(response.status).toBe(200)
+    expect(
+      await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, as)
+    ).toEqual({ status: 403, body: relayError('suspended') })
+  })
+
+  it('can’t refuse a legacy writer op: it names no account', async () => {
+    const owner = await BearerOwner.create()
+    const buddy = await session()
+    const writer = await owner.addWriter()
+    await setStatus(buddy.accountId, 'suspended')
+    expect(
+      (await writerSend(writer, 'card/put', { blob: blobOfSize(64) }, {})).body
+    ).toEqual({ ok: true, seq: 1 })
+  })
+
   it('puts photo blobs by token and reads them with the read token', async () => {
     const owner = await BearerOwner.create()
     const blob = await photoBlob()
