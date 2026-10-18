@@ -217,21 +217,37 @@ describe('linking a RevenueCat customer', () => {
     expect(revenueCat).not.toHaveBeenCalled()
   })
 
-  it('limits each account’s links, which each read RevenueCat, to the register tier', async () => {
+  it('counts each account’s links, which each read RevenueCat, against the register tier', async () => {
     customers.set(RC_A, free)
     const session = await openTestSession(app, h.env)
     const other = await openTestSession(app, h.env)
-    // One limiter window throughout (the fake counts per wall-clock minute).
-    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
-    for (let i = 0; i < 60; i++)
+    // The register tier's limiter, at 2 a minute: the real one's 60 would
+    // take 60 links to reach.
+    const keys: string[] = []
+    const used = new Map<string, number>()
+    ;(h.env as Environment).BUDDIES_REGISTER_LIMITER = {
+      limit: async ({ key }: { key: string }) => {
+        keys.push(key)
+        const count = (used.get(key) ?? 0) + 1
+        used.set(key, count)
+        return { success: count <= 2 }
+      },
+    } as unknown as Environment['BUDDIES_REGISTER_LIMITER']
+    for (let i = 0; i < 2; i++)
       expect((await link(session, RC_A)).status).toBe(200)
     const refused = await link(session, RC_A)
     expect(refused.status).toBe(429)
     expect(refused.body.code).toBe('rate_limited')
     expect(refused.headers.get('retry-after')).toBe('60')
-    expect(revenueCat).toHaveBeenCalledTimes(60)
-    // Another account (same IP) has its own budget.
+    expect(revenueCat).toHaveBeenCalledTimes(2)
+    // Keyed on a hash of the account, never the id or the IP: another
+    // account (same IP) has its own budget.
     expect((await link(other, RC_A)).status).toBe(200)
+    expect(new Set(keys).size).toBe(2)
+    for (const key of keys) {
+      expect(key).toMatch(/^account:/)
+      expect(key).not.toContain(session.accountId)
+    }
   })
 
   it('answers 503 unavailable with Retry-After when RevenueCat is down, changing nothing', async () => {
