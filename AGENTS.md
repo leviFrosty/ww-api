@@ -878,12 +878,18 @@ wrangler secret put REVENUECAT_WEBHOOK_AUTHORIZATION --env dev   # dev
 wrangler secret put REVENUECAT_WEBHOOK_AUTHORIZATION             # prod
 ```
 
-RevenueCat dashboard → Project → Integrations → Webhooks: one integration per
-worker. Sandbox events → `https://ww-proxy-dev.levi-wilkerson.workers.dev/revenuecat/v1/webhook`;
-production events → `https://ww-proxy.leviwilkerson.com/revenuecat/v1/webhook`,
-each with its worker's `Bearer <secret>` as the Authorization header value.
-Send a test event from the integration page: the worker answers 200
-`customers: 0` (a test customer is never linked).
+RevenueCat dashboard → Integrations → Webhooks, one integration per worker,
+in the project whose secret key the worker holds (`REVENUECAT_API_KEY`):
+
+| Worker | RevenueCat project | URL | Environment |
+| --- | --- | --- | --- |
+| dev | **WitnessWork Dev** (`67824560`, Test Store only; key "ww-proxy-dev") | `https://ww-proxy-dev.levi-wilkerson.workers.dev/revenuecat/v1/webhook` | Both (dashboard promo grants arrive as production events) |
+| prod | **WitnessWork** (`4c282809`; key "ww-proxy") | `https://ww-proxy.leviwilkerson.com/revenuecat/v1/webhook` | Both (TestFlight Beta and Play test tracks buy in sandbox and talk to prod) |
+
+Authorization header value: `Bearer ` plus that worker's secret. Leave HMAC
+signing off (the worker checks the Authorization header). "Send test event"
+on the integration should answer 200 `customers: 0` (a test customer is
+never linked).
 
 ### Handoff and backup
 
