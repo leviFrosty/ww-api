@@ -1161,7 +1161,7 @@ export const supporterLinkDocs = describeRoute({
 
 The app user id is the RevenueCat SDK’s capability for that customer: send only the one the app is logged in as. It travels in the body, never the URL.
 
-Works for a suspended account. ${readTier}`,
+Works for a suspended account. ${readTier} Each link also reads RevenueCat, so it counts against the Buddies register tier per account too (60 a minute).`,
   security: [{ bearerAuth: [] }],
   requestBody: jsonBody(
     z.object({
@@ -1188,7 +1188,7 @@ Works for a suspended account. ${readTier}`,
 export const supporterStatusDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'Read your Supporter status',
-  description: `The token’s account’s Supporter status from the server’s record, which RevenueCat’s webhook keeps current. A customer record more than a day old is read from RevenueCat again first. For the app’s developer tools.
+  description: `The token’s account’s Supporter status from the server’s record, which RevenueCat’s webhook keeps current. A customer record more than a day old, or a Supporter whose end has passed since it was read (a renewal, or a lapse), is read from RevenueCat again first. For the app’s developer tools.
 
 Works for a suspended account. ${readTier}`,
   security: [{ bearerAuth: [] }],

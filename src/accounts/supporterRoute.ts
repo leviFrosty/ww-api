@@ -1,6 +1,11 @@
 import type { AppContext } from '../types'
 import { RevenueCatError } from '../revenuecat'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
+import {
+  EDGE_RETRY_AFTER_SECONDS,
+  allowBuddiesCaller,
+  buddiesAccountCallerKey,
+} from '../buddies/limits'
 import { authenticateAccount, readPlainJson } from './auth'
 import { guarded, refuseAtEdge } from './signed'
 import { accountsDb } from './store'
@@ -21,7 +26,10 @@ import {
  * - `GET /accounts/v1/supporter`: Bearer. The account's status.
  *
  * Both work for a suspended account and count against the read edge tier.
- * RevenueCat unreachable is 503 `unavailable` with `Retry-After`.
+ * Every link also reads RevenueCat, so it counts against the register tier
+ * per account too: the read tier alone would let one account spend the
+ * worker's shared RevenueCat rate limit. RevenueCat unreachable is 503
+ * `unavailable` with `Retry-After`.
  *
  * Privacy: nothing here logs or reports the token, the account id, or the
  * app user id.
@@ -45,6 +53,11 @@ export const createSupporterHandlers = (
     if (limited) return limited
     const auth = await authenticateAccount(c)
     if (!auth.ok) return auth.response
+    const callerKey = await buddiesAccountCallerKey(auth.account.accountId)
+    if (!(await allowBuddiesCaller(c.env, 'inbox/register', callerKey)))
+      return buddiesErrorResponse('rate_limited', {
+        retryAfterSeconds: EDGE_RETRY_AFTER_SECONDS,
+      })
 
     const body = await readPlainJson(c)
     const appUserId =
