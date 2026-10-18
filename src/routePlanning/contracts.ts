@@ -10,16 +10,26 @@ const coordinate = z
 
 export type Coordinate = z.infer<typeof coordinate>
 
+const routeFields = {
+  start: coordinate,
+  stops: z.array(coordinate).min(1).max(ROUTE_PLANNING_LIMITS.maxStops),
+}
+
 /**
- * `POST /route-planning/optimize`. Coordinates only: `strict()` rejects any
- * other field, so names, notes, or topics can never ride along.
+ * `POST /route-planning/optimize` with a bearer token (witness-work ADR
+ * 0029): the token's account is the caller. Coordinates only: `strict()`
+ * rejects any other field, so names, notes, or topics can never ride along.
  */
-export const routeOptimizeRequestSchema = z
-  .object({
+export const routeOptimizeBearerRequestSchema = z.object(routeFields).strict()
+
+/**
+ * The legacy form (no `Authorization` header), for app versions before
+ * sessions, while the legacy switch is on.
+ */
+export const routeOptimizeRequestSchema = routeOptimizeBearerRequestSchema
+  .extend({
     /** The app's account id (RevenueCat app user id), for the Supporter check. */
     accountId: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/),
-    start: coordinate,
-    stops: z.array(coordinate).min(1).max(ROUTE_PLANNING_LIMITS.maxStops),
   })
   .strict()
 
@@ -38,6 +48,11 @@ export interface RouteOptimizeResponse {
 
 export type RouteOptimizeErrorCode =
   | 'bad_request'
+  | 'unauthorized'
+  | 'suspended'
+  | 'upgrade_required'
+  | 'disabled'
+  | 'internal'
   | 'payload_too_large'
   | 'unavailable'
   | 'supporter_required'

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  fetchSupporterStatus,
   isSupporter,
   LIFETIME_SUPPORTER_ENTITLEMENT,
   RevenueCatError,
@@ -262,5 +263,41 @@ describe('isSupporter', () => {
     await expect(call(500, { error: 'boom' })).rejects.toBeInstanceOf(
       RevenueCatError
     )
+  })
+})
+
+describe('fetchSupporterStatus deadline', () => {
+  const read = (fetchImpl: typeof fetch) =>
+    fetchSupporterStatus({
+      apiKey: 'sk_test',
+      appUserId: 'uuid-123',
+      fetchImpl,
+      nowMs: NOW,
+      timeoutMs: 20,
+    })
+
+  it('gives up on headers that never come, as unreachable', async () => {
+    const hang = (() => new Promise<Response>(() => {})) as typeof fetch
+    await expect(read(hang)).rejects.toBeInstanceOf(RevenueCatError)
+  })
+
+  it('gives up on a body that never ends', async () => {
+    const slowBody = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}),
+      }) as unknown as Response) as typeof fetch
+    await expect(read(slowBody)).rejects.toBeInstanceOf(RevenueCatError)
+  })
+
+  it('passes the deadline on to the fetch', async () => {
+    let signal: AbortSignal | null | undefined
+    const capture = (async (_url: unknown, init?: RequestInit) => {
+      signal = init?.signal
+      return Response.json({ subscriber: {} })
+    }) as typeof fetch
+    await read(capture)
+    expect(signal).toBeInstanceOf(AbortSignal)
   })
 })

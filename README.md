@@ -383,19 +383,19 @@ included).
 
 | Route | Body | 200 |
 | --- | --- | --- |
-| `POST /notes-import/kickoff` | `{ notesText, context, refinement?, revenueCatAppUserId? }` | `{ importId, refinement, credits }` (no `subscribeToken`) |
+| `POST /notes-import/kickoff` | `{ notesText, context, refinement? }` | `{ importId, refinement, credits }` (no `subscribeToken`) |
 | `POST /notes-import` (synchronous fallback) | the same | `{ result, contentHash, refinement, emptyCharged, credits }` |
-| `POST /notes-import/transcribe` | `{ image, mimeType, revenueCatAppUserId? }` | `{ ok, text, truncated, pagesRemaining }` |
+| `POST /notes-import/transcribe` | `{ image, mimeType }` | `{ ok, text, truncated, pagesRemaining }` |
 | `GET /notes-import/{importId}/events` | none; `Last-Event-ID` header to resume | the SSE stream |
 | `GET /notes-import/{importId}/result` | none | `{ status, payload?, error? }` |
 | `POST /notes-import/{importId}/cancel` | none | `{ status, payload?, error? }` |
 | `POST /notes-import/{importId}/destroy` | none | `{ ok: true }` |
 
-- `revenueCatAppUserId` (optional, 8-64 of `A-Z a-z 0-9 _ -`): the app's
-  RevenueCat app user id. The server asks RevenueCat whether it's a Supporter,
-  at kickoff and again when the run settles; absent means not a Supporter.
-  It's a stopgap until RevenueCat is linked to the account, when the server
-  will use the account's own id and ignore this field.
+- **Supporter status** is the account's (witness-work ADR 0029; see
+  [Supporter status](#supporter-status-on-the-account) below), asked at kickoff
+  and again when the run settles. An account that hasn't linked a RevenueCat
+  customer isn't a Supporter. Builds before ADR 0029 sent a
+  `revenueCatAppUserId`; it's ignored.
 - **Run routes** take the access token instead of `?token=` (a bearer request
   never reads it) and serve only imports the token's account kicked off.
   Another account's import, an unknown id, and one deleted or past its 1-hour
@@ -477,6 +477,34 @@ permanent hash replay and refinement records survive. Missing configuration or
 bad auth returns 404. Data Studio remains the manual emergency fallback. Never
 reuse `NOTES_IMPORT_DEV_BYPASS_TOKEN` as the admin secret.
 
+### Supporter status on the account
+
+The server answers whether an account is a Supporter from its own record
+(witness-work ADR 0029, `src/accounts/supporter.ts`), kept current by
+RevenueCat's webhook. Who counts is ADR 0014's rule (`src/revenuecat.ts`).
+
+- `POST /accounts/v1/revenuecat-customers` (Bearer) `{ appUserId }` →
+  `{ ok, supporter, expiresAt }`. `appUserId` is the RevenueCat app user id the
+  app is logged in as. The server reads that customer from RevenueCat, stores
+  what RevenueCat says, links it to the token's account, and answers the
+  account's status. Repeating it reads RevenueCat again. A customer RevenueCat
+  has never seen isn't linked. At most 5 customers an account and 5 accounts a
+  customer; a new link past either replaces the least recently linked.
+  RevenueCat unreachable is 503 `unavailable`. Besides the read tier per IP,
+  links count against the register tier (60 a minute) per account.
+- `GET /accounts/v1/supporter` (Bearer) → `{ ok, supporter, expiresAt,
+  customers }`.
+- `POST /revenuecat/v1/webhook`: RevenueCat's servers only, with the
+  integration's Authorization header (`Bearer <REVENUECAT_WEBHOOK_AUTHORIZATION>`).
+  Each customer an event names that some account links is read again from
+  RevenueCat's REST API; unlinked customers are ignored. Idempotent by event
+  id; RevenueCat trouble is 503 so RevenueCat retries.
+- A record read within the last day is the answer until its expiry; an older
+  one is read again first, as is a Supporter whose expiry passed since it was
+  read (one read tells a renewal from a lapse). Each RevenueCat read gives up
+  after 5 seconds. RevenueCat unreachable then: route planning answers
+  503 `supporter_check_failed`, Notes Import counts the User as free.
+
 ### `POST /route-planning/optimize`
 
 Supporter-only shortest driving order for the app's "Plan today's route". Sends
@@ -484,20 +512,27 @@ the stops to HERE Waypoints Sequence v8 (`findsequence2`), which returns the
 fastest visiting order (live traffic, open path ending at the last stop) for one
 transaction per request.
 
-**Request** (JSON; any other field is rejected):
+**Request** (JSON; any other field is rejected), with `Authorization: Bearer
+<access token>`:
 
 ```json
 {
-  "accountId": "<app account id>",
   "start": { "lat": 39.1031, "lng": -84.512 },
   "stops": [{ "lat": 39.11, "lng": -84.5 }, { "lat": 39.12, "lng": -84.49 }]
 }
 ```
 
+The token's account must be a Supporter ([above](#supporter-status-on-the-account)),
+and a suspended account is refused (403 `suspended`). Limits are per account.
+
+**Legacy** (no `Authorization` header; app versions before sessions): the body
+also carries `"accountId"`, the RevenueCat app user id, which RevenueCat must
+say is a Supporter; it's also the limits' key. Served while the legacy switch
+(KV `auth:legacy`) is on, and 426 `upgrade_required` once it's off.
+
 1–10 stops. HERE receives only the coordinates, under opaque ids (`start`,
-`s0`…), in a form POST body. The account id is used only for the RevenueCat
-Supporter check and the per-account limits; neither it nor the coordinates are
-logged or stored.
+`s0`…), in a form POST body. Neither the coordinates nor any id are logged or
+stored.
 
 **Response:**
 
@@ -508,8 +543,9 @@ logged or stored.
 `order` lists indices into `stops` in visiting order.
 
 **Errors** carry `{ "ok": false, "error", "code" }` (`error` is a message;
-branch on `code`): `bad_request` (400), `payload_too_large` (413),
-`supporter_required` (403), `supporter_check_failed` (503 — RevenueCat
+branch on `code`): `bad_request` (400), `unauthorized` (401, bearer),
+`payload_too_large` (413), `supporter_required` / `suspended` (403),
+`upgrade_required` (426, legacy), `supporter_check_failed` (503 — RevenueCat
 unreachable; fails closed), `unavailable` (503 — kill switch), `daily_limit` /
 `rate_limited` (429), `no_route` (422), `upstream_error` (502). Every 429 and
 503 sends `Retry-After` and repeats it as `retryAfter` (and, for older builds,

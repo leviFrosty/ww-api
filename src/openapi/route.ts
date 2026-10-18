@@ -60,6 +60,11 @@ export const OPENAPI_TAGS = [
       'Universal-link support: the AASA file and the no-app fallback pages for shared contacts (`/contacts`), buddy invites (`/buddies/invite`), and Set Up Another Device (`/accounts/handoff`). The short paths (`/c`, `/b`, `/h`) in links already shared are served for good.',
   },
   {
+    name: 'Webhooks',
+    description:
+      'Called by outside services, never by the app: RevenueCat’s webhook keeps Supporter status on accounts current.',
+  },
+  {
     name: 'Admin',
     description:
       'Maintainer tools. Each needs `x-ww-admin-token`; without a valid token every admin route answers 404.',
@@ -94,6 +99,12 @@ const DOCUMENTATION = {
         in: 'header',
         name: 'x-ww-admin-token',
         description: 'The environment’s `ADMIN_API_TOKEN` secret.',
+      },
+      revenueCatWebhook: {
+        type: 'http' as const,
+        scheme: 'bearer',
+        description:
+          'The Authorization header value set on the RevenueCat webhook integration: `Bearer` and the environment’s `REVENUECAT_WEBHOOK_AUTHORIZATION` secret.',
       },
       bearerAuth: {
         type: 'http' as const,

@@ -32,8 +32,14 @@ export const ARTIFACTS_DIR = join(ROOT, '.verify', 'artifacts')
 
 interface VerifyState {
   url: string
-  tokens?: { devBypass?: string; admin?: string }
+  tokens?: {
+    devBypass?: string
+    admin?: string
+    accountToken?: string
+    revenueCatWebhook?: string
+  }
   configured?: Record<string, boolean>
+  revenueCatApiUrl?: string | null
 }
 
 const readState = (): VerifyState | null =>
@@ -59,6 +65,15 @@ export const DEV_BYPASS_TOKEN =
   process.env.WW_API_DEV_BYPASS_TOKEN ?? state?.tokens?.devBypass ?? null
 export const ADMIN_TOKEN =
   process.env.WW_API_ADMIN_TOKEN ?? state?.tokens?.admin ?? null
+/** The worker's `ACCOUNT_TOKEN_SECRET` (local launcher only), to mint tokens. */
+export const ACCOUNT_TOKEN_SECRET = state?.tokens?.accountToken ?? null
+/** The RevenueCat webhook's Authorization secret (local launcher only). */
+export const REVENUECAT_WEBHOOK_TOKEN =
+  process.env.WW_API_REVENUECAT_WEBHOOK_TOKEN ??
+  state?.tokens?.revenueCatWebhook ??
+  null
+/** Where the worker expects the fake RevenueCat (`REVENUECAT_API_URL`). */
+export const REVENUECAT_API_URL = state?.revenueCatApiUrl ?? null
 export const configured = (name: string): boolean =>
   Boolean(state?.configured?.[name])
 /** True when the worker is the launcher's local instance (KV helpers work). */

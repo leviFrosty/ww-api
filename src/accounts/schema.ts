@@ -1,4 +1,10 @@
-import { index, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core'
+import {
+  index,
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+} from 'drizzle-orm/sqlite-core'
 
 /**
  * The accounts database (D1 `ACCOUNTS_DB`). It knows each account by a random
@@ -153,4 +159,57 @@ export const accountInboxes = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [index('account_inboxes_account_idx').on(t.accountId)]
+)
+
+/**
+ * The RevenueCat customers accounts link (witness-work ADR 0029), with what
+ * RevenueCat's REST API last said about each. Never written from a client's
+ * say-so: every row is a read of RevenueCat. A customer nobody links isn't
+ * stored. `appUserId` is ADR 0011's shared id (or an install id), which
+ * RevenueCat's SDK treats as the customer's capability: never log it.
+ */
+export const revenueCatCustomers = sqliteTable('revenuecat_customers', {
+  appUserId: text('app_user_id').primaryKey(),
+  /** ADR 0014's rule, as of `checkedAt`. */
+  supporter: integer('supporter', { mode: 'boolean' }).notNull(),
+  /** When Supporter status ends; null for no end, or when not a Supporter. */
+  supporterExpiresAt: integer('supporter_expires_at', { mode: 'timestamp_ms' }),
+  /**
+   * When the read stored here started. A write lands only over an older one,
+   * so concurrent webhook reads can't leave the stale answer behind.
+   */
+  checkedAt: integer('checked_at', { mode: 'timestamp_ms' }).notNull(),
+})
+
+/**
+ * Which accounts link which customers. An account is a Supporter when any
+ * customer it links is. Each side keeps at most `SUPPORTER_LINK_LIMITS`
+ * links; a new one past that replaces the least recently linked.
+ */
+export const accountRevenueCatCustomers = sqliteTable(
+  'account_revenuecat_customers',
+  {
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    appUserId: text('app_user_id')
+      .notNull()
+      .references(() => revenueCatCustomers.appUserId, { onDelete: 'cascade' }),
+    /** The last time an app linked it; every repeat moves it. */
+    linkedAt: integer('linked_at', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.accountId, t.appUserId] }),
+    index('account_revenuecat_customers_customer_idx').on(t.appUserId),
+  ]
+)
+
+/** RevenueCat webhook event ids already handled, kept 30 days. Ids only. */
+export const revenueCatWebhookEvents = sqliteTable(
+  'revenuecat_webhook_events',
+  {
+    eventId: text('event_id').primaryKey(),
+    receivedAt: integer('received_at', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [index('revenuecat_webhook_events_received_idx').on(t.receivedAt)]
 )

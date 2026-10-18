@@ -1126,3 +1126,137 @@ Works for a suspended account. ${readTier}`,
     ...bearerReadErrors,
   },
 })
+
+// --- Supporter status (witness-work ADR 0029) ------------------------------
+
+const supporterExpiresAt = z.number().int().nullable().meta({
+  description:
+    'When the account’s Supporter status ends, epoch milliseconds: the latest end over every linked customer. `null` for no end (a lifetime grant), and when not a Supporter.',
+})
+
+const supporterFields = {
+  ok: z.literal(true),
+  supporter: z.boolean().meta({
+    description:
+      'Whether the account is a Supporter: any customer it links has an active subscription or a `Lifetime Supporter` grant (ADR 0014; Tips never count).',
+  }),
+  expiresAt: supporterExpiresAt,
+}
+
+const revenueCatUnavailable = {
+  503: errorResponse(
+    'Accounts are off on this worker (`disabled`), or RevenueCat couldn’t be read (`unavailable`, with `Retry-After`); nothing changed.',
+    ['disabled', 'unavailable']
+  ),
+}
+
+export const supporterLinkDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Link your RevenueCat customer',
+  description: `Links the RevenueCat customer the app is logged in as to the token’s account, so the server answers Supporter status from the account (Notes Import, route planning). The server reads the customer from RevenueCat’s REST API with its secret key and stores what RevenueCat says; it never takes status from the request. Answers the account’s status afterwards, over every customer it links.
+
+- A customer RevenueCat has never seen isn’t linked; the answer is the account’s status without it.
+- Idempotent. Repeating a link refreshes it and reads RevenueCat again, so it doubles as “check my status now” (after a purchase or a restore).
+- An account keeps at most 5 customers and a customer at most 5 accounts; a new link past either replaces the least recently linked.
+
+The app user id is the RevenueCat SDK’s capability for that customer: send only the one the app is logged in as. It travels in the body, never the URL.
+
+Works for a suspended account. ${readTier} Each link also reads RevenueCat, so it counts against the Buddies register tier per account too (60 a minute).`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({
+      appUserId: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]{8,64}$/)
+        .meta({
+          description:
+            'The RevenueCat app user id the app is logged in as (`Purchases.getAppUserID()`): ADR 0011’s shared id or the install id. 8 to 64 of `A-Z a-z 0-9 _ -`; RevenueCat’s anonymous ids never match.',
+        }),
+    })
+  ),
+  responses: {
+    200: jsonResponse(
+      'The account’s Supporter status after linking.',
+      z.object(supporterFields)
+    ),
+    400: errorResponse('Missing or malformed `appUserId`.', ['bad_request']),
+    ...bearerReadErrors,
+    ...revenueCatUnavailable,
+  },
+})
+
+export const supporterStatusDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Read your Supporter status',
+  description: `The token’s account’s Supporter status from the server’s record, which RevenueCat’s webhook keeps current. A customer record more than a day old, or a Supporter whose end has passed since it was read (a renewal, or a lapse), is read from RevenueCat again first. For the app’s developer tools.
+
+Works for a suspended account. ${readTier}`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse(
+      'The account’s Supporter status.',
+      z.object({
+        ...supporterFields,
+        customers: z.number().int().meta({
+          description: 'How many RevenueCat customers the account links.',
+        }),
+      })
+    ),
+    ...bearerReadErrors,
+    ...revenueCatUnavailable,
+  },
+})
+
+export const revenueCatWebhookDocs = describeRoute({
+  tags: ['Webhooks'],
+  summary: 'RevenueCat webhook',
+  description: `Called by RevenueCat’s servers when a customer’s purchases change; not for clients. Authenticated by the Authorization header set on the RevenueCat integration (\`Bearer <REVENUECAT_WEBHOOK_AUTHORIZATION>\`), compared in constant time.
+
+The body is RevenueCat’s event (\`{ api_version, event }\`), read only for \`event.id\` and the customers it names (\`app_user_id\`, \`original_app_user_id\`, \`aliases\`, and a \`TRANSFER\`’s \`transferred_from\` and \`transferred_to\`). Each customer some account links is read again from RevenueCat’s REST API, the authority, so event order and type don’t matter. Customers nobody linked are ignored and never stored. A repeated \`event.id\` is answered 200 without reading anything.
+
+Any answer but 200 makes RevenueCat retry (five times over about 80 minutes).`,
+  security: [{ revenueCatWebhook: [] }],
+  requestBody: jsonBody(
+    z
+      .object({
+        api_version: z.string().optional(),
+        event: z
+          .object({
+            id: z.string().meta({ description: 'The event id; deduplicated.' }),
+            type: z.string().optional(),
+            app_user_id: z.string().optional(),
+            original_app_user_id: z.string().optional(),
+            aliases: z.array(z.string()).optional(),
+            transferred_from: z.array(z.string()).optional(),
+            transferred_to: z.array(z.string()).optional(),
+          })
+          .passthrough(),
+      })
+      .meta({
+        description: 'RevenueCat’s webhook event; other fields are ignored.',
+      })
+  ),
+  responses: {
+    200: jsonResponse(
+      'Handled.',
+      z.object({
+        ok: z.literal(true),
+        customers: z.number().int().meta({
+          description: 'How many linked customers were read again.',
+        }),
+        duplicate: z.literal(true).optional().meta({
+          description: 'The event id was already handled.',
+        }),
+      })
+    ),
+    400: errorResponse('No event or event id.', ['bad_request']),
+    401: errorResponse('Missing or wrong Authorization header.', [
+      'unauthorized',
+    ]),
+    500: errorResponse('Unexpected failure; RevenueCat retries.', ['internal']),
+    503: errorResponse(
+      'No webhook secret or accounts database on this worker (`disabled`), or RevenueCat couldn’t be read (`unavailable`); RevenueCat retries.',
+      ['disabled', 'unavailable']
+    ),
+  },
+})

@@ -590,6 +590,7 @@ logs.persist = true
 # wrangler secret put SENTRY_DSN
 # wrangler secret put OPENROUTER_API_KEY        # OpenRouter key (routed ZDR-only)
 # wrangler secret put REVENUECAT_API_KEY        # RevenueCat REST v1 secret (sk_...)
+# wrangler secret put REVENUECAT_WEBHOOK_AUTHORIZATION [--env dev]  # RevenueCat webhook secret (ADR 0029), per worker
 # wrangler secret put NOTES_IMPORT_DEV_BYPASS_TOKEN --env dev  # DEV only
 # wrangler secret put ADMIN_API_TOKEN                # dedicated prod reset token
 # wrangler secret put ADMIN_API_TOKEN --env dev      # DIFFERENT dev reset token

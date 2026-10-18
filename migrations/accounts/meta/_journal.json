@@ -22,6 +22,13 @@
       "when": 1792127536490,
       "tag": "0002_account-activity",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792299695246,
+      "tag": "0003_revenuecat-customers",
+      "breakpoints": true
     }
   ]
 }

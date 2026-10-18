@@ -86,6 +86,20 @@ export interface Environment {
   /** RevenueCat REST v1 secret key (`sk_...`) for server-side supporter checks (secret). */
   REVENUECAT_API_KEY: string;
 
+  /**
+   * The RevenueCat webhook's Authorization secret (witness-work ADR 0029).
+   * Secret, distinct per prod/dev worker; the integration sends
+   * `Bearer <this>`. Unset, `POST /revenuecat/v1/webhook` answers `disabled`.
+   */
+  REVENUECAT_WEBHOOK_AUTHORIZATION?: string;
+
+  /**
+   * Development workers only: RevenueCat's REST origin for account Supporter
+   * status, so the verify loop can point at a local fake. Production ignores
+   * it.
+   */
+  REVENUECAT_API_URL?: string;
+
   /** Explicit Worker environment; production fails closed if a dev bypass exists. */
   APP_ATTEST_ENVIRONMENT: 'development' | 'production';
 

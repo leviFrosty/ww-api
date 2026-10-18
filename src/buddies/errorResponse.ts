@@ -13,6 +13,7 @@ const DEFAULT_RETRY_AFTER: Partial<Record<BuddiesErrorCode, number>> = {
   disabled: KILL_SWITCH_RETRY_AFTER_SECONDS,
   photos_disabled: KILL_SWITCH_RETRY_AFTER_SECONDS,
   rate_limited: EDGE_RETRY_AFTER_SECONDS,
+  unavailable: 30,
 }
 
 /** What every `unauthorized` refusal tells the client (RFC 6750). */

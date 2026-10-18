@@ -1,9 +1,7 @@
 import { isSupporter, RevenueCatError } from '../revenuecat'
 import { Sentry } from '../sentry'
-import {
-  isAccountSupporter,
-  type AccountSupporterLookup,
-} from '../accounts/supporter'
+import type { Environment } from '../types'
+import { isAccountSupporter } from '../accounts/supporter'
 
 export interface ResolveTerminalSupporterArgs {
   kickoffSupporter: boolean
@@ -12,12 +10,17 @@ export interface ResolveTerminalSupporterArgs {
   appUserId: string
   entitlementId: string
   /**
-   * A bearer run's account: its Supporter status (`isAccountSupporter`)
-   * replaces the lookup by `appUserId`.
+   * A bearer run's account: its Supporter status (`isAccountSupporter`, from
+   * the account's linked RevenueCat customers) replaces the lookup by
+   * `appUserId`. `env` supplies the accounts database.
    */
-  account?: AccountSupporterLookup
+  account?: {
+    accountId: string
+    env: Pick<Environment, 'REVENUECAT_API_KEY' | 'ACCOUNTS_DB'>
+  }
   /** Injectable for the smallest public regression seam. */
   checkSupporter?: typeof isSupporter
+  checkAccountSupporter?: typeof isAccountSupporter
   captureException?: (error: unknown) => void
 }
 
@@ -34,17 +37,14 @@ export const resolveTerminalSupporter = async ({
   entitlementId,
   account,
   checkSupporter = isSupporter,
+  checkAccountSupporter = isAccountSupporter,
   captureException = Sentry.captureException,
 }: ResolveTerminalSupporterArgs): Promise<boolean> => {
   if (devBypass) return kickoffSupporter
 
   try {
     return account
-      ? await isAccountSupporter(
-          { REVENUECAT_API_KEY: apiKey },
-          account,
-          checkSupporter
-        )
+      ? await checkAccountSupporter(account.env, account.accountId)
       : await checkSupporter({ apiKey, appUserId, entitlementId })
   } catch (error) {
     if (!(error instanceof RevenueCatError)) captureException(error)

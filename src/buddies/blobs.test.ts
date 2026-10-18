@@ -139,12 +139,14 @@ describe('blob/put and blob/get', () => {
     expect((await owner.putBlob(blob)).status).toBe(200)
   })
 
+  // Hashes, signs and compares a whole MiB: 2 to 4 seconds on a shared CI
+  // runner, too close to the 5-second default.
   it('accepts exactly 1 MiB', async () => {
     const owner = await photoOwner()
     const blob = await photoBlob(BUDDIES_LIMITS.blobBytes)
     expect((await owner.putBlob(blob)).status).toBe(200)
     expect((await owner.getBlob(blob)).bytes).toEqual(blob.bytes)
-  })
+  }, 15_000)
 
   it('counts as owner activity for the 180-day wipe, but reads do not', async () => {
     const owner = await photoOwner()

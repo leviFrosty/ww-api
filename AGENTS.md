@@ -249,10 +249,10 @@ Notes Import identifies the caller by the session's account (witness-work ADR
   produce one: a legacy kickoff can never get a subscribe token for an
   account's run.
 - **Supporter**: one seam, `isAccountSupporter`
-  (`src/accounts/supporter.ts`), at kickoff and settlement. Until RevenueCat
-  is linked to the account it checks the request's optional
-  `revenueCatAppUserId`; absent is free. The RevenueCat-linking change swaps
-  its body and drops the field.
+  (`src/accounts/supporter.ts`), at kickoff and settlement: the account's
+  own status (see [Supporter status](#supporter-status-revenuecat)). An
+  account with no linked RevenueCat customer is free. A
+  `revenueCatAppUserId` from builds before ADR 0029 is ignored.
 - **Dev**: a `dev` session gets the dev bypass's allowances only where
   `NOTES_IMPORT_DEV_BYPASS_TOKEN` is set (dev worker); the bypass header is
   ignored on bearer requests.
@@ -809,6 +809,95 @@ reverse: `wrangler kv key delete --binding NOTES_KV auth:legacy` (back to
 `AUTH_LEGACY`, on), then put the previous floors back, or delete
 `app:min-version` and `notes-import:min-version` to remove them.
 
+### Supporter status (RevenueCat)
+
+The account is the authority on whether a User is a Supporter (witness-work
+ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
+`supporterRoute.ts`, and `revenueCatWebhook.ts`; the rule is still ADR 0014's
+(`fetchSupporterStatus` in `src/revenuecat.ts`).
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/revenuecat-customers` | Bearer; `{ appUserId }` → link it, `{ ok, supporter, expiresAt }` |
+| `GET /accounts/v1/supporter` | Bearer; `{ ok, supporter, expiresAt, customers }` |
+| `POST /revenuecat/v1/webhook` | RevenueCat's servers; `Authorization: Bearer <REVENUECAT_WEBHOOK_AUTHORIZATION>` |
+
+- **Linking**: the app sends the RevenueCat app user id it's logged in as
+  (ADR 0011's shared id, or the install id). The server reads that customer
+  from RevenueCat's REST API and stores only what RevenueCat says; a client's
+  claim never sets status. A customer RevenueCat doesn't know isn't linked.
+  Repeating a link reads RevenueCat again (the app does after purchases and
+  restores). At most 5 customers an account, 5 accounts a customer
+  (`SUPPORTER_LINK_LIMITS`); past either, the least recently linked goes.
+  Read edge tier per IP, plus the register tier (60 a minute) per account,
+  since every link reads RevenueCat and the worker's RevenueCat key has one
+  rate limit for everyone; works for a suspended account; RevenueCat
+  unreachable is 503 `unavailable` (`Retry-After: 30`).
+- **Threat model**: RevenueCat's SDK treats the app user id as the
+  customer's capability (anyone with it can log in as it), so ours does too.
+  Claiming someone else's purchases takes their id (122 random bits, never
+  shown or logged) plus an attested session. Store-signed proof is deferred
+  (ADR 0029 §2).
+- **Answering** (`isAccountSupporter`): any linked customer active. A record
+  read within 24 hours is the answer until its expiry; an older one is read
+  again first, and so is a Supporter whose expiry passed since its read (a
+  subscription renews at its end, and the webhook can be late), once. Reads
+  run together; one that finds a Supporter answers, else a failed read throws
+  `RevenueCatError` (route planning 503, Notes Import free). No link: false,
+  no RevenueCat call. Every RevenueCat read has a 5-second deadline
+  (`REVENUECAT_TIMEOUT_MS`), legacy checks included.
+- **Webhook**: constant-time compare of the whole Authorization header (401
+  otherwise; 503 `disabled` without the secret). The body is read only for
+  `event.id` and the customers it names (`app_user_id`,
+  `original_app_user_id`, `aliases`, `transferred_from`, `transferred_to`);
+  each one some account links is read again from RevenueCat, all at once, so
+  order and type don't matter, and a read only overwrites an older one
+  (`checked_at`).
+  Unlinked customers are ignored and never stored. Event ids are recorded
+  after the reads (30 days) and a repeat is 200 `duplicate`. RevenueCat
+  trouble is 503, so RevenueCat retries (5 times over ~80 minutes).
+- **Storage**: D1 `revenuecat_customers`, `account_revenuecat_customers`,
+  `revenuecat_webhook_events` (migration
+  `migrations/accounts/0003_revenuecat-customers.sql`). The hourly cron prunes
+  event ids past 30 days and customers no account links.
+- **Not logged** in the activity log: Supporter start and end are billing
+  state (ADR 0029 §7).
+- **Verify loop**: `REVENUECAT_API_URL` (development workers only; production
+  ignores it) points account reads at a fake. `pnpm test:e2e` serves one when
+  the worker was started with
+  `REVENUECAT_API_URL=http://127.0.0.1:18790 node scripts/verify/dev.mjs up`;
+  the launcher sets a synthetic webhook secret.
+- **Privacy**: never log or report app user ids, account ids, tokens, the
+  webhook's Authorization header, or webhook bodies. The webhook logs only the
+  event type and how many linked customers it read. Sentry drops
+  `Authorization` from every event (`SECRET_HEADER` in `src/sentry.ts`), the
+  webhook's included, and RevenueCat reads use the pre-Sentry `fetch`, so the
+  app user id in RevenueCat's URL stays out of spans.
+
+Each worker has its own webhook secret; keep copies in 1Password's Agents
+vault ("ww-api RevenueCat webhook secret (prod)" and "(dev)"). RevenueCat's
+integration sends the header value exactly as entered, so enter `Bearer `
+plus the secret.
+
+```bash
+openssl rand -hex 32   # the secret; store it in the Agents vault first
+wrangler secret put REVENUECAT_WEBHOOK_AUTHORIZATION --env dev   # dev
+wrangler secret put REVENUECAT_WEBHOOK_AUTHORIZATION             # prod
+```
+
+RevenueCat dashboard → Integrations → Webhooks, one integration per worker,
+in the project whose secret key the worker holds (`REVENUECAT_API_KEY`):
+
+| Worker | RevenueCat project | URL | Environment |
+| --- | --- | --- | --- |
+| dev | **WitnessWork Dev** (`67824560`, Test Store only; key "ww-proxy-dev") | `https://ww-proxy-dev.levi-wilkerson.workers.dev/revenuecat/v1/webhook` | Both (dashboard promo grants arrive as production events) |
+| prod | **WitnessWork** (`4c282809`; key "ww-proxy") | `https://ww-proxy.leviwilkerson.com/revenuecat/v1/webhook` | Both (TestFlight Beta and Play test tracks buy in sandbox and talk to prod) |
+
+Authorization header value: `Bearer ` plus that worker's secret. Leave HMAC
+signing off (the worker checks the Authorization header). "Send test event"
+on the integration should answer 200 `customers: 0` (a test customer is
+never linked).
+
 ### Handoff and backup
 
 Moving the account to another phone and backing it up (witness-work ADR 0026;
@@ -947,17 +1036,21 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   per 1,000). `mode=fastest;car;traffic:enabled`, `departure=now`, no `end` (the
   route finishes at the last stop). Matrix Routing would cost about 5 × N
   transactions plus our own solver, and Tour Planning bills every location.
-- **Gate**: `isSupporter()` against the request's `accountId` (the RevenueCat
-  app user id). Fails closed: a RevenueCat error returns 503
-  `supporter_check_failed`, never a route. No App Attest, so Android works too;
-  the account id is an unguessable UUID, and the per-account limits bound what
-  a leaked one could spend. On the dev worker the shared `x-ww-dev-bypass`
-  token (`NOTES_IMPORT_DEV_BYPASS_TOKEN`) skips the RevenueCat check; production
-  ignores it.
+- **Gate**: a bearer request (witness-work ADR 0029) is the token's
+  account: `requireActive` (403 `suspended`), then `isAccountSupporter`, the
+  account's own status. A legacy request (no `Authorization` header) still
+  checks `isSupporter()` against the body's `accountId` (the RevenueCat app
+  user id) while `auth:legacy` is on, and is 426 `upgrade_required` once it's
+  off. Both fail closed: a RevenueCat error returns 503
+  `supporter_check_failed`, never a route. On the dev worker a `dev` session
+  (bearer) or the shared `x-ww-dev-bypass` token (legacy,
+  `NOTES_IMPORT_DEV_BYPASS_TOKEN`) skips the Supporter check; production
+  ignores both.
 - **Limits** (`ROUTE_PLANNING_LIMITS` in `src/routePlanning/config.ts`): 10
   stops per request, and per account 10 optimizations in any rolling 24 hours
   and 3 per minute. Enforced by the `RoutePlanningQuota` SQLite DO (binding
-  `ROUTE_PLANNING_QUOTA`, migration `v5`, one instance per account id, which
+  `ROUTE_PLANNING_QUOTA`, migration `v5`, one instance per caller:
+  `account:<accountId>` for bearer, the app user id for legacy, which
   stores only optimization timestamps and deletes itself a day after the
   newest). Every call that reaches HERE counts, including `no_route` answers.
   The per-IP `RATE_LIMITER` also applies.
