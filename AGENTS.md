@@ -650,7 +650,8 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   `ww-api/<APP_ATTEST_ENVIRONMENT>`, `aud` `ww-account`, `iat`, `exp`.
   Nothing is stored; a token is valid until it expires, so closing a
   session stops its refresh token at once and its access token within 15
-  minutes. Without a usable `ACCOUNT_TOKEN_SECRET` (at least 32 characters)
+  minutes, except on the security surfaces (`requireLiveSession`, below),
+  which refuse it at once. Without a usable `ACCOUNT_TOKEN_SECRET` (at least 32 characters)
   the session routes are 503 `disabled` and no bearer token passes.
 - **Dev bypass**: on the dev worker, `x-ww-dev-bypass` with
   `NOTES_IMPORT_DEV_BYPASS_TOKEN` stands in for the attestation (platform
@@ -690,12 +691,25 @@ Building a route on accounts (`src/accounts/auth.ts`):
   `c.var.account = { accountId, sessionId, platform }` (read it with
   `accountOf(c)`). `{ requireActive: true }` also refuses a suspended
   account with 403 `suspended` (one D1 read, cached 30 s per isolate).
+  `{ requireLiveSession: true }` also refuses a token whose session has
+  ended (signed out, revoked, replaced, expired, or deleted) with the same
+  401 `unauthorized` and `WWW-Authenticate` an expired token gets, so the
+  app's refresh → 401 → open path signs it back in. One D1 read
+  (`isSessionLive`), **never cached**: revocation bites at once. Use it on
+  security surfaces a signed-out device must not act on in its token's last
+  15 minutes: today `GET /sessions`, `POST /sessions/revoke`,
+  `GET /activity`, `GET /account` (and `account/info`'s bearer form),
+  `handoff/open` and `handoff/send`, and `backup/delete`. Leave it off hot
+  paths (Buddies, Notes Import, route planning, backup put/list/get,
+  Supporter, handoff status/cancel), where ADR 0027's 15 minutes stand, and
+  off `DELETE /sessions/current`, which must always succeed.
 - `authenticateAccount(c, options?)`: the same check as a call, for routes
   that order their own gates (`GET /account` counts its edge tier first).
   Returns `{ ok: true, account }` or `{ ok: false, error, response }`
   (`unauthorized`, `suspended`, `disabled`, `internal`), so routes with
   their own error format can map `error`.
-- `bearerOrLegacy(c, { bearer, legacy }, options?)`: for converted routes.
+- `bearerOrLegacy(c, { bearer, legacy }, options?)` (and `accountCall`'s
+  last argument): for converted routes.
   A request with an `Authorization` header is a bearer request, always (a
   bad token is 401, never a fallback to the envelope). Without one, `legacy`
   runs while the legacy switch is on, else 426.
@@ -738,6 +752,29 @@ The account's security history and its signed-in devices (witness-work ADR
 All three count against the read edge tier and work for suspended accounts.
 Revoke is a `POST` so the session id stays out of the URL; another account's
 session (or none) is 404 `not_found`, and the caller's own is signed out.
+
+- **Signed-out callers**: all three take `requireLiveSession`, so a session
+  that was signed out (or revoked, replaced, or expired) is 401
+  `unauthorized` at once, even with an unexpired access token: it can't sign
+  the device that signed it out back out, or show a device list without
+  itself. Revoke also ends another session only while the caller's own is
+  live, in the same D1 statements (`endSession`'s `actorSessionId`), so of
+  two devices revoking each other at once only the first wins; the loser
+  gets 401 (`RevokeOutcome` `caller_ended`).
+- **Ids and cursors** (`src/accounts/activityIds.ts`): `account_activity.id`
+  is a global autoincrement, so it never leaves the worker; diffing one's
+  own ids would measure everyone's activity. Each entry's `id` (also the
+  cursor, `nextCursor`, and `before`) is the row id sealed for its account:
+  AES-256-GCM with the account id as associated data and a synthetic nonce
+  (HMAC-SHA256 of the account id and row id), 48 base64url characters. It's
+  deterministic (an entry keeps its id across pages, which the app keys its
+  list on) and unlinkable across accounts. Another account's cursor, a
+  forged or altered one, or a bare row id is 400 `bad_request`. The keys
+  derive from `ACCOUNT_TOKEN_SECRET` (`activityIds` in `tokens.ts`): ids
+  are sealed under the current secret and cursors open under it or
+  `ACCOUNT_TOKEN_SECRET_PREVIOUS`, so a rotation changes every id (the app
+  reloads its list) and cursors from before it page on while the previous
+  slot is set.
 
 - **Kinds**: `account.created`, `session.opened`, `session.signed_out`,
   `session.revoked`, `session.replaced` (the 10-session cap),
@@ -913,7 +950,9 @@ bodies and headers, never URLs.
   are Bearer with their fields as plain JSON; while the legacy switch is on
   they also take envelopes (`payload`/`signature`) signed by the account key
   like `account/register`, which need a registered account
-  (`unknown_account` otherwise). A suspended account may still hand off. The
+  (`unknown_account` otherwise). A suspended account may still hand off.
+  `open` and `send` (which move the account) need a live session
+  (`requireLiveSession`; a signed-out phone is 401 and signs in again). The
   new phone's (`claim`, `receive`, `done`, and `cancel` with `claimToken`)
   are plain JSON carrying `claimToken`, with or without an `Authorization`
   header. One `AccountHandoff` SQLite DO per `channelId`
@@ -936,7 +975,8 @@ bodies and headers, never URLs.
   sends the blob as the raw body, with `x-ww-slot-id`, `x-ww-sha256`, and
   `Content-Length` as its size. `delete` is Bearer **and** the account key's
   envelope; its key must be the token's account (403 `forbidden`), so a
-  leaked token can't delete backups. While the legacy switch is on, all four
+  leaked token can't delete backups; it also needs a live session
+  (`requireLiveSession`). While the legacy switch is on, all four
   also take the envelope alone; the old `put` sends it in
   `x-ww-payload`/`x-ww-signature` (or the short `x-ww-p`/`x-ww-s`). Sentry
   drops all four envelope headers and `x-ww-slot-id`. R2

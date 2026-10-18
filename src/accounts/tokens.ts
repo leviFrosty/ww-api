@@ -24,7 +24,8 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  * Each secret also yields the two refresh token keys
  * (src/accounts/sessionStore.ts): the one each token's MAC is signed under
  * (`macKey`), and the one the next token is derived under (`rotationKey`),
- * each kept apart from the signing key and the other by its own derivation.
+ * each kept apart from the signing key and the other by its own derivation;
+ * and the two keys that seal activity entry ids (src/accounts/activityIds.ts).
  *
  * The issuer names the environment (`APP_ATTEST_ENVIRONMENT`) and each
  * environment has its own secret, so a development token never passes on
@@ -69,9 +70,22 @@ export interface RefreshKeys {
   rotationKey: CryptoKey
 }
 
+/**
+ * The keys one secret yields for activity entry ids
+ * (src/accounts/activityIds.ts), each the SHA-256 of its own label and the
+ * secret.
+ */
+export interface ActivityIdKeys {
+  /** AES-256-GCM: seals the row id. */
+  cipherKey: CryptoKey
+  /** HMAC-SHA256: derives each id's nonce from what it seals. */
+  nonceKey: CryptoKey
+}
+
 interface TokenKey extends RefreshKeys {
   kid: string
   key: CryptoKey
+  activityIds: ActivityIdKeys
 }
 
 export interface AccessTokenKeys {
@@ -107,18 +121,28 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
           false,
           ['sign', 'verify']
         )
-      const derived = (label: string) =>
-        sha256Bytes(encoder.encode(`${label}\n${secret}`)).then(hmac)
-      const [key, macKey, rotationKey] = await Promise.all([
-        hmac(encoder.encode(secret)),
-        derived('ww-account/v1/refresh-mac'),
-        derived('ww-account/v1/refresh-rotation'),
-      ])
+      const labelled = (label: string) =>
+        sha256Bytes(encoder.encode(`${label}\n${secret}`))
+      const derived = (label: string) => labelled(label).then(hmac)
+      const [key, macKey, rotationKey, cipherKey, nonceKey] =
+        await Promise.all([
+          hmac(encoder.encode(secret)),
+          derived('ww-account/v1/refresh-mac'),
+          derived('ww-account/v1/refresh-rotation'),
+          labelled('ww-account/v1/activity-id-cipher').then((bytes) =>
+            crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
+              'encrypt',
+              'decrypt',
+            ])
+          ),
+          derived('ww-account/v1/activity-id-nonce'),
+        ])
       return {
         kid: bytesToBase64Url(digest).slice(0, 16),
         key,
         macKey,
         rotationKey,
+        activityIds: { cipherKey, nonceKey },
       }
     })()
     cached.catch(() => keyCache.delete(secret))
@@ -167,6 +191,12 @@ export const accessTokenKeys = async (
 export const refreshKeys = (keys: AccessTokenKeys): RefreshKeys[] =>
   (keys.previous ? [keys.current, keys.previous] : [keys.current]).map(
     ({ macKey, rotationKey }) => ({ macKey, rotationKey })
+  )
+
+/** Each secret's activity id keys: the current secret's first. */
+export const activityIdKeys = (keys: AccessTokenKeys): ActivityIdKeys[] =>
+  (keys.previous ? [keys.current, keys.previous] : [keys.current]).map(
+    ({ activityIds }) => activityIds
   )
 
 const encodeJson = (value: unknown): string =>

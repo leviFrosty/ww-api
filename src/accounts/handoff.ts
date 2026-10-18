@@ -64,7 +64,9 @@ const precheck = async (
 
 /**
  * The old phone's account and fields for `op`, from the token and the JSON
- * body `text`, or from the envelope `text` holds (legacy).
+ * body `text`, or from the envelope `text` holds (legacy). `open` and `send`,
+ * which move the account, also need the token's session to be live
+ * (`requireLiveSession`): a device that was signed out signs in again first.
  */
 const oldPhone = <K extends OldPhoneOp>(
   c: AppContext,
@@ -84,7 +86,8 @@ const oldPhone = <K extends OldPhoneOp>(
       legacy: () =>
         verifyEnvelope(op, text == null ? null : parseEnvelope(text)),
     },
-    run
+    run,
+    { requireLiveSession: op === 'handoff/open' || op === 'handoff/send' }
   )
 
 const handleOpen = guarded('handoff/open', async (c) => {
