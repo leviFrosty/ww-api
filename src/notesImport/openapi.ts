@@ -102,15 +102,6 @@ const BEARER_FORM =
 const LEGACY_FORM =
   '**Legacy** (no `Authorization` header; app versions before sessions): the attested forms, metered by `accountId` or `uuid`. They work while the legacy switch (KV `auth:legacy`) is on and are 426 `upgrade_required` once it’s off.'
 
-const revenueCatAppUserId = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{8,64}$/)
-  .optional()
-  .meta({
-    description:
-      'Bearer only: the app’s RevenueCat app user id, checked with RevenueCat for Supporter status. Absent: not a Supporter. Temporary, until RevenueCat is linked to the account; a malformed value is a 400.',
-  })
-
 const upgradeRequired = niError(
   'A legacy request (no `Authorization` header) after the legacy switch was turned off. No `Retry-After`: only updating the app helps.',
   ['upgrade_required']
@@ -289,7 +280,6 @@ const bearerImportFields = {
   notesText: importBaseFields.notesText,
   context: contextSchema,
   refinement: refinementSchema,
-  revenueCatAppUserId,
 }
 
 const bearerImportSchema = z
@@ -344,7 +334,7 @@ const successSchema = z
 
 const importGateErrors = (legacy: boolean) => ({
   400: niError(
-    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, empty or whitespace-only \`notesText\`, or an invalid \`revenueCatAppUserId\`. Legacy: ${
+    `Bearer: invalid JSON, missing \`notesText\` or \`context\`, or empty or whitespace-only \`notesText\`. Legacy: ${
       legacy
         ? 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` doesn’t match `notesText`; or an App Attest v2 / Play Integrity body (`reason: unsupported_protocol`).'
         : 'invalid JSON; missing `uuid`, `notesText`, or `context`; empty or whitespace-only `notesText`; an invalid `accountId`; `contentHash` or `requestHash` doesn’t match the payload; or an invalid v2 / Play Integrity request (`reason: invalid_request`).'
@@ -374,7 +364,7 @@ const importGateErrors = (legacy: boolean) => ({
   426: upgradeRequired,
 })
 
-const GATE_DESCRIPTION = `**Gate**, in order: the access token and account (bearer) or the legacy switch (legacy), the kill switch and provider health (503 \`unavailable\`), body checks, then for legacy requests the content and request hashes and attestation (or the dev bypass), Supporter status from RevenueCat (an outage counts as free), then the allowance. Bearer requests ask RevenueCat about \`revenueCatAppUserId\` (none: free); legacy requests about \`accountId\` or \`uuid\`. A bearer \`dev\` session (dev worker only) gets the dev bypass’s unlimited allowances. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.
+const GATE_DESCRIPTION = `**Gate**, in order: the access token and account (bearer) or the legacy switch (legacy), the kill switch and provider health (503 \`unavailable\`), body checks, then for legacy requests the content and request hashes and attestation (or the dev bypass), Supporter status (an outage counts as free), then the allowance. Bearer requests use the account’s Supporter status (\`POST /accounts/v1/revenuecat-customers\` links the app’s RevenueCat customer; none linked: free); legacy requests ask RevenueCat about \`accountId\` or \`uuid\`. A bearer \`dev\` session (dev worker only) gets the dev bypass’s unlimited allowances. Content already imported by this user replays without using an import; a refinement uses the per-content refinement allowance. An import is charged only when it succeeds.
 
 ${BEARER_FORM}
 
@@ -473,7 +463,7 @@ export const transcribeDocs = describeRoute({
   summary: 'Read a photographed page',
   description: `Import from Paper: reads one page image into plain text with a vision model on the zero-data-retention allowlist. Nothing is stored. The app shows the text for editing, then imports it through \`POST /notes-import/kickoff\`, which is where an import is used.
 
-Bearer requests send just \`image\`, \`mimeType\`, and optionally \`revenueCatAppUserId\`, and are metered by the token’s account. Legacy requests take App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.
+Bearer requests send just \`image\` and \`mimeType\`, and are metered by the token’s account, with its Supporter status. Legacy requests take App Attest v2 (purpose \`notes-import-transcribe\`) or Play Integrity only; v1 is a 400 with \`reason: unsupported_protocol\`. Gated by the kill switch. Pages are free but limited per user per rolling 24 hours (40 free, 200 Supporter by default), and a free user with no imports left is refused before any page is read.
 
 ${BEARER_FORM}
 
@@ -486,7 +476,6 @@ ${LEGACY_FORM}`,
         .object({
           image: transcribeBaseFields.image,
           mimeType: transcribeBaseFields.mimeType,
-          revenueCatAppUserId,
         })
         .meta({ title: 'Bearer' }),
       z
@@ -518,7 +507,7 @@ ${LEGACY_FORM}`,
       })
     ),
     400: niError(
-      'Invalid JSON; missing `image`; an unsupported `mimeType`; an image that isn’t base64 of the declared type. Bearer: an invalid `revenueCatAppUserId`. Legacy: missing `uuid`; an invalid `accountId`; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
+      'Invalid JSON; missing `image`; an unsupported `mimeType`; an image that isn’t base64 of the declared type. Legacy: missing `uuid`; an invalid `accountId`; a hash mismatch; App Attest v1 (`reason: unsupported_protocol`); or an invalid v2 / Play Integrity request.',
       ['bad_request', 'attestation_failed']
     ),
     401: niError(

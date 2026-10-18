@@ -69,31 +69,35 @@ describe('resolveTerminalSupporter', () => {
   })
 
   it('asks about a bearer run’s account, never its meter id', async () => {
-    const checkSupporter = vi.fn(async () => true)
+    const checkSupporter = vi.fn(async () => false)
+    const checkAccountSupporter = vi.fn(async () => true)
+    const env = { REVENUECAT_API_KEY: 'rc-key' }
     await expect(
       resolveTerminalSupporter({
         ...BASE,
         kickoffSupporter: false,
-        account: { accountId: 'account-id', revenueCatAppUserId: 'rc-user' },
+        account: { accountId: 'account-id', env },
         checkSupporter,
+        checkAccountSupporter,
       })
     ).resolves.toBe(true)
-    expect(checkSupporter).toHaveBeenCalledWith({
-      apiKey: 'rc-key',
-      appUserId: 'rc-user',
-    })
+    expect(checkAccountSupporter).toHaveBeenCalledWith(env, 'account-id')
+    expect(checkSupporter).not.toHaveBeenCalled()
   })
 
-  it('confirms a bearer run without a RevenueCat id as free, asking no one', async () => {
-    const checkSupporter = vi.fn(async () => true)
+  it('keeps a bearer run’s kickoff status when RevenueCat can’t be read', async () => {
+    const captureException = vi.fn()
     await expect(
       resolveTerminalSupporter({
         ...BASE,
-        kickoffSupporter: false,
-        account: { accountId: 'account-id', revenueCatAppUserId: null },
-        checkSupporter,
+        kickoffSupporter: true,
+        account: { accountId: 'account-id', env: { REVENUECAT_API_KEY: 'k' } },
+        checkAccountSupporter: vi.fn(async () => {
+          throw new RevenueCatError('RevenueCat 503')
+        }),
+        captureException,
       })
-    ).resolves.toBe(false)
-    expect(checkSupporter).not.toHaveBeenCalled()
+    ).resolves.toBe(true)
+    expect(captureException).not.toHaveBeenCalled()
   })
 })

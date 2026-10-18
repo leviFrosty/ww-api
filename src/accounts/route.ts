@@ -22,6 +22,7 @@ import { handoffHandlers } from './handoff'
 import { backupHandlers } from './backup'
 import { sessionHandlers } from './session'
 import { handleActivity } from './activityRoute'
+import { supporterHandlers } from './supporterRoute'
 import {
   accountDocs,
   activityListDocs,
@@ -43,6 +44,8 @@ import {
   sessionListDocs,
   sessionRefreshDocs,
   sessionRevokeDocs,
+  supporterLinkDocs,
+  supporterStatusDocs,
 } from './openapi'
 
 /**
@@ -152,6 +155,9 @@ export const createAccountsRoutes = () => {
   routes.post('/sessions/revoke', sessionRevokeDocs, sessionHandlers.revoke)
   routes.get('/account', accountDocs, handleAccount)
   routes.get('/activity', activityListDocs, handleActivity)
+  // Supporter status (ADR 0029): link the app's RevenueCat customer, read it.
+  routes.post('/revenuecat-customers', supporterLinkDocs, supporterHandlers.link)
+  routes.get('/supporter', supporterStatusDocs, supporterHandlers.status)
   // App versions before sessions (and `GET /account`).
   routes.post('/account/register', accountRegisterDocs, handleRegister)
   routes.post('/account/info', accountInfoDocs, handleInfo)

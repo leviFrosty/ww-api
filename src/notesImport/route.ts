@@ -267,21 +267,6 @@ export const importOwnerKey = (accountId: string): Promise<string> =>
   sha256Hex(`ww-api:notes-import:owner:${accountId}`)
 
 /**
- * A bearer request's optional `revenueCatAppUserId`: the id, null when
- * absent, or undefined when malformed. The same shape as the legacy
- * `accountId` it replaces: it becomes a RevenueCat URL path segment.
- */
-const parseRevenueCatAppUserId = (
-  record: Record<string, unknown>
-): string | null | undefined => {
-  const value = record.revenueCatAppUserId
-  if (value == null) return null
-  return typeof value === 'string' && isValidAccountId(value)
-    ? value
-    : undefined
-}
-
-/**
  * GET /notes-import/status — cheap availability probe for the app's import
  * entry points. No App Attest (it's a public health check) and no inference:
  * a manual KV kill-switch plus OpenRouter's free provider-health metadata.
@@ -299,8 +284,6 @@ interface NotesImportBody {
   uuid: string
   /** Shared account id (ADR 0011); absent on pre-account clients. Legacy only. */
   accountId?: string
-  /** Bearer requests: the app's RevenueCat app user id, for the Supporter check. */
-  revenueCatAppUserId?: string
   notesText: string
   contentHash: string
   requestHash?: string
@@ -321,8 +304,6 @@ interface GateAccount {
   accountId: string
   /** `importOwnerKey(accountId)`. */
   ownerKey: string
-  /** What the request named for the Supporter check (`isAccountSupporter`). */
-  revenueCatAppUserId: string | null
 }
 
 /** A request that passed authentication + the credit gate, ready to spend inference. */
@@ -444,14 +425,12 @@ async function authenticateAndGate(
 
   let uuid: string | null = null
   let accountId: string | null = null
-  let revenueCatAppUserId: string | null = null
   if (account) {
+    // Supporter status is the account's (ADR 0029); a `revenueCatAppUserId`
+    // from builds before it is ignored.
     if (notesText == null || !body.context) {
       return badRequest('Missing notesText or context')
     }
-    const named = parseRevenueCatAppUserId(record)
-    if (named === undefined) return badRequest('Invalid revenueCatAppUserId')
-    revenueCatAppUserId = named
   } else {
     uuid = asString(body.uuid)
     if (!uuid || notesText == null || !body.context) {
@@ -516,7 +495,6 @@ async function authenticateAndGate(
     ? {
         accountId: account.accountId,
         ownerKey: await importOwnerKey(account.accountId),
-        revenueCatAppUserId,
       }
     : null
 
@@ -526,7 +504,7 @@ async function authenticateAndGate(
   if (!devBypass) {
     try {
       supporter = gateAccount
-        ? await isAccountSupporter(ctx.env, gateAccount)
+        ? await isAccountSupporter(ctx.env, gateAccount.accountId)
         : await isSupporter({
             apiKey: ctx.env.REVENUECAT_API_KEY,
             appUserId: meterId,
@@ -898,10 +876,7 @@ export async function handleNotesImportKickoffRequest(ctx: AppContext) {
       decision,
       analytics,
       ...(gate.account && {
-        account: {
-          ownerKey: gate.account.ownerKey,
-          revenueCatAppUserId: gate.account.revenueCatAppUserId,
-        },
+        account: { ownerKey: gate.account.ownerKey },
       }),
     })
   } catch (e) {
@@ -1247,7 +1222,9 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       apiKey: ctx.env.REVENUECAT_API_KEY,
       appUserId: meterId,
       entitlementId: config.entitlementId,
-      account: gate.account ?? undefined,
+      account: gate.account
+        ? { accountId: gate.account.accountId, env: ctx.env }
+        : undefined,
     })
     const terminalLimits = await resolveNotesImportLimits(
       ctx.env,
@@ -1347,7 +1324,6 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
   const mimeType = record.mimeType
   let uuid: string | null = null
   let accountId: string | null = null
-  let revenueCatAppUserId: string | null = null
   if (account) {
     if (!image || !isTranscribeMimeType(mimeType)) {
       return err(
@@ -1357,16 +1333,6 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
         'bad_request'
       )
     }
-    const named = parseRevenueCatAppUserId(record)
-    if (named === undefined) {
-      return err(
-        ctx,
-        HTTP_STATUS.BAD_REQUEST,
-        'Invalid revenueCatAppUserId',
-        'bad_request'
-      )
-    }
-    revenueCatAppUserId = named
   } else {
     uuid = asString(record.uuid)
     if (!uuid || !image || !isTranscribeMimeType(mimeType)) {
@@ -1448,10 +1414,7 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
   if (!devBypass) {
     try {
       supporter = account
-        ? await isAccountSupporter(ctx.env, {
-            accountId: account.accountId,
-            revenueCatAppUserId,
-          })
+        ? await isAccountSupporter(ctx.env, account.accountId)
         : await isSupporter({
             apiKey: ctx.env.REVENUECAT_API_KEY,
             appUserId: meterId,

@@ -10,6 +10,7 @@ import {
 } from '../test/accounts'
 import { createNamespace, type FakeNamespace } from '../test/durableObjects'
 import { resetAccountStatusCache } from '../accounts/auth'
+import { defaultSupporterDependencies } from '../accounts/supporter'
 import { createAccountsRoutes } from '../accounts/route'
 import { accountsDb, setAccountStatus } from '../accounts/store'
 import { accessTokenKeys, signAccessToken } from '../accounts/tokens'
@@ -120,6 +121,10 @@ beforeEach(async () => {
   // RevenueCat: nobody is a Supporter unless a test says otherwise.
   fetchMock = vi.fn(async () => new Response(null, { status: 404 }))
   vi.stubGlobal('fetch', fetchMock)
+  // Account Supporter status reads RevenueCat through its own fetch.
+  vi.spyOn(defaultSupporterDependencies, 'fetch').mockImplementation(
+    (...args) => fetchMock(...args)
+  )
   mocks.runModel.mockReset()
   mocks.runModel.mockResolvedValue({
     result: RESULT,
@@ -205,6 +210,13 @@ const kickoff = (token: string, fields: Record<string, unknown> = {}) =>
   call('POST', '/notes-import/kickoff', {
     headers: bearer(token),
     body: { notesText: 'Field service 1 hour', context: CONTEXT, ...fields },
+  })
+
+/** Links `appUserId` to the token's account (ADR 0029). */
+const linkCustomer = (token: string, appUserId = RC_ID) =>
+  call('POST', '/accounts/v1/revenuecat-customers', {
+    headers: bearer(token),
+    body: { appUserId },
   })
 
 /** Kicks off and runs the import to `done`; returns its id. */
@@ -354,11 +366,11 @@ describe('bearer kickoff', () => {
       error: 'Missing notesText or context',
       code: 'bad_request',
     })
-    const badId = await kickoff(session.accessToken, {
+    // Builds before ADR 0029 named a RevenueCat id; it's ignored now.
+    const oldField = await kickoff(session.accessToken, {
       revenueCatAppUserId: 'not a valid id!',
     })
-    expect(badId.status).toBe(400)
-    expect(badId.body.error).toBe('Invalid revenueCatAppUserId')
+    expect(oldField.status).toBe(200)
   })
 })
 
@@ -368,8 +380,8 @@ describe('empty notes', () => {
     const token = await iosToken(session)
     const metered = vi.spyOn(indexes.namespace, 'idFromName')
     const requests = (notesText: string) => [
-      ['/notes-import/kickoff', bearer(token), { notesText, context: CONTEXT, revenueCatAppUserId: RC_ID }],
-      ['/notes-import', bearer(token), { notesText, context: CONTEXT, revenueCatAppUserId: RC_ID }],
+      ['/notes-import/kickoff', bearer(token), { notesText, context: CONTEXT }],
+      ['/notes-import', bearer(token), { notesText, context: CONTEXT }],
       ['/notes-import/kickoff', legacyHeaders, legacyBody({ notesText })],
       ['/notes-import', legacyHeaders, legacyBody({ notesText })],
     ] as const
@@ -728,37 +740,56 @@ describe('NotesImportIndex synchronous slots', () => {
   })
 })
 
-describe('Supporter status through revenueCatAppUserId', () => {
-  it('checks the named RevenueCat id at kickoff and again at settlement', async () => {
+describe('Supporter status from the account’s linked customer', () => {
+  it('answers from the stored record at kickoff and settlement, asking RevenueCat only to link', async () => {
     fetchMock.mockImplementation(async () => Response.json(LIFETIME))
     const session = await devSession()
     const token = await iosToken(session)
-    const started = await kickoff(token, { revenueCatAppUserId: RC_ID })
+    const linked = await linkCustomer(token)
+    expect(linked.body).toEqual({ ok: true, supporter: true, expiresAt: null })
+    expect(revenueCatIds()).toEqual([RC_ID])
+
+    const started = await kickoff(token)
     expect(started.status).toBe(200)
     expect(started.body.credits).toMatchObject({ isSupporter: true, limit: null })
-    expect(revenueCatIds()).toEqual([RC_ID])
-
     await runs.fireAlarm(started.body.importId)
     await flush()
-    expect(revenueCatIds()).toEqual([RC_ID, RC_ID])
     const result = await run(started.body.importId, 'result', token)
     expect(result.body.payload.credits).toMatchObject({ isSupporter: true })
-  })
-
-  it('treats a missing id, or one RevenueCat doesn’t know, as free', async () => {
-    const session = await devSession()
-    const token = await iosToken(session)
-    const started = await kickoff(token, { revenueCatAppUserId: RC_ID })
-    expect(started.body.credits).toMatchObject({ isSupporter: false, limit: 3 })
     expect(revenueCatIds()).toEqual([RC_ID])
   })
 
-  it('never asks RevenueCat about the account id', async () => {
+  it('reads a record over a day old from RevenueCat again', async () => {
     fetchMock.mockImplementation(async () => Response.json(LIFETIME))
     const session = await devSession()
+    const token = await iosToken(session)
+    await linkCustomer(token)
+    vi.setSystemTime(START + 25 * 60 * 60_000)
+    fetchMock.mockImplementation(async () => Response.json({ subscriber: {} }))
     const started = await kickoff(await iosToken(session))
-    expect(started.body.credits.isSupporter).toBe(false)
+    expect(started.body.credits).toMatchObject({ isSupporter: false, limit: 3 })
+    expect(revenueCatIds()).toEqual([RC_ID, RC_ID])
+  })
+
+  it('counts an account with no linked customer as free, asking no one, whatever it names', async () => {
+    fetchMock.mockImplementation(async () => Response.json(LIFETIME))
+    const session = await devSession()
+    const started = await kickoff(await iosToken(session), {
+      revenueCatAppUserId: RC_ID,
+    })
+    expect(started.body.credits).toMatchObject({ isSupporter: false, limit: 3 })
     expect(revenueCatIds()).toEqual([])
+  })
+
+  it('counts an account as free when its stale record can’t be read again', async () => {
+    fetchMock.mockImplementation(async () => Response.json(LIFETIME))
+    const session = await devSession()
+    const token = await iosToken(session)
+    await linkCustomer(token)
+    vi.setSystemTime(START + 25 * 60 * 60_000)
+    fetchMock.mockImplementation(async () => new Response(null, { status: 503 }))
+    const started = await kickoff(await iosToken(session))
+    expect(started.body.credits).toMatchObject({ isSupporter: false, limit: 3 })
   })
 })
 
@@ -766,15 +797,15 @@ describe('dev sessions', () => {
   it('get the dev bypass’s allowances on the dev worker, never Supporter status', async () => {
     fetchMock.mockImplementation(async () => Response.json(LIFETIME))
     const session = await devSession()
-    const started = await kickoff(session.accessToken, {
-      revenueCatAppUserId: RC_ID,
-    })
+    await linkCustomer(session.accessToken)
+    const started = await kickoff(session.accessToken)
     expect(started.body.credits).toMatchObject({
       isSupporter: false,
       limit: null,
       remaining: null,
     })
-    expect(revenueCatIds()).toEqual([])
+    // Only the link asked RevenueCat; the dev session's kickoff never does.
+    expect(revenueCatIds()).toEqual([RC_ID])
   })
 
   it('get ordinary allowances without the bypass token configured', async () => {
@@ -917,7 +948,7 @@ describe('bearer transcribe', () => {
     ).toHaveLength(1)
   })
 
-  it('uses the Supporter page limit for a named Supporter id', async () => {
+  it('uses the Supporter page limit for an account with a linked Supporter', async () => {
     fetchMock.mockImplementation(async () => Response.json(LIFETIME))
     mocks.transcribe.mockResolvedValue({
       text: 'x',
@@ -925,9 +956,11 @@ describe('bearer transcribe', () => {
       finishReason: 'stop',
     })
     const session = await devSession()
+    const token = await iosToken(session)
+    await linkCustomer(token)
     const response = await call('POST', '/notes-import/transcribe', {
-      headers: bearer(await iosToken(session)),
-      body: { image: JPEG, mimeType: 'image/jpeg', revenueCatAppUserId: RC_ID },
+      headers: bearer(token),
+      body: { image: JPEG, mimeType: 'image/jpeg' },
     })
     expect(response.body.pagesRemaining).toBe(199)
     expect(revenueCatIds()).toEqual([RC_ID])

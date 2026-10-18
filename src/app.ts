@@ -61,6 +61,8 @@ import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { handleHandoffPage } from "./accounts/handoffPage";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
+import { handleRevenueCatWebhook } from "./accounts/revenueCatWebhook";
+import { revenueCatWebhookDocs } from "./accounts/openapi";
 import { mountApiDocs } from "./openapi/route";
 import {
   aasaDocs,
@@ -260,6 +262,14 @@ app.route("/buddies/v1", createBuddiesRoutes());
 // take signed envelopes while the legacy switch is on (handoff's new-phone ops
 // carry a claim token instead). Rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
+// RevenueCat's webhook (ADR 0029): keeps linked customers' Supporter status
+// current. RevenueCat's servers only, authenticated by the integration's
+// Authorization header.
+app.post(
+  "/revenuecat/v1/webhook",
+  revenueCatWebhookDocs,
+  handleRevenueCatWebhook
+);
 // Buddy invite no-app fallback; the invite secret stays in the URL fragment.
 // `/b` is the short path in invites already sent.
 app.get("/buddies/invite", buddyInvitePageDocs, handleBuddyInvitePage);

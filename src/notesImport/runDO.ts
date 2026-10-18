@@ -63,8 +63,6 @@ export interface StartImportInput {
   account?: {
     /** `importOwnerKey(accountId)`, kept as the run's owner until it's deleted. */
     ownerKey: string
-    /** The RevenueCat app user id the kickoff named, or null (not a Supporter). */
-    revenueCatAppUserId: string | null
   }
 }
 
@@ -364,10 +362,7 @@ export class NotesImportRun extends DurableObject<Environment> {
         apiKey: this.env.REVENUECAT_API_KEY,
         appUserId: input.uuid,
         entitlementId: config.entitlementId,
-        account: input.account && {
-          accountId: input.uuid,
-          revenueCatAppUserId: input.account.revenueCatAppUserId,
-        },
+        account: input.account && { accountId: input.uuid, env: this.env },
       })
       const limits = await resolveNotesImportLimits(this.env, this.env.NOTES_KV)
       const allowances = selectEffectiveAllowances(

@@ -5,10 +5,12 @@ import { app } from "./app";
 import { accountsDb } from "./accounts/store";
 import { pruneEndedSessions } from "./accounts/sessionStore";
 import { pruneActivity } from "./accounts/activity";
+import { pruneSupporterRecords } from "./accounts/supporter";
 
 /**
- * Deletes account sessions that ended over a week ago and activity entries
- * over 400 days old; failures only report.
+ * Deletes account sessions that ended over a week ago, activity entries
+ * over 400 days old, RevenueCat webhook event ids over 30 days old, and
+ * RevenueCat customers no account links; failures only report.
  */
 async function pruneAccountSessions(environment: Environment): Promise<void> {
   if (!environment.ACCOUNTS_DB) return;
@@ -24,6 +26,12 @@ async function pruneAccountSessions(environment: Environment): Promise<void> {
   } catch (error) {
     console.error("accounts: pruning activity failed");
     Sentry.captureException(error);
+  }
+  try {
+    await pruneSupporterRecords(db);
+  } catch (error) {
+    console.error("accounts: pruning supporter records failed");
+    captureFailure(error, "supporter prune");
   }
 }
 

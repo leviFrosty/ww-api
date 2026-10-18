@@ -188,6 +188,11 @@ export const BUDDIES_ERROR_STATUS = {
   unauthorized: 401,
   /** Opening a session refused the attestation (`reason` says why). */
   attestation_failed: 403,
+  /**
+   * An outside service the request needs couldn't be reached (RevenueCat,
+   * for Supporter status). Always with `Retry-After`.
+   */
+  unavailable: 503,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
