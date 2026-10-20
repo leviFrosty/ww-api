@@ -1,5 +1,6 @@
 import type { AppContext, Environment } from './types'
 import { parseMinAppVersion } from './notesImport/config'
+import { syncSwitches } from './accounts/syncSwitch'
 
 /**
  * `GET /app/v1/config` (witness-work ADR 0027, `docs/accounts-protocol.md`,
@@ -46,9 +47,25 @@ export const resolveAppMinVersion = async (
   return null
 }
 
+/**
+ * Also carries Cloud Sync's switches (witness-work ADR 0030), so a device
+ * without a session knows whether opening one would get it Cloud Sync:
+ * `sync: { enabled, entitlement }`. `enabled` is false on a worker without
+ * the sync bucket or the accounts database.
+ */
 export const handleAppConfigRequest = async (c: AppContext) => {
-  const minAppVersion = await resolveAppMinVersion(c.env)
-  return c.json(minAppVersion ? { ok: true, minAppVersion } : { ok: true }, 200, {
-    'Cache-Control': 'no-store',
-  })
+  const [minAppVersion, switches] = await Promise.all([
+    resolveAppMinVersion(c.env),
+    syncSwitches(c.env),
+  ])
+  const sync = {
+    enabled:
+      switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null,
+    entitlement: switches.entitlement,
+  }
+  return c.json(
+    minAppVersion ? { ok: true, minAppVersion, sync } : { ok: true, sync },
+    200,
+    { 'Cache-Control': 'no-store' }
+  )
 }

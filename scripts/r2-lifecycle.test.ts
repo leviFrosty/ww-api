@@ -1,12 +1,15 @@
 import { expect, it } from 'vitest'
 import { BUDDIES_LIMITS, buddyBlobKey } from '../src/buddies/contracts'
 import { backupObjectKey } from '../src/accounts/contracts'
+import { SYNC_LIMITS, syncObjectKey } from '../src/accounts/syncContracts'
 import {
   BACKSTOP_DAYS,
   BACKSTOP_RULE_ID,
   BACKUP_EXPIRY_DAYS,
   BACKUP_RULE_ID,
   BLOB_PREFIX,
+  SYNC_EXPIRY_DAYS,
+  SYNC_RULE_ID,
   lifecycleRules,
   parseBlocks,
   ruleFor,
@@ -47,6 +50,22 @@ it('deletes account backup slots 400 days after their last upload', () => {
   expect(lifecycleRules('ww-buddy-blobs-dev').rules[0].id).toBe(BACKSTOP_RULE_ID)
   expect(ruleFor('some-other-bucket')).toBeNull()
   expect(backupObjectKey('account', 'slot').startsWith(BLOB_PREFIX)).toBe(true)
+})
+
+it('deletes Cloud Sync slots 400 days after their last put', () => {
+  expect(SYNC_EXPIRY_DAYS).toBe(SYNC_LIMITS.maxRetentionMs / DAY_MS)
+  for (const bucket of ['ww-account-sync', 'ww-account-sync-dev']) {
+    const [expiry] = lifecycleRules(bucket).rules
+    expect(expiry).toEqual({
+      id: SYNC_RULE_ID,
+      enabled: true,
+      conditions: { prefix: BLOB_PREFIX },
+      deleteObjectsTransition: {
+        condition: { type: 'Age', maxAge: 400 * 24 * 60 * 60 },
+      },
+    })
+  }
+  expect(syncObjectKey('account', 'slot').startsWith(BLOB_PREFIX)).toBe(true)
 })
 
 it('reads wrangler’s labelled blocks', () => {

@@ -273,6 +273,33 @@ export interface Environment {
   ACCOUNT_BACKUPS?: R2Bucket;
 
   /**
+   * Cloud Sync's ciphertext (witness-work ADR 0030): one end-to-end
+   * encrypted snapshot per device slot at `v1/<accountId>/<slotId>`. Without
+   * it, `sync/*` answers `disabled`.
+   */
+  ACCOUNT_SYNC?: R2Bucket;
+
+  /**
+   * One SQLite DO per account (`idFromName(accountId)`): Cloud Sync's slot
+   * metadata, change `seq`, put limits, retention alarm, and live sockets.
+   */
+  ACCOUNT_SYNC_INDEX: DurableObjectNamespace<
+    import('./accounts/syncDO').AccountSync
+  >;
+
+  /**
+   * Cloud Sync's kill-switch fallback when KV `sync:enabled` is absent:
+   * `"true"` (or `"on"`) on, anything else off.
+   */
+  SYNC_ENABLED?: string;
+
+  /**
+   * Who gets Cloud Sync when KV `sync:entitlement` is absent: `"everyone"`,
+   * else Supporters only.
+   */
+  SYNC_ENTITLEMENT?: string;
+
+  /**
    * Signs session access tokens (HS256, witness-work ADR 0027). Secret, at
    * least 32 characters, distinct per prod/dev worker. Without it, the
    * session routes (`/accounts/v1/sessions*`) answer `disabled` and bearer

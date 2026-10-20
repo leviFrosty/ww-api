@@ -24,7 +24,12 @@ export interface MemoryR2 {
     value: ArrayBuffer | ArrayBufferView,
     options?: { sha256?: string; customMetadata?: Record<string, string> }
   ): Promise<{ key: string; size: number }>
-  get(key: string): Promise<{ body: ReadableStream; size: number } | null>
+  get(key: string): Promise<{
+    body: ReadableStream
+    size: number
+    uploaded: Date
+    customMetadata?: Record<string, string>
+  } | null>
   head(key: string): Promise<{ key: string; size: number } | null>
   delete(keys: string | string[]): Promise<void>
   /** Keys in order, `limit` (default 1,000) at a time; `cursor` is the last key. */
@@ -102,6 +107,10 @@ export const makeMemoryR2 = (): MemoryR2 => {
       return {
         body: new Response(object.bytes.slice()).body as ReadableStream,
         size: object.bytes.byteLength,
+        uploaded: new Date(object.uploaded),
+        ...(object.customMetadata
+          ? { customMetadata: { ...object.customMetadata } }
+          : {}),
       }
     },
     head: async (key) => {

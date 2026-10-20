@@ -79,6 +79,10 @@ AUTH_LEGACY = "on"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor.
 # APP_MIN_VERSION = "1.42.0"
+# Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
+# `sync:entitlement` are absent. On in dev; Supporters only.
+SYNC_ENABLED = "true"
+SYNC_ENTITLEMENT = "supporter"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -136,6 +140,10 @@ class_name = "BuddyRegistrationQuota"
 name = "ACCOUNT_HANDOFF"
 class_name = "AccountHandoff"
 
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_SYNC_INDEX"
+class_name = "AccountSync"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
@@ -149,6 +157,13 @@ bucket_name = "ww-buddy-blobs-dev"
 [[env.dev.r2_buckets]]
 binding = "ACCOUNT_BACKUPS"
 bucket_name = "ww-account-backups-dev"
+
+# Cloud Sync snapshots (witness-work ADR 0030), separate from prod's bucket.
+# `pnpm run deploy:dev` creates it and sets its 400-day lifecycle rule
+# (scripts/r2-lifecycle.mjs).
+[[env.dev.r2_buckets]]
+binding = "ACCOUNT_SYNC"
+bucket_name = "ww-account-sync-dev"
 
 # Anonymous accounts (witness-work ADR 0024): accounts, their status, and which
 # Buddies inboxes they own. Not inherited, like every binding. Migrations come
@@ -187,6 +202,10 @@ new_sqlite_classes = ["BuddyRegistrationQuota"]
 [[env.dev.migrations]]
 tag = "v7"
 new_sqlite_classes = ["AccountHandoff"]
+
+[[env.dev.migrations]]
+tag = "v8"
+new_sqlite_classes = ["AccountSync"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -305,6 +324,11 @@ AUTH_LEGACY = "on"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor. Repeated under [env.dev.vars].
 # APP_MIN_VERSION = "1.42.0"
+# Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
+# `sync:entitlement` are absent. Off in prod until KV `sync:enabled` turns it
+# on, before the app release that defaults to it. Repeated under [env.dev.vars].
+SYNC_ENABLED = "false"
+SYNC_ENTITLEMENT = "supporter"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -384,6 +408,18 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 # runbook is AGENTS.md, "Turning off backward compatibility".
 #   wrangler kv key put --binding NOTES_KV auth:legacy off
 #   wrangler kv key delete --binding NOTES_KV auth:legacy        # use the var
+# (add `--env dev` for the dev worker).
+#
+# Cloud Sync switches (cacheTtl 60; witness-work ADR 0030). `sync:enabled`:
+# "true" (or "on") on, anything else off; absent falls back to SYNC_ENABLED.
+# `sync:entitlement`: "everyone" makes it free, "supporter" a Supporter
+# benefit; absent falls back to SYNC_ENTITLEMENT, else supporter. Off refuses
+# sync/put, list, get, and live with 503 disabled; delete and GET /sync work.
+#   wrangler kv key put --binding NOTES_KV sync:enabled true          # on
+#   wrangler kv key put --binding NOTES_KV sync:enabled false         # off
+#   wrangler kv key put --binding NOTES_KV sync:entitlement everyone  # free
+#   wrangler kv key put --binding NOTES_KV sync:entitlement supporter # Supporters
+#   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -498,6 +534,16 @@ bucket_name = "ww-buddy-blobs"
 binding = "ACCOUNT_BACKUPS"
 bucket_name = "ww-account-backups"
 
+# Cloud Sync (witness-work ADR 0030): one end-to-end encrypted snapshot per
+# device slot at v1/<accountId>/<slotId>; the AccountSync DO holds the
+# metadata. Without the binding, sync/* answers `disabled`. Every deploy runs
+# scripts/r2-lifecycle.mjs first: it creates the bucket if it's missing and
+# deletes v1/ objects 400 days after their last put (the DO's retention
+# deletes sooner). Repeated (with its own bucket) under [env.dev] above.
+[[r2_buckets]]
+binding = "ACCOUNT_SYNC"
+bucket_name = "ww-account-sync"
+
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
 # SQLite-backed (event log / active-import set). See
 # docs/notes-import-streaming-durable-objects.md. Repeated under [env.dev] above.
@@ -550,6 +596,12 @@ class_name = "BuddyRegistrationQuota"
 name = "ACCOUNT_HANDOFF"
 class_name = "AccountHandoff"
 
+# Cloud Sync: one index per account (slot metadata, change seq, put limits,
+# retention alarm, live sockets; never data). Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "ACCOUNT_SYNC_INDEX"
+class_name = "AccountSync"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -579,6 +631,10 @@ new_sqlite_classes = ["BuddyRegistrationQuota"]
 [[migrations]]
 tag = "v7"
 new_sqlite_classes = ["AccountHandoff"]
+
+[[migrations]]
+tag = "v8"
+new_sqlite_classes = ["AccountSync"]
 
 [observability]
 enabled = true

@@ -29,7 +29,11 @@ describe('GET /app/v1/config', () => {
     )
     expect(response.status).toBe(200)
     expect(response.headers.get('cache-control')).toBe('no-store')
-    expect(await response.json()).toEqual({ ok: true, minAppVersion: '1.42.0' })
+    expect(await response.json()).toEqual({
+      ok: true,
+      minAppVersion: '1.42.0',
+      sync: { enabled: false, entitlement: 'supporter' },
+    })
   })
 
   it('leaves minAppVersion out without a floor', async () => {
@@ -37,7 +41,46 @@ describe('GET /app/v1/config', () => {
       new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
       await env()
     )
-    expect(await response.json()).toEqual({ ok: true })
+    expect(await response.json()).toEqual({
+      ok: true,
+      sync: { enabled: false, entitlement: 'supporter' },
+    })
+  })
+
+  it('says whether Cloud Sync is on and who gets it', async () => {
+    const config = async (
+      overrides: Record<string, unknown>,
+      kv: Record<string, string> = {}
+    ) => {
+      const base = await env()
+      for (const [key, value] of Object.entries(kv))
+        await base.NOTES_KV.put(key, value)
+      const response = await app.fetch(
+        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+        { ...base, ...overrides } as unknown as Environment
+      )
+      return ((await response.json()) as { sync: unknown }).sync
+    }
+    const bound = { ACCOUNT_SYNC: {}, ACCOUNTS_DB: {} }
+    expect(await config({ ...bound, SYNC_ENABLED: 'true' })).toEqual({
+      enabled: true,
+      entitlement: 'supporter',
+    })
+    // KV wins over the vars, both ways.
+    expect(
+      await config(
+        { ...bound, SYNC_ENABLED: 'true', SYNC_ENTITLEMENT: 'supporter' },
+        { 'sync:enabled': 'false', 'sync:entitlement': 'everyone' }
+      )
+    ).toEqual({ enabled: false, entitlement: 'everyone' })
+    expect(
+      await config({ ...bound, SYNC_ENTITLEMENT: 'everyone' }, { 'sync:enabled': 'on' })
+    ).toEqual({ enabled: true, entitlement: 'everyone' })
+    // Without the bucket there's no Cloud Sync to offer.
+    expect(await config({ SYNC_ENABLED: 'true' })).toEqual({
+      enabled: false,
+      entitlement: 'supporter',
+    })
   })
 
   it('counts against its own per-IP bucket', async () => {
