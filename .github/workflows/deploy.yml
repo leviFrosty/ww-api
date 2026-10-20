@@ -73,6 +73,13 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      # The Cloud Sync bucket (witness-work ADR 0030) and its 400-day expiry.
+      - name: Ensure the Cloud Sync bucket
+        run: node scripts/r2-lifecycle.mjs ww-account-sync
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       # Accounts schema (src/accounts/schema.ts) before the code that needs it.
       # Already-applied migrations are skipped. The API token needs D1: Edit.
       - name: Apply accounts database migrations

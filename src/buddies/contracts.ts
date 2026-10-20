@@ -208,6 +208,16 @@ export const BUDDIES_ERROR_STATUS = {
    * for Supporter status). Always with `Retry-After`.
    */
   unavailable: 503,
+  /**
+   * `sync/put` with an `If-Match` the slot no longer matches (another put
+   * replaced it, or `*` and there's no slot yet).
+   */
+  precondition_failed: 412,
+  /**
+   * Cloud Sync for an account that isn't entitled: `sync:entitlement` is
+   * `supporter` and the account isn't a Supporter (witness-work ADR 0030).
+   */
+  supporter_required: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS

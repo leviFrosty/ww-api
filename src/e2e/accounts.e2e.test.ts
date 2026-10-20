@@ -486,11 +486,11 @@ describe('GET /app/v1/config', () => {
   it.skipIf(!LOCAL_LAUNCHER)('serves KV app:min-version', async () => {
     try {
       localKv('put', 'app:min-version', '{"minVersion":"9.8.7"}')
-      expect((await http('GET', '/app/v1/config')).body).toEqual({ ok: true, minAppVersion: '9.8.7' })
+      expect((await http('GET', '/app/v1/config')).body).toMatchObject({ ok: true, minAppVersion: '9.8.7' })
     } finally {
       localKv('delete', 'app:min-version')
     }
-    expect((await http('GET', '/app/v1/config')).body).toEqual({ ok: true })
+    expect((await http('GET', '/app/v1/config')).body).not.toHaveProperty('minAppVersion')
   })
 })
 

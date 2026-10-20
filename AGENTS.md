@@ -1043,6 +1043,85 @@ wrangler r2 bucket create ww-account-backups
 wrangler r2 bucket lifecycle add ww-account-backups account-backups-expiry v1/ --expire-days 400
 ```
 
+### Cloud Sync
+
+End-to-end encrypted, realtime sync of every device's data through this
+worker, across iPhone and Android (witness-work ADR 0030; "Sync" in its
+`docs/accounts-protocol.md`). It's one of the app's sync options, beside
+iCloud and Google Drive; each device uses exactly one. Code in
+`src/accounts/sync.ts` (routes), `syncDO.ts` (`AccountSync`),
+`syncContracts.ts` (limits, headers), and `syncSwitch.ts` (switches).
+
+| Route | What |
+| --- | --- |
+| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed? }` |
+| `POST /accounts/v1/sync/put` | Bearer; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`? → `{ ok, etag, size, updatedAt, seq }` |
+| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt }] }` |
+| `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
+| `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
+| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id`: `hello`, then `changed` |
+
+- **Storage**: one `AccountSync` SQLite DO per account (binding
+  `ACCOUNT_SYNC_INDEX`, `idFromName(accountId)`, migration `v8`) holds each
+  slot's metadata (slot id = the device's sync id, ETag = b64u SHA-256 of
+  the blob, size, server time, writing session id), the account's change
+  `seq`, the put limits, and the live sockets. The ciphertext is in R2
+  `ACCOUNT_SYNC` (`ww-account-sync` prod, `ww-account-sync-dev` dev) at
+  `v1/<accountId>/<slotId>`, with the ETag and time in `customMetadata`.
+- **Puts** run in three steps so the metadata never names missing bytes:
+  the Worker reads and checks the body (size, SHA-256), the DO's
+  `beginPut` checks the limits and `If-Match` (`"<etag>"`, or `*` for an
+  existing slot; 412 `precondition_failed`) and reserves the slot, the
+  Worker writes R2, and `commitPut` records it, advances `seq`, and sends
+  `{"type":"changed","seq"}` to every socket but the writer's own slot. A
+  failed R2 write frees the reservation (`abortPut`); one whose commit never
+  comes frees it after 2 minutes, and the daily alarm deletes any object no
+  slot names. A delete (one slot or all) deletes the objects, then the rows,
+  and tells every socket.
+- **Switches** (KV in `NOTES_KV`, edge-cached 60 s): `sync:enabled`
+  (`true`/`on`, absent → `SYNC_ENABLED`: dev `"true"`, prod `"false"`) and
+  `sync:entitlement` (`everyone` | `supporter`, absent → `SYNC_ENTITLEMENT`,
+  else `supporter`). Off: put, list, get, and live are 503 `disabled`. Not
+  entitled: 403 `supporter_required`, from `accountSupporterStatus` (the
+  account's own status), cached 60 s per isolate per account; RevenueCat
+  unreachable is 503 `unavailable`, never "not a Supporter". Delete and the
+  status always work. `GET /app/v1/config` carries both as `sync: { enabled,
+  entitlement }` for devices without a session. Turning it off refuses new
+  sockets and doesn't close open ones.
+- **Limits** (`SYNC_LIMITS`, each with its sizing): 20 MiB a blob (413
+  `too_large` from `Content-Length` before the body is read), 20 slots an
+  account (429 `limit`, new slots only), one put a slot every 2 seconds and
+  one at a time, 1,000 puts and 2 GiB an account a rolling day (429
+  `rate_limited` with `Retry-After`), 20 live sockets an account (the oldest
+  closes with `4000 "replaced"`). Put counts in the Buddies write edge tier,
+  the rest in the read tier. Hits log `buddies: limit hit {op: 'sync/put',
+  limit}`.
+- **Retention** (the DO's daily alarm, while it has slots): a slot not
+  written for 30 days whose writing session isn't live (`isSessionLive`; a
+  deleted session row counts as ended) is deleted, and any slot not written
+  for 400 days. R2's lifecycle rule (400 days on `v1/`, set by
+  `scripts/r2-lifecycle.mjs` on every deploy) is the backstop. A failed
+  session read keeps the slot until the next run.
+- **Suspended** accounts keep syncing (nothing reaches another person).
+- **Privacy**: ciphertext only; the server can't read a device name or any
+  data. Never log or report slot ids, account ids, session ids, sizes,
+  bodies, or tokens. The socket carries only change notices.
+
+```bash
+# Turn Cloud Sync on (prod starts off; before the app release that defaults to it)
+wrangler kv key put --binding NOTES_KV sync:enabled true
+# Off (kill switch): refuses put/list/get/live with 503 disabled
+wrangler kv key put --binding NOTES_KV sync:enabled false
+# Make it free for everyone, or a Supporter benefit again
+wrangler kv key put --binding NOTES_KV sync:entitlement everyone
+wrangler kv key put --binding NOTES_KV sync:entitlement supporter
+# Fall back to the SYNC_ENABLED / SYNC_ENTITLEMENT vars
+wrangler kv key delete --binding NOTES_KV sync:enabled
+wrangler kv key delete --binding NOTES_KV sync:entitlement
+# Add --env dev to each for the dev worker.
+node scripts/r2-lifecycle.mjs ww-account-sync --check   # read-only bucket check
+```
+
 ## App Store ratings (paywall social proof)
 
 `GET /app-store/ratings` returns `{averageRating, ratingCount, countryCount,

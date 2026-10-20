@@ -6,6 +6,7 @@
  *   node scripts/r2-lifecycle.mjs ww-buddy-blobs           # create if missing, set the rules
  *   node scripts/r2-lifecycle.mjs ww-buddy-blobs --check   # read-only; exit 1 if anything is off
  *   node scripts/r2-lifecycle.mjs ww-account-backups       # the same for account backups
+ *   node scripts/r2-lifecycle.mjs ww-account-sync          # and for Cloud Sync
  *
  * Buddies photo buckets (`ww-buddy-blobs*`): the backstop deletes any object a
  * day past the longest a photo can live (`BUDDIES_LIMITS.maxBlobLifetimeMs`,
@@ -16,6 +17,10 @@
  * Account backup buckets (`ww-account-backups*`): a slot not uploaded for 400
  * days is deleted (witness-work ADR 0026). Every `backup/put` rewrites the
  * slot's object, which restarts its age.
+ *
+ * Cloud Sync buckets (`ww-account-sync*`): a slot not written for 400 days is
+ * deleted (witness-work ADR 0030), a backstop to the AccountSync DO's own
+ * retention, which deletes sooner. Every `sync/put` rewrites the slot.
  *
  * `lifecycle set` replaces every rule on the bucket, so R2's default
  * multipart-abort rule is restated here too.
@@ -41,10 +46,15 @@ export const BLOB_PREFIX = 'v1/'
 export const BACKUP_EXPIRY_DAYS = 400
 export const BACKUP_RULE_ID = 'account-backups-expiry'
 
+/** Cloud Sync slots: deleted 400 days after their last put. */
+export const SYNC_EXPIRY_DAYS = 400
+export const SYNC_RULE_ID = 'account-sync-expiry'
+
 /** Each bucket family's expiry rule, by bucket name prefix. */
 export const BUCKET_RULES = [
   { bucketPrefix: 'ww-buddy-blobs', id: BACKSTOP_RULE_ID, days: BACKSTOP_DAYS },
   { bucketPrefix: 'ww-account-backups', id: BACKUP_RULE_ID, days: BACKUP_EXPIRY_DAYS },
+  { bucketPrefix: 'ww-account-sync', id: SYNC_RULE_ID, days: SYNC_EXPIRY_DAYS },
 ]
 
 /** The expiry rule for `bucket`, or null for a bucket this script doesn't know. */

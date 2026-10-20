@@ -3,6 +3,7 @@ import { BuddyInbox } from '../buddies/inboxDO'
 import { BuddyInvite } from '../buddies/inviteDO'
 import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { AccountHandoff } from '../accounts/handoffDO'
+import { AccountSync } from '../accounts/syncDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -114,6 +115,8 @@ export interface HarnessOptions {
   accountsDb?: boolean
   /** Bind the account backup bucket (default true). */
   backupBucket?: boolean
+  /** Bind the Cloud Sync bucket (`ACCOUNT_SYNC`). Default true. */
+  syncBucket?: boolean
   /**
    * Account sessions as on the dev worker (default true): a token secret,
    * `APP_ATTEST_ENVIRONMENT` development, and the dev bypass token.
@@ -134,7 +137,10 @@ export interface Harness {
   accountsDb: MemoryD1 | null
   /** The `ACCOUNT_BACKUPS` bucket (present even when unbound, for assertions). */
   backups: MemoryR2
+  /** The `ACCOUNT_SYNC` bucket (present even when unbound, for assertions). */
+  syncBlobs: MemoryR2
   handoffs: FakeNamespace<AccountHandoff>
+  syncIndexes: FakeNamespace<AccountSync>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -211,6 +217,7 @@ export const createHarness = async (
   if (options.kvPhotos != null) await kv.put('buddies:photos', options.kvPhotos)
   const r2 = makeMemoryR2()
   const backups = makeMemoryR2()
+  const syncBlobs = makeMemoryR2()
   const accountsDb = options.accountsDb === false ? null : makeMemoryD1()
 
   const apnsKeys = (await crypto.subtle.generateKey(
@@ -248,6 +255,8 @@ export const createHarness = async (
     ...(options.blobBucket === false ? {} : { BUDDY_BLOBS: r2 }),
     ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
+    ...(options.syncBucket === false ? {} : { ACCOUNT_SYNC: syncBlobs }),
+    SYNC_ENABLED: 'true',
     ...(options.sessions === false
       ? {}
       : {
@@ -283,6 +292,11 @@ export const createHarness = async (
     (state) => new AccountHandoff(state as never, env as never)
   )
   env.ACCOUNT_HANDOFF = handoffs.namespace as Environment['ACCOUNT_HANDOFF']
+  const syncIndexes = createNamespace(
+    (state) => new AccountSync(state as never, env as never)
+  )
+  env.ACCOUNT_SYNC_INDEX =
+    syncIndexes.namespace as Environment['ACCOUNT_SYNC_INDEX']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -299,7 +313,9 @@ export const createHarness = async (
     r2,
     accountsDb,
     backups,
+    syncBlobs,
     handoffs,
+    syncIndexes,
     inboxes,
     invites,
     quotas,

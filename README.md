@@ -190,6 +190,10 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
 - **`GET /accounts/v1/account`** reads the token's account.
 - Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
   take the bearer token too, as `POST /{op}` with ids in bodies.
+- **Cloud Sync** (`GET /accounts/v1/sync`, `POST /accounts/v1/sync/put|list|get|delete`,
+  and the `GET /accounts/v1/sync/live` WebSocket): each device's end-to-end
+  encrypted snapshot in a slot, changes streamed to the account's other
+  devices. Behind KV `sync:enabled` and `sync:entitlement`; see `AGENTS.md`.
 
 Older app versions authenticate the pre-session way (signed envelopes,
 `account/register`, `account/info`) while the legacy switch (KV

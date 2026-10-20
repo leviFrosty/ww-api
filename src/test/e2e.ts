@@ -669,12 +669,16 @@ const liveConnection = (socket: Socket, head: Buffer): LiveConnection => {
 }
 
 /**
- * `GET /buddies/v1/inbox/live` as a raw WebSocket handshake, so refusals keep
+ * `GET /buddies/v1/inbox/live` (or another live `path`, such as
+ * `/accounts/v1/sync/live`) as a raw WebSocket handshake, so refusals keep
  * their status and JSON body. Header values never reach the transcript.
  */
-export const openLive = (headers: Record<string, string>): Promise<LiveAttempt> =>
+export const openLive = (
+  headers: Record<string, string>,
+  path = '/buddies/v1/inbox/live'
+): Promise<LiveAttempt> =>
   new Promise((resolve, reject) => {
-    const url = new URL(`${BASE_URL}/buddies/v1/inbox/live`)
+    const url = new URL(`${BASE_URL}${path}`)
     const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
       url,
       {
@@ -692,7 +696,7 @@ export const openLive = (headers: Record<string, string>): Promise<LiveAttempt> 
     const record = (status: number, response: string) =>
       transcript.push({
         method: 'GET',
-        path: '/buddies/v1/inbox/live',
+        path,
         headers: Object.keys(headers),
         status,
         response: clip(response),

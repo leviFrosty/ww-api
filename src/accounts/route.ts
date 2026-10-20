@@ -23,6 +23,7 @@ import { backupHandlers } from './backup'
 import { sessionHandlers } from './session'
 import { handleActivity } from './activityRoute'
 import { supporterHandlers } from './supporterRoute'
+import { syncHandlers } from './sync'
 import {
   accountDocs,
   activityListDocs,
@@ -46,6 +47,12 @@ import {
   sessionRevokeDocs,
   supporterLinkDocs,
   supporterStatusDocs,
+  syncDeleteDocs,
+  syncGetDocs,
+  syncListDocs,
+  syncLiveDocs,
+  syncPutDocs,
+  syncStatusDocs,
 } from './openapi'
 
 /**
@@ -178,5 +185,13 @@ export const createAccountsRoutes = () => {
   routes.post('/backup/list', backupListDocs, backupHandlers.list)
   routes.post('/backup/get', backupGetDocs, backupHandlers.get)
   routes.post('/backup/delete', backupDeleteDocs, backupHandlers.delete)
+  // Cloud Sync (ADR 0030): the status is a resource; the ops stay
+  // `POST /{op}` so slot ids travel in bodies and headers, never URLs.
+  routes.get('/sync', syncStatusDocs, syncHandlers.status)
+  routes.post('/sync/put', syncPutDocs, syncHandlers.put)
+  routes.post('/sync/list', syncListDocs, syncHandlers.list)
+  routes.post('/sync/get', syncGetDocs, syncHandlers.get)
+  routes.post('/sync/delete', syncDeleteDocs, syncHandlers.delete)
+  routes.get('/sync/live', syncLiveDocs, syncHandlers.live)
   return routes
 }

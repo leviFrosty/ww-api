@@ -1286,3 +1286,317 @@ Any answer but 200 makes RevenueCat retry (five times over about 80 minutes).`,
     ),
   },
 })
+
+// --- Cloud Sync --------------------------------------------------------------
+
+const syncSlotId = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{8,64}$/)
+  .meta({
+    description:
+      'The device’s sync id, 8 to 64 characters of `A-Z a-z 0-9 _ -`: the `<deviceId>` in its `witness-work-<deviceId>.json`.',
+  })
+const syncEtag = b64u(
+  'The slot’s ETag: `SHA-256` of its blob, 32 bytes. Sent quoted in `ETag` headers'
+)
+const syncSeq = z.number().int().min(0).meta({
+  description:
+    'The account’s change counter: every put and delete advances it. Only grows.',
+})
+const syncOff = {
+  503: errorResponse(
+    'Cloud Sync is off (kill switch KV `sync:enabled`, or no sync bucket or accounts database: `disabled`, with `Retry-After`), or RevenueCat couldn’t be read to check the account’s Supporter status (`unavailable`, with `Retry-After`).',
+    ['disabled', 'unavailable']
+  ),
+}
+const syncUnentitled = {
+  403: errorResponse(
+    'Cloud Sync is a Supporter benefit (KV `sync:entitlement` is `supporter`) and the account isn’t one.',
+    ['supporter_required']
+  ),
+}
+const syncNotes =
+  'A suspended account keeps syncing. A slot not written for 30 days whose writer’s session has ended, or not written for 400 days, is deleted.'
+const SYNC_ENTITLED =
+  'Needs Cloud Sync on (KV `sync:enabled`) and an entitled account: everyone when KV `sync:entitlement` is `everyone`, else Supporters (the account’s own status, ADR 0029).'
+const syncBinary = (description: string) => ({
+  description,
+  content: {
+    'application/octet-stream': {
+      schema: { type: 'string' as const, format: 'binary' },
+    },
+  },
+})
+
+export const syncStatusDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Read your Cloud Sync status',
+  description: `Whether the token’s account gets Cloud Sync (witness-work ADR 0030): end-to-end encrypted sync of every device’s data through this server, across iPhone and Android. Works while Cloud Sync is off. A RevenueCat failure answers \`supporter: false\` with \`supporterCheckFailed: true\`, never a 5xx.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse(
+      'The account’s Cloud Sync status.',
+      z.object({
+        ok: z.literal(true),
+        enabled: z.boolean().meta({
+          description:
+            'The kill switch (KV `sync:enabled`, then the `SYNC_ENABLED` var).',
+        }),
+        entitled: z.boolean().meta({
+          description:
+            'Whether puts, reads, and the live socket would be served: enabled, and `everyone` or a Supporter.',
+        }),
+        entitlement: z.enum(['supporter', 'everyone']).meta({
+          description:
+            'Who gets it (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `supporter`).',
+        }),
+        supporter: z.boolean().meta({
+          description: 'The account’s own Supporter status (ADR 0029).',
+        }),
+        supporterCheckFailed: z.literal(true).optional().meta({
+          description:
+            'RevenueCat couldn’t be read; `supporter` is false for now. Absent otherwise.',
+        }),
+      })
+    ),
+    ...bearerReadErrors,
+  },
+})
+
+export const syncPutDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Upload this device’s sync snapshot',
+  description: `Replaces this device’s slot with its end-to-end encrypted snapshot (\`0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305\` under the account’s sync key; the server never sees plaintext). The body is the raw blob, at most 20 MiB, with the slot in \`x-ww-slot-id\`, \`b64u(SHA-256(body))\` in \`x-ww-sha256\` (the slot’s new ETag), and its length in \`Content-Length\`. After it lands, every other live socket of the account gets \`{"type":"changed","seq":…}\`.
+
+\`If-Match: "<etag>"\` puts only while the slot still holds that ETag, and \`If-Match: *\` only while the slot exists (412 \`precondition_failed\` otherwise). Without it the put replaces whatever is there.
+
+${SYNC_ENTITLED}
+
+Limits: 20 MiB a blob, 20 slots an account (new slots only), one put a slot every 2 seconds (and one at a time), 1,000 puts and 2 GiB an account a rolling day, and the Buddies write tier (600 a minute per caller IP). ${syncNotes}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  parameters: [
+    {
+      name: 'x-ww-slot-id',
+      in: 'header' as const,
+      required: true,
+      schema: { type: 'string' as const },
+      description: 'This device’s slot (its sync id).',
+    },
+    {
+      name: 'x-ww-sha256',
+      in: 'header' as const,
+      required: true,
+      schema: { type: 'string' as const },
+      description: '`SHA-256(body)`, 32 bytes, base64url.',
+    },
+    {
+      name: 'Content-Length',
+      in: 'header' as const,
+      required: true,
+      schema: { type: 'integer' as const },
+      description: 'The body’s length, at most 20 MiB.',
+    },
+    {
+      name: 'If-Match',
+      in: 'header' as const,
+      required: false,
+      schema: { type: 'string' as const },
+      description: '`"<etag>"` or `*`; see above.',
+    },
+  ],
+  requestBody: { required: true, ...syncBinary('The encrypted snapshot.') },
+  responses: {
+    200: jsonResponse(
+      'Stored. Also sent as `ETag`.',
+      z.object({
+        ok: z.literal(true),
+        etag: syncEtag,
+        size: z.number().int().meta({ description: 'Bytes.' }),
+        updatedAt: epochMs('When the slot was written, the server’s clock'),
+        seq: syncSeq,
+      })
+    ),
+    400: errorResponse(
+      'A missing or malformed header, or a body that doesn’t match its length or `SHA-256`.',
+      ['bad_request']
+    ),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    409: errorResponse(
+      'The slot was deleted while this put was uploading; nothing was stored.',
+      ['conflict']
+    ),
+    412: errorResponse('`If-Match` didn’t match the slot.', [
+      'precondition_failed',
+    ]),
+    413: errorResponse('Over 20 MiB, refused from `Content-Length`.', [
+      'too_large',
+    ]),
+    429: errorResponse(
+      'Over a limit: the account’s slot cap (`limit`), or a rate (`rate_limited`, with `Retry-After`).',
+      ['limit', 'rate_limited']
+    ),
+    ...internal,
+    ...syncOff,
+  },
+})
+
+export const syncListDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'List the account’s sync slots',
+  description: `Every slot’s ETag, size, and last write, and the account’s \`seq\`. A pull downloads only slots whose ETag changed since its last read. Send \`{}\`.
+
+${SYNC_ENTITLED}
+
+${readTier}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(z.object({}), 'An empty JSON object.'),
+  responses: {
+    200: jsonResponse(
+      'The account’s slots.',
+      z.object({
+        ok: z.literal(true),
+        seq: syncSeq,
+        slots: z.array(
+          z.object({
+            slotId: syncSlotId,
+            etag: syncEtag,
+            size: z.number().int().meta({ description: 'Bytes.' }),
+            updatedAt: epochMs('When the slot was last written, the server’s clock'),
+          })
+        ),
+      })
+    ),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncOff,
+  },
+})
+
+export const syncGetDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Download a sync slot',
+  description: `One slot’s bytes exactly as put.
+
+${SYNC_ENTITLED}
+
+${readTier}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(z.object({ slotId: syncSlotId }), 'The slot to read.'),
+  responses: {
+    200: {
+      ...syncBinary('The encrypted snapshot.'),
+      headers: {
+        ETag: {
+          description: 'The slot’s ETag, quoted.',
+          schema: { type: 'string' as const },
+        },
+        'x-ww-updated-at': {
+          description: 'When the slot was written (epoch ms, the server’s clock).',
+          schema: { type: 'integer' as const },
+        },
+        'Cache-Control': {
+          description: '`no-store`.',
+          schema: { type: 'string' as const },
+        },
+      },
+    },
+    400: errorResponse('Malformed JSON or `slotId`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    404: errorResponse('The account has no such slot.', ['not_found']),
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncOff,
+  },
+})
+
+export const syncDeleteDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Delete sync slots',
+  description: `Deletes one slot, or every slot of the account when \`slotId\` is left out. Gone from storage at once; idempotent. Every live socket gets \`changed\`. A device deletes its own slot when it leaves Cloud Sync or the account, and every slot before Delete Buddies replaces the account key; another device’s only from its Devices list or a reset.
+
+Works while Cloud Sync is off and for an account that isn’t entitled, so a device can always take its data off the server. Deleting every slot needs a live session: ${ENDED_SESSION}
+
+${readTier}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({ slotId: syncSlotId.optional() }),
+    'One slot, or `{}` for every slot.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'Deleted (or already gone).',
+      z.object({ ok: z.literal(true), seq: syncSeq })
+    ),
+    400: errorResponse('Malformed JSON or `slotId`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    429: bearerReadErrors[429],
+    ...internal,
+    503: errorResponse('No sync bucket or accounts database on this worker.', [
+      'disabled',
+    ]),
+  },
+})
+
+export const syncLiveDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Cloud Sync live socket (WebSocket)',
+  description: `Upgrades to a WebSocket that says *that* another device of the account changed its slot, so the app pulls at once while in the foreground. It never carries data: everything it prompts is read with the bearer token.
+
+Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \`x-ww-slot-id\`, the device’s own slot, so its own puts don’t echo back.
+
+**Server → app messages:**
+
+- \`{"type":"hello","seq":N}\` right after the upgrade (as Buddies' inbox socket); pull when \`N\` differs from the last \`seq\` pulled.
+- \`{"type":"changed","seq":N}\` after every put by another slot, and every delete.
+
+**Keepalive:** send the text \`ping\` about every 25 s; the server answers \`pong\` without waking the account’s Durable Object. Anything else the app sends is ignored.
+
+**Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account). Reconnect with backoff while in the foreground.
+
+${SYNC_ENTITLED} Turning Cloud Sync off refuses new sockets but doesn’t close open ones.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  parameters: [
+    {
+      name: 'Upgrade',
+      in: 'header' as const,
+      required: true,
+      schema: { type: 'string' as const, enum: ['websocket'] },
+      description: 'Must be `websocket`, else `426 upgrade_required`.',
+    },
+    {
+      name: 'x-ww-slot-id',
+      in: 'header' as const,
+      required: true,
+      schema: { type: 'string' as const },
+      description: 'This device’s slot (its sync id).',
+    },
+  ],
+  responses: {
+    101: { description: 'Switching protocols: the socket is open.' },
+    400: errorResponse('Missing or malformed `x-ww-slot-id`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    426: errorResponse('Not a WebSocket upgrade. No `Retry-After`.', [
+      'upgrade_required',
+    ]),
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncOff,
+  },
+})

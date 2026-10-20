@@ -56,7 +56,7 @@ export const appConfigDocs = describeRoute({
   tags: ['Service'],
   summary: 'App configuration',
   description:
-    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. No authentication.',
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`). No authentication.',
   responses: {
     200: jsonResponse(
       'The configuration.',
@@ -69,6 +69,21 @@ export const appConfigDocs = describeRoute({
           .meta({
             description:
               'The oldest app version (`major.minor.patch`) the API still supports. Absent without a floor.',
+          }),
+        sync: z
+          .object({
+            enabled: z.boolean().meta({
+              description:
+                'Whether Cloud Sync is on (KV `sync:enabled`, then the `SYNC_ENABLED` var; false on a worker without its bucket or the accounts database).',
+            }),
+            entitlement: z.enum(['supporter', 'everyone']).meta({
+              description:
+                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `supporter`).',
+            }),
+          })
+          .meta({
+            description:
+              'Cloud Sync’s switches (witness-work ADR 0030), so a device without a session knows whether opening one would get it Cloud Sync. `GET /accounts/v1/sync` gives the account’s own answer.',
           }),
       })
     ),
