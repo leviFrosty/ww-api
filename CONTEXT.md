@@ -1,10 +1,12 @@
-# ww-proxy — Notes Import
+# ww-proxy — Scribe AI and Notes Import
 
 This repo is a Cloudflare Workers proxy hosting several unrelated features (HERE
-API, iOS universal links, Notes Import). The only one with rich domain language
-is **Notes Import** — the feature that turns a user's free-text field-service
-notes into structured WitnessWork records. This glossary governs that feature
-across both repos (`ww-proxy` backend + `witness-work` client).
+API, iOS universal links, Scribe AI, Notes Import). The ones with rich domain
+language are **Scribe AI** — the in-app assistant that proposes changes to the
+User's records ([Scribe AI](#scribe-ai) below) — and **Notes Import**, the
+feature it replaced, which turns a user's free-text field-service notes into
+structured WitnessWork records. This glossary governs both across the two repos
+(`ww-proxy` backend + `witness-work` client).
 
 ## Language
 
@@ -120,3 +122,63 @@ model does a different, kickoff-time dedup against `existingContacts`).
   finished and a result is available — that is the **Ready** state, NOT the
   user-facing **Done** (which requires an **Accept**). When you see `done` in
   `events.ts`/run code, read it as **Ready**.
+
+## Scribe AI
+
+The wire contract and its terms are witness-work's
+[`docs/scribe-ai-protocol.md`](https://github.com/leviFrosty/witness-work/blob/main/docs/scribe-ai-protocol.md)
+(ADR 0032). The device runs the loop and every tool; the server runs one model
+call per **Step** and keeps no conversation content.
+
+**Conversation**:
+A device-owned transcript, id `conversationId` (a ULID minted on the device).
+The server never stores one; each Step carries all of it.
+
+**Turn**:
+One user message and every Step until the model stops calling tools; id
+`turnId`. A Turn admitted at Step 0 may finish over the limit within the
+**Turn grace**.
+_Avoid_: round, exchange.
+
+**Step**:
+One model call, `step` its 0-based index within the Turn; one
+`POST /scribe/v1/step`. Its idempotency key is `(turnId, step)`.
+_Avoid_: request (a refused request is no Step), iteration.
+
+**Tool**:
+A capability the app defines and runs on the device: `read`, `write`, or
+`destructive`. The server checks a Tool's shape, never runs it, and names none
+in its system prompt.
+
+**Offered set**:
+The Tools a Step lets the model call: the app's definitions minus the KV
+denylist and, once the Turn is **Tainted**, minus every `destructive` Tool.
+
+**Proposal**:
+The write calls of one Turn, resolved on the device and waiting for the User
+to review and tap Add. Nothing is saved before that.
+_Avoid_: saying the model "saved", "logged", or "added" anything.
+
+**Ref**:
+A short alias the device minted for a record (`c3`, `p1`); the model never sees
+raw ids.
+
+**Tainted**:
+A Turn after any tool result carried text a person wrote (`untrusted_text`,
+such as a Visit note). It loses `destructive` Tools for its remaining Steps.
+
+**Usage unit**:
+The meter's unit: `ceil(uncached input + 0.1 × cached input + 5 × output)`
+tokens by default. Distinct from Notes Import's **Import Credit**.
+_Avoid_: credit, token (tokens are the model's own count).
+
+**Usage window**:
+A period with a unit limit: `session` (5 h) and `weekly` (7 d) for
+Supporters, `monthly` (30 d) for everyone else. A window starts at the first
+charge after the previous one ended.
+
+**Turn grace**:
+Steps after Step 0 of a Turn admitted under the limit keep being admitted for
+`turnGraceMinutes` while usage stays under the limit plus `graceUnits`, so a
+Turn isn't cut off halfway.
+

@@ -18,7 +18,8 @@ import { apiError } from './errors'
  * Address search and geocoding stay in one `places` bucket because both spend
  * HERE transactions. Behind each family sit stronger, identity-keyed limits
  * (Notes Import: App Attest or Play Integrity, allowances, the concurrency
- * cap; attestation: the per-install challenge cap; route planning: the
+ * cap; Scribe AI: the per-account usage windows and active-step cap;
+ * attestation: the per-install challenge cap; route planning: the
  * per-account quota), which a client-supplied install or account id can't
  * replace here: before those checks it is unauthenticated, so keying on it
  * would let one caller mint fresh buckets at will. The attestation routes'
@@ -35,6 +36,7 @@ export type RateLimitFamily =
   | 'route-planning'
   | 'admin'
   | 'app'
+  | 'scribe'
 
 /** The bucket key for one family and caller. */
 export const rateLimitKey = (

@@ -2,15 +2,24 @@
 
 import { pathToFileURL } from 'node:url'
 
+/**
+ * Resets an account's Scribe AI usage windows (`POST /admin/scribe/reset`).
+ * `--notes-import` resets the old Notes Import meter instead
+ * (`POST /admin/notes-import/reset`), which answers only while KV
+ * `scribe:legacy-notes-import` is on.
+ */
+
 const PROD_URL = 'https://ww-proxy.leviwilkerson.com'
-const VALID_METER = /^[A-Za-z0-9_-]{8,64}$/
+const VALID_ID = /^[A-Za-z0-9_-]{8,64}$/
+const FLAGS = new Set(['--dev', '--notes-import'])
 
 export function resolveResetCommand(args, env) {
   const development = args.includes('--dev')
-  const positional = args.filter((arg) => arg !== '--dev')
-  if (positional.length !== 1 || !VALID_METER.test(positional[0])) {
+  const notesImport = args.includes('--notes-import')
+  const positional = args.filter((arg) => !FLAGS.has(arg))
+  if (positional.length !== 1 || !VALID_ID.test(positional[0])) {
     throw new Error(
-      'Usage: pnpm run admin:reset-usage [--dev] <meterId> (8-64 letters, digits, _ or -)'
+      'Usage: pnpm run admin:reset-usage [--dev] [--notes-import] <accountId> (8-64 letters, digits, _ or -)'
     )
   }
 
@@ -29,7 +38,8 @@ export function resolveResetCommand(args, env) {
   }
 
   return {
-    meterId: positional[0],
+    path: notesImport ? '/admin/notes-import/reset' : '/admin/scribe/reset',
+    body: notesImport ? { meterId: positional[0] } : { accountId: positional[0] },
     baseUrl: rawBaseUrl.replace(/\/+$/, ''),
     token,
     environment: development ? 'development' : 'production',
@@ -38,17 +48,14 @@ export function resolveResetCommand(args, env) {
 
 async function main() {
   const command = resolveResetCommand(process.argv.slice(2), process.env)
-  const response = await fetch(
-    `${command.baseUrl}/admin/notes-import/reset`,
-    {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-ww-admin-token': command.token,
-      },
-      body: JSON.stringify({ meterId: command.meterId }),
-    }
-  )
+  const response = await fetch(`${command.baseUrl}${command.path}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-ww-admin-token': command.token,
+    },
+    body: JSON.stringify(command.body),
+  })
   const body = await response.text()
   if (!response.ok) {
     throw new Error(

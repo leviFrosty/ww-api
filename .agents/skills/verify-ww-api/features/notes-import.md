@@ -1,5 +1,7 @@
 # Notes Import
 
+Legacy: Scribe AI replaced it. Every `/notes-import/*` route but `GET /notes-import/status` answers 426 unless KV `scribe:legacy-notes-import` is `on`; the e2e files turn it on for their run, and curl recipes here need `node scripts/verify/dev.mjs kv put scribe:legacy-notes-import on` first (delete it after).
+
 Notes Import turns a publisher's free-form notes into contacts, visits, and time entries through an LLM. App versions with account sessions call every route with `Authorization: Bearer <accessToken>` and are metered by the account; older ones attest each metered call (App Attest on iOS, Play Integrity on Android) while the legacy switch is on. Simulators, emulators and agents open a session with the dev bypass, or send the development-only bypass header on legacy requests. The safe verification surface is the attested no-op `verify` probe and the auth gate in front of `kickoff`. A real kickoff spends OpenRouter credits and is opt-in only.
 
 ## Sub-features

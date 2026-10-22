@@ -2,7 +2,9 @@
 
 **Status:** Implemented 2026-06-23 (backend + client). Decisions + final shape in
 the "Implemented" section at the bottom; the design narrative below is preserved
-for context.
+for context. Superseded by Scribe AI (witness-work ADR 0032): these routes now
+answer 426 unless KV `scribe:legacy-notes-import` is `on`, and the code goes
+once the cutover has run (AGENTS.md → Scribe AI).
 **Owner:** —
 **Repos touched:** `ww-proxy` (backend, primary) + `witness-work` (client UI/hook).
 

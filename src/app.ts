@@ -54,6 +54,21 @@ import {
   statusDocs as attestationStatusDocs,
   verifyDocs as attestationVerifyDocs,
 } from "./attestation/openapi";
+import {
+  handleScribeStatusRequest,
+  handleScribeStepRequest,
+  handleScribeTranscribeRequest,
+  handleScribeUsageRequest,
+} from "./scribe/route";
+import { handleScribeAdminResetRequest } from "./scribe/admin";
+import { legacyAdminGate, notesImportCutover } from "./scribe/legacy";
+import {
+  scribeAdminResetDocs,
+  scribeStatusDocs,
+  scribeStepDocs,
+  scribeTranscribeDocs,
+  scribeUsageDocs,
+} from "./scribe/openapi";
 import { handleAppStoreRatingsRequest } from "./appStoreRatings/route";
 import { handleAppConfigRequest } from "./appConfig";
 import { Sentry, reportableError } from "./sentry";
@@ -133,6 +148,13 @@ function handleApplicationError(error: Error, context: AppContext) {
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 
+// Scribe AI's hard cutover (src/scribe/legacy.ts): every Notes Import route
+// but `GET /notes-import/status` is 426 unless KV `scribe:legacy-notes-import`
+// is on, before its rate limit, auth, or kill switch. Registered first so it
+// runs first.
+app.use("/notes-import", notesImportCutover());
+app.use("/notes-import/*", notesImportCutover());
+
 // Each family counts in its own per-IP bucket (src/rateLimit.ts).
 app.use("/geocode", rateLimit("places"));
 app.use("/autocomplete", rateLimit("places"));
@@ -144,6 +166,10 @@ app.use(
   rateLimit("notes-import", ["/notes-import/usage"])
 );
 app.use("/attestation/*", rateLimit("attestation"));
+// Scribe AI's model calls; status and usage count in the read edge tier (in
+// their handlers) instead.
+app.use("/scribe/v1/step", rateLimit("scribe"));
+app.use("/scribe/v1/transcribe", rateLimit("scribe"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
 app.use("/app/v1/*", rateLimit("app"));
@@ -247,10 +273,28 @@ app.post(
 );
 // Legacy synchronous path (fallback during cutover).
 app.post("/notes-import", notesImportLegacyDocs, handleNotesImportRequest);
-// Maintainer-only usage reset (secret auth inside handler; 404 fail-closed).
+// Scribe AI (witness-work docs/scribe-ai-protocol.md): the public status, the
+// account's usage windows, one model step over SSE, and paper pages. Bearer
+// account sessions; metered per account in the ScribeMeter DO.
+app.get("/scribe/v1/status", scribeStatusDocs, handleScribeStatusRequest);
+app.get("/scribe/v1/usage", scribeUsageDocs, handleScribeUsageRequest);
+app.post("/scribe/v1/step", scribeStepDocs, handleScribeStepRequest);
+app.post(
+  "/scribe/v1/transcribe",
+  scribeTranscribeDocs,
+  handleScribeTranscribeRequest
+);
+// Maintainer-only usage resets (secret auth inside handler; 404 fail-closed).
+app.post(
+  "/admin/scribe/reset",
+  scribeAdminResetDocs,
+  handleScribeAdminResetRequest
+);
+// Notes Import's reset is reachable only while its routes are (legacy on).
 app.post(
   "/admin/notes-import/reset",
   notesImportAdminResetDocs,
+  legacyAdminGate(),
   handleNotesImportAdminResetRequest
 );
 // Account moderation: look up and suspend accounts (token auth; 404 fail-closed).

@@ -297,8 +297,10 @@ Android. Code in `src/attestation/`.
 - **`POST /attestation/v1/verify`** is an attested no-op for the app's
   developer tools (purpose `attestation-verify`; the older
   `notes-import-verify` is accepted too).
-- **`GET /attestation/v1/status`** lists the accepted providers (App Attest
-  always; Play Integrity once configured).
+- **`GET /attestation/v1/status`** lists the accepted providers as
+  `capabilities` (App Attest always; Play Integrity once configured), the
+  same object `GET /notes-import/status` carries. `providers` repeats it for
+  builds that read the old name.
 
 Each protected route verifies an assertion signed for its own `purpose`
 (registry: `src/attestation/purposes.ts`). New routes call
@@ -307,159 +309,55 @@ Play Integrity. Purposes are signed by installed apps, so a shipped one is
 never renamed.
 
 The old paths `POST /notes-import/challenge`, `/notes-import/attest`, and
-`/notes-import/verify` run the same handlers for deployed apps, adding
+`/notes-import/verify` run the same handlers for deployed apps while the
+Notes Import legacy switch is on (426 otherwise; see
+[Notes Import](#notes-import-legacy-notes-import)), adding
 `Deprecation: @1792022400` (2026-10-15) and
 `Link: </attestation/v1/…>; rel="successor-version"`. Each hit logs
 `deprecated path: <old> -> <new>` (route names only). Remove them once the
 minimum app version uses the new paths and those logs go quiet.
 
-### Notes Import (`/notes-import*`)
+### Scribe AI (`/scribe/v1/*`)
 
-LLM-backed parsing of free-form ministry notes into structured WitnessWork
-records. The proxy owns the prompt + JSON schema, calls the model through
-OpenRouter with routing pinned ZDR-only (`zdr: true` + `data_collection: 'deny'`,
-restricted to a vetted Western provider allowlist) so the request can only reach
-a zero-data-retention host that never trains on or stores it — failing rather
-than ever downgrading to a data-retaining provider (ADR 0008). It persists
-non-content authentication/runtime metadata in KV and aggregate usage plus
-permanent replay/refinement records in a per-user Durable Object—never imported
-text or model output in either meter store.
+The model side of Scribe AI, the in-app assistant that logs time, plans time,
+records visits and updates contacts by proposing changes the User reviews.
+The app owns the tools and runs every one of them on the device; ww-api runs
+one model step per request and stores no conversation content. **The wire
+contract is the app repo's
+[`docs/scribe-ai-protocol.md`](https://github.com/leviFrosty/witness-work/blob/main/docs/scribe-ai-protocol.md)**
+(witness-work ADR 0032); `/docs` has each route's OpenAPI entry. Code in
+`src/scribe/`.
 
-Both production and development use `openai/gpt-6-luna` through
-OpenRouter. The fixed extraction instructions precede user context and tagged
-notes; refinements keep that notes prefix and append the previous result and
-correction. Strict JSON-schema output is validated locally before delivery,
-including recovery from a completed response with misrouted reasoning-channel
-JSON. Monthly totals become one dated time entry without an automatic warning.
-The default uses `low` reasoning with a 32,000-token combined reasoning/JSON
-budget. Higher efforts exhausted that budget in historical replay tests. A
-blank completion that spent its full budget on reasoning gets one retry with
-thinking explicitly disabled; partial/invalid JSON is never accepted, and
-both attempts count toward the run's token usage.
-Ambiguous dates are resolved once with a warning; conflicting house numbers
-prevent fuzzy-name merges, and unnamed people identified by address retain
-their visits. Model logs include only routing, finish reason, and token/cache
-counts.
-
-Core routes (all rate-limited). Attestation (challenge, App Attest key
-registration, the verify probe) lives under `/attestation/v1/` (below); the
-old `POST /notes-import/challenge`, `/attest`, and `/verify` still serve the
-same handlers for deployed apps.
-
-- **`POST /notes-import/kickoff`** starts a streaming run and returns its handle
-  (and, for legacy requests, a capability token) and strict `credits` preview;
-  `GET .../events` / `.../result` carry the terminal result and authoritative
-  `credits` snapshot.
-- **`POST /notes-import/transcribe`** (Import from Paper) reads one page image
-  (base64 JPEG or PNG, ≤ `NOTES_IMPORT_TRANSCRIBE_MAX_BYTES`) into plain text
-  with `NOTES_IMPORT_TRANSCRIBE_MODEL` on the same ZDR allowlist, and returns
-  `{ text, truncated, pagesRemaining }`. Legacy requests are attested with
-  App Attest v2 or Play Integrity under purpose `notes-import-transcribe`: the
-  content hash is the SHA-256 of the base64 string, and the request hash
-  covers `{ imageHash, mimeType }`. The image is never stored or logged.
-  Pages spend no credit (the app sends the edited text through kickoff), but a
-  free user with no imports left is refused, and each identity gets
-  `NOTES_IMPORT_TRANSCRIBE_PAGES_PER_DAY` pages per rolling day (`…_SUPPORTER`
-  for Supporters); over it → 429 `transcribe_limit` with `Retry-After`.
-  `GET /notes-import/status` advertises `capabilities.transcribe`.
-- **`POST /notes-import`** is the synchronous fallback under identical rules.
-- Both import routes refuse empty or whitespace-only `notesText` with 400
-  `bad_request`, bearer and legacy alike, before attestation, the allowance,
-  or the model.
-- **`GET /notes-import/status`** is public and supplies a fresh allowance
-  schedule only when availability is confirmed.
-
-#### Who's calling: account sessions (bearer) or legacy
-
-App versions with account sessions call every Notes Import route with
-`Authorization: Bearer <accessToken>` (from `POST /accounts/v1/sessions`, see
-[Accounts and sessions](#accounts-and-sessions-accountsv1)). The session
-attested once, so these requests carry no attestation fields and no hashes, and
-the token's account is the meter: allowances, replays, the concurrency cap, and
-Import from Paper's page limit all key on it. A request with an `Authorization`
-header is always a bearer request; a bad token is never a fallback to the old
-way. Older app versions send no `Authorization` header and authenticate per
-request (below) while the legacy switch (KV `auth:legacy`) is on.
-
-**Bearer contract.** JSON bodies; any field not listed is ignored (`uuid`,
-`accountId`, `contentHash`, `requestHash`, and every attestation field
-included).
-
-| Route | Body | 200 |
+| Route | Auth | Answer |
 | --- | --- | --- |
-| `GET /notes-import/usage` | none | the account's allowance (below) |
-| `POST /notes-import/kickoff` | `{ notesText, context, refinement? }` | `{ importId, refinement, credits }` (no `subscribeToken`) |
-| `POST /notes-import` (synchronous fallback) | the same | `{ result, contentHash, refinement, emptyCharged, credits }` |
-| `POST /notes-import/transcribe` | `{ image, mimeType }` | `{ ok, text, truncated, pagesRemaining }` |
-| `GET /notes-import/{importId}/events` | none; `Last-Event-ID` header to resume | the SSE stream |
-| `GET /notes-import/{importId}/result` | none | `{ status, payload?, error? }` |
-| `POST /notes-import/{importId}/cancel` | none | `{ status, payload?, error? }` |
-| `POST /notes-import/{importId}/destroy` | none | `{ ok: true }` |
+| `GET /scribe/v1/status` | none | `{ enabled, reason, protocol: { min, max }, minAppVersion, disabledTools, limits }`, the same for everyone, reused per isolate for 30 s |
+| `GET /scribe/v1/usage` | bearer | the account's usage snapshot (windows, `limited`, `resetsAt`); read-only |
+| `POST /scribe/v1/step` | bearer | one model step as SSE: `start`, then `text` / `tool_call`, then exactly one `done` or `error` |
+| `POST /scribe/v1/transcribe` | bearer | Import from Paper: one page image to text, metered like a step |
+| `POST /admin/scribe/reset` | `x-ww-admin-token` | sets an account's windows back to unused (404 without the token) |
 
-- **Supporter status** is the account's (witness-work ADR 0029; see
-  [Supporter status](#supporter-status-on-the-account) below), asked at kickoff
-  and again when the run settles. An account that hasn't linked a RevenueCat
-  customer isn't a Supporter. Builds before ADR 0029 sent a
-  `revenueCatAppUserId`; it's ignored.
-- **Run routes** take the access token instead of `?token=` (a bearer request
-  never reads it) and serve only imports the token's account kicked off.
-  Another account's import, an unknown id, and one deleted or past its 1-hour
-  retention are all 404 `not_found`, so a response never says whether an
-  import exists. A destroy of an import already deleted is that same 404.
-- **Errors** keep Notes Import's shape, `{ ok: false, error: <message>, code }`,
-  on both kinds of request: 401 `unauthorized` (missing, expired, or invalid
-  token, with `WWW-Authenticate: Bearer error="invalid_token"`: refresh once
-  and retry), 403 `suspended` on the metered routes (a suspended account can
-  still read and delete its runs), 404 `not_found` (run routes), 503 `disabled`
-  (sessions off on this worker), and every existing code (`limit_reached`,
-  `refinement_limit`, `active_cap`, `transcribe_limit`, `unavailable`,
-  `too_large`, `bad_request`, `model_error`, `server_error`).
-- **Allowances start fresh.** Usage recorded under an install id or shared
-  account id doesn't carry over to the account: each account gets a new
-  window (decided in witness-work ADR 0027).
-- **Dev sessions** (opened with the dev bypass on the dev worker) get the
-  bypass's unlimited allowances and never Supporter status; production never
-  verifies a `dev` token.
-- **Usage** (`GET /notes-import/usage`): the account's allowance right now,
-  the same on every device, computed by kickoff's own code (Supporter
-  status, runtime limits, the account's meter). Read-only: it counts as no
-  import. Bearer only, `Cache-Control: no-store`, and counted in the read
-  edge tier (600 a minute per IP), not the `notes-import` bucket.
-
-  ```json
-  {
-    "ok": true,
-    "accountStatus": "active",
-    "supporter": false,
-    "supporterCheckFailed": false,
-    "imports": { "limit": 3, "used": 1, "remaining": 2, "resetsAt": "2026-11-17T12:00:00.000Z" },
-    "refinements": { "limitPerImport": 5 },
-    "windowDays": 30
-  }
-  ```
-
-  `null` limits and `remaining` are unlimited; `resetsAt` is `null` until a
-  charged import starts a window. `supporterCheckFailed: true` means
-  RevenueCat couldn't be reached and the account is answered (and metered
-  by kickoff) as free. A suspended account still gets its answer, with
-  `accountStatus: "suspended"`; kickoff refuses it. Refinements count per
-  notes text, so only their per-import limit is account-wide. Errors: 401
-  `unauthorized`, 429 `rate_limited`, 503 `disabled`.
-- `GET /notes-import/status` stays public and the same for everyone; it
-  ignores `Authorization`. The account's balance is `GET /notes-import/usage`
-  (and kickoff's `credits`).
-
-**Legacy** (no `Authorization` header). Inference is attested per request:
-App Attest on iOS, Play Integrity on Android, with the body fields in `/docs`.
-Run routes take the kickoff's `subscribeToken` as `?token=`. Once the legacy
-switch is off, every legacy Notes Import request is 426 `upgrade_required` in
-Notes Import's shape (message in `error`), with no `Retry-After`. A dev worker
-may set `NOTES_IMPORT_DEV_BYPASS_TOKEN` so the simulator can send
-`x-ww-dev-bypass: <token>` to skip attestation. It overrides both effective usage
-allowances to unlimited while keeping real Supporter status false and retaining
-hash/refinement accounting. Existing active-concurrency behavior is unchanged.
-On a bearer request the header is ignored: the session's platform decides.
-**Never set this token in production.**
+- **One step per request.** The app sends the whole conversation, its tool
+  definitions, and an app context each step; the server validates their
+  shape and size, adds its static system prompt, and streams the model's text
+  and tool calls back. Tools have no server-side `execute`. Write tools only
+  propose: nothing changes until the User taps Add in the app.
+- **Metering** is in units, `ceil(uncached input + 0.1 × cached input + 5 ×
+  output)`, charged per step to a per-account `ScribeMeter` Durable Object.
+  Free accounts have a monthly window; Supporters a 5-hour session window and
+  a weekly window. A turn admitted at step 0 may finish over the limit within
+  the turn grace. Admission also checks the step's idempotency key and the
+  active-step cap.
+- **Model**: `openai/gpt-6-luna` on Azure through OpenRouter, ZDR-only
+  (`zdr: true`, `data_collection: 'deny'`, the provider allowlist, fail closed;
+  ADR 0008). Status needs an allowlisted host whose metadata lists `tools`;
+  KV `scribe:model` can name a fallback.
+- **Privacy**: logs, Sentry, and the `api_scribe_step` / `api_scribe_transcribe`
+  analytics events carry structure only (tool names, counts, tokens, units,
+  timings, finish), never messages, arguments, results, context, tool
+  descriptions, or provider error bodies.
+- **Configuration**: every limit and switch resolves KV → `SCRIBE_*`
+  environment variable → default. The KV keys and the Notes Import cutover
+  runbook are in [AGENTS.md](AGENTS.md#scribe-ai).
 
 **One-time setup** (beyond HERE/Sentry):
 
@@ -473,21 +371,6 @@ pnpm exec wrangler secret put ADMIN_API_TOKEN
 pnpm exec wrangler secret put ADMIN_API_TOKEN --env dev  # use a DIFFERENT value
 ```
 
-#### Runtime allowance configuration
-
-Each environment's `NOTES_KV` may contain `notes-import:limits`:
-
-```json
-{"importsFree":3,"importsSupporter":-1,"refinementsFree":5,"refinementsSupporter":-1,"windowDays":30}
-```
-
-Allowance values are integer `-1` (unlimited), `0` (none), or positive finite;
-`windowDays` is any positive finite number and may be fractional in development.
-Each field independently resolves KV → environment variable → code default. KV
-reads use a 60-second edge cache. Model/provider, concurrency, and Empty Import
-grace controls remain environment-only; see `src/notesImport/config.ts` and
-`wrangler.toml`.
-
 #### Admin usage reset
 
 Generate distinct prod/dev tokens with `openssl rand -base64 32`, configure the
@@ -495,18 +378,29 @@ Wrangler secrets above, copy `.env.example` to the gitignored `.env`, and set th
 matching local tokens plus the dev Worker URL. Then run:
 
 ```bash
-pnpm run admin:reset-usage <meterId>         # production
-pnpm run admin:reset-usage --dev <meterId>   # development
+pnpm run admin:reset-usage <accountId>         # production
+pnpm run admin:reset-usage --dev <accountId>   # development
 ```
 
-The meter id is the account id for app versions with account sessions (find it
-from a Buddies inbox with `POST /admin/accounts/lookup`), and the shared
-account id or install uuid for older ones.
+It sets every Scribe AI window of the account back to unused, and its paper
+pages for the day. Find an account id from a Buddies inbox with
+`POST /admin/accounts/lookup`. `--notes-import` resets the old Notes Import
+meter instead (`POST /admin/notes-import/reset`), which answers only while the
+legacy switch below is on. Missing configuration or bad auth returns 404.
+Never reuse `NOTES_IMPORT_DEV_BYPASS_TOKEN` as the admin secret.
 
-The secret route clears only the aggregate import window and Empty Import rows;
-permanent hash replay and refinement records survive. Missing configuration or
-bad auth returns 404. Data Studio remains the manual emergency fallback. Never
-reuse `NOTES_IMPORT_DEV_BYPASS_TOKEN` as the admin secret.
+### Notes Import (legacy, `/notes-import*`)
+
+Scribe AI replaced Notes Import. Every `/notes-import/*` route except
+`GET /notes-import/status` answers 426 `upgrade_required` (no `Retry-After`)
+unless KV `scribe:legacy-notes-import` is `on`, before its rate limit, auth,
+or kill switch (`src/scribe/legacy.ts`); `GET /notes-import/usage` is 404, as
+before the route, so opening an older composer doesn't put the whole app
+behind Update Required. `GET /notes-import/status` stays,
+because older app versions read attestation capabilities from it to open
+account sessions; newer ones read `GET /attestation/v1/status`. The code stays,
+unreachable while the switch is off, until a follow-up deletes it. Its
+contract is in `/docs` and this file's git history.
 
 ### Supporter status on the account
 
@@ -534,7 +428,8 @@ RevenueCat's webhook. Who counts is ADR 0014's rule (`src/revenuecat.ts`).
   one is read again first, as is a Supporter whose expiry passed since it was
   read (one read tells a renewal from a lapse). Each RevenueCat read gives up
   after 5 seconds. RevenueCat unreachable then: route planning answers
-  503 `supporter_check_failed`, Notes Import counts the User as free.
+  503 `supporter_check_failed`; Scribe AI (and Notes Import) count the User
+  as free, with `supporterCheckFailed: true`.
 
 ### `POST /route-planning/optimize`
 
@@ -608,11 +503,12 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
 ```
 
 - `code` is always the stable, machine-readable code; read it first.
-- `error` is the same code everywhere except attestation, Notes Import, and
-  route planning, where it stays a human-readable message for shipped builds.
+- `error` is the same code everywhere except attestation, Notes Import,
+  Scribe AI, and route planning, where it's a human-readable message.
 - Every 429 and 503 sends `Retry-After` (seconds) and repeats it as
   `retryAfter`, except quotas no wait can free (Notes Import's
-  `limit_reached` and `refinement_limit`, Buddies' `limit`).
+  `limit_reached` and `refinement_limit`, Buddies' `limit`). Scribe AI's 402
+  `limit_reached` sends it too, until the full window resets.
 - Routes add their own fields beside these (`reason`, `action`, `credits`,
   `serverTime`, HERE's own error fields on the place-search proxy).
 - A bearer route's missing, expired, or invalid token is 401 `unauthorized`
@@ -630,8 +526,9 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   (`application/octet-stream`) on success; its errors use the envelope.
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
-bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`,
-`attestation`, `route-planning`, `admin`, and `app` (`/app/v1/*`)
+bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`, `scribe`
+(`/scribe/v1/step`, `/scribe/v1/transcribe`), `attestation`,
+`route-planning`, `admin`, and `app` (`/app/v1/*`)
 (`src/rateLimit.ts`). The old `/notes-import/*` attestation paths still
 count in `notes-import`. Refusals are 429 `rate_limited` with
 `Retry-After: 60`. Buddies and accounts have their own per-caller tiers.
@@ -658,7 +555,7 @@ Response to Client
 
 ## Stack
 
-- **Runtime**: Cloudflare Workers with `nodejs_compat`
+- **Runtime**: Cloudflare Workers with `nodejs_compat` and `enable_request_signal`
 - **Framework**: [Hono](https://hono.dev/)
 - **Language**: TypeScript
 - **Package Manager**: pnpm

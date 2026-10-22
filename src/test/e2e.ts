@@ -724,3 +724,19 @@ export const openLive = (
     request.on('error', reject)
     request.end()
   })
+
+/**
+ * Turns on Scribe AI's legacy switch (KV `scribe:legacy-notes-import`) in the
+ * launcher's local KV, so a Notes Import suite reaches the old routes; returns
+ * the restore. A remote worker answers with whatever its own KV says.
+ */
+export const enableLegacyNotesImport = (): (() => void) => {
+  if (!LOCAL_LAUNCHER) return () => undefined
+  const key = 'scribe:legacy-notes-import'
+  const previous = localKv('get', key).trim()
+  localKv('put', key, 'on')
+  return () => {
+    if (previous === '' || previous === 'Value not found') localKv('delete', key)
+    else localKv('put', key, previous)
+  }
+}

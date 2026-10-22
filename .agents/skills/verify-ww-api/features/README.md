@@ -16,7 +16,7 @@ This directory is the maintained source for verifying ww-api's user-facing behav
 - Treat every command as literal. Keep paths, headers, and JSON unchanged.
 - Signed Buddies ops go through `pnpm test:e2e` (helpers in `src/test/e2e.ts`), not hand-built curl.
 - Restore any KV switch you flip (`node scripts/verify/dev.mjs kv delete <key>`) before the next recipe.
-- Never call `POST /notes-import/kickoff` with the bypass unless `WW_API_E2E_ALLOW_PAID=1` is part of the task. It spends OpenRouter credits.
+- Never call `POST /notes-import/kickoff` with the bypass, or let `POST /scribe/v1/step` pass validation on a worker with an OpenRouter key, unless `WW_API_E2E_ALLOW_PAID=1` is part of the task. Both spend OpenRouter credits.
 
 ## Proof and skip reporting
 
@@ -40,7 +40,8 @@ Keep implementation details out of the map. Name only user paths, stable handles
 ## Features
 
 - [Health and status](./health-and-status.md) covers `/health`, `/notes-import/status`, App Store ratings, and the JSON 404.
-- [Notes Import](./notes-import.md) covers the attestation verify probe and challenge (`/attestation/v1/*` and their old `/notes-import/*` paths), kickoff's auth gate, and the opt-in paid kickoff.
+- [Scribe AI](./scribe.md) covers `/scribe/v1/status`, `/scribe/v1/usage`, every step refusal before the model, the KV switches, the meter at a zero allowance, the Notes Import cutover, `/attestation/v1/status`, the admin reset, and the opt-in real-model suite.
+- [Notes Import](./notes-import.md) (legacy, behind KV `scribe:legacy-notes-import`) covers the attestation verify probe and challenge (`/attestation/v1/*` and their old `/notes-import/*` paths), kickoff's auth gate, and the opt-in paid kickoff.
 - [Buddies relay](./buddies-relay.md) covers pairing end to end, sync read-backs, auth failures, caps, the kill switch, bearer requests on account sessions and the legacy switch, and fuzzing both.
 - [Universal link pages](./universal-link-pages.md) covers the AASA, the `/contacts` (`/c`, `/c/:payload`) contact pages, and the `/buddies/invite` (`/b`) invite page.
 - [Admin reset](./admin.md) covers the maintainer usage reset and its 404 fail-closed auth.

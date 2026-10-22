@@ -246,6 +246,42 @@ export interface Environment {
   /** Dedicated admin reset credential. Secret; distinct per prod/dev worker. */
   ADMIN_API_TOKEN?: string;
 
+  // --- Scribe AI (witness-work docs/scribe-ai-protocol.md) ----------------
+
+  /**
+   * One SQLite DO per account (`idFromName(accountId)`): Scribe AI's usage
+   * windows, step keys, open turns, active steps, charges (31 days), and paper
+   * pages (24 hours). No conversation content.
+   */
+  SCRIBE_METER: DurableObjectNamespace<import('./scribe/meterDO').ScribeMeter>;
+
+  /** Step model slug when KV `scribe:model` has none. Default `openai/gpt-6-luna`. */
+  SCRIBE_MODEL?: string;
+  /** Comma-separated Western ZDR host allowlist, in priority order. Default `azure`. */
+  SCRIBE_PROVIDERS?: string;
+  /** `minimal`…`max`, or `off`. Default `low`. */
+  SCRIBE_REASONING_EFFORT?: string;
+  /** A step's output ceiling, reasoning included. Default 4096. */
+  SCRIBE_MAX_OUTPUT_TOKENS?: string;
+  /** Used when no allowlisted host for the model serves tool calls. Unset = none. */
+  SCRIBE_FALLBACK_MODEL?: string;
+  /** The fallback's hosts. Default: `SCRIBE_PROVIDERS`. */
+  SCRIBE_FALLBACK_PROVIDERS?: string;
+  /** Paper pages' vision model. Default: the step model. */
+  SCRIBE_TRANSCRIBE_MODEL?: string;
+  /** Advisory `minAppVersion` on GET /scribe/v1/status when KV `scribe:min-version` is absent. */
+  SCRIBE_MIN_APP_VERSION?: string;
+  /**
+   * Every field of the `scribe:limits` document also reads
+   * `SCRIBE_<SNAKE_CASE_PATH>` when KV has no valid value for it
+   * (`SCRIBE_FREE_MONTHLY`, `SCRIBE_SUPPORTER_SESSION`,
+   * `SCRIBE_WINDOW_LENGTHS_SESSION_HOURS`, `SCRIBE_MAX_INPUT_TOKENS`, …;
+   * `limitEnvName` in src/scribe/config.ts).
+   */
+  SCRIBE_FREE_MONTHLY?: string;
+  SCRIBE_SUPPORTER_SESSION?: string;
+  SCRIBE_SUPPORTER_WEEKLY?: string;
+
   // --- Accounts ------------------------------------------------------------
 
   /**
