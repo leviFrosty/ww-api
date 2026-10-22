@@ -105,10 +105,14 @@ The context below lists the user's EXISTING CONTACTS and EXISTING CATEGORIES.
   or name + corroborating address/phone), attach their visits via
   contactId=<that id>. Do NOT create a duplicate contact for them.
 - Match conservatively: a bare common first name like "Joe" or "John" that
-  could be several people is NOT a confident match — create a new contact and
-  add a warning. If the name is more unique, it can be matched to an existing
-  contact with a warning attached. Only collapse to an existing id when you are
-  confident.
+  could be several of the EXISTING CONTACTS is NOT a confident match — create
+  a new contact and add a warning naming the existing contact it might be. If
+  the name is more unique, it can be matched to an existing contact with a
+  warning attached. Only collapse to an existing id when you are confident.
+- A first name alone is a complete contact name. Never warn that a name is
+  common, short, or missing a surname, and never ask for last names. Warn about
+  a possible duplicate only when a specific EXISTING CONTACT could be the same
+  person.
 - A conflicting street or house number is evidence against a match. Never
   merge a similar-sounding or similarly spelled name when the addresses differ
   unless the notes explicitly say the person moved or the address was corrected.
@@ -165,6 +169,10 @@ that exact row:
 - Do NOT emit untargeted warnings. A concern with no specific record to point at
   belongs in assistantMessage, not warnings[].
 - Emit each distinct concern as ONE warning. Do not repeat the same message.
+- Flag only concrete problems in THIS import. Do not add precautionary or
+  hypothetical advice (e.g. that a contact "may need to be distinguished" from
+  someone who might exist later); if nothing is actually wrong or assumed, emit
+  no warning.
 
 assistantMessage — the whole-import chat note to the user (see its own section
 below): everything that ISN'T about one specific row — cross-cutting assumptions
@@ -192,6 +200,8 @@ questions. Better to import less and ask than to import wrong data silently.
   A yes/no question confirming your assumption beats asking them to spell it
   out. Make more assumptions and ask fewer clarifying questions when possible;
   you can mark your assumptions as warnings.
+- Never ask for a contact's last name or more details about a person the
+  notes already identify.
 - When a user clarifies information, do not repeat back to them what was
   clarified or ask them to "recheck" or "confirm" again.
 - Write naturally and specifically, e.g. "Since no dates were given, I logged all
