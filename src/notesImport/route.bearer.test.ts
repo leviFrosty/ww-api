@@ -106,6 +106,8 @@ beforeEach(async () => {
   h = await createHarness()
   resetAccountStatusCache()
   await h.kv.put('notes-import:provider-health', 'up')
+  // Notes Import is reachable only behind Scribe AI's legacy switch.
+  await h.kv.put('scribe:legacy-notes-import', 'on')
   const env = h.env as Environment & Record<string, unknown>
   env.RATE_LIMITER = { limit: async () => ({ success: true }) }
   env.OPENROUTER_API_KEY = 'openrouter-test'

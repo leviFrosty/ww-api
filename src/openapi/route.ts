@@ -34,6 +34,11 @@ export const OPENAPI_TAGS = [
       '/blob/main/docs/notes-import-streaming-durable-objects.md).',
   },
   {
+    name: 'Scribe AI',
+    description:
+      'The tool-calling assistant: the app runs the loop and its own tools; each model step is one stateless bearer request streamed back as SSE, metered per account in usage units (session, weekly, and monthly windows). ww-api stores no conversation content. The wire contract is witness-work’s [docs/scribe-ai-protocol.md](https://github.com/leviFrosty/witness-work/blob/main/docs/scribe-ai-protocol.md).',
+  },
+  {
     name: 'Buddies',
     description:
       'End-to-end encrypted relay between buddies. The relay only sees ciphertext and random ids. Every op is `POST /buddies/v1/{op}` with a signed envelope; ids travel in bodies, never URLs. The wire contract is [docs/buddies-protocol.md](' +

@@ -1,10 +1,19 @@
-import { afterAll, describe, expect, it } from 'vitest'
-import { ADMIN_TOKEN, http, writeTranscript } from '../test/e2e'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { ADMIN_TOKEN, enableLegacyNotesImport, http, writeTranscript } from '../test/e2e'
 
 /** Maintainer usage reset: every auth failure is an indistinguishable 404. */
 
 afterAll(() => {
   writeTranscript('admin')
+})
+
+// Notes Import answers only behind Scribe AI's legacy switch (src/scribe/legacy.ts).
+let restoreLegacy = () => {}
+beforeAll(() => {
+  restoreLegacy = enableLegacyNotesImport()
+})
+afterAll(() => {
+  restoreLegacy()
 })
 
 const reset = (headers: Record<string, string>, body: unknown = { meterId: 'verifyMeter01' }) =>

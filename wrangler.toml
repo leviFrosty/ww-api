@@ -1,7 +1,9 @@
 name = "ww-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-11-27"
-compatibility_flags = ["nodejs_compat"]
+# `enable_request_signal`: `request.signal` aborts when the client leaves, so a
+# Scribe AI step or page read stops its model call (protocol: Metering).
+compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 workers_dev = false
 preview_urls = false
 # Generate source maps on deploy (and upload them to Cloudflare for mapped
@@ -90,6 +92,17 @@ SYNC_ENTITLEMENT = "supporter"
 ANDROID_PACKAGE_NAME = "com.leviwilkerson.jwtime"
 PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
 ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
+# Scribe AI (witness-work docs/scribe-ai-protocol.md) fallbacks when KV
+# `scribe:model` / `scribe:limits` have no value for a field. Named
+# environments don't inherit [vars], so they're repeated here; they mirror the
+# code defaults (src/scribe/config.ts).
+SCRIBE_MODEL = "openai/gpt-6-luna"
+SCRIBE_PROVIDERS = "azure"
+SCRIBE_REASONING_EFFORT = "medium"
+SCRIBE_MAX_OUTPUT_TOKENS = "4096"
+SCRIBE_FREE_MONTHLY = "150000"
+SCRIBE_SUPPORTER_SESSION = "540000"
+SCRIBE_SUPPORTER_WEEKLY = "1550000"
 # Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
 # runs stay out of the production dashboards; uncomment to check delivery
 # (events carry `environment: development`).
@@ -143,6 +156,10 @@ class_name = "AccountHandoff"
 [[env.dev.durable_objects.bindings]]
 name = "ACCOUNT_SYNC_INDEX"
 class_name = "AccountSync"
+
+[[env.dev.durable_objects.bindings]]
+name = "SCRIBE_METER"
+class_name = "ScribeMeter"
 
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
@@ -206,6 +223,10 @@ new_sqlite_classes = ["AccountHandoff"]
 [[env.dev.migrations]]
 tag = "v8"
 new_sqlite_classes = ["AccountSync"]
+
+[[env.dev.migrations]]
+tag = "v9"
+new_sqlite_classes = ["ScribeMeter"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -341,6 +362,18 @@ PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = "53605912655"
 # (MEETS_DEVICE_INTEGRITY default; BASIC/STRONG need Play Console opt-in).
 ANDROID_CERT_SHA256_DIGESTS = "TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw"
 # PLAY_INTEGRITY_REQUIRED_DEVICE_VERDICT = "MEETS_DEVICE_INTEGRITY"
+# Scribe AI (witness-work docs/scribe-ai-protocol.md) fallbacks when KV
+# `scribe:model` / `scribe:limits` have no value for a field; they mirror the
+# code defaults (src/scribe/config.ts). Every other limit has its own
+# SCRIBE_<SNAKE_CASE> var (AGENTS.md → Scribe AI). Repeated under
+# [env.dev.vars].
+SCRIBE_MODEL = "openai/gpt-6-luna"
+SCRIBE_PROVIDERS = "azure"   # Western ZDR, priority order (ADR 0008)
+SCRIBE_REASONING_EFFORT = "medium"
+SCRIBE_MAX_OUTPUT_TOKENS = "4096"
+SCRIBE_FREE_MONTHLY = "150000"
+SCRIBE_SUPPORTER_SESSION = "540000"
+SCRIBE_SUPPORTER_WEEKLY = "1550000"
 # Anonymous Notes Import usage events (src/analytics.ts, AGENTS.md). The
 # WitnessWork PostHog project's write-only ingestion token, the same one the
 # app ships, so not a secret. Remove to turn server analytics off.
@@ -426,6 +459,20 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 # absent key (or a failed read) leaves it on. Per-account limits always apply.
 #   wrangler kv key put --binding NOTES_KV route-planning:enabled false   # off
 #   wrangler kv key delete --binding NOTES_KV route-planning:enabled      # on
+# (add `--env dev` for the dev worker).
+#
+# Scribe AI switches (cacheTtl 60; AGENTS.md → Scribe AI has the runbook):
+#   scribe:enabled               off: false/off/0/no/disabled or {"available":false}
+#   scribe:disabled-tools        JSON array or comma list of tool names never offered
+#   scribe:protocol-min          integer floor; below it /step is 426
+#   scribe:min-version           {"minVersion":"x.y.z"}; advisory (status)
+#   scribe:limits                JSON, any subset of the limits document
+#   scribe:model                 JSON {model, providers, reasoningEffort, maxOutputTokens, strictTools, fallback}
+#   scribe:provider-health       written by the provider probe
+#   scribe:legacy-notes-import   "on" re-allows /notes-import/*; absent = 426
+#                                (except GET /notes-import/status). Must be "on"
+#                                before a deploy reaches apps without Scribe AI.
+#   wrangler kv key put --binding NOTES_KV scribe:legacy-notes-import on
 # (add `--env dev` for the dev worker).
 #
 # Also holds the paywall's App Store ratings (`app-store-ratings:state` sweep
@@ -602,6 +649,13 @@ class_name = "AccountHandoff"
 name = "ACCOUNT_SYNC_INDEX"
 class_name = "AccountSync"
 
+# Scribe AI: one meter per account (usage windows, step keys, open turns,
+# active steps, charges for 31 days, paper pages for 24 hours; never content).
+# Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "SCRIBE_METER"
+class_name = "ScribeMeter"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -635,6 +689,10 @@ new_sqlite_classes = ["AccountHandoff"]
 [[migrations]]
 tag = "v8"
 new_sqlite_classes = ["AccountSync"]
+
+[[migrations]]
+tag = "v9"
+new_sqlite_classes = ["ScribeMeter"]
 
 [observability]
 enabled = true

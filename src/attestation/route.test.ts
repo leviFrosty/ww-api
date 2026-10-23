@@ -150,10 +150,25 @@ describe('/attestation/v1', () => {
     expect(response.status).toBe(200)
     expect(response.headers.get('Cache-Control')).toBe('no-store')
     await expect(response.json()).resolves.toEqual({
+      ok: true,
+      capabilities: { appAttest: { protocolVersions: [1, 2] } },
       providers: { appAttest: { protocolVersions: [1, 2] } },
     })
   })
 })
+
+/**
+ * An env with Scribe AI's legacy switch on: the old paths are under
+ * `/notes-import/`, which answers 426 otherwise (src/scribe/legacy.ts).
+ */
+const legacyEnv = (...args: Parameters<typeof makeEnv>) => {
+  const made = makeEnv(...args)
+  ;(made.env.NOTES_KV as unknown as ReturnType<typeof makeMemoryKv>).store.set(
+    'scribe:legacy-notes-import',
+    'on'
+  )
+  return made
+}
 
 describe('the old /notes-import attestation paths', () => {
   it.each([
@@ -163,7 +178,7 @@ describe('the old /notes-import attestation paths', () => {
   ])(
     '%s answers like %s, with Deprecation and a successor link',
     async (path, successor, body) => {
-      const { env } = makeEnv()
+      const { env } = legacyEnv()
       vi.spyOn(console, 'log').mockImplementation(() => {})
       const [old, current] = await Promise.all([
         call(env, 'POST', path, body),
@@ -184,7 +199,7 @@ describe('the old /notes-import attestation paths', () => {
   )
 
   it('still counts in the Notes Import rate-limit family', async () => {
-    const { env, limit } = makeEnv()
+    const { env, limit } = legacyEnv()
     vi.spyOn(console, 'log').mockImplementation(() => {})
     await call(env, 'POST', '/notes-import/challenge', undefined, {
       'cf-connecting-ip': '198.18.0.1',
@@ -193,7 +208,7 @@ describe('the old /notes-import attestation paths', () => {
   })
 
   it('keeps accepting the old verify purpose', async () => {
-    const { env, verifyAssertion } = makeEnv()
+    const { env, verifyAssertion } = legacyEnv()
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const response = await call(
       env,

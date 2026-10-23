@@ -1,6 +1,12 @@
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createHash, randomUUID } from 'node:crypto'
-import { DEV_BYPASS_TOKEN, configured, http, writeTranscript } from '../test/e2e'
+import {
+  DEV_BYPASS_TOKEN,
+  configured,
+  enableLegacyNotesImport,
+  http,
+  writeTranscript,
+} from '../test/e2e'
 
 /**
  * Notes Import without inference: the attestation verify probe (dev bypass),
@@ -12,6 +18,15 @@ import { DEV_BYPASS_TOKEN, configured, http, writeTranscript } from '../test/e2e
 
 afterAll(() => {
   writeTranscript('notes-import')
+})
+
+// Notes Import answers only behind Scribe AI's legacy switch (src/scribe/legacy.ts).
+let restoreLegacy = () => {}
+beforeAll(() => {
+  restoreLegacy = enableLegacyNotesImport()
+})
+afterAll(() => {
+  restoreLegacy()
 })
 
 const bypass = (token = DEV_BYPASS_TOKEN ?? '') => ({

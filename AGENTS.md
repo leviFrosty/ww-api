@@ -181,6 +181,231 @@ isolated worker on 8790-8799, and 8787 belongs to the user's own `wrangler dev`.
 Neither gives a stable public URL for an iOS device — use the deployed
 `--env dev` worker (or a `cloudflared` tunnel) for real-device App Attest tests.
 
+## Scribe AI
+
+Scribe AI (witness-work ADR 0032) is one model step per request: the app sends
+the conversation, its tool definitions, and an app context; the worker adds the
+static system prompt (`src/scribe/prompt.ts`), streams the model's text and
+tool calls back as SSE, and charges the step's units to the account's
+`ScribeMeter` Durable Object. The device runs every tool. The wire contract is
+witness-work's
+[`docs/scribe-ai-protocol.md`](https://github.com/leviFrosty/witness-work/blob/main/docs/scribe-ai-protocol.md);
+implement it as written and list any deviation in the PR. Code: `src/scribe/`
+(`route.ts` handlers, `validate.ts` request rules, `render.ts` wire → model
+input, `step.ts` the model call, `meter.ts` + `meterDO.ts` metering,
+`status.ts` kill switch and provider health, `legacy.ts` the Notes Import
+cutover).
+
+A Cancel or a dropped connection stops the model call through
+`c.req.raw.signal`, which aborts only under the `enable_request_signal`
+compatibility flag in `wrangler.toml`; keep it. The step is then charged as an
+abort (`error_code: "cancelled"`, `usage_estimated`). Under `wrangler dev` the
+signal fires on the stream's next write (model output or the 15 s heartbeat),
+not at the disconnect itself.
+
+### Configuration (KV and vars)
+
+Every switch lives in `NOTES_KV` and is edge-cached for 60 seconds. Each limit
+and model field resolves on its own: KV → environment variable → the code
+default (`src/scribe/config.ts`), so one bad KV field falls through without
+taking the others with it. A failed KV read counts as absent (fail open).
+
+| Key | Value | Effect |
+| --- | --- | --- |
+| `scribe:enabled` | `off`/`false`/`0`/`no`/`disabled`, JSON `false`, or `{"available":false}`; absent is on | Kill switch: status says `enabled: false, reason: "disabled"`; step and transcribe answer 503 `disabled` |
+| `scribe:disabled-tools` | JSON array or comma list of tool names | Denylist: those tools leave the offered set (`start.dropped`, reason `disabled`) |
+| `scribe:protocol-min` | integer ≥ 1 | Steps below it get 426 `upgrade_required` |
+| `scribe:min-version` | `{"minVersion":"x.y.z"}` or `x.y.z` | Advisory floor in status (`SCRIBE_MIN_APP_VERSION` otherwise); the worker refuses nothing by version |
+| `scribe:limits` | JSON, any subset of the protocol's limits | Windows, weights, grace, caps, sizes, `stepTimeoutMs`, `transcribePagesPerDay` |
+| `scribe:model` | JSON `{ model, providers, reasoningEffort, maxOutputTokens, strictTools, cacheKeyBuckets, fallback: { model, providers }, transcribeModel }` | Model and hosts. `reasoningEffort` is `low`, `medium`, `high`, `xhigh`, `max` or `off` (Luna has no `minimal`). `strictTools` and `cacheKeyBuckets` are KV only |
+| `scribe:provider-health` | written by the worker | Provider-health cache (300 s TTL, fresh for 60 s); delete it to re-probe now |
+| `scribe:legacy-notes-import` | `on` | Re-opens the Notes Import routes (below) |
+| `scribe:dev-session` | JSON `{"limits":"real","plan":"supporter"}`, either field | Dev sessions only (no effect in prod, which has none): keep the real limits instead of unlimited, and meter as that plan. For verifying the limit card and Supporter windows |
+
+Environment variables are `SCRIBE_` plus the field path in snake case:
+`SCRIBE_FREE_MONTHLY`, `SCRIBE_SUPPORTER_SESSION`, `SCRIBE_SUPPORTER_WEEKLY`,
+`SCRIBE_WINDOW_LENGTHS_SESSION_HOURS`, `SCRIBE_GRACE_UNITS`,
+`SCRIBE_MAX_INPUT_TOKENS`, `SCRIBE_STEP_TIMEOUT_MS`,
+`SCRIBE_TRANSCRIBE_PAGES_PER_DAY_FREE`, and so on, plus `SCRIBE_MODEL`,
+`SCRIBE_PROVIDERS` (comma list), `SCRIBE_REASONING_EFFORT` (`off` for none),
+`SCRIBE_MAX_OUTPUT_TOKENS`, `SCRIBE_FALLBACK_MODEL`,
+`SCRIBE_FALLBACK_PROVIDERS`, and `SCRIBE_TRANSCRIBE_MODEL`.
+
+```bash
+# Kill switch (on again: delete the key)
+wrangler kv key put --binding NOTES_KV scribe:enabled off
+# Withdraw a tool the app defines
+wrangler kv key put --binding NOTES_KV scribe:disabled-tools '["visits_log"]'
+# Change limits (fields not named keep their var or default)
+wrangler kv key put --binding NOTES_KV scribe:limits '{"free":{"monthly":120000}}'
+# Less reasoning (faster and cheaper, but drops actions more often; see below)
+wrangler kv key put --binding NOTES_KV scribe:model '{"reasoningEffort":"low"}'
+# Spread prompt-cache traffic over 4 keys (see Model notes before turning it on)
+wrangler kv key put --binding NOTES_KV scribe:model '{"cacheKeyBuckets":4}'
+# A fallback for when no allowlisted host serves tool calls for the model
+wrangler kv key put --binding NOTES_KV scribe:model '{"fallback":{"model":"openai/<model>","providers":["azure"]}}'
+```
+
+Add `--env dev` for the dev worker. `providers` is the ZDR allowlist (ADR
+0008): only Western zero-retention hosts, and it's never widened
+automatically. A dev session (opened with the dev bypass on the dev worker)
+gets unlimited windows and pages, metered as free, unless
+`scribe:dev-session` keeps the real limits or names the Supporter plan;
+request caps still apply. Locally: `node scripts/verify/dev.mjs kv put
+scribe:dev-session '{"limits":"real","plan":"supporter"}'` plus a small
+`scribe:limits` reaches the limit card in a minute.
+
+### Model notes (measured)
+
+- Azure serves `openai/gpt-6-luna` without `parallel_tool_calls`, so the
+  worker doesn't send it (with `require_parameters` OpenRouter would find no
+  host). The model makes parallel calls anyway.
+- Every step and page read sends OpenRouter's `user`: `providerUserId`, a
+  SHA-256 of the account id under its own label (`ww_` + 32 hex), never the
+  id itself and not the analytics id. Without it OpenRouter sends the whole
+  key's identity upstream, so one User's provider policy block (GPT-6's
+  `bio_policy`/`cyber_policy` 403s) would block every User. Azure still
+  routes with `require_parameters` (checked 2026-10-22).
+- The app context goes in a user-role message ahead of the conversation, not a
+  second system message: system messages are merged ahead of the tool
+  definitions, so a per-User context there split the prompt + tools prefix
+  every User shares, and step 0 got no cache hit. As a user message, step 0
+  caches about 3,500 of its 4,900 input tokens.
+- At `low` reasoning the model sometimes leaves out the second of two actions
+  in one message (9–10 of 12 multi-action utterances complete, 1.4–3.8 s a
+  step); `medium` completed 12 of 12 at 3.6–10 s a step and about 500–1,000
+  more units a step. The default is `medium` because a dropped action is worse
+  than a slower step; `scribe:model` `{"reasoningEffort":"low"}` trades back.
+- OpenRouter's account guardrail answers 403 "Request blocked: prompt
+  injection patterns detected" (nothing charged) when the input contains text
+  like "ignore previous instructions". A Visit note is enough, and since the
+  app resends the whole conversation, every later step would be blocked too.
+  So a blocked step is sent once more with every untrusted tool result
+  withheld (`render.ts` `WITHHELD_NOTICE`; the model says it couldn't read
+  it), and a step blocked again, or with no untrusted text to withhold, ends
+  as `done` `refused` instead of a retryable `model_error`. `injection_block`
+  in `api_scribe_step` counts both.
+- Prompt caching (measured October 2026; `cost` matched to the micro-dollar):
+  - GPT-6 Luna on Azure caches implicitly and **writes every uncached token**
+    of a prompt of 1,024 tokens or more (all but ≈ 3), billed at 1.25× input.
+    Usage reports them (`cache_write_tokens`), and the meter charges them at
+    `weights.cacheWrite` (1.25), so 1 unit ≈ $0.0000001 of real cost.
+  - The system prompt + tools prefix (≈ 3,860 tokens) is shared across Users
+    and conversations without any breakpoint: a new conversation's step 0
+    reads it and writes only its context and message.
+  - A page is read with caching off (`prompt_cache_options: { mode:
+    'explicit' }`, no breakpoints): nothing written or read, 17.6 % cheaper a
+    page. A 2,000 px page is ≈ 4,450 input tokens.
+  - OpenRouter sends a `prompt_cache_key` of its own when we send none, so
+    every step shares one key. Ours (`cacheKeyBuckets`) reaches Azure and
+    partitions the cache: each bucket keeps its own copy of the shared prefix
+    (one cold write, ≈ 4,800 units, per bucket idle 30 minutes), and turning
+    it on costs every User one cold step. Leave it at 0 until Azure's
+    overflow applies: sustained traffic above ≈ 15 requests a minute on one
+    key (watch step-0 `cached_input_tokens` and `turn_gap` in
+    `api_scribe_step`); then set it to about peak Scribe requests a minute ÷
+    10.
+- Limits are sized from these measurements at medium reasoning and a 50 %
+  cache hit rate (real sessions pause between turns, so the prefix cache often
+  goes cold), with cache writes at 1.25×: a 7-turn conversation ≈ 54.6k units
+  and a quick edit ≈ 7.2k, so the free 150k month fits two longer
+  conversations and three quick edits (130.8k) with headroom. Supporter: 540k
+  per 5 hours (≈ 9 longer conversations), 1.55M per week (≈ 28). Metering
+  writes raised every limit by ≈ 1.19×, which keeps each one's real cost
+  where it was.
+- Steps and pages read the account's plan through a 30-second per-isolate
+  cache (`src/scribe/plan.ts`), started alongside the body read. `GET
+  /scribe/v1/usage` always asks afresh, and a refusal never rests on a cached
+  plan (it's asked again first), so a new Supporter is never held back.
+- `done` is sent only after `settleStep` returns: the next step's admission
+  must see this step's charge, and a failed settle must end the step as an
+  error rather than leave an answered step uncharged.
+
+### Release and cutover
+
+**Before** a deploy carrying Scribe AI reaches prod or dev, set
+`scribe:legacy-notes-import` to `on` in that namespace, or every installed app
+on a Notes Import version gets 426 for imports:
+
+```bash
+wrangler kv key put --binding NOTES_KV scribe:legacy-notes-import on
+wrangler kv key put --binding NOTES_KV scribe:legacy-notes-import on --env dev
+```
+
+With it off (or absent), every `/notes-import/*` route except
+`GET /notes-import/status` answers 426 `upgrade_required` before its rate
+limit, auth, or kill switch, and `/admin/notes-import/reset` is 404. `GET
+/notes-import/usage` is 404 too: older composers read it on every open
+through the session client, which shows Update Required over the whole app
+on a 426, so they'd lose the app instead of seeing the composer's own update
+message. A failed
+KV read lets the request through. The cutover, once the user decides to run
+it, in order:
+
+1. The Scribe AI app version is live on both stores.
+2. Older composers show their update message:
+   `wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"X.Y.Z"}'`
+   (that version).
+3. Close the old routes:
+   `wrangler kv key put --binding NOTES_KV scribe:legacy-notes-import off`.
+4. Watch `api_scribe_step` errors and Notes Import 426 counts for a week; then
+   a follow-up deletes the Notes Import code.
+
+Undo step 3 with `scribe:legacy-notes-import on`. Each step takes up to 60
+seconds to reach every colo.
+
+### Usage reset
+
+`pnpm run admin:reset-usage [--dev] <accountId>` calls `POST
+/admin/scribe/reset`: every window of the account back to unused, and its
+pages for the day (the log line carries only the previous totals).
+`--notes-import` calls the old `POST /admin/notes-import/reset` instead, which
+answers only while `scribe:legacy-notes-import` is on.
+
+### Logging and analytics
+
+One JSON line per step (`console.info`) and the same properties to PostHog as
+`api_scribe_step` (and `api_scribe_transcribe` per page), with `distinct_id`
+the hashed account id and no person profile. Properties: `protocol`, `step`,
+`plan`, `platform`, `app_version`, `conversation_id`, `turn_id`, `offered`
+(tool names), `offered_count`, `dropped`, `tool_calls` (names), counts of
+unknown-tool and bad-args calls, `finish`, token counts (including
+`cache_write_tokens`), `units`, `usage_estimated`, `cost_usd` (OpenRouter's
+billed USD), `turn_gap` (step 0 of a later turn: minutes since the previous
+user message, `<5`, `5-30`, `30-120` or `>120`), `model`, `provider`,
+`latency_ms`, `ttft_ms`, `tainted`,
+`grace`, `retried_without_reasoning`, `injection_block` (`withheld` or
+`refused`, below), `rule` (the validation rule that refused the request), and
+`error_code`. **Never** add message text, the context, tool
+descriptions or schemas, call arguments, tool results, Refs, names, or
+provider error bodies: Sentry gets `ScribeModelError` (error class, HTTP
+status, provider code) instead of the AI SDK's error, and `streamText`'s
+`onError` is silenced because its default logs the whole provider response.
+
+### Verifying with a real model
+
+The free e2e (`src/e2e/scribe.e2e.test.ts`) covers every refusal without the
+model. The real-model suite costs a few cents:
+
+```bash
+# A file holding only OPENROUTER_API_KEY=… (mode 600, outside the repo)
+node scripts/verify/dev.mjs up --secrets-from /path/to/openrouter.env
+WW_API_E2E_ALLOW_PAID=1 pnpm exec vitest run --config vitest.e2e.config.ts src/e2e/scribeModel.e2e.test.ts
+node scripts/verify/dev.mjs down
+```
+
+It drives a 16-tool manifest (`src/test/scribeFixture.ts`) through tool
+calls, read → write, parallel calls, caching, units against the window,
+`limit_reached` with turn grace, `strictTools`, the legacy 426, and a 7-turn
+conversation, and writes `.verify/artifacts/scribe-model-<timestamp>.json`.
+
+Model quality (does each message become the right calls and reply) is
+measured from the app instead, with its real tools, context and turn loop: the
+app's `src/features/scribe/evals` runs about 60 spoken-style scenarios against
+this worker (`SCRIBE_EVAL_WORKER=<this checkout> pnpm exec vitest run
+src/features/scribe/evals` in the app; its README-style header has the
+options). Run it after any change to `prompt.ts`.
+
 ## Notes Import runtime limits and admin reset
 
 Allowance policy lives in each environment's `NOTES_KV` under
@@ -213,13 +438,14 @@ wrangler kv key delete --binding NOTES_KV notes-import:min-version              
 Resolution is KV → `NOTES_IMPORT_MIN_APP_VERSION` env var → unset (no floor);
 invalid values are logged and ignored. The read is edge-cached for 60 seconds.
 
-To reset one meter's rolling aggregate and Empty Import rows while preserving
-permanent replay/refinement records, copy `.env.example` to the gitignored
+To reset one Notes Import meter's rolling aggregate and Empty Import rows
+while preserving permanent replay/refinement records (only while
+`scribe:legacy-notes-import` is on), copy `.env.example` to the gitignored
 `.env`, set the environment-specific token/URL, then run:
 
 ```bash
-pnpm run admin:reset-usage <meterId>         # production
-pnpm run admin:reset-usage --dev <meterId>   # development
+pnpm run admin:reset-usage --notes-import <meterId>         # production
+pnpm run admin:reset-usage --dev --notes-import <meterId>   # development
 ```
 
 The meter id is the account id for app versions with sessions (from an inbox

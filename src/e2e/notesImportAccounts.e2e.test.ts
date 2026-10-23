@@ -1,10 +1,11 @@
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { accountSignedMessage } from '../accounts/contracts'
 import { SigningKey, b64u, randomId } from '../test/buddiesClient'
 import {
   DEV_BYPASS_TOKEN,
   LOCAL_LAUNCHER,
   configured,
+  enableLegacyNotesImport,
   http,
   localKv,
   writeTranscript,
@@ -24,6 +25,15 @@ import {
 
 afterAll(() => {
   writeTranscript('notes-import-accounts')
+})
+
+// Notes Import answers only behind Scribe AI's legacy switch (src/scribe/legacy.ts).
+let restoreLegacy = () => {}
+beforeAll(() => {
+  restoreLegacy = enableLegacyNotesImport()
+})
+afterAll(() => {
+  restoreLegacy()
 })
 
 const encoder = new TextEncoder()

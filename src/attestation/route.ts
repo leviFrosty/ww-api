@@ -18,7 +18,7 @@ import {
   issuePlayIntegrityChallenge,
   parsePlayIntegrityChallengeRequest,
 } from '../playIntegrity'
-import { attestationProviders } from './providers'
+import { attestationStatus } from './status'
 import {
   ATTESTATION_VERIFY_PURPOSE,
   NOTES_IMPORT_VERIFY_PURPOSE,
@@ -308,9 +308,12 @@ export async function handleAttestationVerifyRequest(ctx: AppContext) {
   }
 }
 
-/** GET /attestation/v1/status: the providers this worker accepts. No I/O. */
+/**
+ * GET /attestation/v1/status: the providers this worker accepts, as
+ * `capabilities` (the same objects `GET /notes-import/status` carries).
+ */
 export function handleAttestationStatusRequest(ctx: AppContext) {
-  return ctx.json({ providers: attestationProviders(ctx.env) }, 200, {
+  return ctx.json(attestationStatus(ctx.env), 200, {
     'Cache-Control': 'no-store',
   })
 }

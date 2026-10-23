@@ -305,7 +305,7 @@ export const notesImportAdminResetDocs = describeRoute({
   tags: ['Admin'],
   summary: 'Reset a Notes Import meter',
   description:
-    'Resets one meter’s rolling allowance and its Empty Import rows, keeping permanent replay and refinement records. Used by `pnpm run admin:reset-usage`.',
+    'Resets one meter’s rolling allowance and its Empty Import rows, keeping permanent replay and refinement records. Used by `pnpm run admin:reset-usage --notes-import`; answers only while KV `scribe:legacy-notes-import` is on.',
   security: [{ adminToken: [] }],
   requestBody: jsonBody(
     z.object({

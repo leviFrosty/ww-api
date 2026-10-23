@@ -541,11 +541,18 @@ export const attestationProvidersShape = {
 const statusRoute: RouteDocs = {
   summary: 'Accepted attestation providers',
   description:
-    'Which attestation providers and protocol versions this worker accepts, from its configuration alone (no I/O, `Cache-Control: no-store`). `GET /notes-import/status` repeats them in `capabilities` for older apps.',
+    'Which attestation providers and protocol versions this worker accepts, from its configuration alone (no I/O, reused per isolate for 30 s, `Cache-Control: no-store`). The app reads `capabilities` here to open account sessions; it is the same object `GET /notes-import/status` carries in `capabilities` for older apps.',
   responses: {
     200: jsonResponse(
       'The accepted providers.',
-      z.object({ providers: z.object(attestationProvidersShape) })
+      z.object({
+        ok: z.literal(true),
+        capabilities: z.object(attestationProvidersShape),
+        providers: z.object(attestationProvidersShape).meta({
+          description: 'Deprecated: the same object as `capabilities`, for builds that read this name.',
+          deprecated: true,
+        }),
+      })
     ),
     ...rateLimitedResponse,
   },
