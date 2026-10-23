@@ -86,11 +86,18 @@ export const nextIp = (): string => {
   return `198.18.${ipCounter >> 8}.${ipCounter & 255}`
 }
 
-/** Cloudflare rejects synthetic caller IPs on real deployments. */
-const callerHeaders = (): Record<string, string> =>
-  ['localhost', '127.0.0.1', '[::1]'].includes(new URL(BASE_URL).hostname)
+/**
+ * A fresh connection per request: `localKv` blocks the event loop while
+ * wrangler runs, so fetch never sees the worker close an idle keep-alive
+ * socket and the next request on it fails with "other side closed".
+ * Cloudflare rejects synthetic caller IPs on real deployments.
+ */
+const callerHeaders = (): Record<string, string> => ({
+  connection: 'close',
+  ...(['localhost', '127.0.0.1', '[::1]'].includes(new URL(BASE_URL).hostname)
     ? { 'cf-connecting-ip': nextIp() }
-    : {}
+    : {}),
+})
 
 export interface Exchange {
   status: number
