@@ -282,6 +282,10 @@ describe('event kinds and templates', () => {
     expect(
       parse('device/register', { ...android, pushService: 'gcm' })
     ).toBeNull()
+    // Absent means APNs; null isn't a service.
+    expect(
+      parse('device/register', { ...device, templates: {}, pushService: null })
+    ).toBeNull()
     // An FCM token alone is still an APNs registration, missing its token.
     expect(
       parse('device/register', { ...android, pushService: undefined })
