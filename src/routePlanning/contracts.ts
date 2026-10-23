@@ -46,6 +46,35 @@ export interface RouteOptimizeResponse {
   remainingToday: number
 }
 
+/**
+ * `POST /route-planning/directions`, bearer only: the driving route through
+ * `points` in the order given (start, stops, finish). Coordinates only.
+ */
+export const routeDirectionsRequestSchema = z
+  .object({
+    points: z
+      .array(coordinate)
+      .min(2)
+      .max(ROUTE_PLANNING_LIMITS.maxDirectionsPoints),
+  })
+  .strict()
+
+export interface RouteDirectionsLeg {
+  /** Driving distance for the leg, in metres. */
+  distanceMeters: number
+  /** Driving time for the leg, in seconds, with traffic at request time. */
+  durationSeconds: number
+  /** The road shape: flat `[lat, lng, lat, lng, …]`, 5 decimals. */
+  coordinates: number[]
+}
+
+export interface RouteDirectionsResponse {
+  /** One per consecutive pair of `points`. */
+  legs: RouteDirectionsLeg[]
+  /** Directions this account has left in the rolling 24 hours. */
+  remainingToday: number
+}
+
 export type RouteOptimizeErrorCode =
   | 'bad_request'
   | 'unauthorized'

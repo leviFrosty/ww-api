@@ -16,6 +16,8 @@ import {
 } from './config'
 import {
   type Coordinate,
+  routeDirectionsRequestSchema,
+  type RouteDirectionsResponse,
   routeOptimizeBearerRequestSchema,
   routeOptimizeRequestSchema,
   type RouteOptimizeErrorCode,
@@ -23,7 +25,8 @@ import {
   type RouteOptimizeResponse,
 } from './contracts'
 import { fetchWaypointsSequence } from './here'
-import { routeOptimizeDocs } from './openapi'
+import { fetchRoute } from './hereRouting'
+import { routeDirectionsDocs, routeOptimizeDocs } from './openapi'
 
 /**
  * `POST /route-planning/optimize` — Supporter-only shortest driving order for
@@ -39,6 +42,13 @@ import { routeOptimizeDocs } from './openapi'
  * Privacy: the body holds bare coordinates (and, legacy, an app user id).
  * Nothing here logs or reports them, the token, or the account id; HERE
  * receives only the coordinates.
+ */
+
+/**
+ * `POST /route-planning/directions` — the driving route through the points in
+ * the order given, so the app can draw roads and time each leg. Bearer only,
+ * for every account (not only Supporters): the per-account directions quota
+ * bounds spend. iOS asks MapKit on the device instead; this serves Android.
  */
 
 /**
@@ -95,6 +105,33 @@ const AUTH_REFUSALS = {
   disabled: [HTTP_STATUS.SERVICE_UNAVAILABLE, 'Accounts are unavailable'],
   internal: [HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Something went wrong'],
 } as const
+
+/** The JSON body within the size limit, or the refusal to send. */
+const readJson = async (
+  ctx: AppContext
+): Promise<{ ok: true; json: unknown } | { ok: false; response: Response }> => {
+  const tooLarge = () => ({
+    ok: false as const,
+    response: fail(
+      ctx,
+      HTTP_STATUS.PAYLOAD_TOO_LARGE,
+      'payload_too_large',
+      'Request too large'
+    ),
+  })
+  const declaredLength = Number(ctx.req.header('content-length') ?? 0)
+  if (declaredLength > LIMITS.maxBodyBytes) return tooLarge()
+  const text = await ctx.req.text()
+  if (text.length > LIMITS.maxBodyBytes) return tooLarge()
+  try {
+    return { ok: true, json: JSON.parse(text) }
+  } catch {
+    return {
+      ok: false,
+      response: fail(ctx, HTTP_STATUS.BAD_REQUEST, 'bad_request', 'Invalid JSON'),
+    }
+  }
+}
 
 /** Who's asking: the session's account, or a legacy request's app user id. */
 type Caller =
@@ -158,30 +195,9 @@ export const createRoutePlanningRoutes = (
       caller = { kind: 'legacy' }
     }
 
-    const declaredLength = Number(ctx.req.header('content-length') ?? 0)
-    if (declaredLength > LIMITS.maxBodyBytes) {
-      return fail(
-        ctx,
-        HTTP_STATUS.PAYLOAD_TOO_LARGE,
-        'payload_too_large',
-        'Request too large'
-      )
-    }
-    const text = await ctx.req.text()
-    if (text.length > LIMITS.maxBodyBytes) {
-      return fail(
-        ctx,
-        HTTP_STATUS.PAYLOAD_TOO_LARGE,
-        'payload_too_large',
-        'Request too large'
-      )
-    }
-    let json: unknown
-    try {
-      json = JSON.parse(text)
-    } catch {
-      return fail(ctx, HTTP_STATUS.BAD_REQUEST, 'bad_request', 'Invalid JSON')
-    }
+    const body = await readJson(ctx)
+    if (!body.ok) return body.response
+    const { json } = body
     let request: { start: Coordinate; stops: Coordinate[]; quotaName: string }
     if (caller.kind === 'bearer') {
       const parsed = routeOptimizeBearerRequestSchema.safeParse(json)
@@ -296,6 +312,98 @@ export const createRoutePlanningRoutes = (
       order: result.order,
       distanceMeters: Math.round(result.distanceMeters),
       durationSeconds: Math.round(result.durationSeconds),
+      remainingToday: decision.remainingToday,
+    }
+    return ctx.json(response)
+  })
+
+  routes.post('/directions', routeDirectionsDocs, async (ctx) => {
+    if (!(await isRoutePlanningEnabled(ctx.env))) {
+      return fail(
+        ctx,
+        HTTP_STATUS.SERVICE_UNAVAILABLE,
+        'unavailable',
+        'Route planning is unavailable',
+        UNAVAILABLE_RETRY_AFTER_SECONDS
+      )
+    }
+
+    // No legacy form: no app version before sessions asks for directions.
+    const auth = hasAuthorization(ctx)
+      ? await authenticateAccount(ctx, { requireActive: true })
+      : ({ ok: false, error: 'unauthorized' } as const)
+    if (!auth.ok) {
+      const [status, message] = AUTH_REFUSALS[auth.error]
+      const response = fail(
+        ctx,
+        status,
+        auth.error,
+        message,
+        auth.error === 'disabled' ? UNAVAILABLE_RETRY_AFTER_SECONDS : undefined
+      )
+      if (auth.error === 'unauthorized')
+        response.headers.set('WWW-Authenticate', BEARER_CHALLENGE)
+      return response
+    }
+
+    const body = await readJson(ctx)
+    if (!body.ok) return body.response
+    const parsed = routeDirectionsRequestSchema.safeParse(body.json)
+    if (!parsed.success) {
+      return fail(ctx, HTTP_STATUS.BAD_REQUEST, 'bad_request', 'Invalid request')
+    }
+
+    // Its own quota object, so drawing routes never spends Shortest Order's.
+    const decision = await quota(
+      ctx.env,
+      `directions:account:${auth.account.accountId}`
+    ).consume({
+      nowMs: deps.now(),
+      dailyLimit: LIMITS.directionsDailyLimit,
+      minuteLimit: LIMITS.directionsMinuteLimit,
+    })
+    if (!decision.allowed) {
+      return fail(
+        ctx,
+        HTTP_STATUS.TOO_MANY_REQUESTS,
+        decision.reason === 'daily' ? 'daily_limit' : 'rate_limited',
+        decision.reason === 'daily'
+          ? 'Daily directions limit reached'
+          : 'Too many directions requests',
+        decision.retryAfterSeconds
+      )
+    }
+
+    const result = await fetchRoute(
+      parsed.data.points,
+      ctx.env.HERE_API_KEY,
+      deps.fetch,
+      LIMITS.hereTimeoutMs
+    )
+    if (result.kind === 'no_route') {
+      return fail(
+        ctx,
+        HTTP_STATUS.UNPROCESSABLE_ENTITY,
+        'no_route',
+        'No driving route connects these points'
+      )
+    }
+    if (result.kind === 'upstream_error') {
+      Sentry.captureMessage('HERE Routing request failed', {
+        level: 'warning',
+        fingerprint: ['here-routing-failed'],
+        tags: { 'here_api.status': result.status ?? 'network' },
+      })
+      return fail(
+        ctx,
+        HTTP_STATUS.BAD_GATEWAY,
+        'upstream_error',
+        'Routing service unavailable'
+      )
+    }
+
+    const response: RouteDirectionsResponse = {
+      legs: result.legs,
       remainingToday: decision.remainingToday,
     }
     return ctx.json(response)

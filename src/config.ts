@@ -2,6 +2,7 @@ export const HERE_API = {
   GEOCODE_URL: 'https://geocode.search.hereapi.com/v1/geocode',
   AUTOCOMPLETE_URL: 'https://autocomplete.search.hereapi.com/v1/autocomplete',
   WAYPOINTS_SEQUENCE_URL: 'https://wps.hereapi.com/v8/findsequence2',
+  ROUTES_URL: 'https://router.hereapi.com/v8/routes',
   API_KEY_PARAM: 'apiKey',
 } as const;
 
