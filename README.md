@@ -477,6 +477,43 @@ unreachable; fails closed), `unavailable` (503 — kill switch), `daily_limit` /
 503 sends `Retry-After` and repeats it as `retryAfter` (and, for older builds,
 `retryAfterSeconds`).
 
+### `POST /route-planning/directions`
+
+The driving route through the points in the order given, so the Android app
+can draw roads on the route map and time each leg (iOS asks MapKit on the
+device). One HERE Routing v8 transaction per request: every point between the
+first and last is a stopover `via`, so the route comes back as one section per
+leg.
+
+**Request** (JSON; any other field is rejected), with `Authorization: Bearer
+<access token>`: 2–12 points (the start, the stops, and a finish elsewhere).
+
+```json
+{ "points": [{ "lat": 39.1031, "lng": -84.512 }, { "lat": 39.11, "lng": -84.5 }] }
+```
+
+Any account with a session, Supporter or not; a suspended account is refused
+(403 `suspended`). No legacy form. Limits are per account and separate from
+optimizations (100 a day, 10 a minute). Routing v8 takes waypoints only in the
+query string, so the coordinates are in HERE's URL; the call uses an
+uninstrumented `fetch`, so the URL never reaches a trace, and nothing logs or
+stores the coordinates.
+
+**Response:** one leg per consecutive pair of points. `coordinates` is the
+road shape as flat `[lat, lng, lat, lng, …]`, rounded to 5 decimals.
+
+```json
+{
+  "legs": [{ "distanceMeters": 4321, "durationSeconds": 601, "coordinates": [39.1031, -84.512, 39.11, -84.5] }],
+  "remainingToday": 99
+}
+```
+
+**Errors** as for optimize: `bad_request` (400), `unauthorized` (401),
+`suspended` (403), `payload_too_large` (413), `no_route` (422),
+`daily_limit` / `rate_limited` (429), `upstream_error` (502), `unavailable` /
+`disabled` (503).
+
 ### `/health`
 
 Health check endpoint, and the clock clients calibrate against: it sends

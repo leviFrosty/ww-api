@@ -15,6 +15,19 @@ export const ROUTE_PLANNING_LIMITS = {
   maxBodyBytes: 4096,
   /** HERE answers a 10-stop sequence in well under a second. */
   hereTimeoutMs: 15_000,
+  /**
+   * Points per directions request: the start, every stop, and a finish
+   * elsewhere.
+   */
+  maxDirectionsPoints: 12,
+  /**
+   * Directions per account in any rolling 24 hours. The app asks again only
+   * when a leg it hasn't seen appears (a stop added, moved, or a new start), so
+   * a day of planning uses a few dozen.
+   */
+  directionsDailyLimit: 100,
+  /** Directions per account in any rolling minute. */
+  directionsMinuteLimit: 10,
 } as const
 
 export const ROUTE_PLANNING_ENABLED_KEY = 'route-planning:enabled'
