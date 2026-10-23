@@ -606,7 +606,7 @@ const MAX_BUNDLE_ID_CHARS = 155
  * ignored.
  */
 const pushAddress = (p: Fields): PushAddress | null => {
-  const service = p.pushService ?? 'apns'
+  const service = p.pushService === undefined ? 'apns' : p.pushService
   if (service === 'fcm') {
     if (p.appAlerts !== undefined && typeof p.appAlerts !== 'boolean')
       return null
