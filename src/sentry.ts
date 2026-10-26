@@ -21,20 +21,23 @@ export function redactContactLinkPayloads(value: string): string {
 }
 
 /**
- * Query parameters that carry a credential: Notes Import's legacy run routes
- * (`/notes-import/:importId/events|result|cancel|destroy`) take their
- * subscribe token as `?token=`, and the HERE proxy drops a client-sent
- * `apiKey` for its own. The SDK records the request URL whole
- * (`event.request.url` and `query_string`, `url.full` span data, the Referer
- * header, breadcrumbs), and Notes Import traces at 100%, so their values are
- * cut from every string in an event, like contact links. Names are lowercase
- * and match without regard to case.
+ * Query parameters that carry a credential or the user's data: Notes Import's
+ * legacy run routes (`/notes-import/:importId/events|result|cancel|destroy`)
+ * take their subscribe token as `?token=`, and the HERE proxy drops a
+ * client-sent `apiKey` for its own. The HERE proxy (`/geocode`,
+ * `/autocomplete`) also takes what the user typed, often a contact's address,
+ * as `q` or `qq`, and the user's location as `at` or `in`. The SDK records the
+ * request URL whole (`event.request.url` and `query_string`, `url.full` span
+ * data, the Referer header, breadcrumbs), and Notes Import traces at 100%
+ * (everything else at 10%), so their values are cut from every string in an
+ * event, like contact links. Names are lowercase and match without regard to
+ * case.
  *
  * A name is compared as the worker reads it: Hono and `URLSearchParams`
  * decode percent-escapes (and `+`) in names, so `?to%6Ben=` is a `token`
  * too. The raw name stays in the string; only the value is cut.
  */
-const SECRET_QUERY_PARAMETERS = ['token', 'apikey'];
+const SECRET_QUERY_PARAMETERS = ['token', 'apikey', 'q', 'qq', 'at', 'in'];
 /**
  * A query parameter's `name=` at the start of a string or after `?` or `&`.
  * It matches only up to the `=`, so a parameter inside another one's value
