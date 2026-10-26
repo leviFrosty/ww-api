@@ -539,11 +539,13 @@ Because those traces record request URLs whole, `src/sentry.ts` cuts the value
 of every `token` query parameter (legacy run routes' subscribe token, `?token=`)
 and `apiKey` (a client-sent HERE key) from every string in an event,
 transaction, span, and breadcrumb (`token=[redacted]`), and from an object or
-pair-list `request.query_string`. Names match as the worker reads them,
-percent-escapes decoded (`?to%6Ben=` is `token` to Hono), and without regard
-to case. A new route that takes a credential in its
-query string adds its name to `SECRET_QUERY_PARAMETERS` (better: take it in a
-header).
+pair-list `request.query_string`. It cuts the HERE proxy's `q` and `qq` (what
+the user typed, often a contact's address) and `at` and `in` (the user's
+location) the same way, since `/geocode` and `/autocomplete` trace at 10%.
+Names match as the worker reads them, percent-escapes decoded (`?to%6Ben=` is
+`token` to Hono), and without regard to case. A new route that takes a
+credential or user data in its query string adds its name to
+`SECRET_QUERY_PARAMETERS` (better: take it in a header or body).
 
 ## Buddies
 

@@ -77,8 +77,22 @@ describe('redactSecretQueryParameters', () => {
     ['token=s3cr3t&lastEventId=3', 'token=[redacted]&lastEventId=3'],
     [
       'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=k3y',
-      'https://ww-proxy.test/autocomplete?q=Main%20St&apiKey=[redacted]',
+      'https://ww-proxy.test/autocomplete?q=[redacted]&apiKey=[redacted]',
     ],
+    // The HERE proxy's search text and the user's location.
+    [
+      'https://ww-proxy.test/autocomplete?q=12+Oak+Rd&limit=5&in=circle%3A35.3%2C-79.1%3Br%3D1000000',
+      'https://ww-proxy.test/autocomplete?q=[redacted]&limit=5&in=[redacted]',
+    ],
+    [
+      'https://ww-proxy.test/geocode?q=12%20Oak%20Rd%20Springfield&limit=1',
+      'https://ww-proxy.test/geocode?q=[redacted]&limit=1',
+    ],
+    [
+      '?qq=city%3DSpringfield&at=35.3,-79.1&lang=en',
+      '?qq=[redacted]&at=[redacted]&lang=en',
+    ],
+    ['Q=12+Oak+Rd&limit=5', 'Q=[redacted]&limit=5'],
     // Hono and URLSearchParams decode names, so these are `token` too. The
     // raw name stays.
     [`${EVENTS}?to%6ben=s3cr3t`, `${EVENTS}?to%6ben=[redacted]`],
@@ -90,7 +104,7 @@ describe('redactSecretQueryParameters', () => {
     ['?to%6ben=s3cr3t', '?to%6ben=[redacted]'],
     [
       'https://ww-proxy.test/autocomplete?q=Main&api%4Bey=k3y',
-      'https://ww-proxy.test/autocomplete?q=Main&api%4Bey=[redacted]',
+      'https://ww-proxy.test/autocomplete?q=[redacted]&api%4Bey=[redacted]',
     ],
     // A secret's value runs to the next `&`, whatever it holds.
     [`${EVENTS}?token=s3c?r3t=x&a=1`, `${EVENTS}?token=[redacted]&a=1`],
@@ -114,8 +128,8 @@ describe('redactSecretQueryParameters', () => {
   it.each([
     `${EVENTS}?lastEventId=3`,
     'GET /notes-import/:importId/events',
-    'https://ww-proxy.test/autocomplete?q=token',
-    'https://ww-proxy.test/geocode?q=a%3Dtoken%3D1',
+    'https://ww-proxy.test/autocomplete?lang=token',
+    'https://ww-proxy.test/geocode?limit=a%3Dtoken%3D1',
     'a token=s3cr3t in prose',
     // Names that decode to something else, malformed escapes included.
     `${EVENTS}?to%6ben%=x&tok%ZZen=x&to%256ben=x&tokens=x&to+ken=x`,
@@ -399,6 +413,10 @@ describe('Sentry scrubbers', () => {
         [['%74oken', SECRET], ['lastEventId', '3']],
         [['%74oken', '[redacted]'], ['lastEventId', '3']],
       ],
+      [
+        [['q', '12 Oak Rd'], ['limit', '5'], ['in', 'circle:35.3,-79.1;r=1000000']],
+        [['q', '[redacted]'], ['limit', '5'], ['in', '[redacted]']],
+      ],
     ]) {
       const scrubbed = config.beforeSend!(
         { type: undefined, request: request(queryString) },
@@ -448,7 +466,7 @@ describe('Sentry scrubbers', () => {
     const event: TransactionEvent = {
       type: 'transaction',
       transaction: 'GET /c/:payload',
-      request: { url: 'https://ww-proxy.leviwilkerson.com/geocode?q=1' },
+      request: { url: 'https://ww-proxy.leviwilkerson.com/geocode?limit=1' },
     }
     const snapshot = structuredClone(event)
 
@@ -607,5 +625,52 @@ describe('database errors', () => {
     expect(redactDatabaseErrors('No query here; params are fine')).toBe(
       'No query here; params are fine'
     )
+  })
+})
+
+describe('HERE proxy requests', () => {
+  it('sends neither the search text nor the location', () => {
+    const ADDRESS = '12 Oak Rd Springfield'
+    const url =
+      'https://ww-proxy.test/autocomplete?q=12+Oak+Rd+Springfield&limit=5&in=circle%3A35.3289%2C-79.1165%3Br%3D1000000'
+    const redactedUrl =
+      'https://ww-proxy.test/autocomplete?q=[redacted]&limit=5&in=[redacted]'
+    const config = createSentryConfig({
+      SENTRY_DSN: 'https://public@o0.ingest.sentry.io/0',
+      APP_ATTEST_ENVIRONMENT: 'production',
+    } as Environment)
+    const transaction = config.beforeSendTransaction!(
+      {
+        type: 'transaction',
+        transaction: 'GET /autocomplete',
+        request: {
+          url,
+          query_string: 'q=12+Oak+Rd+Springfield&limit=5&in=circle%3A35.3289%2C-79.1165%3Br%3D1000000',
+          headers: { referer: url },
+        },
+        contexts: {
+          trace: {
+            trace_id: 't',
+            span_id: 's',
+            data: {
+              'url.full': url,
+              'http.query': '?q=12+Oak+Rd+Springfield&limit=5',
+              'url.query': 'q=12+Oak+Rd+Springfield&limit=5',
+            },
+          },
+        },
+      },
+      {}
+    ) as TransactionEvent
+    const sent = JSON.stringify(transaction)
+    for (const leaked of ['Oak', '35.3289', '79.1165', ADDRESS]) {
+      expect(sent).not.toContain(leaked)
+    }
+    expect(transaction.request?.url).toBe(redactedUrl)
+    expect(transaction.contexts?.trace?.data).toEqual({
+      'url.full': redactedUrl,
+      'http.query': '?q=[redacted]&limit=5',
+      'url.query': 'q=[redacted]&limit=5',
+    })
   })
 })
