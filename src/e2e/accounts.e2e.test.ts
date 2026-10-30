@@ -224,7 +224,11 @@ describe('POST /accounts/v1/backup/*', () => {
     const bytes = randomBytes(64 * 1_024)
     const stored = await put(key, slotId, bytes)
     expect(stored.status).toBe(200)
-    expect(stored.body).toEqual({ ok: true, uploadedAt: expect.any(Number) })
+    expect(stored.body).toEqual({
+      ok: true,
+      uploadedAt: expect.any(Number),
+      etag: expect.any(String),
+    })
     // One put a slot a minute.
     const again = await put(key, slotId, bytes)
     expect(again.status).toBe(429)
@@ -233,7 +237,14 @@ describe('POST /accounts/v1/backup/*', () => {
     const listed = await send('backup/list', key)
     expect(listed.body).toEqual({
       ok: true,
-      slots: [{ slotId, size: bytes.byteLength, uploadedAt: stored.body.uploadedAt }],
+      slots: [
+        {
+          slotId,
+          size: bytes.byteLength,
+          uploadedAt: stored.body.uploadedAt,
+          etag: stored.body.etag,
+        },
+      ],
     })
 
     const got = await httpBytes('/accounts/v1/backup/get', {
@@ -241,6 +252,7 @@ describe('POST /accounts/v1/backup/*', () => {
     })
     expect(got.status).toBe(200)
     expect(got.bytes).toEqual(bytes)
+    expect(got.headers.get('etag')).toBe(`"${stored.body.etag}"`)
 
     expect((await send('backup/delete', key)).status).toBe(200)
     expect((await send('backup/list', key)).body.slots).toEqual([])
