@@ -18,7 +18,16 @@ import {
   refuseOverDailyQuota,
   verifiedBody,
 } from './signed'
-import { accountsDb, newAccountId, registerAccount } from './store'
+import {
+  accountsDb,
+  changes,
+  findAccountByPub,
+  keyRetiredResponse,
+  refuseRetiredKey,
+  newAccountId,
+  registerAccount,
+  type AccountsDb,
+} from './store'
 import {
   closeSession,
   isSessionLive,
@@ -93,6 +102,7 @@ const issueTokens = async (
     id: string
     accountId: string
     platform: SessionPlatform
+    keyEpoch: number
     expiresAt: number
   },
   refreshToken: string
@@ -101,6 +111,7 @@ const issueTokens = async (
     accountId: session.accountId,
     sessionId: session.id,
     platform: session.platform,
+    keyEpoch: session.keyEpoch,
     sessionExpiresAt: session.expiresAt,
   })
   return { ...access, refreshToken, sessionExpiresAt: session.expiresAt }
@@ -112,6 +123,10 @@ const issueTokens = async (
  * place of the attestation. Creates the account when the key has none
  * (never with a ticket), opens a session, and ends the account's oldest past
  * the cap. 201, with `Location` naming the session the new token addresses.
+ * A key a key change retired is 403 `key_retired` whichever way it opens.
+ * With `accountId` in the payload, it opens only when the key is that
+ * account's current key, else 404 `unknown_account`, and never creates an
+ * account (ADR 0039: a device resolving a key change asks which key won).
  */
 const handleOpen = guarded('session/open', async (c) => {
   const setup = await ready(c)
@@ -136,6 +151,15 @@ const handleOpen = guarded('session/open', async (c) => {
   )
   if (overQuota) return overQuota
 
+  const db = accountsDb(setup.db)
+  const retired = await refuseRetiredKey(db, accountPub)
+  if (retired) return retired
+  if (fields.accountId != null) {
+    const known = await findAccountByPub(db, accountPub)
+    if (!known || known.id !== fields.accountId)
+      return buddiesErrorResponse('unknown_account')
+  }
+
   if (fields.ticket != null)
     return openWithTicket(c, setup, verified.payload, fields)
 
@@ -146,16 +170,24 @@ const handleOpen = guarded('session/open', async (c) => {
     platform = attested.platform
   }
 
-  const db = accountsDb(setup.db)
-  const account = await registerAccount(db, accountPub, newAccountId)
+  const registered = await registerAccount(db, accountPub, newAccountId)
+  if ('retired' in registered) return keyRetiredResponse(registered.retired)
+  const { account } = registered
   const issued = await createSession(db, setup.keys.current, {
     accountId: account.id,
+    accountPub,
+    keyEpoch: account.keyEpoch,
     platform,
     device,
     method: platform === 'dev' ? 'dev' : 'attestation',
     appVersion: fields.appVersion,
     capabilities: fields.capabilities,
   })
+  if (!issued)
+    return (
+      (await refuseRetiredKey(db, accountPub)) ??
+      buddiesErrorResponse('conflict')
+    )
   return opened(c, setup.keys, account, issued)
 })
 
@@ -248,6 +280,8 @@ const openWithTicket = async (
 
   const { statements, issued } = await prepareSession(db, setup.keys.current, {
     accountId: account.id,
+    accountPub: payload.accountPub,
+    keyEpoch: account.keyEpoch,
     platform: 'web',
     device: fields.device,
     method: claims.kind,
@@ -268,6 +302,11 @@ const openWithTicket = async (
     ])
   )
   if ('used' in result) return repeat()
+  // The account's key changed between the read and the batch.
+  if (changes(result.result[1]) !== 1)
+    return (
+      (await refuseRetiredKey(db, payload.accountPub)) ?? invalid()
+    )
   return opened(c, setup.keys, account, issued)
 }
 

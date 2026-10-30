@@ -246,8 +246,13 @@ export const BUDDIES_ERROR_STATUS = {
   turnstile_failed: 403,
   /** A web session hasn't passed a step-up in the last 5 minutes. */
   step_up_required: 403,
-  /** Reserved (ADR 0039): a session open with a retired account key. */
+  /**
+   * A session open, `account/register`, or web sign-up with an account key a
+   * key change retired (ADR 0039); `changedAt` says when.
+   */
   key_retired: 403,
+  /** A web session less than 24 hours old asked to change the account key. */
+  session_too_new: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS

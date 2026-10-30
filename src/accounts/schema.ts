@@ -58,6 +58,43 @@ export const accounts = sqliteTable('accounts', {
   createdVia: text('created_via', { enum: ACCOUNT_ORIGINS })
     .notNull()
     .default('app'),
+  /** When the account key last changed (ADR 0039); null if it never has. */
+  keyChangedAt: integer('key_changed_at', { mode: 'timestamp_ms' }),
+})
+
+/**
+ * Account keys a key change replaced (ADR 0039), retired for good: opening a
+ * session, registering, or signing up with one is `key_retired`, and none
+ * ever creates an account. Public keys only, as pseudonymous as
+ * `accounts.account_pub`. No foreign key, so a key stays retired whatever
+ * becomes of its account.
+ */
+export const retiredAccountKeys = sqliteTable(
+  'retired_account_keys',
+  {
+    /** The retired signing key's Ed25519 public key (b64u, 32 bytes). */
+    accountPub: text('account_pub').primaryKey(),
+    accountId: text('account_id').notNull(),
+    /** The account's key epoch while this key was its key. */
+    keyEpoch: integer('key_epoch').notNull(),
+    retiredAt: integer('retired_at', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [index('retired_account_keys_account_idx').on(t.accountId)]
+)
+
+/**
+ * The key history blob the last key change stored (ADR 0039 §6): sealed by
+ * the devices under a key from the current account key, stored opaque and
+ * never read here.
+ */
+export const accountKeyHistory = sqliteTable('account_key_history', {
+  accountId: text('account_id')
+    .primaryKey()
+    .references(() => accounts.id, { onDelete: 'cascade' }),
+  /** The epoch it was sealed for (its AAD names it). */
+  keyEpoch: integer('key_epoch').notNull(),
+  blob: text('blob').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
 })
 
 /** Every status change, for appeals and auditing. */
@@ -179,6 +216,7 @@ export const ACTIVITY_KINDS = [
   'passkey.added',
   'passkey.removed',
   'device.approved',
+  'account.key_changed',
 ] as const
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number]
 

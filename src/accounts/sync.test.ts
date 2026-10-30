@@ -227,13 +227,16 @@ describe('put, list, get, delete', () => {
     expect(h.syncBlobs.objects.size).toBe(0)
   })
 
-  it('needs a live session to delete every slot, not one', async () => {
+  it('needs a live session to put or delete a slot', async () => {
     const s = await session()
     const mine = slot()
     await put(s, mine)
     await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(s.accessToken))
     expect((await del(s)).status).toBe(401)
-    expect((await del(s, { slotId: mine })).status).toBe(200)
+    expect((await del(s, { slotId: mine })).status).toBe(401)
+    expect((await put(s, mine)).status).toBe(401)
+    // Reads keep the token's 15 minutes.
+    expect((await get(s, mine)).status).toBe(200)
   })
 
   it('refuses malformed requests', async () => {

@@ -36,6 +36,7 @@ import {
   handoffBlobTooLarge,
   parseAccountKeyPayload,
   passkeyAddTooLarge,
+  rekeyTooLarge,
   sessionDeviceTooLarge,
   webSignupTooLarge,
 } from './contracts'
@@ -63,6 +64,7 @@ const TOO_LARGE: Partial<Record<AccountsOp, (payload: unknown) => boolean>> = {
   'session/open': sessionDeviceTooLarge,
   'passkey/add': passkeyAddTooLarge,
   'web/signup': webSignupTooLarge,
+  'account/rekey': rekeyTooLarge,
 }
 
 /**
