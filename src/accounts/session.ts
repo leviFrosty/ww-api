@@ -158,11 +158,12 @@ const handleOpen = guarded('session/open', async (c) => {
 })
 
 /** 201 with the new session's tokens, as every way of opening answers. */
-const opened = async (
+export const opened = async (
   c: AppContext,
   keys: AccessTokenKeys,
   account: { id: string; status: AccountStatus },
-  issued: IssuedSession
+  issued: IssuedSession,
+  extras: Record<string, unknown> = {}
 ) =>
   c.json(
     {
@@ -172,6 +173,7 @@ const opened = async (
       sessionId: issued.session.id,
       platform: issued.session.platform,
       ...(await issueTokens(keys, issued.session, issued.refreshToken)),
+      ...extras,
     },
     201,
     { Location: CURRENT_SESSION_PATH }

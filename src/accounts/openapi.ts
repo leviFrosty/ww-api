@@ -836,7 +836,7 @@ const refreshTokenSchema = (description: string) =>
       description: `${description}. Opaque to the app: the session’s id, a secret, and the server’s MAC over both, \`<sessionId>.<secret>.<mac>\` (base64url, 16, 32, and 32 bytes); store and send it as is`,
     })
 
-const tokenPair = {
+export const tokenPair = {
   accessToken: z.string().meta({
     description:
       'A JWT (HS256) for `Authorization: Bearer`, opaque to the app. Keep it in memory only.',
@@ -850,7 +850,7 @@ const tokenPair = {
   ),
 }
 
-const sessionPlatformOf = z.enum(SESSION_PLATFORMS).meta({
+export const sessionPlatformOf = z.enum(SESSION_PLATFORMS).meta({
   description: 'The session’s platform (the access token’s `platform` claim): `ios`, `android`, `dev`, or `web`.',
 })
 

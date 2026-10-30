@@ -37,6 +37,7 @@ import {
   parseAccountKeyPayload,
   passkeyAddTooLarge,
   sessionDeviceTooLarge,
+  webSignupTooLarge,
 } from './contracts'
 import { accountsDb, findAccountByPub, type AccountRecord } from './store'
 import { envelopeNonce, findUsedToken, type UsedId } from './passkeyStore'
@@ -56,21 +57,24 @@ export type Verified<K extends AccountsOp> =
   | VerifiedCall<K>
   | { refusal: Response }
 
+/** Each op's own `too_large` check, run on the payload before parsing it. */
+const TOO_LARGE: Partial<Record<AccountsOp, (payload: unknown) => boolean>> = {
+  'handoff/send': handoffBlobTooLarge,
+  'session/open': sessionDeviceTooLarge,
+  'passkey/add': passkeyAddTooLarge,
+  'web/signup': webSignupTooLarge,
+}
+
 /**
  * Checks a parsed envelope for `op`: the key payload and the op's own fields
- * (`bad_request`, or `too_large` for `handoff/send`'s oversized key and
- * `session/open`'s oversized device label), the signature
- * by the named key (`bad_signature`), and the timestamp (`stale`).
+ * (`bad_request`, or `too_large` for a field over its cap: `TOO_LARGE`), the
+ * signature by the named key (`bad_signature`), and the timestamp (`stale`).
  */
 export const verifyEnvelope = async <K extends AccountsOp>(
   op: K,
   envelope: Envelope | null
 ): Promise<Verified<K>> => {
-  if (op === 'handoff/send' && envelope && handoffBlobTooLarge(envelope.payload))
-    return { refusal: buddiesErrorResponse('too_large') }
-  if (op === 'session/open' && envelope && sessionDeviceTooLarge(envelope.payload))
-    return { refusal: buddiesErrorResponse('too_large') }
-  if (op === 'passkey/add' && envelope && passkeyAddTooLarge(envelope.payload))
+  if (envelope && TOO_LARGE[op]?.(envelope.payload))
     return { refusal: buddiesErrorResponse('too_large') }
   const payload = envelope ? parseAccountKeyPayload(envelope.payload) : null
   const fields = envelope

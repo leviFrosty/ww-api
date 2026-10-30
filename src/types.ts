@@ -421,8 +421,39 @@ export interface Environment {
   ACCOUNT_TICKET_SECRET?: string;
 
   /**
+   * Web sign-up's kill-switch fallback when KV `accounts:web-signup` is
+   * absent: `"off"` (or `"false"`) refuses both sign-up routes with 503
+   * `disabled`; anything else (and unset) leaves them on.
+   */
+  WEB_SIGNUP?: string;
+
+  /** Web sign-ups per caller IP (IPv6 by /64) a rolling day. Default 3. */
+  WEB_SIGNUP_PER_IP_DAY?: string;
+
+  /** Web sign-ups per network (ASN) a rolling hour. Default 30. */
+  WEB_SIGNUP_PER_ASN_HOUR?: string;
+
+  /** Web recoveries (`web/recovery`) per caller IP a rolling day. Default 10. */
+  WEB_RECOVERY_PER_IP_DAY?: string;
+
+  /**
+   * Turnstile's site key for web sign-up and recovery, served by
+   * `GET /app/v1/config` (`webSignup.turnstileSiteKey`). Not a secret.
+   * Development workers fall back to Cloudflare's always-passing test key.
+   */
+  TURNSTILE_SITE_KEY?: string;
+
+  /**
+   * Turnstile's secret for Siteverify. Secret. Development workers fall back
+   * to Cloudflare's always-passing test secret; production without it has
+   * web sign-up and recovery off.
+   */
+  TURNSTILE_SECRET_KEY?: string;
+
+  /**
    * Rolling-window counters for the accounts routes (passkey sign-in failures
-   * per IP), one SQLite DO per hashed name (`src/accounts/rateCounterDO.ts`).
+   * per IP; web sign-up and recovery caps in one `web-caps` instance), one
+   * SQLite DO per hashed name (`src/accounts/rateCounterDO.ts`).
    */
   ACCOUNT_RATE_COUNTER: DurableObjectNamespace<
     import('./accounts/rateCounterDO').AccountRateCounter
