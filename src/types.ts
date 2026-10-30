@@ -336,6 +336,14 @@ export interface Environment {
   SYNC_ENTITLEMENT?: string;
 
   /**
+   * The web app's origins (witness-work ADR 0038 §10), comma-separated, each
+   * matched exactly against `Origin`: CORS (src/cors.ts) and the browser's
+   * live sockets (src/liveSubprotocol.ts) admit only these. Unset: no
+   * browser access.
+   */
+  WEB_APP_ORIGINS?: string;
+
+  /**
    * Signs session access tokens (HS256, witness-work ADR 0027). Secret, at
    * least 32 characters, distinct per prod/dev worker. Without it, the
    * session routes (`/accounts/v1/sessions*`) answer `disabled` and bearer

@@ -18,6 +18,7 @@ import {
   type Harness,
   type HarnessOptions,
   type PhotoBlob,
+  TEST_WEB_ORIGIN,
 } from '../test/buddies'
 import { bearer, openTestSession, type TestSession } from '../test/accounts'
 import { inboxLinkMessage } from '../accounts/contracts'
@@ -27,9 +28,11 @@ import { resetAccountStatusCache } from '../accounts/auth'
 import {
   BUDDIES_CLIENT_HEADER,
   BUDDIES_LIVE_ACCOUNT_HEADER,
+  BUDDIES_LIMITS,
   BUDDIES_OPS,
   type BuddiesSignedOp,
 } from './contracts'
+import { BuddyInbox } from './inboxDO'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -1059,6 +1062,323 @@ describe('bearer live socket', () => {
       status: 426,
       body: relayError('upgrade_required'),
     })
+  })
+})
+
+/**
+ * The browser's live socket (witness-work ADR 0038 §10): the token and the
+ * fields ride in the `Sec-WebSocket-Protocol` offer, next to `ww.v1`, from
+ * an allowed origin.
+ */
+describe('browser live socket', () => {
+  const MINUTE_MS = 60_000
+  const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
+
+  const offer = (owner: BearerOwner, session = owner.session) => [
+    'ww.v1',
+    `bearer.${session.accessToken}`,
+    `payload.${encodeFields({ inboxId: owner.inboxId })}`,
+  ]
+
+  const browserLive = (
+    protocols: string[] | string,
+    headers: Record<string, string> = {}
+  ) =>
+    h.live({
+      upgrade: 'websocket',
+      origin: TEST_WEB_ORIGIN,
+      'sec-websocket-protocol': Array.isArray(protocols)
+        ? protocols.join(', ')
+        : protocols,
+      ...headers,
+    })
+
+  /** The requests `BuddyInbox` got through `fetch`. */
+  const forwarded = () => {
+    const seen: Request[] = []
+    const original = BuddyInbox.prototype.fetch
+    vi.spyOn(BuddyInbox.prototype, 'fetch').mockImplementation(function (
+      this: BuddyInbox,
+      request: Request
+    ) {
+      seen.push(request)
+      return original.call(this, request)
+    })
+    return seen
+  }
+
+  it('opens with ww.v1 echoed, says hello, and signals changes', async () => {
+    const owner = await BearerOwner.create()
+    const live = await browserLive(offer(owner))
+    expect(live.status).toBe(101)
+    expect(live.protocol).toBe('ww.v1')
+    expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
+    await owner.op('roster/put', { blob: blobOfSize(32) })
+    expect(live.socket!.messages().at(-1)).toEqual({ type: 'changed', seq: 1 })
+  })
+
+  it('works with the legacy switch off: it is always a bearer request', async () => {
+    const owner = await BearerOwner.create()
+    await legacyOff()
+    expect((await browserLive(offer(owner))).status).toBe(101)
+  })
+
+  it('never forwards the token or the offer to the DO', async () => {
+    const seen = forwarded()
+    const owner = await BearerOwner.create()
+    expect((await browserLive(offer(owner))).status).toBe(101)
+    expect(seen).toHaveLength(1)
+    const headers = Object.fromEntries(seen[0].headers.entries())
+    expect(headers['sec-websocket-protocol']).toBeUndefined()
+    expect(headers.authorization).toBeUndefined()
+    expect(JSON.stringify(headers)).not.toContain(owner.session.accessToken)
+    expect(headers[BUDDIES_LIVE_ACCOUNT_HEADER]).toBe(owner.session.accountId)
+    expect(headers['x-buddies-session-expires-at']).toBe(
+      String(owner.session.accessExpiresAt)
+    )
+    expect(seen[0].url).not.toContain(owner.inboxId)
+  })
+
+  it('needs ww.v1 and an allowed Origin, checked before the token and the DO', async () => {
+    const seen = forwarded()
+    const owner = await BearerOwner.create()
+    expect(await browserLive(offer(owner).slice(1))).toMatchObject({
+      status: 400,
+      body: relayError('bad_request'),
+      protocol: null,
+    })
+    for (const origin of ['https://evil.example', 'null']) {
+      expect(await browserLive(offer(owner), { origin })).toMatchObject({
+        status: 403,
+        body: relayError('forbidden'),
+      })
+      const badToken = offer(owner)
+      badToken[1] = 'bearer.nope'
+      expect(await browserLive(badToken, { origin })).toMatchObject({
+        status: 403,
+        body: relayError('forbidden'),
+      })
+    }
+    const noOrigin = await h.live({
+      upgrade: 'websocket',
+      'sec-websocket-protocol': offer(owner).join(', '),
+    })
+    expect(noOrigin).toMatchObject({ status: 403, body: relayError('forbidden') })
+    expect(seen).toHaveLength(0)
+  })
+
+  it('refuses a bad, expired, or missing token like the header path', async () => {
+    const owner = await BearerOwner.create()
+    const bad = offer(owner)
+    bad[1] = 'bearer.not.a.token'
+    expect(await browserLive(bad)).toMatchObject({
+      status: 401,
+      body: relayError('unauthorized'),
+    })
+    expect(await browserLive([offer(owner)[0], offer(owner)[2]])).toMatchObject({
+      status: 401,
+      body: relayError('unauthorized'),
+    })
+    advance(16 * MINUTE_MS)
+    expect(await browserLive(offer(owner))).toMatchObject({
+      status: 401,
+      body: relayError('unauthorized'),
+    })
+  })
+
+  it('refuses malformed offers with bad_request', async () => {
+    const owner = await BearerOwner.create()
+    const [ww, token, payload] = offer(owner)
+    for (const protocols of [
+      [ww, ww, token, payload],
+      [ww, token, token, payload],
+      [ww, token, payload, payload],
+      [ww, '', token, payload],
+      [ww, token, payload, 'chat'],
+      [ww, token, 'payload.'],
+      [ww, token, 'payload.not base64'],
+      [ww, token, `payload.${encodeFields({ inboxId: 'x' })}`],
+      [ww, token, `payload.${encodeFields({ nope: true })}`],
+      [ww, token, payload, `slot.${randomId()}`],
+      [ww, token],
+      [ww, token, payload, `x${'A'.repeat(5_000)}`],
+    ]) {
+      expect(
+        await browserLive(protocols),
+        protocols.join(', ').slice(0, 80)
+      ).toMatchObject({ status: 400, body: relayError('bad_request') })
+    }
+    expect(
+      await browserLive(offer(owner), { 'x-buddies-signature': 'x' })
+    ).toMatchObject({ status: 400, body: relayError('bad_request') })
+    expect(await browserLive(offer(owner), owner.auth)).toMatchObject({
+      status: 400,
+      body: relayError('bad_request'),
+    })
+  })
+
+  it('runs the header path’s checks: kill switch, ownership, link, suspension', async () => {
+    const owner = await BearerOwner.create()
+    const other = await BearerOwner.create()
+    expect(await browserLive(offer(owner, other.session))).toMatchObject({
+      status: 403,
+      body: relayError('forbidden'),
+    })
+
+    const unlinked = await BearerOwner.create(false)
+    expect(await browserLive(offer(unlinked))).toMatchObject({
+      status: 404,
+      body: relayError('not_found'),
+    })
+    const legacy = await Owner.create(h)
+    const legacyInbox = [
+      'ww.v1',
+      `bearer.${owner.session.accessToken}`,
+      `payload.${encodeFields({ inboxId: legacy.inboxId })}`,
+    ]
+    expect(await browserLive(legacyInbox)).toMatchObject({
+      status: 409,
+      body: relayError('not_linked'),
+    })
+
+    await setStatus(owner.session.accountId, 'suspended')
+    expect(await browserLive(offer(owner))).toMatchObject({
+      status: 403,
+      body: relayError('suspended'),
+    })
+    await setStatus(owner.session.accountId, 'active')
+
+    await h.kv.put('buddies:enabled', 'false')
+    expect(await browserLive(offer(owner))).toMatchObject({
+      status: 503,
+      body: relayError('disabled'),
+    })
+  })
+
+  it('needs an upgrade like the header path', async () => {
+    const owner = await BearerOwner.create()
+    const notUpgrade = {
+      origin: TEST_WEB_ORIGIN,
+      'sec-websocket-protocol': offer(owner).join(', '),
+    }
+    expect(await h.live(notUpgrade)).toMatchObject({
+      status: 426,
+      body: relayError('upgrade_required'),
+    })
+  })
+
+  it('leaves header-path sockets as they were: no subprotocol, no expiry', async () => {
+    const seen = forwarded()
+    const owner = await BearerOwner.create()
+    const live = await owner.connect({
+      ...owner.auth,
+      'x-buddies-session-expires-at': String(Date.now() + MINUTE_MS),
+    })
+    expect(live.status).toBe(101)
+    expect(live.protocol).toBeNull()
+    expect(seen[0].headers.get('x-buddies-session-expires-at')).toBeNull()
+    const legacy = await Owner.create(h)
+    const signed = await legacy.connect()
+    expect(signed.status).toBe(101)
+    expect(signed.protocol).toBeNull()
+    // The inbox's own deadline (180 days of inactivity), not a token's.
+    expect(h.inboxes.storage(owner.inboxId).alarm()).toBeGreaterThan(
+      Date.now() + DAY_MS
+    )
+  })
+
+  it('closes with 4004 expired once the token expires; header sockets stay', async () => {
+    const owner = await BearerOwner.create()
+    const storage = h.inboxes.storage(owner.inboxId)
+    const inactivity = storage.alarm()!
+    expect(inactivity).toBeGreaterThan(Date.now() + DAY_MS)
+
+    const browser = await browserLive(offer(owner))
+    const native = await owner.connect()
+    expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
+
+    advance(owner.session.accessExpiresAt - Date.now())
+    await h.inboxes.fireAlarm(owner.inboxId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(native.socket!.closedBy).toBeNull()
+    // The inbox's own duties keep their deadline, and the inbox its data.
+    expect(storage.alarm()).toBe(inactivity)
+    expect(storage.query('SELECT inbox_id FROM meta')).toHaveLength(1)
+  })
+
+  it('runs no retention duty early when woken only for a socket’s expiry', async () => {
+    const owner = await BearerOwner.create()
+    const storage = h.inboxes.storage(owner.inboxId)
+    // An R2 delete that failed and backs off for six hours.
+    const retryAt = Date.now() + 6 * 60 * MINUTE_MS
+    storage.query(
+      'INSERT INTO pending_blob_delete (object_key) VALUES (?)',
+      'v1/x/y'
+    )
+    storage.query(
+      'INSERT OR REPLACE INTO blob_delete_backoff (singleton, failures, retry_at) VALUES (1, 9, ?)',
+      retryAt
+    )
+    const browser = await browserLive(offer(owner))
+    expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
+    const deletes = () =>
+      h.r2.calls.filter((call) => call.startsWith('delete')).length
+    const before = deletes()
+
+    advance(owner.session.accessExpiresAt - Date.now())
+    await h.inboxes.fireAlarm(owner.inboxId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(deletes()).toBe(before)
+    expect(storage.query('SELECT object_key AS key FROM pending_blob_delete')).toEqual([
+      { key: 'v1/x/y' },
+    ])
+    expect(storage.alarm()).toBe(retryAt)
+  })
+
+  it('schedules the earliest of the inbox’s deadlines and the sockets’ expiries', async () => {
+    const owner = await BearerOwner.create()
+    const storage = h.inboxes.storage(owner.inboxId)
+    const first = await browserLive(offer(owner))
+    advance(5 * MINUTE_MS)
+    const later = await openTestSession(accountsApp, h.env, owner.session.key)
+    const second = await browserLive(offer(owner, later))
+    expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
+
+    advance(owner.session.accessExpiresAt - Date.now())
+    await h.inboxes.fireAlarm(owner.inboxId)
+    expect(first.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(second.socket!.closedBy).toBeNull()
+    expect(storage.alarm()).toBe(later.accessExpiresAt)
+
+    advance(later.accessExpiresAt - Date.now())
+    await h.inboxes.fireAlarm(owner.inboxId)
+    expect(second.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+  })
+
+  it('counts browser sockets in the inbox’s socket cap', async () => {
+    const owner = await BearerOwner.create()
+    const browser = await browserLive(offer(owner))
+    expect(browser.status).toBe(101)
+    advance(1)
+    for (let i = 0; i < BUDDIES_LIMITS.liveSockets; i++) {
+      expect((await owner.connect()).status).toBe(101)
+      advance(1)
+    }
+    expect(browser.socket!.closedBy).toEqual({ code: 4002, reason: 'replaced' })
+  })
+
+  it('never logs the token or the inbox id', async () => {
+    const logs: unknown[] = []
+    for (const level of ['log', 'warn', 'error', 'info'] as const)
+      vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
+    const owner = await BearerOwner.create()
+    await browserLive(offer(owner))
+    await browserLive(offer(owner), { origin: 'https://evil.example' })
+    advance(owner.session.accessExpiresAt - Date.now())
+    await h.inboxes.fireAlarm(owner.inboxId)
+    const text = JSON.stringify(logs)
+    for (const secret of [owner.inboxId, owner.session.accountId, owner.session.accessToken])
+      expect(text).not.toContain(secret)
   })
 })
 

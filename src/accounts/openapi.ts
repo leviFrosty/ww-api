@@ -1558,6 +1558,8 @@ export const syncLiveDocs = describeRoute({
 
 Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \`x-ww-slot-id\`, the device’s own slot, so its own puts don’t echo back.
 
+**Browsers** can’t set headers on a WebSocket, so they offer the same values as \`Sec-WebSocket-Protocol\` entries instead: \`ww.v1\`, \`bearer.<access token>\`, and \`slot.<slotId>\` (any order; no \`Authorization\` header). The \`Origin\` must be one of the web app’s (\`WEB_APP_ORIGINS\`), else \`403 forbidden\`, checked before the token; an offer without \`ww.v1\`, with a repeated or unknown entry, or that isn’t a list of tokens is \`400 bad_request\`. The token is checked like the header’s, and the 101 answers \`Sec-WebSocket-Protocol: ww.v1\`. Ids never go in the URL.
+
 **Server → app messages:**
 
 - \`{"type":"hello","seq":N}\` right after the upgrade (as Buddies' inbox socket); pull when \`N\` differs from the last \`seq\` pulled.
@@ -1565,7 +1567,7 @@ Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \
 
 **Keepalive:** send the text \`ping\` about every 25 s; the server answers \`pong\` without waking the account’s Durable Object. Anything else the app sends is ignored.
 
-**Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account). Reconnect with backoff while in the foreground.
+**Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account, browser sockets included). \`4004 "expired"\` (browser sockets only): the access token it opened with expired; refresh and reconnect. Header sockets outlive their token. Reconnect with backoff while in the foreground.
 
 ${SYNC_ENTITLED} Turning Cloud Sync off refuses new sockets but doesn’t close open ones.
 
@@ -1584,14 +1586,31 @@ ${readTier}`,
       in: 'header' as const,
       required: true,
       schema: { type: 'string' as const },
-      description: 'This device’s slot (its sync id).',
+      description: 'This device’s slot (its sync id). Browsers send `slot.<slotId>` in `Sec-WebSocket-Protocol` instead.',
+    },
+    {
+      name: 'Sec-WebSocket-Protocol',
+      in: 'header' as const,
+      required: false,
+      schema: { type: 'string' as const },
+      description:
+        'Browsers only: `ww.v1, bearer.<access token>, slot.<slotId>`, in place of `Authorization` and `x-ww-slot-id`. Needs an allowed `Origin`.',
     },
   ],
   responses: {
-    101: { description: 'Switching protocols: the socket is open.' },
-    400: errorResponse('Missing or malformed `x-ww-slot-id`.', ['bad_request']),
+    101: {
+      description:
+        'Switching protocols: the socket is open. A browser upgrade gets `Sec-WebSocket-Protocol: ww.v1`.',
+    },
+    400: errorResponse(
+      'Missing or malformed `x-ww-slot-id` (or `slot.` entry), or a malformed `Sec-WebSocket-Protocol` offer (no `ww.v1`, a repeated or unknown entry, or with `Authorization` too).',
+      ['bad_request']
+    ),
     401: bearerReadErrors[401],
-    ...syncUnentitled,
+    403: errorResponse(
+      'Cloud Sync is a Supporter benefit and the account isn’t one (`supporter_required`), or a browser upgrade’s `Origin` isn’t one of the web app’s (`forbidden`).',
+      ['supporter_required', 'forbidden']
+    ),
     426: errorResponse('Not a WebSocket upgrade. No `Retry-After`.', [
       'upgrade_required',
     ]),

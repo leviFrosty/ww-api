@@ -9,7 +9,9 @@ import {
   BUDDIES_CLIENT_HEADER,
   BUDDIES_FIELD_PARSERS,
   BUDDIES_LIMITS,
+  BUDDIES_ENVELOPE_HEADERS,
   BUDDIES_LIVE_ACCOUNT_HEADER,
+  BUDDIES_LIVE_EXPIRES_HEADER,
   BUDDIES_LIVE_OP,
   BUDDIES_NOTIFICATION_SERVICE_CLIENT,
   BUDDIES_OPS,
@@ -72,6 +74,11 @@ import {
 import { recordActivity } from '../accounts/activity'
 import { isBuddiesEnabled, isBuddiesPhotosEnabled } from './killSwitch'
 import { buddiesErrorResponse, buddiesInternalError } from './errorResponse'
+import {
+  acceptLiveSubprotocol,
+  forwardedLiveRequest,
+  readBrowserLive,
+} from '../liveSubprotocol'
 import {
   EDGE_RETRY_AFTER_SECONDS,
   allowBuddiesCaller,
@@ -158,6 +165,8 @@ const photosAvailable = async (env: Environment): Promise<boolean> =>
 interface Caller {
   key: string
   account: AccountAuth | null
+  /** A bearer caller's token expiry, epoch ms; null for a legacy one. */
+  expiresAt: number | null
   /**
    * A legacy request admitted while the legacy switch is off: only the
    * Notification Service Extension's `inbox/sync`, which the inbox serves
@@ -193,14 +202,24 @@ type Admission = { ok: true; caller: Caller } | { ok: false; response: Response 
  */
 const admitCaller = async (
   c: AppContext,
-  op: BuddiesRouteOp
+  op: BuddiesRouteOp,
+  /** A browser socket's `bearer.` token (null: none offered); always bearer. */
+  browserToken?: string | null
 ): Promise<Admission> => {
   let caller: Caller
-  if (hasAuthorization(c)) {
-    const auth = await authenticateAccount(c)
+  if (browserToken !== undefined || hasAuthorization(c)) {
+    const auth = await authenticateAccount(
+      c,
+      browserToken === undefined ? {} : { token: browserToken }
+    )
     if (!auth.ok) return auth
     const key = await buddiesAccountCallerKey(auth.account.accountId)
-    caller = { key, account: auth.account, linkedOnly: false }
+    caller = {
+      key,
+      account: auth.account,
+      expiresAt: auth.expiresAt,
+      linkedOnly: false,
+    }
   } else {
     const legacy = await isLegacyAuthEnabled(c.env)
     if (!legacy && !isNotificationServiceSync(c, op))
@@ -208,6 +227,7 @@ const admitCaller = async (
     caller = {
       key: buddiesCallerKey(c.req.header('CF-Connecting-IP')),
       account: null,
+      expiresAt: null,
       linkedOnly: !legacy,
     }
   }
@@ -630,13 +650,20 @@ const handleBuddiesOp = async (
 /**
  * The upgrade as the inbox DO gets it. A bearer one names the token's account
  * in `BUDDIES_LIVE_ACCOUNT_HEADER`, which the DO trusts; any copy a client
- * sent is dropped, so a legacy upgrade never carries one.
+ * sent is dropped, so a legacy upgrade never carries one. Nor does any
+ * native upgrade carry `BUDDIES_LIVE_EXPIRES_HEADER`: only browser sockets
+ * close when their token expires.
  */
 const liveRequest = (request: Request, account: AccountAuth | null): Request => {
-  if (!account && !request.headers.has(BUDDIES_LIVE_ACCOUNT_HEADER))
+  if (
+    !account &&
+    !request.headers.has(BUDDIES_LIVE_ACCOUNT_HEADER) &&
+    !request.headers.has(BUDDIES_LIVE_EXPIRES_HEADER)
+  )
     return request
   const headers = new Headers(request.headers)
   headers.delete(BUDDIES_LIVE_ACCOUNT_HEADER)
+  headers.delete(BUDDIES_LIVE_EXPIRES_HEADER)
   if (account) headers.set(BUDDIES_LIVE_ACCOUNT_HEADER, account.accountId)
   return new Request(request, { headers })
 }
@@ -648,16 +675,46 @@ const liveRequest = (request: Request, account: AccountAuth | null): Request => 
  * upgrade. The Worker counts it as a read and checks its shape (and a legacy
  * one's `ts`) to find the inbox; the inbox DO authenticates it and accepts
  * the socket.
+ *
+ * A browser can't set headers on a WebSocket, so it offers `ww.v1`,
+ * `bearer.<token>`, and `payload.<the x-buddies-payload value>` in
+ * `Sec-WebSocket-Protocol` (src/liveSubprotocol.ts), from an allowed
+ * `Origin`. That's always a bearer upgrade, checked like one in the same
+ * order. The DO gets the payload in `x-buddies-payload` and the token's
+ * expiry in `BUDDIES_LIVE_EXPIRES_HEADER` (never the token), and closes the
+ * socket with `4004 "expired"` then; the 101 says `Sec-WebSocket-Protocol:
+ * ww.v1`.
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
+    const browser = readBrowserLive(c.env, c.req.raw.headers, [
+      'payload',
+    ] as const)
+    if (browser && !browser.ok) return errorResponse(browser.error)
     if (!(await isBuddiesEnabled(c.env))) return errorResponse('disabled')
-    const admission = await admitCaller(c, BUDDIES_LIVE_OP)
+    const admission = await admitCaller(
+      c,
+      BUDDIES_LIVE_OP,
+      browser ? browser.token : undefined
+    )
     if (!admission.ok) return admission.response
     const { caller } = admission
     if (!isWebSocketUpgrade(c.req.raw))
       return errorResponse('upgrade_required')
     const now = Date.now()
+    if (browser) {
+      const internal = {
+        [BUDDIES_ENVELOPE_HEADERS.payload]: browser.ids.payload ?? '',
+        [BUDDIES_LIVE_ACCOUNT_HEADER]: caller.account!.accountId,
+        [BUDDIES_LIVE_EXPIRES_HEADER]: String(caller.expiresAt),
+      }
+      const request = forwardedLiveRequest(c.req.raw, internal)
+      const fields = readHeaderFields(BUDDIES_LIVE_OP, request.headers, now)
+      if (!fields.ok) return errorResponse(fields.error)
+      return acceptLiveSubprotocol(
+        await inbox(c.env, fields.value.inboxId).fetch(request)
+      )
+    }
     let inboxId: string
     if (caller.account) {
       const fields = readHeaderFields(BUDDIES_LIVE_OP, c.req.raw.headers, now)
