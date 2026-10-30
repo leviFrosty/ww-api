@@ -103,6 +103,7 @@ The kill switch applies as for \`web/signup/options\`. ${capsText} The account k
       label: b64u('The browser’s label, sealed like a session’s `device`, at most 512 characters').optional(),
       device: b64u('The session’s sealed device label, at most 512 characters').optional(),
       appVersion: z.string().optional().meta({ description: 'The web app’s version, at most 32 characters.' }),
+      capabilities: z.array(z.string()).optional().meta({ description: 'Like a session open’s `capabilities`.' }),
     },
     ' The key is the new account’s, and the envelope works once (409 `replay`).'
   ),

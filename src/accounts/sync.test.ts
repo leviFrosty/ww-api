@@ -20,8 +20,9 @@ import type { FakeWebSocket } from '../test/durableObjects'
 import { RevenueCatError } from '../revenuecat'
 import { createAccountsRoutes } from './route'
 import { resetSyncEntitlementCache } from './sync'
+import { resetSessionCapabilitiesCache } from './sessionStore'
 import { SYNC_LIMITS } from './syncContracts'
-import { syncEntitlement } from './syncSwitch'
+import { entitlementForApp, syncEntitlement } from './syncSwitch'
 import { AccountSync } from './syncDO'
 import { accountSupporterStatus } from './supporter'
 import { accessTokenKeys, signAccessToken } from './tokens'
@@ -47,6 +48,8 @@ vi.mock('./supporter', async (original) => ({
  * `AccountSync` index per account, a live socket, switches, and retention.
  */
 
+/** A session from an app that says it turns Cloud Sync on only for new installs. */
+const CURRENT_APP = { appVersion: '1.47.0', capabilities: ['sync-everyone'] }
 const START = Date.UTC(2026, 9, 19, 12)
 const SECOND = 1_000
 const DAY = 24 * 60 * 60 * SECOND
@@ -61,6 +64,7 @@ beforeEach(async () => {
   vi.setSystemTime(START)
   h = await createHarness()
   resetSyncEntitlementCache()
+  resetSessionCapabilitiesCache()
   supporterStatus.mockReset()
   supporterStatus.mockResolvedValue({
     supporter: true,
@@ -75,7 +79,7 @@ afterEach(() => {
 })
 
 const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
-const session = () => openTestSession(app as never, h.env)
+const session = () => openTestSession(app as never, h.env, undefined, CURRENT_APP)
 const slot = () => randomId().slice(0, 16)
 
 const request = (path: string, init: RequestInit) =>
@@ -348,7 +352,7 @@ describe('limits', () => {
     expect(over.body).toMatchObject({ code: 'rate_limited', retryAfter: 24 * 60 * 60 })
     advance(DAY + 1)
     // The token expired meanwhile; the same account signs in again.
-    const again = await openTestSession(app as never, h.env, s.key)
+    const again = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect((await put(again, slot())).status).toBe(200)
 
     const other = await session()
@@ -372,6 +376,78 @@ describe('switches and entitlement', () => {
     expect(
       (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(s.accessToken))).body
     ).toMatchObject({ entitled: true, entitlement: 'everyone', supporter: false })
+  })
+
+  it("doesn't give everyone's Cloud Sync to an app without the capability", async () => {
+    // An app that never sends `sync-everyone` (any version) turns Cloud Sync
+    // on by itself for any device that never chose once it's entitled
+    // (ADR 0040 §2).
+    const old = await openTestSession(app as never, h.env)
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    expect(
+      (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(old.accessToken))).body
+    ).toMatchObject({ enabled: true, entitled: false, entitlement: 'supporter', supporter: false })
+    const refused = await put(old, slot())
+    expect(refused.status).toBe(403)
+    expect(refused.body).toMatchObject({ code: 'supporter_required' })
+    // Its Supporters keep Cloud Sync as before.
+    resetSyncEntitlementCache()
+    supporterStatus.mockResolvedValue({ supporter: true, expiresAt: null, customers: 1 })
+    expect((await put(old, slot())).status).toBe(200)
+    // The version doesn't decide it: 1.47.0 without the capability is refused.
+    const versioned = await openTestSession(app as never, h.env, undefined, { appVersion: '1.47.0' })
+    resetSyncEntitlementCache()
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    expect((await put(versioned, slot())).status).toBe(403)
+    // Unknown names are ignored, not granted.
+    const other = await openTestSession(app as never, h.env, undefined, { capabilities: ['sync-later'] })
+    expect((await put(other, slot())).status).toBe(403)
+    // With it, the same account's new session is in.
+    const current = await openTestSession(app as never, h.env, versioned.key, CURRENT_APP)
+    expect((await put(current, slot())).status).toBe(200)
+  })
+
+  it('takes the capability on refresh, and keeps it when a refresh leaves it out', async () => {
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    const s = await openTestSession(app as never, h.env)
+    expect((await put(s, slot())).status).toBe(403)
+    const refresh = async (body: Record<string, unknown>) => {
+      const response = await requestJson(app as never, h.env, 'POST', '/sessions/refresh', {
+        refreshToken: s.refreshToken,
+        ...body,
+      })
+      expect(response.status).toBe(200)
+      const tokens = response.body as { accessToken: string; refreshToken: string }
+      s.accessToken = tokens.accessToken
+      s.refreshToken = tokens.refreshToken
+    }
+    // The app updated: its next refresh says so, answered at once (a session
+    // without capabilities isn't cached).
+    await refresh({ capabilities: ['sync-everyone'] })
+    expect((await put(s, slot())).status).toBe(200)
+    await refresh({ appVersion: '1.47.1' })
+    expect((await put(s, slot())).status).toBe(200)
+    // Sent empty, it replaces the stored list, and this isolate forgets the
+    // cached one.
+    await refresh({ capabilities: [] })
+    expect((await put(s, slot())).status).toBe(403)
+    // Malformed is `bad_request`.
+    for (const capabilities of ['sync-everyone', [1], ['Sync Everyone'], Array(17).fill('a')]) {
+      const response = await requestJson(app as never, h.env, 'POST', '/sessions/refresh', {
+        refreshToken: s.refreshToken,
+        capabilities,
+      })
+      expect(response.body).toMatchObject({ code: 'bad_request' })
+    }
+  })
+
+  it('grants everyone only with the capability, and never past the switch', () => {
+    expect(entitlementForApp('everyone', ['sync-everyone'])).toBe('everyone')
+    expect(entitlementForApp('everyone', ['other', 'sync-everyone'])).toBe('everyone')
+    expect(entitlementForApp('everyone', [])).toBe('supporter')
+    expect(entitlementForApp('everyone', null)).toBe('supporter')
+    expect(entitlementForApp('everyone', undefined)).toBe('supporter')
+    expect(entitlementForApp('supporter', ['sync-everyone'])).toBe('supporter')
   })
 
   it('resolves who gets it from KV, then the var, else everyone', async () => {
@@ -608,7 +684,7 @@ describe('retention', () => {
 describe('sync/list sessions', () => {
   it('says each slot’s writing platform and whether that session is live', async () => {
     const s = await session()
-    const other = await openTestSession(app as never, h.env, s.key)
+    const other = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     const phone = slot()
     const tablet = slot()
     await put(s, phone)
@@ -624,7 +700,7 @@ describe('sync/list sessions', () => {
 
   it('reads the platform of a slot put before it was kept, and says unknown once its session is gone', async () => {
     const s = await session()
-    const other = await openTestSession(app as never, h.env, s.key)
+    const other = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     const phone = slot()
     const tablet = slot()
     await put(s, phone)
@@ -656,7 +732,7 @@ describe('sync/list sessions', () => {
 
   it('says live when the sessions can’t be read', async () => {
     const s = await session()
-    const other = await openTestSession(app as never, h.env, s.key)
+    const other = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     await put(other, slot())
     await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(other.accessToken))
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -694,7 +770,7 @@ describe('the Cloud Sync request', () => {
     expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
     expect(await status(s)).toMatchObject({ requestedAt: START })
     // Any session of the account sees it; withdrawing is bearer only.
-    const web = await openTestSession(app as never, h.env, s.key)
+    const web = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect(await status(web)).toMatchObject({ requestedAt: START })
     expect((await ask(web, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
     expect((await ask(web, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
@@ -722,7 +798,7 @@ describe('the Cloud Sync request', () => {
     expect((await ask(s, { requested: true, ...otherOp })).body).toMatchObject({ code: 'bad_signature' })
     const stale = await accountEnvelope('sync/request', s.key)
     advance(10 * 60 * SECOND)
-    const later = await openTestSession(app as never, h.env, s.key)
+    const later = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect((await ask(later, { requested: true, ...stale })).body).toMatchObject({ code: 'stale' })
     expect(await status(later)).toMatchObject({ requestedAt: null })
   })
@@ -738,7 +814,7 @@ describe('the Cloud Sync request', () => {
     expect(await status(s)).toMatchObject({ requestedAt: null })
     // Past its window it's stale, so forgetting the nonce then is safe.
     advance(10 * 60 * SECOND)
-    const later = await openTestSession(app as never, h.env, s.key)
+    const later = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect((await ask(later, { requested: true, ...envelope })).body).toMatchObject({ code: 'stale' })
     expect((await ask(later, { requested: true })).status).toBe(200)
   })
@@ -756,11 +832,11 @@ describe('the Cloud Sync request', () => {
     let s = await session()
     await ask(s, { requested: true })
     advance(20 * DAY)
-    s = await openTestSession(app as never, h.env, s.key)
+    s = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
     advance(30 * DAY - 1)
     // The token expired meanwhile; the same account signs in again.
-    s = await openTestSession(app as never, h.env, s.key)
+    s = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     expect(await status(s)).toMatchObject({ requestedAt: START })
     advance(1)
     expect(await status(s)).toMatchObject({ requestedAt: null })
@@ -773,9 +849,9 @@ describe('the Cloud Sync request', () => {
 
   it('clears itself once every live phone session has written a slot since', async () => {
     const web = await session()
-    const phone = await openTestSession(app as never, h.env, web.key)
-    const tablet = await openTestSession(app as never, h.env, web.key)
-    const gone = await openTestSession(app as never, h.env, web.key)
+    const phone = await openTestSession(app as never, h.env, web.key, CURRENT_APP)
+    const tablet = await openTestSession(app as never, h.env, web.key, CURRENT_APP)
+    const gone = await openTestSession(app as never, h.env, web.key, CURRENT_APP)
     // A slot written before the request doesn't count.
     await put(tablet, 'tablet-slot')
     advance(SECOND)
@@ -1326,7 +1402,7 @@ describe('browser live socket', () => {
     const firstSocket = await browserLive(await offer(first, slot()))
     advance(5 * MINUTE)
     // A second session of the same account: refresh-style, a later token.
-    const later = await openTestSession(app as never, h.env, first.key)
+    const later = await openTestSession(app as never, h.env, first.key, CURRENT_APP)
     expect(later.accountId).toBe(first.accountId)
     const laterSocket = await browserLive(await offer(later, slot()))
     const storage = h.syncIndexes.storage(first.accountId)
@@ -1370,7 +1446,7 @@ describe('browser live socket', () => {
     await put(s, slot())
     const storage = h.syncIndexes.storage(s.accountId)
     advance(DAY - 5 * MINUTE)
-    const later = await openTestSession(app as never, h.env, s.key)
+    const later = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     const browser = await browserLive(await offer(later, slot()))
     // Retention (START + DAY) is sooner than the token's expiry.
     expect(storage.alarm()).toBe(START + DAY)
@@ -1397,7 +1473,7 @@ describe('browser live socket', () => {
     storage.query('DROP TABLE IF EXISTS alarm_schedule')
     h.syncIndexes.restart(s.accountId)
     const listed = vi.spyOn(h.syncBlobs, 'list')
-    const later = await openTestSession(app as never, h.env, s.key)
+    const later = await openTestSession(app as never, h.env, s.key, CURRENT_APP)
     const browser = await browserLive(await offer(later, slot()))
     expect(storage.alarm()).toBe(later.accessExpiresAt)
 
@@ -1447,5 +1523,78 @@ describe('browser live socket', () => {
     const text = JSON.stringify(logs)
     for (const secret of [phone, s.accountId, s.accessToken, entries[1].slice(7)])
       expect(text).not.toContain(secret)
+  })
+})
+
+/** Every gated route refuses a session that didn't send `sync-everyone` (ADR 0040 §2). */
+describe('sessions without sync-everyone', () => {
+  const refusedEverywhere = async (s: TestSession) => {
+    const refusals = {
+      put: (await put(s, slot())).body,
+      list: (await list(s)).body,
+      get: (await get(s, slot())).body,
+      request: (
+        await postJson(
+          app as never,
+          h.env,
+          '/sync/request',
+          { requested: true, ...(await accountEnvelope('sync/request', s.key)) },
+          bearer(s.accessToken)
+        )
+      ).body,
+      live: await (async () => {
+        const response = await request('/sync/live', {
+          method: 'GET',
+          headers: { ...bearer(s.accessToken), upgrade: 'websocket', 'x-ww-slot-id': slot() },
+        })
+        return response.json()
+      })(),
+      browserLive: await (async () => {
+        const ticket = await liveTicket(app as never, h.env, s, 'sync', slot())
+        const response = await request('/sync/live', {
+          method: 'GET',
+          headers: {
+            upgrade: 'websocket',
+            origin: TEST_WEB_ORIGIN,
+            'sec-websocket-protocol': `ww.v1, ticket.${ticket}`,
+          },
+        })
+        return response.json()
+      })(),
+    }
+    for (const [route, body] of Object.entries(refusals))
+      expect([route, code(body)]).toEqual([route, 'supporter_required'])
+  }
+
+  beforeEach(() => {
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+  })
+
+  it('refuses put, list, get, the request, and both live sockets', async () => {
+    await refusedEverywhere(await openTestSession(app as never, h.env))
+    await refusedEverywhere(
+      await openTestSession(app as never, h.env, undefined, { capabilities: ['sync-later'] })
+    )
+    await refusedEverywhere(await openTestSession(app as never, h.env, undefined, { capabilities: [] }))
+  })
+
+  it('refuses when the session’s capabilities can’t be read', async () => {
+    const s = await session()
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const sessions = await import('./sessionStore')
+    vi.spyOn(sessions, 'cachedSessionCapabilities').mockRejectedValue(new Error('d1 down'))
+    const refused = await put(s, slot())
+    expect(refused.status).toBe(403)
+    expect(refused.body).toMatchObject({ code: 'supporter_required' })
+    vi.mocked(sessions.cachedSessionCapabilities).mockRestore()
+    expect((await put(s, slot())).status).toBe(200)
+  })
+
+  it('refuses a malformed list on open', async () => {
+    for (const capabilities of ['sync-everyone', [1], ['__proto__'], ['a'.repeat(33)], Array(17).fill('a')]) {
+      await expect(
+        openTestSession(app as never, h.env, undefined, { capabilities })
+      ).rejects.toThrow()
+    }
   })
 })

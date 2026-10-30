@@ -62,6 +62,9 @@ const syncOp = (session: E2ESession, op: string, body: unknown = {}) =>
     headers: bearerHeaders(session),
   })
 
+/** Cloud Sync for everyone reaches apps that send the capability (ADR 0040 §2). */
+const CURRENT_APP = { appVersion: '1.47.0', capabilities: ['sync-everyone'] }
+
 describe('Cloud Sync switches', () => {
   it('says them in the public app config', async () => {
     const config = await http('GET', '/app/v1/config')
@@ -74,10 +77,50 @@ describe('Cloud Sync switches', () => {
 })
 
 describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
+  it.skipIf(!LOCAL_LAUNCHER)(
+    'keeps everyone’s Cloud Sync from an app without the capability',
+    async () => {
+      localKv('put', 'sync:entitlement', 'everyone')
+      try {
+        // Even at 1.47.0, an app that doesn't send `sync-everyone` would turn
+        // Cloud Sync on by itself for a device that never chose (ADR 0040 §2).
+        const old = await openSession(undefined, { appVersion: '1.47.0' })
+        const status = await http('GET', '/accounts/v1/sync', {
+          headers: bearerHeaders(old),
+        })
+        expect(status.body).toMatchObject({
+          entitled: false,
+          entitlement: 'supporter',
+          supporter: false,
+        })
+        const refused = await put(old, slot(), randomBytes(64))
+        expect(refused.status).toBe(403)
+        expect(refused.body.code).toBe('supporter_required')
+        const config = await http('GET', '/app/v1/config?appVersion=1.47.0')
+        expect(config.body.sync?.entitlement).toBe('supporter')
+
+        // The same account's session with the capability is in.
+        const current = await openSession(old.key, CURRENT_APP)
+        const entitled = await http('GET', '/accounts/v1/sync', {
+          headers: bearerHeaders(current),
+        })
+        expect(entitled.body).toMatchObject({ entitled: true, entitlement: 'everyone' })
+        expect((await put(current, slot(), randomBytes(64))).status).toBe(200)
+        const currentConfig = await http(
+          'GET',
+          '/app/v1/config?capabilities=sync-everyone'
+        )
+        expect(currentConfig.body.sync?.entitlement).toBe('everyone')
+      } finally {
+        localKv('delete', 'sync:entitlement')
+      }
+    }
+  )
+
   it('refuses an account that isn’t a Supporter while it’s a Supporter benefit', async () => {
     if (LOCAL_LAUNCHER) localKv('put', 'sync:entitlement', 'supporter')
     try {
-      const session = await openSession()
+      const session = await openSession(undefined, CURRENT_APP)
       const status = await http('GET', '/accounts/v1/sync', {
         headers: bearerHeaders(session),
       })
@@ -99,7 +142,7 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
     async () => {
       localKv('put', 'sync:entitlement', 'everyone')
       try {
-        const session = await openSession()
+        const session = await openSession(undefined, CURRENT_APP)
         const phone = slot()
         const tablet = slot()
 
@@ -191,7 +234,7 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
   )
 
   it.skipIf(!LOCAL_LAUNCHER)('sets, repeats, reads, and withdraws the Cloud Sync request', async () => {
-    const session = await openSession()
+    const session = await openSession(undefined, CURRENT_APP)
     const status = async () =>
       (await http('GET', '/accounts/v1/sync', { headers: bearerHeaders(session) })).body
     expect(await status()).toMatchObject({ ok: true, requestedAt: null })
@@ -224,7 +267,7 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
   it.skipIf(!LOCAL_LAUNCHER)(
     'puts, lists, gets, and deletes a photo, telling the other device',
     async () => {
-      const session = await openSession()
+      const session = await openSession(undefined, CURRENT_APP)
       const phone = slot()
       const tablet = slot()
       expect((await put(session, phone, randomBytes(64))).status).toBe(200)
