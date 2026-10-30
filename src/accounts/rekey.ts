@@ -41,6 +41,7 @@ import { accessTokenKeys, signAccessToken } from './tokens'
 import { sessionEndedReason } from './sessionStore'
 import { parseCredentialId } from './webauthn'
 import { syncIndex } from './sync'
+import { keyChangeSupporterStatements } from './supporter'
 
 /**
  * Changing the account key (witness-work ADR 0039, `docs/account-key-change.md`):
@@ -335,6 +336,9 @@ const handleRekey = guarded('account/rekey', async (c) => {
             key_epoch = excluded.key_epoch, blob = excluded.blob,
             updated_at = excluded.updated_at`
       ),
+      // ADR 0039 §9: the account's RevenueCat customers leave every other
+      // account and are locked to this one.
+      ...keyChangeSupporterStatements(db, accountId, committed, now),
       // 7. The change itself.
       activityInsert(
         db,

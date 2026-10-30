@@ -1515,8 +1515,10 @@ deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
   epoch, re-sealed `device`), `session.revoked` for and the end of every
   other session, every wrap deleted and `passkeyWrap` (only the session's
   step-up credential, a phone's too, else 404 `not_found`) stored at the
-  new epoch, the history upserted, and `account.key_changed`. A lost swap
-  is read again: a moved key or epoch is 409 `conflict` with the account's
+  new epoch, the history upserted, the account's RevenueCat customers
+  locked and unlinked elsewhere (`keyChangeSupporterStatements`, ADR 0039
+  §9; see Supporter), and `account.key_changed`. A lost swap is read
+  again: a moved key or epoch is 409 `conflict` with the account's
   `keyEpoch` (another device won); a caller session that ended meanwhile is
   401 `unauthorized` with its `reason` (`revoked`, `replaced`, `expired`),
   so the app never drops its new key for a change nobody made. Then every
@@ -1568,6 +1570,20 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   Repeating a link reads RevenueCat again (the app does after purchases and
   restores). At most 5 customers an account, 5 accounts a customer
   (`SUPPORTER_LINK_LIMITS`); past either, the least recently linked goes.
+  A key change (ADR 0039 §9) dates each customer the account links by its
+  earliest link to it (`first_linked_at`, under any of the customer's
+  ids). It unlinks the customer from other accounts that first linked it
+  later; earlier links stay. It locks the customer to the account for 90
+  days (`revenuecat_customer_locks`, by the linked id and by RevenueCat's
+  `original_app_user_id`) only when no other account links it from as
+  early or earlier, so a later linker's change never locks out the owner.
+  Customers match by `COALESCE(original_app_user_id, app_user_id)`,
+  stored from each read. `first_linked_at` never moves; `linked_at` does on
+  every repeat. While locked, a link from an account that doesn't still
+  link the customer is 409 `conflict` with `reason: "customer_locked"`:
+  checked on the id sent before RevenueCat is read, then on every id the
+  read names (the id, the original, the aliases, as the webhook matches
+  them) in the link's own statement. The cron prunes ended locks.
   Read edge tier per IP, plus the register tier (60 a minute) per account,
   since every link reads RevenueCat and the worker's RevenueCat key has one
   rate limit for everyone; works for a suspended account; RevenueCat
@@ -1597,8 +1613,11 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   trouble is 503, so RevenueCat retries (5 times over ~80 minutes).
 - **Storage**: D1 `revenuecat_customers`, `account_revenuecat_customers`,
   `revenuecat_webhook_events` (migration
-  `migrations/accounts/0003_revenuecat-customers.sql`). The hourly cron prunes
-  event ids past 30 days and customers no account links.
+  `migrations/accounts/0003_revenuecat-customers.sql`), and
+  `revenuecat_customer_locks` with `first_linked_at` and
+  `original_app_user_id` (`0007_rekey-supporter-lock.sql`). The hourly cron
+  prunes event ids past 30 days, customers no account links, and ended
+  locks.
 - **Not logged** in the activity log: Supporter start and end are billing
   state (ADR 0029 §7).
 - **Verify loop**: `REVENUECAT_API_URL` (development workers only; production

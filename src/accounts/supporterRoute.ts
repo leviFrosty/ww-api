@@ -10,6 +10,7 @@ import { authenticateAccount, readPlainJson } from './auth'
 import { guarded, refuseAtEdge } from './signed'
 import { accountsDb } from './store'
 import {
+  CustomerLockedError,
   REVENUECAT_APP_USER_ID,
   accountSupporterStatus,
   linkCustomer,
@@ -81,6 +82,10 @@ export const createSupporterHandlers = (
       return c.json(statusBody(status))
     } catch (error) {
       if (error instanceof RevenueCatError) return unavailable()
+      if (error instanceof CustomerLockedError)
+        return buddiesErrorResponse('conflict', {
+          extras: { reason: 'customer_locked' },
+        })
       throw error
     }
   }),
