@@ -146,7 +146,10 @@ describe('universal links', () => {
     expect(english.headers.get('content-type')).toContain('text/html')
     expect(english.text).toContain('id="open-app"')
     expect(english.text).toContain('witnesswork://import-contact/')
-    expect(english.text).toContain(`property="og:url" content="https://ww-proxy.leviwilkerson.com${path}"`)
+    // The host the Worker was reached on; `wrangler dev` reports its env's
+    // first route (api-dev.witnesswork.app), whatever the Host header says.
+    expect(english.text).toMatch(new RegExp(`property="og:url" content="https://[a-z0-9.-]+${path}"`))
+    expect(english.text).toContain('id="continue-web" data-base="https://app-dev.witnesswork.app/contacts" hidden')
 
     const spanish = await http('GET', `${path}?lang=es`)
     expect(spanish.status).toBe(200)
@@ -166,10 +169,18 @@ describe('universal links', () => {
     expect(hostile.text).not.toContain('<script>x</script>')
   })
 
+  it('serves assetlinks.json as JSON from the static assets', async () => {
+    const res = await http('GET', '/.well-known/assetlinks.json')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('application/json')
+    expect(res.body[0].target.package_name).toBe('com.leviwilkerson.jwtime')
+  })
+
   it.each(['/buddies/invite', '/b'])('GET %s serves the buddy invite page with a locked-down CSP', async (path) => {
     const res = await http('GET', path)
     expect(res.status).toBe(200)
     expect(res.text).toContain('WitnessWork buddy invite')
+    expect(res.text).toContain('id="continue-web" class="btn secondary" data-base="https://app-dev.witnesswork.app/buddies/invite" hidden')
     expect(res.headers.get('content-security-policy')).toContain("default-src 'none'")
     expect(res.headers.get('x-robots-tag')).toBe('noindex, nofollow')
     expect(res.headers.get('referrer-policy')).toBe('no-referrer')

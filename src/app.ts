@@ -78,6 +78,7 @@ import { createAccountsRoutes } from "./accounts/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { handleHandoffPage } from "./accounts/handoffPage";
+import { apexPassthrough } from "./linkHosts";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
 import { createMapsRoutes, createPlacesRoutes } from "./maps/route";
 import { handleRevenueCatWebhook } from "./accounts/revenueCatWebhook";
@@ -150,15 +151,22 @@ function handleApplicationError(error: Error, context: AppContext) {
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 
+// On the website apex (witnesswork.app), only the link pages and association
+// files are ww-api's; any other request a route catches goes on to the site
+// Worker (src/linkHosts.ts), so it never sees ww-api's CORS either. Every
+// other host skips it. Registered first.
+app.use("*", apexPassthrough());
+
 // CORS for the web app's origins (src/cors.ts): answers preflights before
 // every other middleware (no limiter, auth, or KV read sees one) and adds the
-// CORS headers to every answer, errors included. Registered first.
+// CORS headers to every answer, errors included. Registered right after the
+// apex passthrough.
 app.use("*", cors());
 
 // Scribe AI's hard cutover (src/scribe/legacy.ts): every Notes Import route
 // but `GET /notes-import/status` is 426 unless KV `scribe:legacy-notes-import`
-// is on, before its rate limit, auth, or kill switch. Registered first so it
-// runs first.
+// is on, before its rate limit, auth, or kill switch. Registered before them
+// so it runs first.
 app.use("/notes-import", notesImportCutover());
 app.use("/notes-import/*", notesImportCutover());
 

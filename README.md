@@ -6,7 +6,9 @@ A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, i
 
 WW API is open source, like the [WitnessWork app](https://github.com/leviFrosty/witness-work)
 it serves. Anyone can read the code, the protocol docs in [`docs/`](docs/),
-and the generated API reference at [`/docs`](https://ww-proxy.leviwilkerson.com/docs).
+and the generated API reference at [`/docs`](https://api.witnesswork.app/docs).
+The API is at `https://api.witnesswork.app` (dev `https://api-dev.witnesswork.app`);
+the original `https://ww-proxy.leviwilkerson.com` serves the same Worker for good.
 Since the whole contract is public, there's nothing to gain by obscuring it:
 short or cryptic field names, headers, or paths would only make the API harder
 to read, debug, and build on.
@@ -147,7 +149,7 @@ GitHub Actions will automatically deploy to Cloudflare Workers. Monitor deployme
 
 ## API Endpoints
 
-Full API reference: [`/docs`](https://ww-proxy.leviwilkerson.com/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://ww-proxy.leviwilkerson.com/openapi.json). Locally: `http://localhost:8787/docs`.
+Full API reference: [`/docs`](https://api.witnesswork.app/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://api.witnesswork.app/openapi.json). Locally: `http://localhost:8787/docs`.
 
 ### Signed requests (Buddies and accounts)
 
@@ -273,14 +275,17 @@ Matches `/contacts#<payload>`, `/buddies/invite#1…`, and
 `/accounts/handoff#1…`, plus the short paths older app versions put in links
 (`/c#<payload>`, any URL under `/c/*`, `/b#1…`, `/h#1…`). Those links are
 already in people's messages, so the short paths stay listed and served for
-good; dropping one would open its links in Safari instead of the app.
+good; dropping one would open its links in Safari instead of the app. On the
+website apex (`witnesswork.app`), which never had short links, it lists only
+the full-word paths ([`docs/link-pages.md`](docs/link-pages.md)).
 
 ### `/contacts` (and the short `/c`)
 
 Universal-link landing page for shared WitnessWork contacts
 (`/contacts#<payload>`). iOS hands the link off to the WitnessWork app when
 installed; otherwise this endpoint serves a fallback HTML page with an App
-Store CTA. `/c` serves the same page for links older app versions shared.
+Store CTA and "Continue on the web" (the web app's `/contacts` with the same
+fragment). `/c` serves the same page for links older app versions shared.
 
 The page, accessibility labels, and Open Graph/Twitter preview strings support
 the same 18 locales as `witness-work/src/lib/locales.ts`. Pass `?lang=pt-pt`
@@ -292,8 +297,8 @@ same language; Portuguese defaults to `pt-br`, and Chinese uses Simplified
 unless Traditional script or a Taiwan/Hong Kong/Macau region is requested.
 Responses include `Content-Language` and `Vary: Accept-Language`. Preview
 crawlers without a language preference receive English unless `lang` is set.
-The `og:url` is the bare page path (`/contacts` or `/c`), without language or
-contact data.
+The `og:url` is the bare page path (`/contacts` or `/c`) on the host it was
+served on, without language or contact data.
 The same localization rules apply to legacy `/c/:payload` links.
 
 The payload is an opaque gzip + base64url–encoded contact export produced by

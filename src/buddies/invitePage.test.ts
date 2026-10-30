@@ -15,7 +15,9 @@ describe('GET /buddies/invite', () => {
   it('serves the /b page under its own og:url', async () => {
     const [short, readable] = await Promise.all(
       ['/b', '/buddies/invite'].map(async (path) =>
-        (await app.request(path, {}, env)).text()
+        (
+          await app.request(`https://ww-proxy.leviwilkerson.com${path}`, {}, env)
+        ).text()
       )
     )
     expect(readable).toContain(
@@ -49,7 +51,7 @@ describe('GET /b', () => {
     )
     expect(html).toContain('After installing, tap the invite link again')
     expect(html).toContain('Copy invite link')
-    expect(html).toContain('navigator.clipboard.writeText(location.href)')
+    expect(html).toContain('navigator.clipboard.writeText(link)')
     // No custom-scheme deep link, and nothing that could send the fragment.
     expect(html).not.toContain('witnesswork://')
     expect(html).not.toMatch(/\bfetch\(|sendBeacon|XMLHttpRequest/)

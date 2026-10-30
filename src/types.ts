@@ -23,6 +23,12 @@ export interface Environment {
    * prefix used to derive the App Attest relying-party id (`<team>.<bundle>`).
    */
   APPLE_TEAM_ID: string;
+  /**
+   * The web app's origin (`https://app.witnesswork.app`, dev
+   * `https://app-dev.witnesswork.app`), for the contact and Buddies invite
+   * pages' "Continue on the web". Unset = no such link.
+   */
+  WEB_APP_ORIGIN?: string;
   RATE_LIMITER: RateLimit;
 
   /**

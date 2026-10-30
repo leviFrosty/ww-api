@@ -96,11 +96,18 @@ const DOCUMENTATION = {
 **CORS.** Only the web app's own origins (an exact list per environment) may call from a browser, on every route. Allowed request headers: \`authorization\`, \`content-type\`, \`if-match\`, \`if-none-match\`, \`sentry-trace\`, \`baggage\`, \`x-ww-*\`, and \`x-buddies-*\`. Exposed response headers: \`ETag\`, \`Retry-After\`, \`Date\`, \`WWW-Authenticate\`, and \`x-ww-updated-at\`. No credentials (cookies). Preflights aren't rate limited; a disallowed origin, method, or header gets 403. Browsers authenticate live sockets with \`Sec-WebSocket-Protocol\` entries (see each socket).`,
     license: { name: 'See repository', url: REPO_URL },
   },
+  // The old hosts keep serving the same Workers for good (witness-work ADR
+  // 0042).
   servers: [
-    { url: 'https://ww-proxy.leviwilkerson.com', description: 'Production' },
+    { url: 'https://api.witnesswork.app', description: 'Production' },
+    {
+      url: 'https://ww-proxy.leviwilkerson.com',
+      description: 'Production (original host, still served)',
+    },
+    { url: 'https://api-dev.witnesswork.app', description: 'Development' },
     {
       url: 'https://ww-proxy-dev.levi-wilkerson.workers.dev',
-      description: 'Development',
+      description: 'Development (workers.dev)',
     },
   ],
   tags: OPENAPI_TAGS,
