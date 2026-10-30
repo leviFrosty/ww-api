@@ -51,6 +51,7 @@ import {
   approvalSendDocs,
   approvalStatusDocs,
 } from './approvalOpenapi'
+import { handleLiveTicket } from './liveTickets'
 import {
   accountDocs,
   activityListDocs,
@@ -67,6 +68,7 @@ import {
   handoffReceiveDocs,
   handoffSendDocs,
   handoffStatusDocs,
+  liveTicketDocs,
   sessionCloseDocs,
   sessionOpenDocs,
   sessionListDocs,
@@ -259,5 +261,7 @@ export const createAccountsRoutes = () => {
   routes.post('/approval/receive', approvalReceiveDocs, approvalHandlers.receive)
   routes.post('/approval/done', approvalDoneDocs, approvalHandlers.done)
   routes.post('/approval/cancel', approvalCancelDocs, approvalHandlers.cancel)
+  // A browser's ticket onto a live socket (`sync/live`, Buddies' `inbox/live`).
+  routes.post('/live/ticket', liveTicketDocs, handleLiveTicket)
   return routes
 }

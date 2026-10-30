@@ -38,10 +38,10 @@ export const ACCESS_TOKEN_AUDIENCE = 'ww-account'
 /** `openssl rand -base64 32` is 44 characters; anything shorter is refused. */
 export const MIN_TOKEN_SECRET_CHARS = 32
 /** Clock skew allowed on `iat`, seconds. */
-const IAT_SKEW_SECONDS = 60
+export const IAT_SKEW_SECONDS = 60
 /** Far beyond any token this worker mints; longer input isn't parsed. */
 const MAX_TOKEN_CHARS = 2_048
-const ACCESS_TOKEN_SECONDS = ACCOUNT_LIMITS.accessTokenMs / 1_000
+export const ACCESS_TOKEN_SECONDS = ACCOUNT_LIMITS.accessTokenMs / 1_000
 
 export type TokenEnv = Pick<
   Environment,
@@ -178,16 +178,23 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
   return cached
 }
 
-let warnedShortSecret = false
+const warnedShortSecrets = new Set<string>()
 
-const usableSecret = (value: string | undefined): string | null => {
+/**
+ * `value` trimmed, or null when it's unset or shorter than
+ * `MIN_TOKEN_SECRET_CHARS` (warned once per isolate for each `name`).
+ */
+export const usableSecret = (
+  value: string | undefined,
+  name = 'a token secret'
+): string | null => {
   const secret = value?.trim()
   if (!secret) return null
   if (secret.length >= MIN_TOKEN_SECRET_CHARS) return secret
-  if (!warnedShortSecret) {
-    warnedShortSecret = true
+  if (!warnedShortSecrets.has(name)) {
+    warnedShortSecrets.add(name)
     console.warn(
-      `accounts: a token secret is shorter than ${MIN_TOKEN_SECRET_CHARS} characters; ignoring it`
+      `accounts: ${name} is shorter than ${MIN_TOKEN_SECRET_CHARS} characters; ignoring it`
     )
   }
   return null

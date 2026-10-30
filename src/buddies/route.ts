@@ -78,7 +78,9 @@ import {
   acceptLiveSubprotocol,
   forwardedLiveRequest,
   readBrowserLive,
+  LIVE_TICKET_HEADER,
 } from '../liveSubprotocol'
+import { admitLiveTicket, type LiveTicketClaims } from '../accounts/liveTickets'
 import {
   EDGE_RETRY_AFTER_SECONDS,
   allowBuddiesCaller,
@@ -203,15 +205,18 @@ type Admission = { ok: true; caller: Caller } | { ok: false; response: Response 
 const admitCaller = async (
   c: AppContext,
   op: BuddiesRouteOp,
-  /** A browser socket's `bearer.` token (null: none offered); always bearer. */
-  browserToken?: string | null
+  /** A browser socket's verified ticket, in place of the token; always bearer. */
+  ticket?: LiveTicketClaims
 ): Promise<Admission> => {
   let caller: Caller
-  if (browserToken !== undefined || hasAuthorization(c)) {
-    const auth = await authenticateAccount(
-      c,
-      browserToken === undefined ? {} : { token: browserToken }
-    )
+  if (ticket || hasAuthorization(c)) {
+    const auth = ticket
+      ? ({
+          ok: true,
+          account: ticket.account,
+          expiresAt: ticket.tokenExpiresAt,
+        } as const)
+      : await authenticateAccount(c)
     if (!auth.ok) return auth
     const key = await buddiesAccountCallerKey(auth.account.accountId)
     caller = {
@@ -651,22 +656,28 @@ const handleBuddiesOp = async (
  * The upgrade as the inbox DO gets it. A bearer one names the token's account
  * in `BUDDIES_LIVE_ACCOUNT_HEADER`, which the DO trusts; any copy a client
  * sent is dropped, so a legacy upgrade never carries one. Nor does any
- * native upgrade carry `BUDDIES_LIVE_EXPIRES_HEADER`: only browser sockets
- * close when their token expires.
+ * native upgrade carry `BUDDIES_LIVE_EXPIRES_HEADER` or `LIVE_TICKET_HEADER`:
+ * only browser sockets close when their token expires, or hold a ticket.
  */
 const liveRequest = (request: Request, account: AccountAuth | null): Request => {
   if (
     !account &&
     !request.headers.has(BUDDIES_LIVE_ACCOUNT_HEADER) &&
-    !request.headers.has(BUDDIES_LIVE_EXPIRES_HEADER)
+    !request.headers.has(BUDDIES_LIVE_EXPIRES_HEADER) &&
+    !request.headers.has(LIVE_TICKET_HEADER)
   )
     return request
   const headers = new Headers(request.headers)
   headers.delete(BUDDIES_LIVE_ACCOUNT_HEADER)
   headers.delete(BUDDIES_LIVE_EXPIRES_HEADER)
+  headers.delete(LIVE_TICKET_HEADER)
   if (account) headers.set(BUDDIES_LIVE_ACCOUNT_HEADER, account.accountId)
   return new Request(request, { headers })
 }
+
+/** A bearer `inbox/live`'s `x-buddies-payload`: b64u(UTF-8 JSON `{ inboxId }`). */
+const encodeLiveFields = (inboxId: string): string =>
+  bytesToBase64Url(new TextEncoder().encode(JSON.stringify({ inboxId })))
 
 /**
  * Upgrades to the owner's live socket. A WebSocket upgrade has no body (and
@@ -676,37 +687,47 @@ const liveRequest = (request: Request, account: AccountAuth | null): Request => 
  * one's `ts`) to find the inbox; the inbox DO authenticates it and accepts
  * the socket.
  *
- * A browser can't set headers on a WebSocket, so it offers `ww.v1`,
- * `bearer.<token>`, and `payload.<the x-buddies-payload value>` in
- * `Sec-WebSocket-Protocol` (src/liveSubprotocol.ts), from an allowed
- * `Origin`. That's always a bearer upgrade, checked like one in the same
- * order. The DO gets the payload in `x-buddies-payload` and the token's
- * expiry in `BUDDIES_LIVE_EXPIRES_HEADER` (never the token), and closes the
- * socket with `4004 "expired"` then; the 101 says `Sec-WebSocket-Protocol:
+ * A browser can't set headers on a WebSocket, so it offers `ww.v1` and
+ * `ticket.<ticket>` in `Sec-WebSocket-Protocol` (src/liveSubprotocol.ts),
+ * from an allowed `Origin`: a `buddies` ticket from `POST
+ * /accounts/v1/live/ticket` (src/accounts/liveTickets.ts), which names the
+ * inbox. Origin (403) and the offer's shape (400) come first, then the
+ * kill switch and the ticket (401); that's always a bearer upgrade, the
+ * ticket standing in for the token, checked like one in the same order. The
+ * DO gets the inbox in `x-buddies-payload`, the token's expiry from the
+ * ticket in `BUDDIES_LIVE_EXPIRES_HEADER`, and the ticket's hash in
+ * `LIVE_TICKET_HEADER` (never the ticket); it refuses a second socket on the
+ * same ticket while one is open (409 `conflict`), and closes the socket with
+ * `4004 "expired"` at the expiry; the 101 says `Sec-WebSocket-Protocol:
  * ww.v1`.
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
-    const browser = readBrowserLive(c.env, c.req.raw.headers, [
-      'payload',
-    ] as const)
+    const browser = readBrowserLive(c.env, c.req.raw.headers)
     if (browser && !browser.ok) return errorResponse(browser.error)
     if (!(await isBuddiesEnabled(c.env))) return errorResponse('disabled')
-    const admission = await admitCaller(
-      c,
-      BUDDIES_LIVE_OP,
-      browser ? browser.token : undefined
-    )
+    let ticket: LiveTicketClaims | undefined
+    if (browser) {
+      const admitted = await admitLiveTicket(c.env, browser.ticket, 'buddies')
+      if (!admitted.ok) return admitted.response
+      ticket = admitted.claims
+    }
+    const admission = await admitCaller(c, BUDDIES_LIVE_OP, ticket)
     if (!admission.ok) return admission.response
     const { caller } = admission
+    // A browser's token never opens a header socket: nothing would close it
+    // when the token expires. Browsers use tickets.
+    if (!ticket && caller.account?.platform === 'web')
+      return errorResponse('forbidden')
     if (!isWebSocketUpgrade(c.req.raw))
       return errorResponse('upgrade_required')
     const now = Date.now()
-    if (browser) {
+    if (ticket) {
       const internal = {
-        [BUDDIES_ENVELOPE_HEADERS.payload]: browser.ids.payload ?? '',
+        [BUDDIES_ENVELOPE_HEADERS.payload]: encodeLiveFields(ticket.id),
         [BUDDIES_LIVE_ACCOUNT_HEADER]: caller.account!.accountId,
         [BUDDIES_LIVE_EXPIRES_HEADER]: String(caller.expiresAt),
+        [LIVE_TICKET_HEADER]: ticket.hash,
       }
       const request = forwardedLiveRequest(c.req.raw, internal)
       const fields = readHeaderFields(BUDDIES_LIVE_OP, request.headers, now)
