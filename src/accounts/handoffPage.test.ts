@@ -12,7 +12,7 @@ app.get('/accounts/handoff', handleHandoffPage)
 const env = { APPLE_TEAM_ID: 'TEAMID1234' } as Environment
 
 const page = (path = '/h', headers: Record<string, string> = {}) =>
-  app.request(path, { headers }, env)
+  app.request(`https://ww-proxy.leviwilkerson.com${path}`, { headers }, env)
 
 describe('GET /accounts/handoff', () => {
   it('serves the /h page under its own og:url', async () => {
