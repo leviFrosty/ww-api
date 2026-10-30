@@ -203,6 +203,8 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  * it leaves out only cookies), so drop every header that carries a
  * credential or an id outright:
  * - `authorization`: bearer tokens.
+ * - `sec-websocket-protocol`: a browser live socket's offer, which carries
+ *   its bearer token and ids (src/liveSubprotocol.ts).
  * - `x-ww-admin-token` and `x-ww-dev-bypass`: the admin and dev bypass tokens.
  * - `x-buddies-*`: the Buddies live socket's signed envelope (holds the inbox
  *   id).
@@ -214,7 +216,7 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  *   member id, its member token, and the token's hash.
  */
 const SECRET_HEADER =
-  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id|space-auth|space-token|space-member-token)$)/i;
+  /^(authorization$|sec-websocket-protocol$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id|space-auth|space-token|space-member-token)$)/i;
 
 function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;

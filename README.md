@@ -194,6 +194,13 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
   and the `GET /accounts/v1/sync/live` WebSocket): each device's end-to-end
   encrypted snapshot in a slot, changes streamed to the account's other
   devices. Behind KV `sync:enabled` and `sync:entitlement`; see `AGENTS.md`.
+- **Browsers** (the web app) call from an exact allow-list of origins
+  (`WEB_APP_ORIGINS`) with CORS, and open the live sockets (`sync/live`,
+  Buddies' `inbox/live`) by offering `Sec-WebSocket-Protocol: ww.v1,
+  bearer.<accessToken>, slot.<slotId>` (Buddies: `payload.<b64u fields>`)
+  instead of headers; the 101 answers `ww.v1`, and the socket closes with
+  `4004 "expired"` when that token expires. See `AGENTS.md`, "Web app
+  origins (CORS)" and "Browser live sockets".
 
 Older app versions authenticate the pre-session way (signed envelopes,
 `account/register`, `account/info`) while the legacy switch (KV

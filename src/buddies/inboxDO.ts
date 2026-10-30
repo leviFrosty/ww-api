@@ -11,6 +11,7 @@ import { deleteAllThen, readSeqPage } from '../durableObjectStorage'
 import {
   BUDDIES_LIMITS as LIMITS,
   BUDDIES_LIVE_ACCOUNT_HEADER,
+  BUDDIES_LIVE_EXPIRES_HEADER,
   BUDDIES_LIVE_CLOSE,
   BUDDIES_LIVE_OP,
   INVITE_CLAIMED_KIND,
@@ -61,6 +62,11 @@ import {
 import { BUDDIES_ABUSE_LIMITS as ABUSE, SignerBudget, logLimitHit } from './limits'
 import { buddiesErrorResponse } from './errorResponse'
 import { retryAfterSeconds } from '../errors'
+import {
+  closeExpiredSockets,
+  readLiveExpiry,
+  soonestSocketExpiry,
+} from '../liveSubprotocol'
 
 type Empty = Record<string, never>
 
@@ -152,13 +158,19 @@ type BlobRow = {
 /** `WebSocket.READY_STATE_OPEN`. */
 const SOCKET_OPEN = 1
 
-/** Stored on each live socket; survives hibernation. */
-type LiveAttachment = { openedAt: number }
+/**
+ * Stored on each live socket; survives hibernation. `expiresAt` (epoch ms)
+ * is a browser socket's token expiry; native sockets have none.
+ */
+type LiveAttachment = { openedAt: number; expiresAt?: number }
 
-const openedAt = (ws: WebSocket): number => {
-  const attachment = ws.deserializeAttachment() as LiveAttachment | null
-  return attachment?.openedAt ?? 0
-}
+const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
+  (ws.deserializeAttachment() as LiveAttachment | null) ?? null
+
+const openedAt = (ws: WebSocket): number => attachmentOf(ws)?.openedAt ?? 0
+
+const expiryOf = (ws: WebSocket): number | null =>
+  attachmentOf(ws)?.expiresAt ?? null
 
 /** Live sockets carry only these tiny signals, never content. */
 type LiveMessage = { type: 'hello' | 'changed'; seq: number }
@@ -984,10 +996,16 @@ export class BuddyInbox extends DurableObject<Environment> {
    * the account the Worker verified (`BUDDIES_LIVE_ACCOUNT_HEADER`, which it
    * sets only from a valid token), then accepts the socket with the
    * Hibernation API and greets it with the current `seq`. Opening a socket is
-   * not owner activity for the 180-day retention.
+   * not owner activity for the 180-day retention. A browser socket's token
+   * expiry (`BUDDIES_LIVE_EXPIRES_HEADER`, also set only by the Worker) is
+   * one of the alarm's deadlines; the alarm closes it with `4004 "expired"`.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return liveError(fail('upgrade_required'))
+    const expiresAt = readLiveExpiry(
+      request.headers.get(BUDDIES_LIVE_EXPIRES_HEADER)
+    )
+    if (expiresAt === undefined) return liveError(fail('bad_request'))
     const call = this.#liveCall(request.headers, Date.now())
     if (!call.ok) return liveError(call)
     const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
@@ -1003,7 +1021,10 @@ export class BuddyInbox extends DurableObject<Environment> {
 
     const [client, server] = Object.values(new WebSocketPair())
     this.ctx.acceptWebSocket(server)
-    const attachment: LiveAttachment = { openedAt: Date.now() }
+    const attachment: LiveAttachment = {
+      openedAt: Date.now(),
+      ...(expiresAt == null ? {} : { expiresAt }),
+    }
     server.serializeAttachment(attachment)
     // One socket per device is typical; past the cap the oldest make way.
     const others = this.#liveSockets()
@@ -1014,6 +1035,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     for (const ws of others.slice(0, Math.max(0, excess)))
       closeQuietly(ws, code, reason)
     this.#signal(server, { type: 'hello', seq: admitted.value })
+    if (expiresAt != null) await this.#ensureAlarm(Date.now())
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -1183,10 +1205,12 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * Retention: events at 30 days, blobs at their `expiresAt`, the weekly
-   * blob sweep, invite bookkeeping, and the 180-day wipe.
+   * blob sweep, invite bookkeeping, and the 180-day wipe. Also closes
+   * browser sockets whose token expired (their expiries are deadlines too).
    */
   async alarm(): Promise<void> {
     const now = Date.now()
+    closeExpiredSockets(this.#liveSockets(), expiryOf, now)
     if (!this.#ready()) return
     const idle = this.#idleOwnerPub(now)
     if (idle) {
@@ -1199,7 +1223,9 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!this.#ready()) return
     }
     this.ctx.storage.transactionSync(() => this.#prune(now))
-    await this.#flushBlobDeletes()
+    // A socket's expiry can wake the alarm before R2's retry backoff is up.
+    const backoff = this.#blobDeleteBackoff()
+    if (!backoff || backoff.retryAt <= now) await this.#flushBlobDeletes()
     await this.#sweepBlobs(now)
     await this.#retryInviteDeletes(now)
     if (
@@ -2059,6 +2085,8 @@ export class BuddyInbox extends DurableObject<Environment> {
     }
     const sweep = this.#blobSweepDue()
     if (sweep != null) deadlines.push(sweep)
+    const expiry = soonestSocketExpiry(this.#liveSockets(), expiryOf)
+    if (expiry != null) deadlines.push(expiry)
     return deadlines.length ? Math.min(...deadlines) : null
   }
 

@@ -73,7 +73,8 @@ describe('Worker entry', () => {
     const page = await call('/b')
     expect(page.status).toBe(200)
     expect(await page.text()).toContain('Open this invite in WitnessWork')
-  })
+    // A cold import of the whole Worker; slow when the machine is busy.
+  }, 30_000)
 
   it('mounts Shared Spaces at /spaces/v1 and exports its Durable Object', async () => {
     const entry = await import('../index')

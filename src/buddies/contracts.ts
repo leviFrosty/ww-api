@@ -1,6 +1,7 @@
 import { base64ToBytes, bytesToBase64Url } from '../crypto'
 import { APNS_DEVICE_TOKEN_PATTERN, type ApnsEnvironment } from '../apns'
 import { FCM_TOKEN_PATTERN } from '../fcm'
+import { LIVE_EXPIRED_CLOSE } from '../liveSubprotocol'
 
 /**
  * Buddies relay wire contract (protocol v1). The source of truth is
@@ -60,6 +61,13 @@ export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
  * deletes any copy a client sends before forwarding.
  */
 export const BUDDIES_LIVE_ACCOUNT_HEADER = 'x-buddies-session-account'
+/**
+ * A browser `inbox/live` socket's token expiry (epoch ms), set by the Worker
+ * on the request it hands the inbox DO, which closes the socket then. Never
+ * read from a client: the Worker deletes any copy before forwarding, so a
+ * native socket never has one.
+ */
+export const BUDDIES_LIVE_EXPIRES_HEADER = 'x-buddies-session-expires-at'
 
 /**
  * Names the part of the app that sent a request. The iOS Notification
@@ -96,6 +104,8 @@ export const BUDDIES_LIVE_CLOSE = {
   replaced: { code: 4002, reason: 'replaced' },
   /** The inbox's account was suspended. */
   suspended: { code: 4003, reason: 'suspended' },
+  /** A browser socket's token expired (`LIVE_EXPIRED_CLOSE`). */
+  expired: LIVE_EXPIRED_CLOSE,
 } as const
 
 export type BuddiesOwnerOp = (typeof BUDDIES_OWNER_OPS)[number]

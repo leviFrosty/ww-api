@@ -4,6 +4,7 @@ import {
   randomBytes,
   randomId,
   sha256B64u,
+  TEST_WEB_ORIGIN,
   type Harness,
 } from '../test/buddies'
 import {
@@ -19,6 +20,7 @@ import { createAccountsRoutes } from './route'
 import { resetSyncEntitlementCache } from './sync'
 import { SYNC_LIMITS } from './syncContracts'
 import { accountSupporterStatus } from './supporter'
+import { AccountSync } from './syncDO'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -570,6 +572,387 @@ describe('privacy', () => {
     await list(s)
     await get(s, phone)
     await del(s, { slotId: phone })
+    const text = JSON.stringify(logs)
+    for (const secret of [phone, s.accountId, s.accessToken])
+      expect(text).not.toContain(secret)
+  })
+})
+
+/**
+ * The browser's live socket (witness-work ADR 0038 §10): browsers can't set
+ * headers on a WebSocket, so the token and slot ride in the
+ * `Sec-WebSocket-Protocol` offer, next to `ww.v1`, from an allowed origin.
+ */
+describe('browser live socket', () => {
+  const MINUTE = 60 * SECOND
+
+  const offer = (s: TestSession, slotId: string) => [
+    'ww.v1',
+    `bearer.${s.accessToken}`,
+    `slot.${slotId}`,
+  ]
+
+  const browserLive = async (
+    protocols: string[] | string | null,
+    headers: Record<string, string> = {}
+  ) => {
+    const response = (await request('/sync/live', {
+      method: 'GET',
+      headers: {
+        upgrade: 'websocket',
+        origin: TEST_WEB_ORIGIN,
+        ...(protocols == null
+          ? {}
+          : {
+              'sec-websocket-protocol': Array.isArray(protocols)
+                ? protocols.join(', ')
+                : protocols,
+            }),
+        ...headers,
+      },
+    })) as Response & { webSocket?: FakeWebSocket | null }
+    const upgraded = response.status === 101
+    return {
+      status: response.status,
+      protocol: response.headers.get('sec-websocket-protocol'),
+      authenticate: response.headers.get('www-authenticate'),
+      code: upgraded ? null : code(await response.json()),
+      socket: upgraded ? response.webSocket! : null,
+    }
+  }
+
+  /** The requests `AccountSync` got through `fetch`. */
+  const forwarded = () => {
+    const seen: Request[] = []
+    const original = AccountSync.prototype.fetch
+    vi.spyOn(AccountSync.prototype, 'fetch').mockImplementation(function (
+      this: AccountSync,
+      request: Request
+    ) {
+      seen.push(request)
+      return original.call(this, request)
+    })
+    return seen
+  }
+
+  it('opens with ww.v1 echoed, says hello, and honors the slot', async () => {
+    const s = await session()
+    const phone = slot()
+    const tablet = slot()
+    const live = await browserLive(offer(s, phone))
+    expect(live.status).toBe(101)
+    expect(live.protocol).toBe('ww.v1')
+    expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
+
+    await put(s, phone)
+    // Its own slot's put doesn't echo back.
+    expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
+    await put(s, tablet)
+    expect(live.socket!.messages().at(-1)).toEqual({ type: 'changed', seq: 2 })
+    live.socket!.send('ping')
+    expect(live.socket!.received.at(-1)).toBe('pong')
+  })
+
+  it('takes the entries in any order, with or without spaces', async () => {
+    const s = await session()
+    const live = await browserLive(
+      `slot.${slot()},bearer.${s.accessToken} ,  ww.v1`
+    )
+    expect(live.status).toBe(101)
+    expect(live.protocol).toBe('ww.v1')
+  })
+
+  it('never forwards the token or the offer to the DO', async () => {
+    const seen = forwarded()
+    const s = await session()
+    const phone = slot()
+    expect((await browserLive(offer(s, phone))).status).toBe(101)
+    expect(seen).toHaveLength(1)
+    const headers = Object.fromEntries(seen[0].headers.entries())
+    expect(headers['sec-websocket-protocol']).toBeUndefined()
+    expect(headers.authorization).toBeUndefined()
+    expect(JSON.stringify(headers)).not.toContain(s.accessToken)
+    expect(headers['x-ww-sync-account']).toBe(s.accountId)
+    expect(headers['x-ww-slot-id']).toBe(phone)
+    expect(headers['x-ww-sync-expires-at']).toBe(String(s.accessExpiresAt))
+    expect(seen[0].url).not.toContain(phone)
+  })
+
+  it('needs ww.v1 in the offer', async () => {
+    const s = await session()
+    const live = await browserLive([`bearer.${s.accessToken}`, `slot.${slot()}`])
+    expect(live).toMatchObject({ status: 400, code: 'bad_request', protocol: null })
+  })
+
+  it('refuses a bad, expired, or missing token like the header path', async () => {
+    const s = await session()
+    for (const token of ['nope', `${s.accessToken}x`]) {
+      const live = await browserLive(['ww.v1', `bearer.${token}`, `slot.${slot()}`])
+      expect(live).toMatchObject({ status: 401, code: 'unauthorized' })
+      expect(live.authenticate).toContain('Bearer')
+    }
+    expect(await browserLive(['ww.v1', `slot.${slot()}`])).toMatchObject({
+      status: 401,
+      code: 'unauthorized',
+    })
+    advance(16 * MINUTE)
+    expect(await browserLive(offer(s, slot()))).toMatchObject({
+      status: 401,
+      code: 'unauthorized',
+    })
+  })
+
+  it('needs an allowed Origin, before the token or the DO', async () => {
+    const seen = forwarded()
+    const s = await session()
+    for (const origin of ['https://evil.example', 'null', `${TEST_WEB_ORIGIN}/`]) {
+      expect(
+        await browserLive(offer(s, slot()), { origin })
+      ).toMatchObject({ status: 403, code: 'forbidden' })
+      // A bad token from a bad origin is still the origin's refusal.
+      expect(
+        await browserLive(['ww.v1', 'bearer.nope', `slot.${slot()}`], { origin })
+      ).toMatchObject({ status: 403, code: 'forbidden' })
+      // So is a malformed offer: a foreign page learns nothing of its shape.
+      expect(
+        await browserLive(['bearer.nope', 'bad entry'], { origin })
+      ).toMatchObject({ status: 403, code: 'forbidden' })
+    }
+    const response = (await request('/sync/live', {
+      method: 'GET',
+      headers: {
+        upgrade: 'websocket',
+        'sec-websocket-protocol': offer(s, slot()).join(', '),
+      },
+    })) as Response
+    expect(response.status).toBe(403)
+    expect(seen).toHaveLength(0)
+  })
+
+  it('refuses malformed offers with bad_request', async () => {
+    const s = await session()
+    const token = `bearer.${s.accessToken}`
+    const phone = `slot.${slot()}`
+    for (const protocols of [
+      ['ww.v1', 'ww.v1', token, phone],
+      ['ww.v1', token, token, phone],
+      ['ww.v1', token, phone, `slot.${slot()}`],
+      ['ww.v1', '', token, phone],
+      ['ww.v1', token, phone, 'chat'],
+      ['ww.v1', token, phone, 'ww.v2'],
+      ['ww.v1', 'bearer.', phone],
+      ['ww.v1', token, 'slot.'],
+      ['ww.v1', token, 'slot.bad slot'],
+      ['ww.v1', token, 'slot.a/b'],
+      ['ww.v1', token, 'slot.x'],
+      ['ww.v1', token, phone, `payload.${'A'.repeat(16)}`],
+      ['ww.v1', token, phone, `x${'A'.repeat(5_000)}`],
+      ['ww.v1', token],
+    ]) {
+      const live = await browserLive(protocols)
+      expect(live, protocols.join(', ').slice(0, 80)).toMatchObject({
+        status: 400,
+        code: 'bad_request',
+      })
+    }
+    expect(
+      await browserLive(offer(s, slot()), { authorization: `Bearer ${s.accessToken}` })
+    ).toMatchObject({ status: 400, code: 'bad_request' })
+  })
+
+  it('runs the switch and entitlement checks the header path runs', async () => {
+    const s = await session()
+    await h.kv.put('sync:enabled', 'false')
+    expect(await browserLive(offer(s, slot()))).toMatchObject({
+      status: 503,
+      code: 'disabled',
+    })
+    await h.kv.delete('sync:enabled')
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 1 })
+    resetSyncEntitlementCache()
+    expect(await browserLive(offer(s, slot()))).toMatchObject({
+      status: 403,
+      code: 'supporter_required',
+    })
+    const plain = await request('/sync/live', {
+      method: 'GET',
+      headers: {
+        origin: TEST_WEB_ORIGIN,
+        'sec-websocket-protocol': offer(s, slot()).join(', '),
+      },
+    })
+    expect(plain.status).toBe(403)
+  })
+
+  it('needs an upgrade like the header path', async () => {
+    const s = await session()
+    const plain = await request('/sync/live', {
+      method: 'GET',
+      headers: {
+        origin: TEST_WEB_ORIGIN,
+        'sec-websocket-protocol': offer(s, slot()).join(', '),
+      },
+    })
+    expect(plain.status).toBe(426)
+  })
+
+  it('leaves header-path sockets as they were: no subprotocol, no expiry', async () => {
+    const seen = forwarded()
+    const s = await session()
+    const response = (await request('/sync/live', {
+      method: 'GET',
+      headers: {
+        ...bearer(s.accessToken),
+        upgrade: 'websocket',
+        'x-ww-slot-id': slot(),
+        // A client can't set the expiry the Worker hands the DO.
+        'x-ww-sync-expires-at': String(Date.now() + MINUTE),
+      },
+    })) as Response & { webSocket?: FakeWebSocket | null }
+    expect(response.status).toBe(101)
+    expect(response.headers.get('sec-websocket-protocol')).toBeNull()
+    expect(seen[0].headers.get('x-ww-sync-expires-at')).toBeNull()
+    advance(20 * MINUTE)
+    expect(h.syncIndexes.storage(s.accountId).alarm()).toBeNull()
+    expect(response.webSocket!.closedBy).toBeNull()
+  })
+
+  it('closes with 4004 expired once the token expires; header sockets stay', async () => {
+    const s = await session()
+    const browser = await browserLive(offer(s, slot()))
+    const native = await live(s, slot())
+    const storage = h.syncIndexes.storage(s.accountId)
+    expect(storage.alarm()).toBe(s.accessExpiresAt)
+
+    advance(s.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(native.socket!.closedBy).toBeNull()
+    expect(storage.alarm()).toBeNull()
+  })
+
+  it('schedules the earliest expiry, and the next one after it', async () => {
+    const first = await session()
+    const firstSocket = await browserLive(offer(first, slot()))
+    advance(5 * MINUTE)
+    // A second session of the same account: refresh-style, a later token.
+    const later = await openTestSession(app as never, h.env, first.key)
+    expect(later.accountId).toBe(first.accountId)
+    const laterSocket = await browserLive(offer(later, slot()))
+    const storage = h.syncIndexes.storage(first.accountId)
+    expect(storage.alarm()).toBe(first.accessExpiresAt)
+
+    advance(first.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(first.accountId)
+    expect(firstSocket.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(laterSocket.socket!.closedBy).toBeNull()
+    expect(storage.alarm()).toBe(later.accessExpiresAt)
+
+    advance(later.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(first.accountId)
+    expect(laterSocket.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+  })
+
+  it('keeps the daily retention alarm: an expiry runs no retention early', async () => {
+    const s = await session()
+    await put(s, slot())
+    const storage = h.syncIndexes.storage(s.accountId)
+    expect(storage.alarm()).toBe(START + DAY)
+    const listed = vi.spyOn(h.syncBlobs, 'list')
+
+    const browser = await browserLive(offer(s, slot()))
+    expect(storage.alarm()).toBe(s.accessExpiresAt)
+    advance(s.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(listed).not.toHaveBeenCalled()
+    // Back to retention, at the time it had.
+    expect(storage.alarm()).toBe(START + DAY)
+
+    advance(START + DAY - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(listed).toHaveBeenCalled()
+    expect(storage.alarm()).toBe(START + 2 * DAY)
+  })
+
+  it('runs retention when it comes first, then closes at the expiry', async () => {
+    const s = await session()
+    await put(s, slot())
+    const storage = h.syncIndexes.storage(s.accountId)
+    advance(DAY - 5 * MINUTE)
+    const later = await openTestSession(app as never, h.env, s.key)
+    const browser = await browserLive(offer(later, slot()))
+    // Retention (START + DAY) is sooner than the token's expiry.
+    expect(storage.alarm()).toBe(START + DAY)
+    const listed = vi.spyOn(h.syncBlobs, 'list')
+
+    advance(5 * MINUTE)
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(listed).toHaveBeenCalledTimes(1)
+    expect(browser.socket!.closedBy).toBeNull()
+    expect(storage.alarm()).toBe(later.accessExpiresAt)
+
+    advance(later.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    expect(listed).toHaveBeenCalledTimes(1)
+    expect(storage.alarm()).toBe(START + 2 * DAY)
+  })
+
+  it('treats an alarm from before expiries as retention', async () => {
+    const s = await session()
+    await put(s, slot())
+    const storage = h.syncIndexes.storage(s.accountId)
+    // As an object from before this change: an alarm, no schedule row.
+    storage.query('DROP TABLE IF EXISTS alarm_schedule')
+    h.syncIndexes.restart(s.accountId)
+    const listed = vi.spyOn(h.syncBlobs, 'list')
+    const later = await openTestSession(app as never, h.env, s.key)
+    const browser = await browserLive(offer(later, slot()))
+    expect(storage.alarm()).toBe(later.accessExpiresAt)
+
+    advance(later.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(browser.socket!.closedBy).toEqual({ code: 4004, reason: 'expired' })
+    // The old alarm was retention's, kept for its time.
+    expect(listed).not.toHaveBeenCalled()
+    expect(storage.alarm()).toBe(START + DAY)
+    advance(START + DAY - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
+    expect(listed).toHaveBeenCalled()
+  })
+
+  it('counts browser sockets in the 20-socket cap', async () => {
+    const s = await session()
+    const sockets: FakeWebSocket[] = []
+    for (let i = 0; i < SYNC_LIMITS.liveSockets; i++) {
+      sockets.push((await live(s, slot())).socket!)
+      advance(1)
+    }
+    const browser = await browserLive(offer(s, slot()))
+    expect(browser.status).toBe(101)
+    expect(sockets[0].closedBy).toEqual({ code: 4000, reason: 'replaced' })
+    advance(1)
+    // The 19 native sockets older than it go first, then it.
+    for (let i = 0; i < SYNC_LIMITS.liveSockets - 1; i++) {
+      await live(s, slot())
+      advance(1)
+    }
+    expect(browser.socket!.closedBy).toBeNull()
+    await live(s, slot())
+    expect(browser.socket!.closedBy).toEqual({ code: 4000, reason: 'replaced' })
+  })
+
+  it('never logs the token or the slot', async () => {
+    const logs: unknown[] = []
+    for (const level of ['log', 'warn', 'error', 'info'] as const)
+      vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
+    const s = await session()
+    const phone = slot()
+    await browserLive(offer(s, phone))
+    await browserLive(offer(s, phone), { origin: 'https://evil.example' })
+    advance(s.accessExpiresAt - Date.now())
+    await h.syncIndexes.fireAlarm(s.accountId)
     const text = JSON.stringify(logs)
     for (const secret of [phone, s.accountId, s.accessToken])
       expect(text).not.toContain(secret)
