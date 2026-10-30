@@ -30,7 +30,7 @@ import { accountForKey, guarded, refuseAtEdge, verifyEnvelope } from './signed'
 import { admitLiveTicket } from './liveTickets'
 import { cachedSessionCapabilities, sessionStates } from './sessionStore'
 import { accountSupporterStatus } from './supporter'
-import { accountsDb } from './store'
+import { accountsDb, findKeyChangedAt } from './store'
 import {
   SYNC_ETAG_PATTERN,
   SYNC_HEADERS,
@@ -280,6 +280,15 @@ const handleSwitchRequest = guarded('sync/request', async (c) => {
  * is refused before anything else; the body is read and checked against its
  * size and digest before the slot is reserved, so a bad upload never holds
  * the slot.
+ *
+ * `x-ww-reseal: 1` re-seals an existing slot (another device's, too) under a
+ * new account key: it keeps the slot's session, platform, and `updatedAt`,
+ * so retention and the Cloud Sync request see no new write. It needs a
+ * strong quoted-ETag `If-Match` (`bad_request` without one, or with a weak
+ * `W/"…"` one), so it never replaces
+ * bytes a device wrote after the re-sealer read the slot. Allowed only
+ * within `resealWindowMs` of the account's last key change (`forbidden`);
+ * a slot that doesn't exist is `precondition_failed` (ADR 0039).
  */
 const handlePut = guarded('sync/put', async (c) => {
   const declared = c.req.header('content-length')
@@ -287,7 +296,9 @@ const handlePut = guarded('sync/put', async (c) => {
   if (declared != null && Number(declared) > SYNC_LIMITS.blobBytes)
     return off ?? buddiesErrorResponse('too_large')
   if (off) return off
-  const who = await caller(c, 'write')
+  // A signed-out device's last token never writes over a slot re-sealed
+  // under a new account key (ADR 0039).
+  const who = await caller(c, 'write', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
   const { accountId, sessionId, platform } = who.account
   const refused = await refuseUnentitled(c.env, who.account)
@@ -296,8 +307,16 @@ const handlePut = guarded('sync/put', async (c) => {
   const slotId = c.req.header(SYNC_HEADERS.slotId)
   const sha256 = c.req.header(SYNC_HEADERS.sha256)
   const size = declared == null ? NaN : Number(declared)
-  const ifMatch = parseIfMatch(c.req.header('if-match') ?? null)
+  const ifMatchHeader = c.req.header('if-match') ?? null
+  const ifMatch = parseIfMatch(ifMatchHeader)
+  const resealHeader = c.req.header(SYNC_HEADERS.reseal)
+  const reseal = resealHeader === '1'
   if (
+    (resealHeader !== undefined && !reseal) ||
+    // A re-seal replaces exactly the bytes it read, never newer ones: a
+    // strong ETag only (a weak `W/"…"` doesn't promise the same bytes).
+    (reseal &&
+      !(ifMatch != null && 'etag' in ifMatch && !/^\s*W\//.test(ifMatchHeader ?? ''))) ||
     !isSyncSlotId(slotId) ||
     typeof sha256 !== 'string' ||
     !SYNC_ETAG_PATTERN.test(sha256) ||
@@ -307,6 +326,12 @@ const handlePut = guarded('sync/put', async (c) => {
   )
     return buddiesErrorResponse('bad_request')
 
+  if (reseal) {
+    const changedAt = await findKeyChangedAt(accountsDb(c.env.ACCOUNTS_DB!), accountId)
+    if (changedAt == null || Date.now() - changedAt > SYNC_LIMITS.resealWindowMs)
+      return buddiesErrorResponse('forbidden')
+  }
+
   const body = await readBlobBody(c.req.raw, size, SYNC_LIMITS.blobBytes)
   if (!body.ok) return buddiesErrorResponse(body.error)
   const digest = await sha256Bytes(body.value)
@@ -314,13 +339,13 @@ const handlePut = guarded('sync/put', async (c) => {
     return buddiesErrorResponse('bad_request')
 
   const index = syncIndex(c.env, accountId)
-  const begun = await index.beginPut({ accountId, slotId, size, ifMatch })
+  const begun = await index.beginPut({ accountId, slotId, size, ifMatch, reseal })
   if (!begun.ok)
     return buddiesErrorResponse(begun.error, {
       retryAfterSeconds: begun.retryAfterSeconds,
     })
   const { reservation } = begun.value
-  const updatedAt = Date.now()
+  const updatedAt = begun.value.updatedAt ?? Date.now()
   try {
     await c.env.ACCOUNT_SYNC!.put(syncObjectKey(accountId, slotId), body.value, {
       sha256: Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join(
@@ -342,6 +367,7 @@ const handlePut = guarded('sync/put', async (c) => {
     updatedAt,
     sessionId,
     platform,
+    reseal,
   })
   if (!committed.ok) return buddiesErrorResponse(committed.error)
   return c.json({ ok: true, ...committed.value }, 200, {
@@ -421,17 +447,16 @@ const handleGet = guarded('sync/get', async (c) => {
 /**
  * `sync/delete`: one slot, or every slot without `slotId`. Idempotent, and
  * it works while Cloud Sync is off or the account isn't entitled, so a
- * device can always take its data off the server. Deleting every slot needs
- * a live session (Delete Buddies runs it before closing its own).
+ * device can always take its data off the server. Needs a live session
+ * (Delete Buddies runs it before closing its own), so a signed-out device
+ * can't delete what a key change re-sealed (ADR 0039).
  */
 const handleDelete = guarded('sync/delete', async (c) => {
   const off = unavailableHere(c.env)
   if (off) return off
   const field = await readSlotField(c, false)
   if ('refusal' in field) return field.refusal
-  const who = await caller(c, 'read', {
-    requireLiveSession: field.slotId == null,
-  })
+  const who = await caller(c, 'read', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
   // Every slot takes every photo with it (the index marks them deleted).

@@ -106,7 +106,8 @@ const putPhoto = async (
   declared: string | undefined
 ): Promise<Response> => {
   if (off) return off
-  const who = await caller(c, 'photoPut')
+  // Live sessions only, as `sync/put` (ADR 0039).
+  const who = await caller(c, 'photoPut', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
   const refused = await refuseUnentitled(c.env, who.account)
@@ -234,8 +235,8 @@ const handleGet = guarded('sync/photos/get', async (c) => {
 
 /**
  * `photos/delete`: `{ names }` (1 to 100) or `{ all: true }`. Idempotent;
- * works while Cloud Sync is off or the account isn't entitled. Deleting every
- * photo needs a live session, as deleting every slot does.
+ * works while Cloud Sync is off or the account isn't entitled. Needs a live
+ * session, as `sync/delete` does.
  */
 const handleDelete = guarded('sync/photos/delete', async (c) => {
   const off = unavailableHere(c.env, false)
@@ -253,7 +254,7 @@ const handleDelete = guarded('sync/photos/delete', async (c) => {
     names.length <= SYNC_PHOTO_LIMITS.deleteNames &&
     names.every(isSyncPhotoName)
   if (!all && !named) return buddiesErrorResponse('bad_request')
-  const who = await caller(c, 'read', { requireLiveSession: all })
+  const who = await caller(c, 'read', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
   const { usage } = await syncIndex(c.env, accountId).deletePhotos({

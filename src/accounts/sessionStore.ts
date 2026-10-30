@@ -60,6 +60,8 @@ export interface SessionRecord {
   id: string
   accountId: string
   platform: SessionPlatform
+  /** The account's key epoch the session holds (its tokens' `kep`). */
+  keyEpoch: number
   /** Epoch milliseconds. */
   expiresAt: number
 }
@@ -155,6 +157,7 @@ const sessionColumns = {
   id: accountSessions.id,
   accountId: accountSessions.accountId,
   platform: accountSessions.platform,
+  keyEpoch: accountSessions.keyEpoch,
   refreshHash: accountSessions.refreshHash,
   previousRefreshHash: accountSessions.previousRefreshHash,
   expiresAt: accountSessions.expiresAt,
@@ -167,6 +170,7 @@ type SessionRow = {
   id: string
   accountId: string
   platform: SessionPlatform
+  keyEpoch: number
   refreshHash: string
   previousRefreshHash: string | null
   expiresAt: Date
@@ -182,12 +186,20 @@ const record = (row: SessionRow): SessionRecord => ({
   id: row.id,
   accountId: row.accountId,
   platform: row.platform,
+  keyEpoch: row.keyEpoch,
   expiresAt: row.expiresAt.getTime(),
 })
 
 /** What a new session needs besides its account. */
 export interface NewSession {
   accountId: string
+  /**
+   * The account key it opens with, and the account's key epoch read with
+   * it: the session opens only while they're still the account's, checked
+   * in its insert, so a key a key change just retired never gets one.
+   */
+  accountPub: string
+  keyEpoch: number
   platform: SessionPlatform
   device: string | null
   /** How it opened; `attestation` or `dev` for phones. */
@@ -208,6 +220,11 @@ export interface NewSession {
  * and end the least recently active, each logged `session.replaced`. A web
  * session lasts `webSessionMs` from its last refresh and counts as stepped
  * up when it opens. `keys` are the current secret's.
+ *
+ * The row is written only while the account's key and epoch are still
+ * `accountPub` and `keyEpoch`, and the other statements only once it was,
+ * so nothing opens (`statements[0]` changes no row) after a key change
+ * raced it.
  */
 export const prepareSession = async (
   db: AccountsDb,
@@ -238,22 +255,22 @@ export const prepareSession = async (
           AND ${accountSessions.platform} != 'web'
         ORDER BY ${accountSessions.createdAt} DESC, ${accountSessions.id} DESC
         LIMIT -1 OFFSET ${sessionsPerAccount}`
+  const opened = sql`EXISTS (SELECT 1 FROM ${accountSessions}
+    WHERE ${accountSessions.id} = ${id})`
   const statements = [
-    db.insert(accountSessions).values({
-      id,
-      accountId: input.accountId,
-      platform: input.platform,
-      device: input.device,
-      refreshHash: refresh.hash,
-      createdAt: new Date(now),
-      expiresAt: new Date(expiresAt),
-      appVersion: input.appVersion ?? null,
-      capabilities: input.capabilities ?? null,
-      method: input.method,
-      keyEpoch: sql`(SELECT key_epoch FROM accounts WHERE id = ${input.accountId})`,
-      stepUpAt: web ? new Date(now) : null,
-      stepUpCredentialId: input.stepUpCredentialId ?? null,
-    }),
+    // Columns in the table's order (see `activityInsert`).
+    db.insert(accountSessions).select(
+      sql`SELECT ${id}, ${input.accountId}, ${input.platform}, ${input.device},
+          ${refresh.hash}, NULL, NULL, ${now}, ${expiresAt}, NULL,
+          ${input.appVersion ?? null},
+          ${input.capabilities ? JSON.stringify(input.capabilities) : null},
+          ${input.method}, ${input.keyEpoch},
+          ${web ? now : null}, ${input.stepUpCredentialId ?? null}, NULL
+        WHERE EXISTS (SELECT 1 FROM accounts
+          WHERE id = ${input.accountId}
+            AND account_pub = ${input.accountPub}
+            AND key_epoch = ${input.keyEpoch})`
+    ),
     activityInsert(
       db,
       {
@@ -263,7 +280,7 @@ export const prepareSession = async (
         actorSessionId: input.actorSessionId ?? null,
         method: input.method,
       },
-      { now }
+      { now, onlyIf: opened }
     ),
     // `session.replaced` for each session the cap is about to end, before
     // the update ends them. (Columns in the table's order; see
@@ -272,18 +289,19 @@ export const prepareSession = async (
       sql`SELECT NULL, account_id, 'session.replaced',
           id, platform, device, ${id}, ${input.platform}, ${input.device},
           NULL, ${now}, NULL, NULL
-        FROM account_sessions WHERE id IN (${overflow})`
+        FROM account_sessions WHERE id IN (${overflow}) AND ${opened}`
     ),
     db
       .update(accountSessions)
       .set({ revokedAt: new Date(now), endedReason: 'replaced' })
-      .where(sql`${accountSessions.id} IN (${overflow})`),
+      .where(sql`${accountSessions.id} IN (${overflow}) AND ${opened}`),
   ] as const
   const issued: IssuedSession = {
     session: {
       id,
       accountId: input.accountId,
       platform: input.platform,
+      keyEpoch: input.keyEpoch,
       expiresAt,
     },
     refreshToken: refresh.token,
@@ -291,16 +309,19 @@ export const prepareSession = async (
   return { statements, issued }
 }
 
-/** Opens a session (`prepareSession`) in a batch of its own. */
+/**
+ * Opens a session (`prepareSession`) in a batch of its own. Null when the
+ * account's key changed first.
+ */
 export const createSession = async (
   db: AccountsDb,
   keys: RefreshKeys,
   input: NewSession,
   now: number = Date.now()
-): Promise<IssuedSession> => {
+): Promise<IssuedSession | null> => {
   const { statements, issued } = await prepareSession(db, keys, input, now)
-  await db.batch(statements)
-  return issued
+  const [inserted] = await db.batch(statements)
+  return changes(inserted) === 1 ? issued : null
 }
 
 /**
@@ -403,8 +424,22 @@ export const isSessionLive = async (
   sessionId: string,
   now: number = Date.now()
 ): Promise<boolean> =>
-  (await db
-    .select({ id: accountSessions.id })
+  (await liveSessionKeyEpoch(db, accountId, sessionId, now)) != null
+
+/**
+ * The key epoch of the account's session while it's live, else null: the
+ * same one read as `isSessionLive`, so `requireLiveSession` also compares a
+ * token's `kep` with it (ADR 0039).
+ */
+export const liveSessionKeyEpoch = async (
+  db: AccountsDb,
+  accountId: string,
+  sessionId: string,
+  now: number = Date.now()
+): Promise<number | null> =>
+  (
+    await db
+    .select({ keyEpoch: accountSessions.keyEpoch })
     .from(accountSessions)
     .where(
       and(
@@ -414,7 +449,8 @@ export const isSessionLive = async (
         gt(accountSessions.expiresAt, new Date(now))
       )
     )
-    .get()) != null
+    .get()
+  )?.keyEpoch ?? null
 
 const findSession = async (
   db: AccountsDb,
@@ -465,6 +501,24 @@ const endedRefusal = (row: SessionRow, now: number): RefreshRefusal => {
     default:
       return 'revoked'
   }
+}
+
+/**
+ * Why the account's session isn't live (a refresh's `reason`: `revoked`,
+ * `replaced`, `expired`, …), or null while it is. For a request that
+ * started on a live session and found it ended partway (ADR 0039's key
+ * change).
+ */
+export const sessionEndedReason = async (
+  db: AccountsDb,
+  accountId: string,
+  sessionId: string,
+  now: number = Date.now()
+): Promise<RefreshRefusal | null> => {
+  const row = await findSession(db, sessionId)
+  if (!row || row.accountId !== accountId) return 'unknown'
+  if (row.revokedAt == null && row.expiresAt.getTime() > now) return null
+  return endedRefusal(row, now)
 }
 
 /**

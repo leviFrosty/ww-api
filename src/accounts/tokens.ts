@@ -11,8 +11,9 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  * valid while its signature, issuer, audience, and expiry check out.
  *
  * Claims: the registered `iss`, `aud`, `sub` (the account id), `iat`, and
- * `exp`, plus `sid` (the session id, as in OpenID Connect) and `platform`
- * (`ios`, `android`, or `dev`).
+ * `exp`, plus `sid` (the session id, as in OpenID Connect), `platform`
+ * (`ios`, `android`, `dev`, or `web`), and `kep`, the session's key epoch
+ * (ADR 0039; a token without one counts as `0`).
  *
  * Rotation: the header's `kid` is derived from the secret that signed it, so
  * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
@@ -55,6 +56,8 @@ export interface AccessTokenClaims {
   accountId: string
   sessionId: string
   platform: SessionPlatform
+  /** The session's key epoch when the token was issued (`kep`). */
+  keyEpoch: number
   /** Epoch milliseconds. */
   expiresAt: number
 }
@@ -259,6 +262,11 @@ export const signAccessToken = async (
     accountId: string
     sessionId: string
     platform: SessionPlatform
+    /**
+     * The session's key epoch (`kep`). Defaults to `0`, which fails closed:
+     * after a key change, a write with it is refused.
+     */
+    keyEpoch?: number
     sessionExpiresAt?: number
   },
   now: number = Date.now()
@@ -277,6 +285,7 @@ export const signAccessToken = async (
     sub: session.accountId,
     sid: session.sessionId,
     platform: session.platform,
+    kep: session.keyEpoch ?? 0,
     iat,
     exp,
   })
@@ -297,12 +306,15 @@ const isPlatform = (value: unknown): value is SessionPlatform =>
 const isSeconds = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 
+const isKeyEpoch = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+
 /**
  * The claims of a token this worker signed and that hasn't expired, or null.
  * Checks, in order: three base64url segments, an `HS256` header whose `kid`
  * names a configured key, the signature, then `iss`, `aud`, `iat`, `exp`, and
- * the shapes of `sub`, `sid`, and `platform`. A `dev` token never passes on
- * production.
+ * the shapes of `sub`, `sid`, `platform`, and `kep` (absent is `0`). A `dev`
+ * token never passes on production.
  */
 export const verifyAccessToken = async (
   keys: AccessTokenKeys,
@@ -339,7 +351,7 @@ export const verifyAccessToken = async (
 
   const claims = decodeJson(payloadPart)
   if (!claims) return null
-  const { iss, aud, sub, sid, platform, iat, exp } = claims
+  const { iss, aud, sub, sid, platform, iat, exp, kep = 0 } = claims
   const nowSeconds = now / 1_000
   if (iss !== keys.issuer || aud !== ACCESS_TOKEN_AUDIENCE) return null
   if (!isSeconds(iat) || !isSeconds(exp)) return null
@@ -348,6 +360,13 @@ export const verifyAccessToken = async (
   if (!isAccountId(sub)) return null
   if (typeof sid !== 'string' || !BUDDIES_ID_PATTERN.test(sid)) return null
   if (!isPlatform(platform)) return null
+  if (!isKeyEpoch(kep)) return null
   if (platform === 'dev' && keys.issuer === 'ww-api/production') return null
-  return { accountId: sub, sessionId: sid, platform, expiresAt: exp * 1_000 }
+  return {
+    accountId: sub,
+    sessionId: sid,
+    platform,
+    keyEpoch: kep,
+    expiresAt: exp * 1_000,
+  }
 }

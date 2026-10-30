@@ -114,6 +114,7 @@ describe('POST /accounts/v1/account/info', () => {
       accountPub: key.publicKey,
       status: 'active',
       createdAt: expect.any(Number),
+      keyEpoch: 0,
       inboxIds: [],
       statusChanges: [],
     })

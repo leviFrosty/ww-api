@@ -838,9 +838,9 @@ authenticating survive only behind the legacy switch (`auth:legacy`), for app
 versions from before sessions.
 
 - `GET /accounts/v1/account`: Bearer, read-only. Returns the token's
-  account (`accountId`, `accountPub`, `status`, `createdAt`, `inboxIds`, and
-  `statusChanges` without their reasons) for Settings → Account and the
-  developer tools. Counts against the Buddies read edge tier.
+  account (`accountId`, `accountPub`, `status`, `createdAt`, `keyEpoch`,
+  `inboxIds`, and `statusChanges` without their reasons) for Settings →
+  Account and the developer tools. Counts against the Buddies read edge tier.
 - `POST /accounts/v1/account/register` (legacy): self-signed under the
   `ww-account/v1` context; idempotent per key. Counts against the Buddies
   register edge tier and the per-caller daily quota. Replaced by opening a
@@ -962,7 +962,8 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   `accountPub`, or IP. The hourly cron deletes sessions a week after they
   were revoked or expired.
 - **Access tokens**: HS256 JWTs, 15 minutes (never past the session's end),
-  claims `sub` (account), `sid` (session), `platform`, `iss`
+  claims `sub` (account), `sid` (session), `platform`, `kep` (the
+  session's key epoch; absent counts as `0`), `iss`
   `ww-api/<APP_ATTEST_ENVIRONMENT>`, `aud` `ww-account`, `iat`, `exp`.
   Nothing is stored; a token is valid until it expires, so closing a
   session stops its refresh token at once and its access token within 15
@@ -1011,12 +1012,18 @@ Building a route on accounts (`src/accounts/auth.ts`):
   ended (signed out, revoked, replaced, expired, or deleted) with the same
   401 `unauthorized` and `WWW-Authenticate` an expired token gets, so the
   app's refresh → 401 → open path signs it back in. One D1 read
-  (`isSessionLive`), **never cached**: revocation bites at once. Use it on
-  security surfaces a signed-out device must not act on in its token's last
-  15 minutes: today `GET /sessions`, `POST /sessions/revoke`,
-  `GET /activity`, `GET /account` (and `account/info`'s bearer form),
-  `handoff/open` and `handoff/send`, and `backup/delete`. Leave it off hot
-  paths (Buddies, Notes Import, route planning, backup put/list/get,
+  (`liveSessionKeyEpoch`), **never cached**: revocation bites at once. The
+  same read compares the token's `kep` with the session's `key_epoch`: a
+  token from before the session's key change is 401 `unauthorized` with
+  `reason: "key_changed"` (the app refreshes). Use it on security surfaces a
+  signed-out device must not act on in its token's last 15 minutes: today
+  `GET /sessions`, `POST /sessions/revoke`, `GET /activity`, `GET /account`
+  (and `account/info`'s bearer form), `handoff/open` and `handoff/send`, the
+  passkey routes, `account/rekey`, `account/key-history`, and every write
+  of re-sealable data:
+  `sync/put`, `sync/delete`, `sync/photos/put`, `sync/photos/delete`,
+  `backup/put`, `backup/delete` (ADR 0039). Leave it off hot paths (Buddies,
+  Notes Import, route planning, backup list/get, Cloud Sync reads,
   Supporter, handoff status/cancel), where ADR 0027's 15 minutes stand, and
   off `DELETE /sessions/current`, which must always succeed.
 - `authenticateAccount(c, options?)`: the same check as a call, for routes
@@ -1208,10 +1215,12 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
   `account.suspended`/`.reinstated` (never the reason),
   `buddies.inbox_linked` (a new link, in `linkInbox`'s batch),
   `buddies.deleted` (the Worker, after the inbox DO accepted `inbox/delete`;
-  never in the DO). Writer ops log nothing, so nothing ties a writing
-  account to another account's inbox. Expiry, refreshes,
-  reads, and uploads aren't logged. Clients skip unknown kinds, so adding
-  one is safe.
+  never in the DO), `passkey.added`/`.removed`, `device.approved`,
+  `account.key_changed` (the session that changed it; the sessions it ended
+  are `session.revoked` with it as actor). Writer ops log nothing, so
+  nothing ties a writing account to another account's inbox. Expiry,
+  refreshes, reads, and uploads aren't logged. Clients skip unknown kinds,
+  so adding one is safe.
 - **Recording a new action**: add the kind to `ACTIVITY_KINDS`
   (`schema.ts`; no migration, it's a text column), then put
   `activityInsert(db, { accountId, kind, sessionId })` in the action's own
@@ -1366,15 +1375,15 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
 - **Web sessions**: platform `web`, sliding 180 days from the last refresh,
   at most 3 per account apart from the phones' 10 (least recently active
   replaced, `session.replaced`), and stepped up when they open. Step-up
-  (`refuseWithoutStepUp`; `STEP_UP_EXEMPT` lists the platforms that skip
-  it: `ios`, `android`, `dev`) is required of web sessions within 5 minutes on
-  passkey add/remove and `backup/delete` (ADR 0039's key change will use it
-  too). Every session records `method`, `app_version`, `key_epoch`, and
-  `step_up_at`; refreshes refused with 401 carry `reason` (`revoked`,
-  `replaced`, `expired`, `reused`, `unknown`; `ended_reason` on the row).
+  (`refuseWithoutStepUp`; `STEP_UP_EXEMPT` lists the platforms that skip it:
+  `ios`, `android`, `dev`) is required of web sessions within 5 minutes on
+  passkey add/remove, `backup/delete`, and `account/rekey`. Every session
+  records `method`, `app_version`, `key_epoch`, and `step_up_at`; refreshes
+  refused with 401 carry `reason` (`revoked`, `replaced`, `expired`,
+  `reused`, `unknown`; `ended_reason` on the row).
 - **Accounts** gain `passkey_user_handle` (minted with a conditional write),
-  `key_epoch` (ADR 0039 raises it; wraps for another epoch are refused), and
-  `created_via` (`app` or `web`).
+  `key_epoch` (ADR 0039 raises it; wraps for another epoch are refused),
+  `created_via` (`app` or `web`), and `key_changed_at`.
 - **Privacy**: never log or report challenge tokens, tickets, registration or
   assertion bodies, user handles, credential ids, wraps, or anything near a
   PRF output (the server never sees one). Sentry drops request bodies
@@ -1477,6 +1486,67 @@ drives the routes with a software authenticator (`src/test/webauthn.ts`), and
 Siteverify with the test keys. `TURNSTILE_SECRET_KEY=2x0000000000000000000000000000000AA
 node scripts/verify/dev.mjs up` makes every token fail (`3x…` answers "already
 spent").
+
+### Changing the account key
+
+The same account under a new key (witness-work ADR 0039; the wire contract
+is its `docs/account-key-change.md`, implement it as written and list any
+deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
+`store.ts` (`refuseRetiredKey`, `isRetiredKey`, `registerAccount`). Tables
+`retired_account_keys` and `account_key_history`, and
+`accounts.key_changed_at` (migration
+`migrations/accounts/0006_account-key-change.sql`).
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/account/rekey` | Bearer, live session; signed by the old key (op `account/rekey`) and the new (`newSignature`) → `{ ok, keyEpoch, accessToken, accessExpiresAt }` |
+| `GET /accounts/v1/account/key-history` | Bearer, live session → `{ ok, keyEpoch, history }` (the sealed blob, or `null`) |
+
+- **Who may**: phone sessions (`STEP_UP_EXEMPT`) at any age; a web session
+  at least 24 hours old (403 `session_too_new`) with a step-up in the last 5
+  minutes (`step_up_required`). Suspended accounts may.
+- **One batch**, every statement after the swap gated on it having landed
+  (`committed`: the account now has the new key, the new epoch, and this
+  request's `key_changed_at`): the envelope's nonce (each works once, 409
+  `replay`; no idempotent retry, the device refreshes and reads
+  `GET /account`), the swap (a compare-and-swap on `account_pub` and
+  `key_epoch`, also requiring the caller's session live, the new key never
+  retired, and the limits), the retired key, the caller's session (new
+  epoch, re-sealed `device`), `session.revoked` for and the end of every
+  other session, every wrap deleted and `passkeyWrap` (only the session's
+  step-up credential, a phone's too, else 404 `not_found`) stored at the
+  new epoch, the history upserted, and `account.key_changed`. A lost swap
+  is read again: a moved key or epoch is 409 `conflict` with the account's
+  `keyEpoch` (another device won); a caller session that ended meanwhile is
+  401 `unauthorized` with its `reason` (`revoked`, `replaced`, `expired`),
+  so the app never drops its new key for a change nobody made. Then every
+  Cloud Sync socket of the account closes with `4005 "key_changed"`
+  (`closeForKeyChange`); the caller reconnects with the answer's token.
+- **Retired keys** never open a session or make an account: `POST /sessions`
+  (attested and every ticket), legacy `account/register`, `web/signup`, and
+  `web/recovery` answer 403 `key_retired` with `changedAt`. The checks run
+  before the attestation or ticket, and again inside the writes: a session
+  row is inserted only while its key and epoch are still the account's
+  (`prepareSession`), and an account only while its key isn't retired, so a
+  key change racing a session open can't leave either behind.
+- **Opening into a known account**: `POST /sessions` takes an optional
+  `accountId` in its payload; then it opens only when `accountPub` is that
+  account's current key (404 `unknown_account` otherwise) and never creates
+  an account. A device resolving an interrupted key change uses it.
+- **Re-sealing** (`sync/put` with `x-ww-reseal: 1`): it needs a strong
+  quoted-ETag `If-Match` (`bad_request` without one or with a weak `W/"…"`
+  one), so it never replaces bytes written after the device read the slot. Within 7 days of the account's last key
+  change (`forbidden` otherwise), an existing slot (`precondition_failed`
+  otherwise) takes the new bytes but keeps its session, platform, and
+  `updatedAt` (in the DO and in R2's `customMetadata`), so retention and the
+  Cloud Sync request see no new write.
+- **Limits**: 3 changes per account a rolling day and 10 a rolling 30 days,
+  counted from `account.key_changed` entries (checked first for
+  `Retry-After`, and again in the swap's own statement), plus the register
+  edge tier.
+- **Privacy**: never log or report keys, the history blob, wraps, credential
+  ids, account ids, or session ids. The history is sealed by the devices; the
+  server stores it opaque.
 
 ### Supporter status (RevenueCat)
 
@@ -1664,17 +1734,17 @@ iCloud and Google Drive; each device uses exactly one. Code in
 | Route | What |
 | --- | --- |
 | `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt, photos }` |
-| `POST /accounts/v1/sync/put` | Bearer; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`? → `{ ok, etag, size, updatedAt, seq }` |
+| `POST /accounts/v1/sync/put` | Bearer, live session; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`?, `x-ww-reseal`? → `{ ok, etag, size, updatedAt, seq }` |
 | `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
-| `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
+| `POST /accounts/v1/sync/delete` | Bearer, live session; `{ slotId }` or `{}` (every slot) → `{ ok, seq }` |
 | `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
 | `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
 | `POST /accounts/v1/live/ticket` | Bearer `{ socket, id }` → `{ ticket, expiresAt }`: a browser's 30-second [live socket ticket](#browser-live-sockets) |
 | `POST /accounts/v1/sync/photos/put` | Bearer; raw blob, `x-ww-photo-name`, `x-ww-sha256`, `x-ww-photo-meta`, `Content-Length`, `x-ww-slot-id`? → `{ ok, name, size, sha256, createdAt, existed, usage }` |
 | `POST /accounts/v1/sync/photos/list` | Bearer, `{ cursor? }` → `{ ok, photos: [{ name, size, sha256, createdAt, meta }], cursor, usage }` |
 | `POST /accounts/v1/sync/photos/get` | Bearer, `{ name }` → the blob, `ETag`, `x-ww-created-at` |
-| `POST /accounts/v1/sync/photos/delete` | Bearer, `{ names }` (1–100) or `{ all: true }` (needs a live session); `x-ww-slot-id`? → `{ ok, usage }` |
+| `POST /accounts/v1/sync/photos/delete` | Bearer, live session; `{ names }` (1–100) or `{ all: true }`; `x-ww-slot-id`? → `{ ok, usage }` |
 | `GET /accounts/v1/sync/photos/usage` | Bearer → `{ ok, usage: { bytes, count, limit } }` |
 
 - **Storage**: one `AccountSync` SQLite DO per account (binding

@@ -174,6 +174,7 @@ describe('POST /sessions with the dev bypass', () => {
       accountPub: session.key.publicKey,
       status: 'active',
       createdAt: START,
+      keyEpoch: 0,
       inboxIds: [],
       statusChanges: [],
     })
