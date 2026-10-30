@@ -415,6 +415,23 @@ export interface Environment {
   /** Kill-switch fallback (`"true"` enables) when KV `buddies:enabled` is absent. */
   BUDDIES_ENABLED?: string;
 
+  // --- Shared Spaces (witness-work ADR 0037) -------------------------------
+
+  /**
+   * One SQLite DO per space (`idFromName(spaceId)`): sealed records, members
+   * by token hash, wraps, invites, the change `seq`, put limits, the
+   * retention alarm, and live sockets. Never an account.
+   */
+  SHARED_SPACE: DurableObjectNamespace<
+    import('./spaces/spaceDO').SharedSpace
+  >;
+
+  /**
+   * Shared Spaces' kill-switch fallback (`"true"` enables) when KV
+   * `spaces:enabled` is absent. `"true"` in dev, `"false"` in prod.
+   */
+  SPACES_ENABLED?: string;
+
   /** APNs auth key id (secret). Pushes are skipped when unset. */
   APNS_KEY_ID?: string;
 

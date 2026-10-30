@@ -4,10 +4,18 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
  * Durable Object test doubles backed by a real in-memory SQLite database, so
  * DO code runs its actual SQL instead of pattern-matched fakes. Mirrors the
  * SQLite storage API surface our DOs use: `sql.exec` (one statement, cursors),
- * `transactionSync` (rolls back on throw), alarms, and `deleteAll()` (which, as
- * before compatibility date 2026-02-24, leaves the alarm in place). Also the
- * WebSocket Hibernation API: `acceptWebSocket`, `getWebSockets`, and
- * `setWebSocketAutoResponse`, with the runtime globals it needs below.
+ * `transactionSync` (rolls back on throw), alarms, `deleteAll()` (which, as
+ * before compatibility date 2026-02-24, leaves the alarm in place unless a
+ * test says otherwise), and `blockConcurrencyWhile` (no call reaches the
+ * object until its callback settles, and a callback that rejects resets the
+ * object, as workerd does). Also the WebSocket Hibernation API: `acceptWebSocket`,
+ * `getWebSockets`, and `setWebSocketAutoResponse`, with the runtime globals
+ * it needs below.
+ *
+ * Unlike workerd, `exec()` reads every row up front, so a cursor left
+ * unfinished (which on workerd keeps its statement running, and makes a
+ * later `DROP TABLE` fail with `SQLITE_LOCKED`) can't show here: e2e tests
+ * against the local worker cover that.
  */
 
 type Row = Record<string, unknown>
@@ -162,11 +170,21 @@ export interface SqliteState {
   state: DurableObjectState
   /** Routes accepted sockets' traffic to the object's handlers. */
   attach(handlers: SocketHandlers): void
+  /** Called when a `blockConcurrencyWhile` callback rejects (workerd resets the object). */
+  onReset(listener: () => void): void
   /** Accepted (server) ends, including closed ones. */
   sockets(): FakeWebSocket[]
   alarm(): number | null
   /** The runtime clears the alarm just before invoking `alarm()`. */
   clearAlarm(): void
+  /**
+   * Makes `deleteAll()` delete the alarm too, as it does from compatibility
+   * date 2026-02-24 (`wrangler.toml` is on an earlier one, so by default it
+   * keeps it).
+   */
+  deleteAllDeletesAlarm(on: boolean): void
+  /** Settles once no `blockConcurrencyWhile` callback is running. */
+  idle(): Promise<void>
   tables(): string[]
   /** Direct read access for assertions. */
   query(sql: string, ...bindings: (string | number | null)[]): Row[]
@@ -178,7 +196,9 @@ export const createSqliteState = (name: string): SqliteState => {
   // re-prepares a cached statement itself when the schema changes.
   let statements = new Map<string, StatementSync>()
   let alarmAt: number | null = null
+  let deleteAllDeletesAlarm = false
   let depth = 0
+  let blocked: Promise<unknown> = Promise.resolve()
 
   const exec = (query: string, ...bindings: unknown[]) => {
     const statement = query.trim().replace(/;\s*$/, '')
@@ -235,12 +255,14 @@ export const createSqliteState = (name: string): SqliteState => {
       db.close()
       db = new DatabaseSync(':memory:')
       statements = new Map()
+      if (deleteAllDeletesAlarm) alarmAt = null
     },
   }
 
   const sockets: FakeWebSocket[] = []
   let autoResponse: FakeWebSocketRequestResponsePair | null = null
   let handlers: SocketHandlers | null = null
+  let resetListener: (() => void) | null = null
   const host: SocketHost = {
     message: (server, message) => {
       // Answered by the runtime; the object never wakes.
@@ -262,7 +284,21 @@ export const createSqliteState = (name: string): SqliteState => {
       equals: (other: { name?: string }) => other.name === name,
     },
     storage,
-    blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+    // No call reaches the object until the callback settles (`idle`). A
+    // callback that rejects resets the object (its storage stays), and the
+    // rejection reaches the caller.
+    blockConcurrencyWhile: <T>(fn: () => Promise<T>): Promise<T> => {
+      const run = (async () => {
+        try {
+          return await fn()
+        } catch (error) {
+          resetListener?.()
+          throw error
+        }
+      })()
+      blocked = Promise.all([blocked, run.catch(() => undefined)])
+      return run
+    },
     waitUntil: () => undefined,
     acceptWebSocket: (ws: FakeWebSocket) => {
       ws.host = host
@@ -281,10 +317,23 @@ export const createSqliteState = (name: string): SqliteState => {
     attach: (object) => {
       handlers = object
     },
+    onReset: (listener) => {
+      resetListener = listener
+    },
     sockets: () => [...sockets],
     alarm: () => alarmAt,
     clearAlarm: () => {
       alarmAt = null
+    },
+    deleteAllDeletesAlarm: (on) => {
+      deleteAllDeletesAlarm = on
+    },
+    idle: async () => {
+      // A callback may start another (a reset's new instance) before it settles.
+      for (let seen = blocked; ; seen = blocked) {
+        await seen
+        if (seen === blocked) return
+      }
     },
     tables: () =>
       db
@@ -314,25 +363,64 @@ export interface FakeNamespace<T> {
   restart(name: string): void
 }
 
+/** Thrown to a caller whose call was in flight when its object was reset. */
+export const RESET_ERROR_MESSAGE = 'Durable Object reset'
+
 /**
  * A namespace whose stubs call the object's public methods with structured
  * clones of the arguments and result, like Workers RPC (`fetch` excepted).
+ * When an object is reset (its `blockConcurrencyWhile` callback rejected), a
+ * fresh instance takes its place on the same storage, and every call that
+ * was in flight on the old one rejects, as the runtime fails them.
  */
 export const createNamespace = <T extends object>(
   construct: (state: DurableObjectState) => T
 ): FakeNamespace<T> => {
-  const objects = new Map<string, { object: T; storage: SqliteState }>()
+  type Entry = { object: T; storage: SqliteState; resets: number }
+  const objects = new Map<string, Entry>()
   const lostReplies = new Set<string>()
 
-  const ensure = (name: string) => {
+  const replace = (entry: Entry) => {
+    entry.object = construct(entry.storage.state)
+    entry.storage.attach(entry.object as SocketHandlers)
+  }
+
+  const ensure = (name: string): Entry => {
     let entry = objects.get(name)
     if (!entry) {
       const storage = createSqliteState(name)
-      entry = { storage, object: construct(storage.state) }
-      storage.attach(entry.object as SocketHandlers)
-      objects.set(name, entry)
+      const created: Entry = { storage, object: construct(storage.state), resets: 0 }
+      storage.attach(created.object as SocketHandlers)
+      storage.onReset(() => {
+        created.resets++
+        replace(created)
+      })
+      objects.set(name, created)
+      entry = created
     }
     return entry
+  }
+
+  /**
+   * Runs `call` on `name`'s object once no `blockConcurrencyWhile` holds it
+   * (its constructor's included); rejects if the object was reset meanwhile.
+   */
+  const onObject = async <R>(name: string, call: (object: T) => Promise<R>): Promise<R> => {
+    const entry = ensure(name)
+    await entry.storage.idle()
+    const resets = entry.resets
+    const settle = () => {
+      if (entry.resets !== resets) throw new Error(RESET_ERROR_MESSAGE)
+    }
+    let result: R
+    try {
+      result = await call(entry.object)
+    } catch (error) {
+      settle()
+      throw error
+    }
+    settle()
+    return result
   }
 
   const stub = (name: string) =>
@@ -345,21 +433,23 @@ export const createNamespace = <T extends object>(
           // `fetch` passes the Request and Response through, uncloned.
           if (property === 'fetch') {
             return (request: Request) =>
-              (
-                ensure(name).object as {
-                  fetch(request: Request): Promise<Response>
-                }
-              ).fetch(request)
+              onObject(name, (object) =>
+                (object as { fetch(request: Request): Promise<Response> }).fetch(
+                  request
+                )
+              )
           }
           return async (...args: unknown[]) => {
-            const target = ensure(name).object as Record<string, unknown>
-            const method = target[property]
-            if (typeof method !== 'function')
-              throw new Error(`No RPC method ${property}`)
-            const result = await (method as (...a: unknown[]) => unknown).apply(
-              target,
-              structuredClone(args)
-            )
+            const result = await onObject(name, async (object) => {
+              const target = object as Record<string, unknown>
+              const method = target[property]
+              if (typeof method !== 'function')
+                throw new Error(`No RPC method ${property}`)
+              return (method as (...a: unknown[]) => unknown).apply(
+                target,
+                structuredClone(args)
+              )
+            })
             if (lostReplies.delete(name)) throw new Error('RPC reply lost')
             return structuredClone(result)
           }
@@ -377,17 +467,12 @@ export const createNamespace = <T extends object>(
     object: (name) => ensure(name).object,
     storage: (name) => ensure(name).storage,
     fireAlarm: async (name) => {
-      const entry = ensure(name)
-      entry.storage.clearAlarm()
-      await (entry.object as { alarm(): Promise<void> }).alarm()
+      ensure(name).storage.clearAlarm()
+      await onObject(name, (object) => (object as { alarm(): Promise<void> }).alarm())
     },
     failNextReply: (name) => {
       lostReplies.add(name)
     },
-    restart: (name) => {
-      const entry = ensure(name)
-      entry.object = construct(entry.storage.state)
-      entry.storage.attach(entry.object as SocketHandlers)
-    },
+    restart: (name) => replace(ensure(name)),
   }
 }

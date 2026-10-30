@@ -204,14 +204,16 @@ export const quotaName = async (label: string, key: string): Promise<string> =>
 
 /**
  * Counts one call against a rolling-day quota (a `BuddyRegistrationQuota`
- * object under `name`). Null admits; a quota outage admits too.
+ * object under `name`). Null admits; a quota outage admits too. `logHit`
+ * logs a refusal.
  */
 export const refuseOverDailyQuota = async (
   env: Environment,
   name: string,
   limit: number | undefined,
   op: string,
-  limitName: string
+  limitName: string,
+  logHit: (op: string, limit: string) => void = logLimitHit
 ): Promise<Response | null> => {
   try {
     const quota = env.BUDDY_REGISTRATION_QUOTA
@@ -219,7 +221,7 @@ export const refuseOverDailyQuota = async (
       .get(quota.idFromName(name))
       .admit(Date.now(), limit)
     if (admission.ok) return null
-    logLimitHit(op, limitName)
+    logHit(op, limitName)
     return buddiesErrorResponse('rate_limited', {
       retryAfterSeconds: admission.retryAfterSeconds,
     })

@@ -304,16 +304,19 @@ export const BUDDIES_LIMITS = {
 
 /**
  * Kinds that invite someone or answer them (confirm a pairing, reply to a
- * share, invite to a Plan or Follow-up, ask to join) alert right away instead
- * of waiting out the 60 s push spacing, but still count toward the daily cap.
- * Updates and cancellations keep the spacing. `invite.claimed` is a relay
- * event outside the slot budget altogether.
+ * share, invite to a Plan, a Follow-up, or a shared car, ask to join) alert
+ * right away instead of waiting out the 60 s push spacing, but still count
+ * toward the daily cap. Updates and cancellations keep the spacing, and so
+ * does `car.reply` (the shared-cars protocol makes only `car.invite`
+ * immediate). `invite.claimed` is a relay event outside the slot budget
+ * altogether.
  */
 export const BUDDIES_IMMEDIATE_PUSH_KINDS: ReadonlySet<string> = new Set([
   'pair.confirmed',
   'share.reply',
   'plan.invite',
   'followup.invite',
+  'car.invite',
 ])
 /** `join.request.<tag>`: the tag is per buddy, so it matches by prefix. */
 export const BUDDIES_IMMEDIATE_PUSH_PREFIX = 'join.request.'
@@ -335,7 +338,8 @@ export const BUDDIES_PASSIVE_PUSH_KINDS: ReadonlySet<string> = new Set([
 export const BUDDIES_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
 /** `blobId`, `readTokenHash`, and `token`: 32 bytes, so 43 b64u characters. */
 const BYTES32_PATTERN = /^[A-Za-z0-9_-]{43}$/
-const B64U_PATTERN = /^[A-Za-z0-9_-]*$/
+/** Unpadded base64url's alphabet (Shared Spaces parses with it too). */
+export const B64U_PATTERN = /^[A-Za-z0-9_-]*$/
 const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{86}$/
 const KIND_PATTERN = /^[a-z][a-z0-9.]*$/
 export interface PushTemplate {
@@ -395,8 +399,15 @@ export const decodeB64u = (value: string): Uint8Array | null => {
 }
 
 /** Decoded size of a valid unpadded base64url string. */
-const decodedLength = (value: string): number =>
+export const decodedLength = (value: string): number =>
   Math.floor((value.length * 3) / 4)
+
+/** A non-empty, valid unpadded base64url string; its decoded size is the caller's to check. */
+export const isB64u = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  B64U_PATTERN.test(value) &&
+  value.length % 4 !== 1
 
 export const decodeSignature = (value: unknown): Uint8Array | null => {
   if (typeof value !== 'string' || !SIGNATURE_PATTERN.test(value)) return null
@@ -409,10 +420,11 @@ export const isPlainObject = (
 ): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
 
-const isId = (value: unknown): value is string =>
+/** A 22-character id: 16 random bytes as b64u (Buddies' and Shared Spaces'). */
+export const isId = (value: unknown): value is string =>
   typeof value === 'string' && BUDDIES_ID_PATTERN.test(value)
 
-const isSafeInteger = (value: unknown): value is number =>
+export const isSafeInteger = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value)
 
 export const isEventKind = (value: unknown): value is string =>
@@ -434,11 +446,8 @@ const bytes32 = (value: unknown): value is string =>
   fixedBytes(value, 32) === value
 
 /** An opaque sealed blob: valid base64url, 1..maxBytes once decoded. */
-const blob = (value: unknown, maxBytes: number): string | null => {
-  if (typeof value !== 'string' || value.length === 0) return null
-  if (!B64U_PATTERN.test(value) || value.length % 4 === 1) return null
-  return decodedLength(value) <= maxBytes ? value : null
-}
+const blob = (value: unknown, maxBytes: number): string | null =>
+  isB64u(value) && decodedLength(value) <= maxBytes ? value : null
 
 const codePoints = (value: string): number => {
   let count = 0

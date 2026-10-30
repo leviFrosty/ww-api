@@ -202,6 +202,20 @@ Older app versions authenticate the pre-session way (signed envelopes,
 show Update Required first. The runbook is in `AGENTS.md`, "Turning off
 backward compatibility".
 
+### Shared Spaces (`/spaces/v1/*`)
+
+The server half of Shared Cars (witness-work ADR 0037): one Durable Object
+per shared space holding sealed records, members by token hash and X25519
+public key (each `memberId` commits to its key), wrapped keys, and invites,
+for up to 10 members. Every op is `POST /spaces/v1/{op}` (`create`, `sync`,
+`put`, `invite/create`, `invite/delete`, `join`, `leave`, `member/remove`,
+`rekey`, `delete`) with `Authorization: Bearer <accessToken>`; ids and
+member tokens travel in the body, never the URL. `GET /spaces/v1/live` is a
+WebSocket (ids in `x-ww-space-auth`, the member token in `x-ww-space-token`) that
+says `hello`, then `changed`. Behind KV `spaces:enabled`; free. The wire
+contract is witness-work's `docs/shared-cars-protocol.md`; the runbook is in
+`AGENTS.md`, "Shared Spaces".
+
 ### `/autocomplete`
 
 Proxies to HERE Autocomplete API.

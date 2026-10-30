@@ -74,4 +74,39 @@ describe('Worker entry', () => {
     expect(page.status).toBe(200)
     expect(await page.text()).toContain('Open this invite in WitnessWork')
   })
+
+  it('mounts Shared Spaces at /spaces/v1 and exports its Durable Object', async () => {
+    const entry = await import('../index')
+    expect(typeof entry.SharedSpace).toBe('function')
+
+    // SPACES_ENABLED absent and no KV key: the kill switch is off.
+    const env = {
+      NOTES_KV: { get: async () => null },
+      CF_VERSION_METADATA: { id: 'test', tag: '', timestamp: '' },
+    } as unknown as Environment
+    const ctx = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined,
+    } as unknown as ExecutionContext
+    const call = (path: string, init?: RequestInit) =>
+      entry.default.fetch!(
+        new Request(`https://ww-proxy.test${path}`, init) as never,
+        env,
+        ctx
+      )
+
+    const disabled = await call('/spaces/v1/sync', { method: 'POST', body: '{}' })
+    expect(disabled.status).toBe(503)
+    expect(disabled.headers.get('retry-after')).toBe('60')
+    expect(await disabled.json()).toMatchObject(relayError('disabled'))
+    const live = await call('/spaces/v1/live', { headers: { upgrade: 'websocket' } })
+    expect(live.status).toBe(503)
+    expect(await live.json()).toMatchObject(relayError('disabled'))
+    // The switch spares leave, but this worker has no account sessions.
+    const leave = await call('/spaces/v1/leave', { method: 'POST', body: '{}' })
+    expect(leave.status).toBe(503)
+    expect(await leave.json()).toMatchObject(relayError('disabled'))
+    expect((await call('/spaces/v1/nope', { method: 'POST', body: '{}' })).status).toBe(404)
+    expect((await call('/spaces/v1/sync')).status).toBe(404)
+  })
 })

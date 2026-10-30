@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { bytesToBase64Url } from '../crypto'
 import {
   parseEnvelope,
+  readBodyText,
   readEnvelopeText,
   signedMessage,
   verifyBuddiesSignature,
@@ -198,11 +199,52 @@ describe('readEnvelopeText', () => {
     expect(await readEnvelopeText(request)).toBeNull()
   })
 
-  it('refuses a missing body and invalid UTF-8', async () => {
+  it('refuses a missing body, invalid UTF-8, and an unreadable declared length', async () => {
     expect(await readEnvelopeText(post(null))).toBeNull()
     expect(
       await readEnvelopeText(post(Uint8Array.from([0xff, 0xfe])))
     ).toBeNull()
+    expect(
+      await readEnvelopeText(post('{}', { 'content-length': 'lots' }))
+    ).toBeNull()
+  })
+})
+
+describe('readBodyText', () => {
+  const streamed = (chunks: number, size: number) =>
+    new Request('https://relay.test/', {
+      method: 'POST',
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let i = 0; i < chunks; i++)
+            controller.enqueue(new Uint8Array(size).fill(0x20))
+          controller.close()
+        },
+      }),
+      // @ts-expect-error Node's fetch requires duplex for streamed bodies.
+      duplex: 'half',
+    })
+
+  it('reads up to the limit, and says too_large past it, declared or streamed', async () => {
+    expect(await readBodyText(post('{"a":1}'), 7)).toEqual({ ok: true, value: '{"a":1}' })
+    expect(await readBodyText(post('{"a":1}'), 6)).toEqual({ ok: false, error: 'too_large' })
+    expect(
+      await readBodyText(post('x', { 'content-length': String(2_000) }), 1_024)
+    ).toEqual({ ok: false, error: 'too_large' })
+    expect(await readBodyText(streamed(3, 512), 1_024)).toEqual({
+      ok: false,
+      error: 'too_large',
+    })
+    expect((await readBodyText(streamed(2, 512), 1_024)).ok).toBe(true)
+  })
+
+  it('says bad_request for no body, invalid UTF-8, or a declared length that isn’t a number', async () => {
+    const bad = { ok: false, error: 'bad_request' }
+    expect(await readBodyText(post(null), 1_024)).toEqual(bad)
+    expect(await readBodyText(post(Uint8Array.from([0xff])), 1_024)).toEqual(bad)
+    expect(
+      await readBodyText(post('{}', { 'content-length': 'NaN' }), 1_024)
+    ).toEqual(bad)
   })
 })
 

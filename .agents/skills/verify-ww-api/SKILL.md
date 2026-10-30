@@ -17,7 +17,7 @@ node scripts/verify/dev.mjs up --secrets-from ~/dev/ww-api/.dev.vars # opt in to
 
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
-- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, and `BUDDIES_PHOTOS=on`. The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
+- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, `BUDDIES_PHOTOS=on`, and `SPACES_ENABLED=true` (Shared Spaces). The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
 - `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, and `ACCOUNT_TOKEN_SECRET` (account sessions), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
@@ -38,6 +38,7 @@ Read-only. Each check prints an `ok` or `FAIL` line, and the command exits 1 on 
 - Buddies photos are enabled (an unknown `blob/get` returns `not_found`, not `photos_disabled`);
 - the dev bypass works (the value is never printed);
 - account sessions are on (an unknown refresh token returns `unauthorized`, not `disabled`);
+- Shared Spaces is on (a `sync` without a token returns `unauthorized`, not `disabled`);
 - which optional credentials are set.
 
 Run it first whenever anything looks off.

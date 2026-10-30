@@ -1,5 +1,10 @@
 import type { AppContext, Environment } from '../types'
-import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
+import {
+  bytesToBase64Url,
+  bytesToHex,
+  sha256Bytes,
+  timingSafeEqual,
+} from '../crypto'
 import { RevenueCatError } from '../revenuecat'
 import { captureFailure } from '../sentry'
 import { isPlainObject } from '../buddies/contracts'
@@ -207,9 +212,7 @@ const handlePut = guarded('sync/put', async (c) => {
   const updatedAt = Date.now()
   try {
     await c.env.ACCOUNT_SYNC!.put(syncObjectKey(accountId, slotId), body.value, {
-      sha256: Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join(
-        ''
-      ),
+      sha256: bytesToHex(digest),
       httpMetadata: { contentType: 'application/octet-stream' },
       customMetadata: { etag: sha256, updatedAt: String(updatedAt) },
     })

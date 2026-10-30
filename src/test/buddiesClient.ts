@@ -122,6 +122,20 @@ export const blobPutHeaders = async (
 export const sha256B64u = async (bytes: Uint8Array): Promise<string> =>
   b64u(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
 
+/**
+ * A Shared Spaces member's id as the app derives it from their X25519 key:
+ * `b64u(SHA-256("ww-spaces/v1/member-id|" + spaceId + "|" + dhPub)[0..16])`.
+ */
+export const spaceMemberId = async (spaceId: string, dhPub: string): Promise<string> =>
+  b64u(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(`ww-spaces/v1/member-id|${spaceId}|${dhPub}`)
+      )
+    ).slice(0, 16)
+  )
+
 /** A photo blob as the app uploads it: sealed bytes, their id, and a read token. */
 export interface PhotoBlob {
   bytes: Uint8Array

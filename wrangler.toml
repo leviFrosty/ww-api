@@ -85,6 +85,9 @@ AUTH_LEGACY = "on"
 # `sync:entitlement` are absent. On in dev; Supporters only.
 SYNC_ENABLED = "true"
 SYNC_ENTITLEMENT = "supporter"
+# Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
+# `spaces:enabled` is absent. On in dev.
+SPACES_ENABLED = "true"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -158,6 +161,10 @@ name = "ACCOUNT_SYNC_INDEX"
 class_name = "AccountSync"
 
 [[env.dev.durable_objects.bindings]]
+name = "SHARED_SPACE"
+class_name = "SharedSpace"
+
+[[env.dev.durable_objects.bindings]]
 name = "SCRIBE_METER"
 class_name = "ScribeMeter"
 
@@ -227,6 +234,10 @@ new_sqlite_classes = ["AccountSync"]
 [[env.dev.migrations]]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
+
+[[env.dev.migrations]]
+tag = "v10"
+new_sqlite_classes = ["SharedSpace"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -350,6 +361,10 @@ AUTH_LEGACY = "on"
 # on, before the app release that defaults to it. Repeated under [env.dev.vars].
 SYNC_ENABLED = "false"
 SYNC_ENTITLEMENT = "supporter"
+# Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
+# `spaces:enabled` is absent. Off in prod until KV `spaces:enabled` turns it
+# on, before the app release that shares cars. Repeated under [env.dev.vars].
+SPACES_ENABLED = "false"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -453,6 +468,17 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 #   wrangler kv key put --binding NOTES_KV sync:entitlement everyone  # free
 #   wrangler kv key put --binding NOTES_KV sync:entitlement supporter # Supporters
 #   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
+# (add `--env dev` for the dev worker).
+#
+# Shared Spaces switches (cacheTtl 60; witness-work ADR 0037, Shared Cars).
+# `spaces:enabled`: "true" on, anything else off; absent falls back to
+# SPACES_ENABLED. Off refuses every op and new live sockets with 503 disabled,
+# except leave, member/remove, and delete. `spaces:maxMembers`: members plus
+# open invites a space may hold (1-100; absent or invalid: 10).
+#   wrangler kv key put --binding NOTES_KV spaces:enabled true       # on
+#   wrangler kv key put --binding NOTES_KV spaces:enabled false      # off
+#   wrangler kv key put --binding NOTES_KV spaces:maxMembers 12      # raise the cap
+#   wrangler kv key delete --binding NOTES_KV spaces:enabled         # use the var
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -649,6 +675,13 @@ class_name = "AccountHandoff"
 name = "ACCOUNT_SYNC_INDEX"
 class_name = "AccountSync"
 
+# Shared Spaces (Shared Cars): one per space (sealed records, members by token
+# hash, wraps, invites, change seq, put limits, retention alarm, live sockets;
+# never an account). Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "SHARED_SPACE"
+class_name = "SharedSpace"
+
 # Scribe AI: one meter per account (usage windows, step keys, open turns,
 # active steps, charges for 31 days, paper pages for 24 hours; never content).
 # Repeated under [env.dev] above.
@@ -693,6 +726,10 @@ new_sqlite_classes = ["AccountSync"]
 [[migrations]]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
+
+[[migrations]]
+tag = "v10"
+new_sqlite_classes = ["SharedSpace"]
 
 [observability]
 enabled = true

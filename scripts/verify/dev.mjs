@@ -513,6 +513,21 @@ async function doctor() {
     bad(`account sessions probe failed: ${error.message}`)
   }
 
+  try {
+    // No token: `unauthorized` proves Shared Spaces is on; `disabled` means its kill switch is off.
+    const probe = await fetchJson(`${state.url}/spaces/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.5' },
+      body: '{}',
+    })
+    if (probe.status === 401 && probe.body?.error === 'unauthorized') ok('shared spaces enabled')
+    else if (probe.body?.error === 'disabled')
+      bad('shared spaces disabled: KV spaces:enabled is not "true"; run `node scripts/verify/dev.mjs kv delete spaces:enabled`')
+    else bad(`shared spaces probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
+  } catch (error) {
+    bad(`shared spaces probe failed: ${error.message}`)
+  }
+
   const configured = Object.entries(state.configured ?? {})
     .map(([name, on]) => `${name}=${on ? 'set' : 'unset'}`)
     .join(' ')

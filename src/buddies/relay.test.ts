@@ -926,6 +926,7 @@ describe('caps and rate limits', () => {
       'share.reply',
       'plan.invite',
       'followup.invite',
+      'car.invite',
       'join.request.a1b2c3d4e5f6',
     ]
     const spaced = [
@@ -934,6 +935,8 @@ describe('caps and rate limits', () => {
       'followup.update',
       'followup.cancel',
       'join.cancel',
+      'car.reply',
+      'car.cancel',
     ]
     const owner = await Owner.create(h)
     await owner.registerDevice(
@@ -962,13 +965,13 @@ describe('caps and rate limits', () => {
     expect(kinds()).toEqual(['plan.update', ...immediate])
 
     // The spacing runs from the last alert, immediate or not.
-    advance(MINUTE_MS - 5_000)
+    advance(MINUTE_MS - spaced.length * 1_000)
     await buddy.putEvent({ kind: 'plan.cancel', push: true })
     advance(5_000)
     await buddy.putEvent({ kind: 'plan.cancel', push: true })
     await h.flush()
     expect(kinds()).toEqual(['plan.update', ...immediate, 'plan.cancel'])
-    expect((await owner.sync()).body.events).toHaveLength(13)
+    expect((await owner.sync()).body.events).toHaveLength(16)
   })
 
   it('still caps immediate kinds at 10 alerts per slot per day', async () => {
@@ -988,6 +991,37 @@ describe('caps and rate limits', () => {
 
     advance(DAY_MS)
     await buddy.putEvent({ kind: 'share.reply', push: true })
+    await h.flush()
+    expect(h.pushes).toHaveLength(11)
+  })
+
+  it('alerts car.invite at once on its template, under the daily cap, and car.reply on its own', async () => {
+    const owner = await Owner.create(h)
+    await owner.registerDevice(randomId(), {
+      'car.invite': { title: 'Mileage', body: 'Someone shared a car' },
+      'car.reply': { title: 'Mileage', body: 'Someone joined a car' },
+    })
+    const buddy = await owner.addWriter()
+    const alerts = () =>
+      h.pushes.map(
+        (push) => (push.body as { aps: { alert: { body: string } } }).aps.alert.body
+      )
+
+    await buddy.putEvent({ kind: 'car.reply', push: true })
+    // Invites 1 s apart all alert, until the slot's 10 a day.
+    for (let i = 0; i < 11; i++) {
+      advance(1_000)
+      await buddy.putEvent({ kind: 'car.invite', push: true })
+    }
+    await h.flush()
+    expect(alerts()).toEqual([
+      'Someone joined a car',
+      ...Array<string>(9).fill('Someone shared a car'),
+    ])
+    expect((await owner.sync()).body.events).toHaveLength(12)
+
+    advance(DAY_MS)
+    await buddy.putEvent({ kind: 'car.invite', push: true })
     await h.flush()
     expect(h.pushes).toHaveLength(11)
   })
