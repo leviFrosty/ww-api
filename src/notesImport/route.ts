@@ -10,7 +10,11 @@ import {
   selectEffectiveAllowances,
   type NotesImportConfig,
 } from './config'
-import { isSupporter, RevenueCatError } from '../revenuecat'
+import {
+  countsWebSandboxSubscriptions,
+  isSupporter,
+  RevenueCatError,
+} from '../revenuecat'
 import type { CreditDecision, CreditsSnapshot } from '../credits'
 import {
   runNotesImportModel,
@@ -637,6 +641,7 @@ async function authenticateAndGate(
           apiKey: ctx.env.REVENUECAT_API_KEY,
           appUserId: meterId,
           entitlementId: config.entitlementId,
+          countWebSandbox: countsWebSandboxSubscriptions(ctx.env),
         })
       )
   const supporterConcurrency = supporter || devBypass
@@ -1347,6 +1352,7 @@ export async function handleNotesImportRequest(ctx: AppContext) {
       apiKey: ctx.env.REVENUECAT_API_KEY,
       appUserId: meterId,
       entitlementId: config.entitlementId,
+      countWebSandbox: countsWebSandboxSubscriptions(ctx.env),
       account: gate.account
         ? { accountId: gate.account.accountId, env: ctx.env }
         : undefined,
@@ -1544,6 +1550,7 @@ export async function handleNotesImportTranscribeRequest(ctx: AppContext) {
             apiKey: ctx.env.REVENUECAT_API_KEY,
             appUserId: meterId,
             entitlementId: config.entitlementId,
+            countWebSandbox: countsWebSandboxSubscriptions(ctx.env),
           })
     } catch (e) {
       if (!(e instanceof RevenueCatError)) Sentry.captureException(e)

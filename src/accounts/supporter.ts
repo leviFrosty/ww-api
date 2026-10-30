@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, lt, notInArray, sql } from 'drizzle-orm'
 import type { Environment } from '../types'
 import {
   REVENUECAT_API_ORIGIN,
+  countsWebSandboxSubscriptions,
   fetchSupporterStatus,
   type SupporterStatus,
 } from '../revenuecat'
@@ -148,7 +149,14 @@ const storeRead = async (
  * `RevenueCatError` when RevenueCat can't be read; nothing changes then.
  */
 type SupporterEnv = Pick<Environment, 'REVENUECAT_API_KEY'> &
-  Partial<Pick<Environment, 'APP_ATTEST_ENVIRONMENT' | 'REVENUECAT_API_URL'>>
+  Partial<
+    Pick<
+      Environment,
+      | 'APP_ATTEST_ENVIRONMENT'
+      | 'REVENUECAT_API_URL'
+      | 'REVENUECAT_COUNT_WEB_SANDBOX'
+    >
+  >
 
 /**
  * RevenueCat's origin: `REVENUECAT_API_URL` on a development worker (the
@@ -182,6 +190,7 @@ const readCustomer = async (
     fetchImpl: fetch,
     nowMs: startedAt,
     apiOrigin: revenueCatOrigin(env),
+    countWebSandbox: countsWebSandboxSubscriptions(env),
   })
   await storeRead(db, appUserId, status, startedAt)
   return { status, startedAt }

@@ -133,6 +133,7 @@ describe('POST /route-planning/optimize', () => {
       expect.objectContaining({
         apiKey: 'rc-key',
         appUserId: ACCOUNT,
+        countWebSandbox: false,
       })
     )
     const [, init] = s.here.mock.calls[0] as [string, RequestInit]

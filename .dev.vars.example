@@ -22,6 +22,8 @@ OPENROUTER_API_KEY=your_openrouter_key_here
 # RevenueCat REST v1 SECRET key (sk_...) for server-side Supporter checks.
 # Project → API keys → Secret keys. NEVER ship this in the app.
 REVENUECAT_API_KEY=sk_your_revenuecat_secret_here
+# Count web (RevenueCat Billing) sandbox subscriptions as Supporter; needs APP_ATTEST_ENVIRONMENT=development.
+REVENUECAT_COUNT_WEB_SANDBOX=true
 
 # Local dev only: lets the iOS simulator (no Secure Enclave) skip App Attest by
 # sending header `x-ww-dev-bypass: <this value>`. Leave UNSET in production.
