@@ -28,6 +28,7 @@ export const ACCOUNTS_OPS = [
   'backup/get',
   'backup/delete',
   'session/open',
+  'sync/request',
 ] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
@@ -265,6 +266,8 @@ export const ACCOUNT_FIELD_PARSERS = {
     const device = sealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
     return device ? { attestation, device } : null
   },
+  // The envelope proves the account key: a leaked token alone can't ask.
+  'sync/request': (): Fields => ({}),
 } satisfies Record<AccountsOp, (payload: Fields) => object | null>
 
 export type AccountFields<K extends AccountsOp> = NonNullable<

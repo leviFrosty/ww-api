@@ -141,9 +141,9 @@ AUTH_LEGACY = "on"
 # (GET /app/v1/config). Unset = no floor.
 # APP_MIN_VERSION = "1.42.0"
 # Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
-# `sync:entitlement` are absent. On in dev; Supporters only.
+# `sync:entitlement` are absent. On in dev; free for everyone (ADR 0040).
 SYNC_ENABLED = "true"
-SYNC_ENTITLEMENT = "supporter"
+SYNC_ENTITLEMENT = "everyone"
 # The web app's origins (witness-work ADR 0038 §10): CORS and browser live
 # sockets admit exactly these (comma-separated, no wildcards). Dev serves
 # app-dev plus the local web dev servers (Expo/Metro 8081-8082, Expo web
@@ -420,9 +420,11 @@ AUTH_LEGACY = "on"
 # APP_MIN_VERSION = "1.42.0"
 # Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
 # `sync:entitlement` are absent. Off in prod until KV `sync:enabled` turns it
-# on, before the app release that defaults to it. Repeated under [env.dev.vars].
+# on, before the app release that defaults to it. Free for everyone (witness-work
+# ADR 0040); KV `sync:entitlement supporter` is the lever back. Repeated under
+# [env.dev.vars].
 SYNC_ENABLED = "false"
-SYNC_ENTITLEMENT = "supporter"
+SYNC_ENTITLEMENT = "everyone"
 # The web app's origins (witness-work ADR 0038 §10): CORS and browser live
 # sockets admit exactly these (comma-separated, no wildcards; never localhost
 # here). Not inherited by [env.dev], which has its own list.
@@ -526,9 +528,11 @@ MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 #
 # Cloud Sync switches (cacheTtl 60; witness-work ADR 0030). `sync:enabled`:
 # "true" (or "on") on, anything else off; absent falls back to SYNC_ENABLED.
-# `sync:entitlement`: "everyone" makes it free, "supporter" a Supporter
-# benefit; absent falls back to SYNC_ENTITLEMENT, else supporter. Off refuses
-# sync/put, list, get, and live with 503 disabled; delete and GET /sync work.
+# `sync:entitlement`: "supporter" makes it a Supporter benefit again,
+# "everyone" (or anything else) free; absent falls back to SYNC_ENTITLEMENT,
+# else everyone (ADR 0040). Off refuses sync/put, list, get, live, and setting
+# sync/request with 503 disabled; delete, clearing the request, and GET /sync
+# work.
 #   wrangler kv key put --binding NOTES_KV sync:enabled true          # on
 #   wrangler kv key put --binding NOTES_KV sync:enabled false         # off
 #   wrangler kv key put --binding NOTES_KV sync:entitlement everyone  # free

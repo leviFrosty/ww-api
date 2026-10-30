@@ -1311,14 +1311,18 @@ const syncOff = {
 }
 const syncUnentitled = {
   403: errorResponse(
-    'Cloud Sync is a Supporter benefit (KV `sync:entitlement` is `supporter`) and the account isn’t one.',
+    'Cloud Sync was made a Supporter benefit again (KV `sync:entitlement` is `supporter`) and the account isn’t one.',
     ['supporter_required']
   ),
 }
+const syncRequestedAt = z.number().int().nullable().meta({
+  description:
+    'When the standing Cloud Sync request was made (the server’s clock, epoch milliseconds); `null` with none.',
+})
 const syncNotes =
   'A suspended account keeps syncing. A slot not written for 30 days whose writer’s session has ended, or not written for 400 days, is deleted.'
 const SYNC_ENTITLED =
-  'Needs Cloud Sync on (KV `sync:enabled`) and an entitled account: everyone when KV `sync:entitlement` is `everyone`, else Supporters (the account’s own status, ADR 0029).'
+  'Needs Cloud Sync on (KV `sync:enabled`) and an entitled account: everyone (witness-work ADR 0040), unless KV `sync:entitlement` is `supporter`, then Supporters only (the account’s own status, ADR 0029).'
 const syncBinary = (description: string) => ({
   description,
   content: {
@@ -1350,7 +1354,7 @@ ${readTier}`,
         }),
         entitlement: z.enum(['supporter', 'everyone']).meta({
           description:
-            'Who gets it (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `supporter`).',
+            'Who gets it (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`).',
         }),
         supporter: z.boolean().meta({
           description: 'The account’s own Supporter status (ADR 0029).',
@@ -1359,9 +1363,56 @@ ${readTier}`,
           description:
             'RevenueCat couldn’t be read; `supporter` is false for now. Absent otherwise.',
         }),
+        requestedAt: syncRequestedAt,
       })
     ),
     ...bearerReadErrors,
+  },
+})
+
+export const syncSwitchRequestDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Ask the account’s phones to turn on Cloud Sync',
+  description: `\`{ "requested": true, "payload", "signature" }\` records that a browser asked the account’s phones to switch to Cloud Sync (witness-work ADR 0040 §5); phones read \`requestedAt\` in \`GET /accounts/v1/sync\` and switch. Setting is a bearer request **and** a signed envelope: \`signature\` is the account key’s signature over \`ww-account/v1\\nsync/request\\n\` followed by the decoded \`payload\` bytes (\`accountPub\`, \`ts\`, \`nonce\`), and the key must be the token’s own account (\`forbidden\` otherwise), so a leaked token alone can’t move the User’s phones. It needs Cloud Sync on and an entitled account. Each envelope is good once (409 \`replay\` for a reused nonce), so a captured one can’t ask again after a withdrawal. Asking again while it stands keeps \`requestedAt\` and restarts its 30 days.
+
+\`{ "requested": false }\` withdraws it: bearer only, always works, idempotent.
+
+It clears itself once every live phone session of the account (\`ios\`, \`android\` or \`dev\`) has written a slot since \`requestedAt\`, or 30 days after it was last asked for. Phones never clear it. Not in the activity log.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({
+      requested: z.boolean().meta({ description: '`true` sets the request, `false` withdraws it.' }),
+      payload: z.string().optional().meta({
+        description:
+          'With `requested: true`: base64url of the JSON `{ accountPub, ts, nonce }` (`ts` within 5 minutes of the server’s clock).',
+      }),
+      signature: z.string().optional().meta({
+        description: 'With `requested: true`: the account key’s Ed25519 signature, base64url.',
+      }),
+    }),
+    'Set (signed) or withdraw.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'The request as it stands now.',
+      z.object({ ok: z.literal(true), requestedAt: syncRequestedAt })
+    ),
+    400: errorResponse('Malformed JSON, `requested` isn’t a boolean, or setting without a valid envelope.', ['bad_request']),
+    401: errorResponse(
+      'No valid bearer token (`unauthorized`), or the envelope’s signature doesn’t verify (`bad_signature`) or its `ts` is too far off (`stale`).',
+      ['unauthorized', 'bad_signature', 'stale']
+    ),
+    403: errorResponse(
+      'The envelope is signed by another account than the token’s (`forbidden`), or Cloud Sync was made a Supporter benefit again and the account isn’t one (`supporter_required`).',
+      ['forbidden', 'supporter_required']
+    ),
+    404: errorResponse('No account has the envelope’s key.', ['unknown_account']),
+    409: errorResponse('This envelope was already used; sign a new one.', ['replay']),
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncOff,
   },
 })
 
@@ -1448,7 +1499,7 @@ ${ID_IN_BODY}`,
 export const syncListDocs = describeRoute({
   tags: ['Accounts'],
   summary: 'List the account’s sync slots',
-  description: `Every slot’s ETag, size, and last write, and the account’s \`seq\`. A pull downloads only slots whose ETag changed since its last read. Send \`{}\`.
+  description: `Every slot’s ETag, size, last write, the platform of the session that wrote it and whether that session is live, and the account’s \`seq\`. A pull downloads only slots whose ETag changed since its last read. Send \`{}\`.
 
 ${SYNC_ENTITLED}
 
@@ -1469,6 +1520,14 @@ ${ID_IN_BODY}`,
             etag: syncEtag,
             size: z.number().int().meta({ description: 'Bytes.' }),
             updatedAt: epochMs('When the slot was last written, the server’s clock'),
+            platform: z.enum(['ios', 'android', 'dev', 'web']).nullable().meta({
+              description:
+                'The platform of the session that last wrote the slot; `null` for a slot put before it was kept whose session is gone.',
+            }),
+            live: z.boolean().meta({
+              description:
+                'Whether that session is still live (`true` when the sessions couldn’t be read).',
+            }),
           })
         ),
       })

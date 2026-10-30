@@ -78,7 +78,7 @@ export const appConfigDocs = describeRoute({
             }),
             entitlement: z.enum(['supporter', 'everyone']).meta({
               description:
-                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `supporter`).',
+                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`; witness-work ADR 0040).',
             }),
           })
           .meta({
