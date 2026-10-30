@@ -4,6 +4,7 @@ type ContactLinkMessages = {
   instructions: string
   getApp: string
   openApp: string
+  continueOnWeb: string
   imageAlt: string
 }
 
@@ -15,6 +16,7 @@ export const contactLinkTranslations = {
     instructions: 'Install WitnessWork to import the shared contact. If you already have the app, it should have opened automatically.',
     getApp: 'Get WitnessWork',
     openApp: 'Open app (already installed)',
+    continueOnWeb: 'Continue on the web',
     imageAlt: 'WitnessWork app icon',
   },
   'de-de': {
@@ -23,6 +25,7 @@ export const contactLinkTranslations = {
     instructions: 'Installiere WitnessWork, um den geteilten Kontakt zu importieren. Wenn du die App bereits hast, sollte sie sich automatisch geöffnet haben.',
     getApp: 'WitnessWork herunterladen',
     openApp: 'App öffnen (bereits installiert)',
+    continueOnWeb: 'Im Web fortfahren',
     imageAlt: 'WitnessWork-App-Symbol',
   },
   'es-es': {
@@ -31,6 +34,7 @@ export const contactLinkTranslations = {
     instructions: 'Instala WitnessWork para importar el contacto compartido. Si ya tienes la aplicación, debería haberse abierto automáticamente.',
     getApp: 'Descargar WitnessWork',
     openApp: 'Abrir la aplicación (ya instalada)',
+    continueOnWeb: 'Continuar en la web',
     imageAlt: 'Icono de la aplicación WitnessWork',
   },
   'fr-fr': {
@@ -39,6 +43,7 @@ export const contactLinkTranslations = {
     instructions: 'Installez WitnessWork pour importer le contact partagé. Si vous avez déjà l’application, elle devrait s’être ouverte automatiquement.',
     getApp: 'Télécharger WitnessWork',
     openApp: 'Ouvrir l’application (déjà installée)',
+    continueOnWeb: 'Continuer sur le web',
     imageAlt: 'Icône de l’application WitnessWork',
   },
   'it-it': {
@@ -47,6 +52,7 @@ export const contactLinkTranslations = {
     instructions: 'Installa WitnessWork per importare il contatto condiviso. Se hai già l’app, dovrebbe essersi aperta automaticamente.',
     getApp: 'Scarica WitnessWork',
     openApp: 'Apri l’app (già installata)',
+    continueOnWeb: 'Continua sul web',
     imageAlt: 'Icona dell’app WitnessWork',
   },
   'ja-jp': {
@@ -55,6 +61,7 @@ export const contactLinkTranslations = {
     instructions: '共有された連絡先をインポートするには、WitnessWorkをインストールしてください。すでにインストールされている場合は、自動的に開きます。',
     getApp: 'WitnessWorkをダウンロード',
     openApp: 'アプリを開く（インストール済み）',
+    continueOnWeb: 'Webで続ける',
     imageAlt: 'WitnessWorkのアプリアイコン',
   },
   'ko-kr': {
@@ -63,6 +70,7 @@ export const contactLinkTranslations = {
     instructions: '공유된 연락처를 가져오려면 WitnessWork를 설치하세요. 이미 앱이 설치되어 있다면 자동으로 열렸을 것입니다.',
     getApp: 'WitnessWork 다운로드',
     openApp: '앱 열기 (이미 설치됨)',
+    continueOnWeb: '웹에서 계속하기',
     imageAlt: 'WitnessWork 앱 아이콘',
   },
   'nl-nl': {
@@ -71,6 +79,7 @@ export const contactLinkTranslations = {
     instructions: 'Installeer WitnessWork om het gedeelde contact te importeren. Als je de app al hebt, zou deze automatisch geopend moeten zijn.',
     getApp: 'Download WitnessWork',
     openApp: 'Open de app (al geïnstalleerd)',
+    continueOnWeb: 'Doorgaan op het web',
     imageAlt: 'WitnessWork-appicoon',
   },
   'pt-br': {
@@ -79,6 +88,7 @@ export const contactLinkTranslations = {
     instructions: 'Instale o WitnessWork para importar o contato compartilhado. Se você já tem o aplicativo, ele deveria ter aberto automaticamente.',
     getApp: 'Baixar WitnessWork',
     openApp: 'Abrir aplicativo (já instalado)',
+    continueOnWeb: 'Continuar na web',
     imageAlt: 'Ícone do aplicativo WitnessWork',
   },
   'pt-pt': {
@@ -87,6 +97,7 @@ export const contactLinkTranslations = {
     instructions: 'Instale o WitnessWork para importar o contacto partilhado. Se já tem a aplicação, esta deveria ter aberto automaticamente.',
     getApp: 'Descarregar WitnessWork',
     openApp: 'Abrir aplicação (já instalada)',
+    continueOnWeb: 'Continuar na web',
     imageAlt: 'Ícone da aplicação WitnessWork',
   },
   'ru-ru': {
@@ -95,6 +106,7 @@ export const contactLinkTranslations = {
     instructions: 'Установите WitnessWork, чтобы импортировать контакт. Если приложение уже установлено, оно должно было открыться автоматически.',
     getApp: 'Скачать WitnessWork',
     openApp: 'Открыть приложение (уже установлено)',
+    continueOnWeb: 'Продолжить в браузере',
     imageAlt: 'Значок приложения WitnessWork',
   },
   'vi-vn': {
@@ -103,6 +115,7 @@ export const contactLinkTranslations = {
     instructions: 'Cài đặt WitnessWork để nhập liên hệ được chia sẻ. Nếu bạn đã có ứng dụng, ứng dụng sẽ tự động mở.',
     getApp: 'Tải WitnessWork',
     openApp: 'Mở ứng dụng (đã cài đặt)',
+    continueOnWeb: 'Tiếp tục trên web',
     imageAlt: 'Biểu tượng ứng dụng WitnessWork',
   },
   'zh-hant-tw': {
@@ -111,6 +124,7 @@ export const contactLinkTranslations = {
     instructions: '安裝WitnessWork以匯入分享的聯絡人。如果你已安裝此應用程式，它應該已自動開啟。',
     getApp: '下載WitnessWork',
     openApp: '開啟應用程式（已安裝）',
+    continueOnWeb: '在網頁版繼續',
     imageAlt: 'WitnessWork應用程式圖示',
   },
   'zh-hans-cn': {
@@ -119,6 +133,7 @@ export const contactLinkTranslations = {
     instructions: '安装WitnessWork以导入分享的联系人。如果你已安装此应用，它应该已自动打开。',
     getApp: '下载WitnessWork',
     openApp: '打开应用（已安装）',
+    continueOnWeb: '在网页版继续',
     imageAlt: 'WitnessWork应用图标',
   },
   'sw-ke': {
@@ -127,6 +142,7 @@ export const contactLinkTranslations = {
     instructions: 'Sakinisha WitnessWork ili kuingiza anwani uliyotumiwa. Ikiwa tayari una programu, inapaswa kuwa imefunguka kiotomatiki.',
     getApp: 'Pakua WitnessWork',
     openApp: 'Fungua programu (tayari imesakinishwa)',
+    continueOnWeb: 'Endelea kwenye wavuti',
     imageAlt: 'Aikoni ya programu ya WitnessWork',
   },
   'uk-ua': {
@@ -135,6 +151,7 @@ export const contactLinkTranslations = {
     instructions: 'Установіть WitnessWork, щоб імпортувати контакт. Якщо додаток уже встановлено, він мав відкритися автоматично.',
     getApp: 'Завантажити WitnessWork',
     openApp: 'Відкрити додаток (уже встановлено)',
+    continueOnWeb: 'Продовжити в браузері',
     imageAlt: 'Значок додатка WitnessWork',
   },
   'bem-zm': {
@@ -143,6 +160,7 @@ export const contactLinkTranslations = {
     instructions: 'Bikeni WitnessWork pa cibombelo cenu pa kwingisha ifyebo fya muntu mwapeelwa. Nga mwalikwata kale apu, yali no kwisuka iyine.',
     getApp: 'Poseni WitnessWork',
     openApp: 'Isuleni apu (yalibikwa kale)',
+    continueOnWeb: 'Pitilisheni pa web',
     imageAlt: 'Icishibilo ca apu ya WitnessWork',
   },
   'rw-rw': {
@@ -151,6 +169,7 @@ export const contactLinkTranslations = {
     instructions: 'Shyira WitnessWork ku gikoresho cyawe kugira ngo winjize aderesi wasangijwe. Niba usanzwe ufite iyi porogaramu, yagombye kuba yafungutse ubwayo.',
     getApp: 'Kuramo WitnessWork',
     openApp: 'Fungura porogaramu (isanzwe iri ku gikoresho)',
+    continueOnWeb: 'Komereza ku rubuga',
     imageAlt: 'Agashushondanga ka porogaramu ya WitnessWork',
   },
   // One Arabic for every country, like the app (`ar` has no region).
@@ -160,6 +179,7 @@ export const contactLinkTranslations = {
     instructions: 'ثبّت WitnessWork لاستيراد جهة الاتصال التي شوركت معك. إذا كان التطبيق مثبّتًا لديك، فمن المفترض أن يكون قد فُتح تلقائيًا.',
     getApp: 'احصل على WitnessWork',
     openApp: 'فتح التطبيق (مثبّت بالفعل)',
+    continueOnWeb: 'المتابعة على الويب',
     imageAlt: 'أيقونة تطبيق WitnessWork',
   },
 } satisfies Record<string, ContactLinkMessages>

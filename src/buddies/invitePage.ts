@@ -1,35 +1,60 @@
 import type { AppContext } from '../types'
+import {
+  FRAGMENT_LINKS_SCRIPT,
+  LEGACY_LINK_ORIGIN,
+  apexAssetOrigin,
+  imageSources,
+  isApexLinkHost,
+  pageOrigin,
+  scriptSource,
+  webAppOrigin,
+} from '../linkHosts'
 
 /**
  * `GET /buddies/invite` — no-app fallback for Buddy invite links
- * (`https://ww-proxy.leviwilkerson.com/buddies/invite#1<secret>`). The short
- * `/b`, in invites already sent, serves the same page.
+ * (`https://witnesswork.app/buddies/invite#1<secret>`, and older builds'
+ * `https://ww-proxy.leviwilkerson.com/b#1<secret>`). Every host serves it
+ * (docs/link-pages.md); the short `/b` is on the old host only.
  *
  * The secret lives in the fragment, which browsers never send to a server.
- * This handler reads nothing from the request and the page is fully static and
- * generic (no names, no ids). Its one inline script copies `location.href` to
- * the clipboard on tap; the CSP (`connect-src` falls back to `'none'`) keeps the
- * page from sending anything anywhere.
+ * This handler reads nothing from the request but its host, and the page is
+ * generic (no names, no ids). Its one inline script copies the invite link to
+ * the clipboard on tap (always the old host's `/b#…`, the one form every
+ * build's paste field reads) and builds "Continue on the web" (and, on the apex,
+ * "Open in WitnessWork") from the fragment; the CSP (`connect-src` falls back
+ * to `'none'`) keeps the page from sending anything anywhere.
  */
 
-const SITE_ORIGIN = 'https://ww-proxy.leviwilkerson.com'
 const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
 const GOOGLE_PLAY_URL =
   'https://play.google.com/store/apps/details?id=com.leviwilkerson.jwtime'
-const OG_IMAGE_URL = `${SITE_ORIGIN}/assets/og-image.png`
+const OG_IMAGE_PATH = '/assets/og-image.png'
 const ICON_PATH = '/assets/apple-touch-icon.png'
 const OG_TITLE = 'A WitnessWork buddy invite'
 const OG_DESCRIPTION =
   'Open this invite in WitnessWork, the service time and contact management app for Jehovah’s Witnesses.'
+
+const INVITE_PATH = '/buddies/invite'
+const SHORT_INVITE_PATH = '/b'
+
+/**
+ * On the apex, "Open in WitnessWork" goes to the old host's `/b`, which every
+ * build claims and parses: a tap on a link to another domain opens the app.
+ */
+const OPEN_APP_BASE = `${LEGACY_LINK_ORIGIN}${SHORT_INVITE_PATH}`
 
 const COPY_SCRIPT = `
 (function () {
   var button = document.getElementById('copy');
   var status = document.getElementById('copy-status');
   function show(message) { status.textContent = message; }
+  var fragment = location.hash.slice(1);
+  var link = /^[A-Za-z0-9_-]+$/.test(fragment)
+    ? '${OPEN_APP_BASE}#' + fragment
+    : location.href;
   function fallback() {
     var field = document.createElement('textarea');
-    field.value = location.href;
+    field.value = link;
     field.setAttribute('readonly', '');
     field.style.position = 'fixed';
     field.style.opacity = '0';
@@ -43,7 +68,7 @@ const COPY_SCRIPT = `
   button.hidden = false;
   button.addEventListener('click', function () {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(location.href).then(function () {
+      navigator.clipboard.writeText(link).then(function () {
         show('Invite link copied.');
       }, fallback);
     } else {
@@ -53,11 +78,14 @@ const COPY_SCRIPT = `
 })();
 `
 
-const INVITE_PATH = '/buddies/invite'
-const SHORT_INVITE_PATH = '/b'
+const PAGE_SCRIPT = COPY_SCRIPT + FRAGMENT_LINKS_SCRIPT
 
 const renderPage = (
-  path: typeof INVITE_PATH | typeof SHORT_INVITE_PATH
+  path: typeof INVITE_PATH | typeof SHORT_INVITE_PATH,
+  origin: string,
+  apex: boolean,
+  assets: string | undefined,
+  web: string | undefined
 ): string => `<!doctype html>
 <html lang="en">
 <head>
@@ -73,16 +101,17 @@ const renderPage = (
   <meta property="og:site_name" content="WitnessWork">
   <meta property="og:title" content="${OG_TITLE}">
   <meta property="og:description" content="${OG_DESCRIPTION}">
-  <meta property="og:url" content="${SITE_ORIGIN}${path}">
-  <meta property="og:image" content="${OG_IMAGE_URL}">
+  <meta property="og:url" content="${origin}${path}">
+  <meta property="og:image" content="${assets ?? origin}${OG_IMAGE_PATH}">
   <meta property="og:image:alt" content="WitnessWork app icon">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="${OG_TITLE}">
   <meta name="twitter:description" content="${OG_DESCRIPTION}">
 
-  <link rel="apple-touch-icon" href="${ICON_PATH}">
+  <link rel="apple-touch-icon" href="${assets ?? ''}${ICON_PATH}">
   <style>
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
       background: #4BD27C;
@@ -128,51 +157,45 @@ const renderPage = (
 </head>
 <body>
   <main class="card">
-    <img class="icon" src="${ICON_PATH}" alt="WitnessWork" width="88" height="88">
+    <img class="icon" src="${assets ?? ''}${ICON_PATH}" alt="WitnessWork" width="88" height="88">
     <h1>Open this invite in WitnessWork</h1>
     <p>Install WitnessWork from the App Store or Google Play. After installing, tap the invite link again to open it in the app.</p>
     <div class="stores">
       <a class="btn" href="${APP_STORE_URL}">Get it on the App Store</a>
       <a class="btn" href="${GOOGLE_PLAY_URL}">Get it on Google Play</a>
-    </div>
+    </div>${apex ? `
+    <div><a id="open-app" class="btn secondary" data-base="${OPEN_APP_BASE}" hidden>Open in WitnessWork</a></div>` : ''}${web ? `
+    <div><a id="continue-web" class="btn secondary" data-base="${web}${INVITE_PATH}" hidden>Continue on the web</a></div>` : ''}
     <div><button id="copy" class="btn secondary" type="button" hidden>Copy invite link</button></div>
     <p id="copy-status" class="status" role="status"></p>
     <p>Already have the app? Copy the invite link and paste it in WitnessWork.</p>
   </main>
-  <script>${COPY_SCRIPT}</script>
+  <script>${PAGE_SCRIPT}</script>
 </body>
 </html>`
-
-let scriptHash: Promise<string> | null = null
-
-/** CSP source for the inline script, computed once per isolate. */
-const copyScriptSource = (): Promise<string> => {
-  scriptHash ??= crypto.subtle
-    .digest('SHA-256', new TextEncoder().encode(COPY_SCRIPT))
-    .then((digest) => {
-      let binary = ''
-      for (const byte of new Uint8Array(digest))
-        binary += String.fromCharCode(byte)
-      return `'sha256-${btoa(binary)}'`
-    })
-  return scriptHash
-}
 
 export const handleBuddyInvitePage = async (
   context: AppContext
 ): Promise<Response> => {
   const policy = [
     "default-src 'none'",
-    "img-src 'self'",
+    `img-src ${imageSources(context.req.url)}`,
     "style-src 'unsafe-inline'",
-    `script-src ${await copyScriptSource()}`,
+    `script-src ${await scriptSource(PAGE_SCRIPT)}`,
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",
   ].join('; ')
   const path =
     context.req.path === SHORT_INVITE_PATH ? SHORT_INVITE_PATH : INVITE_PATH
-  return context.html(renderPage(path), 200, {
+  const page = renderPage(
+    path,
+    pageOrigin(context.req.url),
+    isApexLinkHost(context.req.url),
+    apexAssetOrigin(context.req.url),
+    webAppOrigin(context.env.WEB_APP_ORIGIN)
+  )
+  return context.html(page, 200, {
     'Cache-Control': 'public, max-age=3600',
     'Content-Security-Policy': policy,
     'Referrer-Policy': 'no-referrer',
