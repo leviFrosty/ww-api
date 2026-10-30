@@ -26,7 +26,7 @@ Preconditions:
 - `node scripts/verify/dev.mjs doctor` passes, including `account sessions enabled`.
 
 - **Whole flow.** Run `pnpm test:e2e src/e2e/accounts.e2e.test.ts`. Vitest reports `/accounts/v1/sessions (dev bypass)`, `the legacy switch (local KV)`, and `GET /app/v1/config` as passed, and `.verify/artifacts/e2e-accounts-*.json` holds the exchanges.
-- **Sessions on.** Run `curl -s -X POST $URL/accounts/v1/sessions/refresh -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.4.1" -d '{"refreshToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'`. The body is `{"ok":false,"error":"unauthorized","code":"unauthorized"}`; `disabled` means no `ACCOUNT_TOKEN_SECRET`.
+- **Sessions on.** Run `curl -s -X POST $URL/accounts/v1/sessions/refresh -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.4.1" -d '{"refreshToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'`. The body is `{"ok":false,"error":"unauthorized","code":"unauthorized","reason":"unknown"}`; `disabled` means no `ACCOUNT_TOKEN_SECRET`.
 - **App config.** Run `node scripts/verify/dev.mjs kv put app:min-version '{"minVersion":"9.8.7"}'`, then `curl -si $URL/app/v1/config`. You get 200, `cache-control: no-store`, and `{"ok":true,"minAppVersion":"9.8.7","sync":{…}}`. Restore it with `node scripts/verify/dev.mjs kv delete app:min-version`.
 - **Cloud Sync.** Run `pnpm test:e2e src/e2e/sync.e2e.test.ts`. It sets KV `sync:entitlement supporter` and refuses a non-Supporter (`supporter_required`), then with `sync:entitlement everyone` does put → live `changed` → list → get → `If-Match` → the kill switch → delete, and the Cloud Sync request's set → repeat → status → clear, and deletes the keys again. `.verify/artifacts/e2e-sync-*.json` holds the exchanges.
 

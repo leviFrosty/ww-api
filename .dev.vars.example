@@ -34,6 +34,13 @@ NOTES_IMPORT_DEV_BYPASS_TOKEN=local-dev-bypass
 # only; generate with: openssl rand -base64 32
 ACCOUNT_TOKEN_SECRET=generate_with_openssl_rand_base64_32_local_only
 
+# Passkeys (witness-work ADR 0038): sign challenge tokens and the tickets a
+# browser opens a web session with. At least 32 characters each, never
+# ACCOUNT_TOKEN_SECRET's value; without either, the passkey routes answer
+# `disabled`. The ticket secret also keys the rate counters' names.
+PASSKEY_CHALLENGE_SECRET=generate_with_openssl_rand_base64_32_local_only
+ACCOUNT_TICKET_SECRET=generate_with_openssl_rand_base64_32_local_only
+
 # Dedicated local admin-reset token. Do not reuse the dev-bypass token.
 ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32
 

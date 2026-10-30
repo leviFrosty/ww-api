@@ -469,7 +469,8 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch (local 
       // Sessions still open (they replace account/register).
       await openSession()
     } finally {
-      localKv('delete', 'auth:legacy')
+      // Back to the suites' default: on (see src/test/e2eGlobalSetup.ts).
+      localKv('put', 'auth:legacy', 'on')
     }
     expect((await send('account/info', key)).status).toBe(200)
   })

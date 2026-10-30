@@ -29,6 +29,9 @@ export const ACCOUNTS_OPS = [
   'backup/delete',
   'session/open',
   'sync/request',
+  'passkey/add',
+  'passkey/wrap',
+  'passkey/remove',
 ] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
@@ -76,6 +79,22 @@ export const ACCOUNT_LIMITS = {
   sessionsPerAccount: 10,
   /** Sessions opened per account key per rolling day. */
   sessionOpensPerDay: 20,
+  /** A web session lasts this long from its last refresh (sliding). */
+  webSessionMs: 180 * DAY_MS,
+  /** Live web sessions per account, apart from the phones' cap. */
+  webSessionsPerAccount: 3,
+  /** A web session's step-up counts this long. */
+  stepUpMs: 5 * MINUTE_MS,
+  /** `appVersion`, characters. */
+  appVersionChars: 32,
+  /** Passkeys per account (`limit`). */
+  passkeysPerAccount: 10,
+  /** Wraps kept per credential; a fifth replaces the oldest. */
+  wrapsPerCredential: 4,
+  /** A passkey's sealed label, b64u characters. */
+  passkeyLabelChars: 512,
+  /** A serialized WebAuthn response, characters (`too_large`). */
+  passkeyResponseChars: 16 * 1_024,
   /** The sealed device label, b64u characters. */
   sessionDeviceChars: 512,
   /** Ended sessions (revoked or expired) are deleted after this long. */
@@ -209,6 +228,60 @@ export interface SessionOpenFields {
   attestation: Record<string, unknown> | null
   /** The sealed device label, stored opaque. */
   device: string | null
+  /** A browser's ticket in place of `attestation` (passkeys protocol). */
+  ticket: string | null
+  appVersion: string | null
+}
+
+export interface PasskeyAddFields {
+  challengeToken: unknown
+  response: unknown
+  wrapId: string | null
+  wrap: string | null
+  label: string | null
+}
+
+export interface PasskeyWrapFields {
+  credentialId: unknown
+  wrapId: string
+  keyEpoch: number
+  wrap: string
+}
+
+export interface PasskeyRemoveFields {
+  credentialId: unknown
+}
+
+const APP_VERSION_PATTERN = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/
+
+/**
+ * An optional `appVersion` (`major.minor.patch`, at most 32 characters):
+ * null when absent, undefined when malformed (`bad_request`).
+ */
+export const parseAppVersion = (value: unknown): string | null | undefined => {
+  if (value === undefined || value === null) return null
+  return typeof value === 'string' &&
+    value.length <= ACCOUNT_LIMITS.appVersionChars &&
+    APP_VERSION_PATTERN.test(value)
+    ? value
+    : undefined
+}
+
+/** A wrap: b64u of `0x01 ‖ nonce[24] ‖ ciphertext[32] ‖ tag[16]`, 73 bytes. */
+export const parseWrap = (value: unknown): string | null => {
+  const canonical = canonicalBytes(value, 73)
+  return canonical != null && canonical === value && decodeB64u(canonical)![0] === 1
+    ? canonical
+    : null
+}
+
+/** An optional sealed label (≤ 512 characters); undefined when malformed. */
+const optionalSealed = (
+  value: unknown,
+  maxChars: number
+): string | null | undefined => {
+  if (value === undefined || value === null) return null
+  return sealed(value, maxChars) ?? undefined
 }
 
 type Fields = Record<string, unknown>
@@ -261,13 +334,43 @@ export const ACCOUNT_FIELD_PARSERS = {
   'session/open': (p: Fields): SessionOpenFields | null => {
     const attestation = p.attestation ?? null
     if (attestation !== null && !isPlainObject(attestation)) return null
-    if (p.device === undefined || p.device === null)
-      return { attestation, device: null }
-    const device = sealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
-    return device ? { attestation, device } : null
+    const ticket = p.ticket ?? null
+    if (ticket !== null && typeof ticket !== 'string') return null
+    // A ticket stands in for the attestation; never both.
+    if (ticket !== null && attestation !== null) return null
+    const appVersion = parseAppVersion(p.appVersion)
+    const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
+    if (appVersion === undefined || device === undefined) return null
+    return { attestation, device, ticket, appVersion }
   },
   // The envelope proves the account key: a leaked token alone can't ask.
   'sync/request': (): Fields => ({}),
+  'passkey/add': (p: Fields): PasskeyAddFields | null => {
+    if (p.challengeToken === undefined || p.response === undefined) return null
+    const label = optionalSealed(p.label, ACCOUNT_LIMITS.passkeyLabelChars)
+    if (label === undefined) return null
+    const hasWrap = p.wrap !== undefined && p.wrap !== null
+    const hasWrapId = p.wrapId !== undefined && p.wrapId !== null
+    if (hasWrap !== hasWrapId) return null
+    if (!hasWrap)
+      return { challengeToken: p.challengeToken, response: p.response, wrapId: null, wrap: null, label }
+    const wrapId = id16(p.wrapId)
+    const wrap = parseWrap(p.wrap)
+    return wrapId && wrap
+      ? { challengeToken: p.challengeToken, response: p.response, wrapId, wrap, label }
+      : null
+  },
+  'passkey/wrap': (p: Fields): PasskeyWrapFields | null => {
+    const wrapId = id16(p.wrapId)
+    const wrap = parseWrap(p.wrap)
+    const keyEpoch = p.keyEpoch
+    if (!wrapId || !wrap || p.credentialId === undefined) return null
+    if (typeof keyEpoch !== 'number' || !Number.isSafeInteger(keyEpoch) || keyEpoch < 0)
+      return null
+    return { credentialId: p.credentialId, wrapId, keyEpoch, wrap }
+  },
+  'passkey/remove': (p: Fields): PasskeyRemoveFields | null =>
+    p.credentialId === undefined ? null : { credentialId: p.credentialId },
 } satisfies Record<AccountsOp, (payload: Fields) => object | null>
 
 export type AccountFields<K extends AccountsOp> = NonNullable<
@@ -320,6 +423,17 @@ export const handoffBlobTooLarge = (body: unknown): boolean => {
 export const sessionDeviceTooLarge = (payload: unknown): boolean =>
   isPlainObject(payload) &&
   over(payload.device, ACCOUNT_LIMITS.sessionDeviceChars)
+
+/** A serialized WebAuthn response over 16 KiB (`too_large`). */
+export const passkeyResponseTooLarge = (value: unknown): boolean =>
+  value !== undefined &&
+  JSON.stringify(value).length > ACCOUNT_LIMITS.passkeyResponseChars
+
+/** A passkey's sealed label over its cap, or its response over 16 KiB (`too_large`). */
+export const passkeyAddTooLarge = (payload: unknown): boolean =>
+  isPlainObject(payload) &&
+  (over(payload.label, ACCOUNT_LIMITS.passkeyLabelChars) ||
+    passkeyResponseTooLarge(payload.response))
 
 // --- Sessions ----------------------------------------------------------------
 

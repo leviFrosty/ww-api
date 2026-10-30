@@ -235,6 +235,17 @@ export const BUDDIES_ERROR_STATUS = {
   storage_full: 429,
   /** A Cloud Sync `photos/put` on an account with no slot. */
   no_slot: 409,
+  /**
+   * A passkey ceremony didn't verify (witness-work
+   * `docs/passkeys-protocol.md`); `reason` says which check failed.
+   */
+  passkey_failed: 403,
+  /** A web session's ticket that's malformed, expired, used, or for another account. */
+  ticket_invalid: 403,
+  /** A web session hasn't passed a step-up in the last 5 minutes. */
+  step_up_required: 403,
+  /** Reserved (ADR 0039): a session open with a retired account key. */
+  key_retired: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
