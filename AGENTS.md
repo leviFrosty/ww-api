@@ -1350,6 +1350,188 @@ wrangler kv key delete --binding NOTES_KV sync:entitlement
 node scripts/r2-lifecycle.mjs ww-account-sync --check   # read-only bucket check
 ```
 
+## Shared Spaces
+
+A blind, end-to-end encrypted record store shared by up to 10 members, one
+space per shared car (witness-work ADR 0037; wire contract
+`docs/shared-cars-protocol.md` there; Shared Cars is the app feature). Code
+in `src/spaces/`: `route.ts` (routes, gates), `spaceDO.ts` (`SharedSpace`),
+`contracts.ts` (limits, parsers, headers, and `SPACES_ERROR_STATUS`: the
+shared envelope's codes plus Spaces' own `stale_key`), `switches.ts`,
+`openapi.ts`.
+
+| Route | What |
+| --- | --- |
+| `POST /spaces/v1/create` | `{ spaceId, memberId, dhPub, tokenHash, wrap }` → `{ ok, seq, joinedAt }` |
+| `POST /spaces/v1/sync` | member, `since`, `limit?` → records, members (`memberId`, `dhPub`, `joinedAt`), invites, owner, epoch, own wrap, `rekeyNeeded`, `more` |
+| `POST /spaces/v1/put` | member, `records` (1-100) → `{ ok, seq, results }` |
+| `POST /spaces/v1/invite/create`, `invite/delete` | member, `inviteId` (+ `joinVerifier`, `expiresAt`, `epoch`) → `{ ok }` |
+| `POST /spaces/v1/join` | `{ spaceId, inviteId, joinSecret, epoch, memberId, dhPub, tokenHash, wrap }` → `{ ok, seq, epoch, joinedAt }` |
+| `POST /spaces/v1/leave`, `member/remove`, `rekey`, `delete` | member (+ `removeId`; `epoch`, `wraps`, `link`) |
+| `GET /spaces/v1/live` | Bearer WebSocket, `x-ww-space-auth` + `x-ww-space-token`: `hello`, then `changed` |
+
+- **Authentication**: every route is bearer (the session proves an attested
+  app and drives suspension and rate limits) but the session is never
+  recorded against the space. Member ops carry `spaceId`, `memberId`, and
+  `token` in the body; the Worker hashes the token and only the hash reaches
+  the DO, which compares it with the member's stored hash in constant time
+  (`join`'s secret likewise). A `memberId` not on an existing space is 410
+  `gone`; a wrong token for one that is, 403 `forbidden`. `create` and
+  `join` carry the member's X25519 `dhPub`, and the Worker refuses a
+  `memberId` other than `b64u(SHA-256("ww-spaces/v1/member-id|" + spaceId +
+  "|" + dhPub)[0..16])` (400 `bad_request`), so nobody can swap in a key.
+  The live upgrade's ids ride in `x-ww-space-auth` (`b64u(JSON { spaceId,
+  memberId })`, ≤ 1,024 characters) and the token in `x-ww-space-token`
+  (`b64u(token)`); the names hold "auth" and "token" so Cloudflare's logs
+  redact them.
+  The Worker forwards the verified member and the member cap to the DO in
+  `x-ww-space-member-token` (it carries the token's hash, so its name holds
+  "token" too), without `Authorization` or either client header, replacing
+  any client copy. Sentry drops all three headers.
+- **Storage**: one `SharedSpace` SQLite DO per space (binding
+  `SHARED_SPACE`, `idFromName(spaceId)`, migration `v10`): the current
+  version of each sealed record with the `seq` it was stored at, members
+  (token hash, `dhPub`, current wrap, `joinedAt`), invites (verifier,
+  inviter, expiry; a used one is kept until it expires so a retried `join`
+  gets its answer), the ids of invites closed before they were used
+  (`closed_invite`, until they'd have expired), the change `seq`, running
+  record and decoded-byte counts, hourly put counts, each member's puts
+  over the last minute, the retention alarm, and the live sockets. No R2.
+  Every change advances `seq`: each stored record takes the next one, and
+  joins, leaves, removals, invite changes, and rekeys take one each (a
+  rekey's link one more). The last member's `leave`, the owner's `delete`,
+  and retention drop every table and write a tombstone in the same
+  transaction as the check that allowed it, so every later request
+  (`create` included) is `gone`. Then `deleteAll()` frees the storage
+  (Cloudflare bills dropped tables' storage until `deleteAll()`) and the
+  tombstone is written back, inside `blockConcurrencyWhile`
+  (`deleteAllThen` in `src/durableObjectStorage.ts`). If that fails,
+  workerd resets the object and the request fails with 500 although the
+  space is gone (its retry is `gone`). An alarm set 10 minutes out first,
+  and set again right after `deleteAll()` (from compatibility date
+  2026-02-24 `deleteAll()` drops it), retries. If the failure came after
+  `deleteAll()`, the next instance's constructor sees no space, no
+  tombstone, and an alarm, and writes the tombstone back before any
+  request, so `create` and `join` stay `gone`; the alarm does the same as a
+  backup. `sync` reads records in whole chunks (`readSeqPage`): a `for …
+  of exec()` loop that stops early leaves its statement running, and the
+  wipe's `DROP TABLE` then fails with `SQLITE_LOCKED` until the object is
+  evicted (`deleteAll()` isn't blocked by it; measured on `wrangler dev`).
+- **Creating**: an identical retry of `create` (same `memberId`, `dhPub`,
+  `tokenHash`, `wrap`) on a space nothing has changed since (`seq` 1) gets
+  the same `{ ok, seq: 1, joinedAt }`; any other reuse is 409 `conflict`. The
+  Worker asks the DO first (`existingCreate`), so a retry, a `conflict`, or a
+  `gone` never counts against the account's 20 creates a day. Two first
+  tries racing can both count.
+- **Invites**: made at the current epoch (`invite/create` with another
+  `epoch` is 409 `stale_key`), so an open invite always carries the current
+  key. They close when used, deleted, burned, or expired; when their
+  inviter leaves (freeing their places, and keeping a gone member from
+  rejoining through their own invite); all of them when anyone is removed
+  (so the removed member can't rejoin through another member's invite
+  before the rekey; inviters send theirs again after it); and all of them
+  at a rekey. A closed id is kept (`closed_invite`) until it would have
+  expired, so an identical `invite/create` landing after the close is 409
+  `conflict`, as is any reuse of a used or burned id; an identical retry is
+  `ok` only while the invite is open. Closed ones count toward no cap and
+  aren't in `sync`'s `invites`, and `join` with one is 404 `not_found`.
+  `join` also refuses an invite whose inviter isn't on the space (404
+  `not_found`). `join` carries the invitation's `epoch`: a fresh join at
+  any other than the current one is 409 `stale_key` (checked after the
+  secret, so a wrong secret still counts). A retried `join` (same secret,
+  `memberId`, `dhPub`, `tokenHash`, whatever its `epoch`) gets the head,
+  the current epoch, and its original `joinedAt`; any other join by a
+  current member is 409 `conflict`. `invite/delete` of an unknown, closed,
+  used, or expired invite is `ok` for any member and changes nothing; an
+  open one is its inviter's or the owner's to close (403 `forbidden`).
+- **Records**: the newest `stamp` wins per `recordId`; on a tie a deletion,
+  then the lower SHA-256 of the decoded blob. Resending the held version is
+  `stored: true` and takes no `seq`. Reserved ids (`mayPutRecord`):
+  `m.<memberId>` is that member's alone (any other `m.` id, one naming
+  nobody yet included) and `k.<x>` the owner's, so a put naming someone
+  else's is 403 `forbidden` and nothing in it is stored (deletions
+  included). Any record off the current epoch is 409 `stale_key` and
+  nothing is stored; a stamp more than 24 h ahead is 400.
+- **Roles**: the creator owns the space; an owner who leaves passes it to
+  the member who joined first. `member/remove` (never yourself), `rekey`,
+  and `delete` are owner only. `rekey` must be to the current epoch + 1
+  (below 2 is 400, anything else 409 `stale_key`) and give a wrap to every
+  current member exactly: naming one twice is 400 `bad_request`, missing one
+  (an empty list included) or naming a non-member 409 `conflict` (the
+  owner's device syncs and tries again). It closes every open invite. Its
+  required `link: { stamp, blob }` is stored in the same transaction as the
+  record `k.<epoch>` at the new epoch, at a `seq` of its own after the
+  rekey's, replacing any version of that id whatever its stamp (so a link
+  planted ahead can't block it); it's checked as a put record (413
+  `too_large`, 400 for a stamp more than 24 h ahead) and counted in the
+  record and byte caps (429 `limit`) but not the put rates (`put_hour`,
+  `member_put`). The link is the owner's by construction. The answer's
+  `seq` is the head, the link's. `rekeyNeeded` is set by a leave or removal
+  and cleared by a rekey.
+- **Switches** (KV in `NOTES_KV`, edge-cached 60 s): `spaces:enabled`
+  (`"true"`; absent → `SPACES_ENABLED`: dev `"true"`, prod `"false"`). Off,
+  everything is 503 `disabled` with `Retry-After` except `leave`,
+  `member/remove`, and `delete`; open sockets stay open. `spaces:maxMembers`:
+  members plus open invites a space holds (1-100; absent or invalid → 10),
+  checked at `invite/create` and `join`. No Supporter check: it's free.
+- **Suspended** accounts get 403 `suspended` on `create`, `put`,
+  `invite/create`, and `join` (the cached `requireActive` status, 30 s);
+  reads, leaving, removing, rekeying, and deleting still work.
+- **Limits** (`SPACES_LIMITS`, each with its sizing): per caller, the
+  Buddies edge tiers keyed on the hashed account (`sync` and `live` read,
+  `join` unsigned, the rest write); 20 creates per account a rolling day
+  (`BuddyRegistrationQuota` under a hashed `space-create` name, counted
+  before the DO, only for a `create` that would make a space); 60 puts a
+  rolling minute per member (counted in the space's SQLite in the put's own
+  transaction once it passes the `forbidden` and `stale_key` checks, so it
+  holds across eviction; a put refused `forbidden` or `stale_key` writes
+  nothing and costs nothing, as does one whose transaction throws, while
+  one refused with `limit` or the daily `rate_limited` counts); 10,000
+  records a rolling day per space (hourly counts); 100 records and 1 MiB a
+  put, 16 KiB a blob (a rekey's link too), 256 KiB any other body, declared
+  or streamed (413 `too_large`); 50,000 records and 256 MiB of decoded
+  blobs a space, deletions and links included (429 `limit`; a replaced
+  version gives its bytes back); members plus open invites (429 `limit`);
+  invites at most 7 days plus 5 minutes; 5 wrong join secrets burn an
+  invite; 4 live sockets per member the cap allows, 40 at 10 (past it,
+  `4002 "replaced"` closes, one at a time, the opener's own oldest while
+  they hold 4 or more, else the oldest of whichever member holds the most,
+  until the space is at the cap, an excess left by a lowered
+  `spaces:maxMembers` included; so a member rotating their sockets can't
+  keep the others out). The rolling counts share `rollingWindowWaitMs`
+  (`src/buddies/limits.ts`) with the Buddies quotas. Sync pages stop at
+  `limit` (≤ 1,000) or 4 MiB of blobs, with `more`. Hits log `spaces:
+  limit hit {op: 'spaces/…', limit}` (edge tiers as `edge.<tier>`).
+- **Live socket**: `hello` with the head, then `changed` to every socket on
+  the space after each change (the writing device's included: a member's
+  devices share one member id). `ping` gets `pong` without waking the DO.
+  `4001 "gone"` closes a leaver's or removed member's sockets, and every
+  socket when the space is deleted.
+- **Retention**: the alarm deletes a space 400 days after its last `sync` or
+  `put` (set at `create`, moved forward each time it fires early). A `sync`
+  records the activity only when the recorded one is over a day old, so most
+  syncs write nothing; the alarm waits 401 days from the recorded one to
+  make up for it.
+- **Privacy**: ciphertext, random ids, and per-space public keys only; the
+  server never learns what a space is or which accounts are on it. Never
+  log or report space, member, or invite ids, tokens, keys, hashes, wraps,
+  or blobs. A failure reaches Sentry as an `OperationError` naming
+  `spaces/<op>` alone (`captureOperationFailure`), since the DO's SQLite
+  errors can quote what they hold. The socket carries only change notices.
+
+```bash
+# Turn Shared Spaces on in prod (before the app release that shares cars)
+wrangler kv key put --binding NOTES_KV spaces:enabled true
+# Off (kill switch): leave, member/remove, and delete keep working
+wrangler kv key put --binding NOTES_KV spaces:enabled false
+# Raise the member cap (members plus open invites)
+wrangler kv key put --binding NOTES_KV spaces:maxMembers 12
+# Fall back to the SPACES_ENABLED var / the default cap
+wrangler kv key delete --binding NOTES_KV spaces:enabled
+wrangler kv key delete --binding NOTES_KV spaces:maxMembers
+# Add --env dev to each for the dev worker.
+```
+
 ## App Store ratings (paywall social proof)
 
 `GET /app-store/ratings` returns `{averageRating, ratingCount, countryCount,
@@ -1454,7 +1636,7 @@ need the token).
 - `hono-openapi` builds the document from the routes themselves: each route
   carries a `describeRoute(...)` middleware, kept in an `openapi.ts` beside its
   handlers (`src/attestation/`, `src/notesImport/`, `src/buddies/`,
-  `src/accounts/`, `src/routePlanning/`; routes registered in `src/app.ts` use
+  `src/accounts/`, `src/spaces/`, `src/routePlanning/`; routes registered in `src/app.ts` use
   `src/openapi/coreDocs.ts`). Shared helpers and the error envelope are in
   `src/openapi/schemas.ts`; tags, servers, and the Scalar config in
   `src/openapi/route.ts`.

@@ -119,6 +119,21 @@ export class DatabaseError extends Error {
   override name = 'DatabaseError';
 }
 
+/** A failure reported as its operation alone (`captureOperationFailure`). */
+export class OperationError extends Error {
+  override name = 'OperationError';
+}
+
+/** `reported`, carrying `error`'s stack frames but none of its text. */
+function withFramesOf<T extends Error>(reported: T, error: unknown): T {
+  const stack = error instanceof Error ? (error.stack ?? '') : '';
+  const frames = stack.split('\n').filter((line) => /^\s+at /.test(line));
+  reported.stack = [`${reported.name}: ${reported.message}`, ...frames].join(
+    '\n'
+  );
+  return reported;
+}
+
 /**
  * What to report for `error`, caught around `operation` (an op name or a
  * fixed label, never a value). A database error, or one caused by it,
@@ -128,18 +143,29 @@ export class DatabaseError extends Error {
  */
 export function reportableError(error: unknown, operation: string): unknown {
   if (!isDatabaseError(error)) return error;
-  const reported = new DatabaseError(`database query failed: ${operation}`);
-  const stack = error instanceof Error ? (error.stack ?? '') : '';
-  const frames = stack.split('\n').filter((line) => /^\s+at /.test(line));
-  reported.stack = [`${reported.name}: ${reported.message}`, ...frames].join(
-    '\n'
+  return withFramesOf(
+    new DatabaseError(`database query failed: ${operation}`),
+    error
   );
-  return reported;
 }
 
 /** `Sentry.captureException` for a failure caught around `operation`. */
 export function captureFailure(error: unknown, operation: string): void {
   Sentry.captureException(reportableError(error, operation));
+}
+
+/**
+ * `captureFailure` for code whose every error may quote user-linked values,
+ * not only database ones: Shared Spaces, whose Durable Object's SQLite
+ * errors can name its tables' contents. Any error is reported as an
+ * `OperationError` whose message is `operation` alone, with the original's
+ * stack frames but no message or cause.
+ */
+export function captureOperationFailure(
+  error: unknown,
+  operation: string
+): void {
+  Sentry.captureException(withFramesOf(new OperationError(operation), error));
 }
 
 /**
@@ -183,9 +209,12 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  * - `x-ww-payload`/`x-ww-signature` (or the legacy `x-ww-p`/`x-ww-s`):
  *   accounts' legacy `backup/put` envelope (account key and slot id).
  * - `x-ww-slot-id`: the bearer `backup/put`'s slot id.
+ * - `x-ww-space-auth`, `x-ww-space-token` (and the Worker's own
+ *   `x-ww-space-member-token`): the Shared Spaces live socket's space id and
+ *   member id, its member token, and the token's hash.
  */
 const SECRET_HEADER =
-  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id)$)/i;
+  /^(authorization$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id|space-auth|space-token|space-member-token)$)/i;
 
 function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;

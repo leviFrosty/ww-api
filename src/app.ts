@@ -74,6 +74,7 @@ import { handleAppConfigRequest } from "./appConfig";
 import { Sentry, reportableError } from "./sentry";
 import { createBuddiesRoutes } from "./buddies/route";
 import { createAccountsRoutes } from "./accounts/route";
+import { createSpacesRoutes } from "./spaces/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { handleHandoffPage } from "./accounts/handoffPage";
@@ -318,6 +319,11 @@ app.route("/buddies/v1", createBuddiesRoutes());
 // take signed envelopes while the legacy switch is on (handoff's new-phone ops
 // carry a claim token instead). Rate-limited per caller inside the handler.
 app.route("/accounts/v1", createAccountsRoutes());
+// Shared Spaces (witness-work ADR 0037; Shared Cars): POST /spaces/v1/{op}
+// and the GET /spaces/v1/live socket, bearer only, ids and member tokens in
+// bodies (the socket's in `x-ww-space-auth` and `x-ww-space-token`).
+// Rate-limited per caller inside the handler.
+app.route("/spaces/v1", createSpacesRoutes());
 // RevenueCat's webhook (ADR 0029): keeps linked customers' Supporter status
 // current. RevenueCat's servers only, authenticated by the integration's
 // Authorization header.

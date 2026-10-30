@@ -192,6 +192,23 @@ describe('event kinds and templates', () => {
     ).toBeNull()
   })
 
+  it('takes the car.invite and car.reply templates beside the app’s others, up to 32', () => {
+    const template = { title: 't', body: 'b' }
+    for (const others of [16, 30]) {
+      const templates = {
+        ...Object.fromEntries(
+          Array.from({ length: others }, (_, i) => [`k${i}`, template])
+        ),
+        'car.invite': { title: 'Mileage', body: 'Anna shared a car with you' },
+        'car.reply': { title: 'Mileage', body: 'Joe joined a shared car' },
+      }
+      const parsed = parse('device/register', { ...device, templates })
+      expect(Object.keys(parsed?.templates ?? {})).toHaveLength(others + 2)
+      expect(parsed?.templates['car.invite']).toEqual(templates['car.invite'])
+      expect(parsed?.templates['car.reply']).toEqual(templates['car.reply'])
+    }
+  })
+
   it('rejects bad template keys, shapes, counts, tokens, and environments', () => {
     const template = { title: 't', body: 'b' }
     expect(
@@ -422,6 +439,7 @@ describe('immediate push kinds', () => {
     ['share.reply', true],
     ['plan.invite', true],
     ['followup.invite', true],
+    ['car.invite', true],
     ['join.request.a1b2c3d4e5f6', true],
     ['invite.claimed', false],
     ['plan.update', false],
@@ -431,6 +449,8 @@ describe('immediate push kinds', () => {
     ['join.cancel', false],
     ['join.request', false],
     ['plan.joined', false],
+    ['car.reply', false],
+    ['car.cancel', false],
   ])('%s skips the push spacing: %s', (kind, immediate) => {
     expect(isImmediatePushKind(kind)).toBe(immediate)
   })

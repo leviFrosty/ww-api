@@ -5,7 +5,8 @@
 
 const encoder = new TextEncoder()
 
-const toHex = (bytes: Uint8Array): string => {
+/** Lowercase hex of `bytes`. */
+export const bytesToHex = (bytes: Uint8Array): string => {
   let out = ''
   for (const b of bytes) out += b.toString(16).padStart(2, '0')
   return out
@@ -24,7 +25,7 @@ export const sha256Bytes = async (data: Uint8Array): Promise<Uint8Array> => {
  * (decisions 6 & 8).
  */
 export const sha256Hex = async (text: string): Promise<string> =>
-  toHex(await sha256Bytes(encoder.encode(text)))
+  bytesToHex(await sha256Bytes(encoder.encode(text)))
 
 /**
  * Fixed-work string comparison for bounded secret tokens. Folding the lengths

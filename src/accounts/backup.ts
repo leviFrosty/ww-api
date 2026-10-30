@@ -1,5 +1,10 @@
 import type { AppContext } from '../types'
-import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
+import {
+  bytesToBase64Url,
+  bytesToHex,
+  sha256Bytes,
+  timingSafeEqual,
+} from '../crypto'
 import { readBlobBody } from '../buddies/envelope'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import {
@@ -131,9 +136,6 @@ const jsonFields =
 const callerSessionId = (c: AppContext): string | null =>
   c.get('account')?.sessionId ?? null
 
-const hex = (bytes: Uint8Array): string =>
-  Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
-
 /**
  * `backup/put`: the blob as the raw body, with `x-ww-slot-id`, `x-ww-sha256`,
  * and `Content-Length` (bearer) or the envelope in `x-ww-payload`/
@@ -183,7 +185,7 @@ const handlePut = guarded('backup/put', async (c) => {
         return buddiesErrorResponse('bad_request')
 
       await bucket.put(backupObjectKey(accountId, slotId), body.value, {
-        sha256: hex(digest),
+        sha256: bytesToHex(digest),
         httpMetadata: { contentType: 'application/octet-stream' },
         customMetadata: { uploadedAt: String(now) },
       })

@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import { BUDDIES_ABUSE_LIMITS as ABUSE } from './limits'
+import { BUDDIES_ABUSE_LIMITS as ABUSE, rollingWindowWaitMs } from './limits'
 
 const HOUR_MS = 60 * 60 * 1_000
 /** The rolling window, counted in whole hours. */
@@ -38,21 +38,22 @@ export class BuddyRegistrationQuota extends DurableObject<Environment> {
     const result = this.ctx.storage.transactionSync(
       (): RegistrationAdmission => {
         this.#ensureSchema()
-        const buckets = this.#prune(hour)
-        let counted = buckets.reduce((sum, bucket) => sum + bucket.n, 0)
-        if (counted >= limit) {
-          // Wait for enough of the oldest hours to leave the window.
-          for (const bucket of buckets) {
-            counted -= bucket.n
-            if (counted < limit) {
-              const frees = (bucket.hour + WINDOW_HOURS) * HOUR_MS
-              return {
-                ok: false,
-                retryAfterSeconds: Math.max(1, Math.ceil((frees - now) / 1000)),
-              }
-            }
+        // Past the limit, wait for enough of the oldest hours to leave the window.
+        const waitMs = rollingWindowWaitMs(
+          this.#prune(hour).map((bucket) => ({
+            start: bucket.hour * HOUR_MS,
+            count: bucket.n,
+          })),
+          1,
+          limit,
+          WINDOW_HOURS * HOUR_MS,
+          now
+        )
+        if (waitMs != null)
+          return {
+            ok: false,
+            retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)),
           }
-        }
         this.ctx.storage.sql.exec(
           `INSERT INTO registration (hour, n) VALUES (?, 1)
            ON CONFLICT (hour) DO UPDATE SET n = n + 1`,

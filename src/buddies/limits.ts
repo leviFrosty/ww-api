@@ -177,11 +177,14 @@ const reportedOutages = new Set<BuddiesEdgeTier>()
  * Counts this request against its op's per-caller edge limit. True when it
  * may proceed. If the limiter itself fails, requests go through (logged once
  * per isolate): the per-inbox caps in the Durable Objects still hold.
+ * `logHit` logs a refusal (Shared Spaces logs its own op under its own
+ * prefix).
  */
 export const allowBuddiesCaller = async (
   env: Environment,
   op: BuddiesRouteOp,
-  callerKey: string
+  callerKey: string,
+  logHit: (op: string, limit: string) => void = logLimitHit
 ): Promise<boolean> => {
   const tier = buddiesEdgeTier(op)
   const { binding } = BUDDIES_ABUSE_LIMITS.edge[tier]
@@ -195,7 +198,7 @@ export const allowBuddiesCaller = async (
     }
     return true
   }
-  logLimitHit(op, `edge.${tier}`)
+  logHit(op, `edge.${tier}`)
   return false
 }
 
@@ -235,4 +238,33 @@ export class SignerBudget {
     }
     return window
   }
+}
+
+/**
+ * Counts in a rolling window, oldest first: each bucket counts what happened
+ * from its `start` (epoch ms), and leaves the window `windowMs` after it.
+ */
+export type WindowBucket = { start: number; count: number }
+
+/**
+ * How long until `adding` more fit beside `buckets` under `limit`: null when
+ * they fit now, else the milliseconds until enough of the oldest buckets have
+ * left the window (the whole window when even an empty one can't hold them).
+ * `buckets` must already be pruned to the window. Buddies' rolling-day
+ * quotas and Shared Spaces' put limits count this way.
+ */
+export const rollingWindowWaitMs = (
+  buckets: readonly WindowBucket[],
+  adding: number,
+  limit: number,
+  windowMs: number,
+  now: number
+): number | null => {
+  let used = buckets.reduce((sum, bucket) => sum + bucket.count, 0)
+  if (used + adding <= limit) return null
+  for (const bucket of buckets) {
+    used -= bucket.count
+    if (used + adding <= limit) return bucket.start + windowMs - now
+  }
+  return windowMs
 }

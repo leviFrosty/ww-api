@@ -4,6 +4,7 @@ import { BuddyInvite } from '../buddies/inviteDO'
 import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { AccountHandoff } from '../accounts/handoffDO'
 import { AccountSync } from '../accounts/syncDO'
+import { SharedSpace } from '../spaces/spaceDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -117,6 +118,8 @@ export interface HarnessOptions {
   backupBucket?: boolean
   /** Bind the Cloud Sync bucket (`ACCOUNT_SYNC`). Default true. */
   syncBucket?: boolean
+  /** The `SPACES_ENABLED` var; `"true"` (dev's) by default. */
+  spacesEnabled?: string
   /**
    * Account sessions as on the dev worker (default true): a token secret,
    * `APP_ATTEST_ENVIRONMENT` development, and the dev bypass token.
@@ -141,6 +144,8 @@ export interface Harness {
   syncBlobs: MemoryR2
   handoffs: FakeNamespace<AccountHandoff>
   syncIndexes: FakeNamespace<AccountSync>
+  /** Shared Spaces' `SHARED_SPACE` objects, one per space id. */
+  spaces: FakeNamespace<SharedSpace>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -257,6 +262,7 @@ export const createHarness = async (
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
     ...(options.syncBucket === false ? {} : { ACCOUNT_SYNC: syncBlobs }),
     SYNC_ENABLED: 'true',
+    SPACES_ENABLED: options.spacesEnabled ?? 'true',
     ...(options.sessions === false
       ? {}
       : {
@@ -297,6 +303,10 @@ export const createHarness = async (
   )
   env.ACCOUNT_SYNC_INDEX =
     syncIndexes.namespace as Environment['ACCOUNT_SYNC_INDEX']
+  const spaces = createNamespace(
+    (state) => new SharedSpace(state as never, env as never)
+  )
+  env.SHARED_SPACE = spaces.namespace as Environment['SHARED_SPACE']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -316,6 +326,7 @@ export const createHarness = async (
     syncBlobs,
     handoffs,
     syncIndexes,
+    spaces,
     inboxes,
     invites,
     quotas,

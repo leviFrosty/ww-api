@@ -41,16 +41,23 @@ export interface Envelope {
 }
 
 /**
- * Reads the request body as UTF-8 text, refusing anything over the envelope
- * ceiling without buffering it. Null means `bad_request`.
+ * Reads a request body as UTF-8 text under `limit` bytes without buffering
+ * past it: a declared `Content-Length` over it, or a stream that overruns
+ * it, is `too_large`; an unreadable declared length, no body, or bytes that
+ * aren't UTF-8 are `bad_request`. Buddies envelopes and Shared Spaces bodies
+ * both read this way.
  */
-export const readEnvelopeText = async (
-  request: Request
-): Promise<string | null> => {
-  const limit = BUDDIES_LIMITS.requestBytes
+export const readBodyText = async (
+  request: Request,
+  limit: number
+): Promise<BuddiesResult<string>> => {
   const declared = request.headers.get('content-length')
-  if (declared != null && !(Number(declared) <= limit)) return null
-  if (!request.body) return null
+  if (declared != null) {
+    const length = Number(declared)
+    if (Number.isNaN(length)) return fail('bad_request')
+    if (length > limit) return fail('too_large')
+  }
+  if (!request.body) return fail('bad_request')
 
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
@@ -61,7 +68,7 @@ export const readEnvelopeText = async (
     size += value.byteLength
     if (size > limit) {
       await reader.cancel().catch(() => undefined)
-      return null
+      return fail('too_large')
     }
     chunks.push(value)
   }
@@ -73,12 +80,23 @@ export const readEnvelopeText = async (
     offset += chunk.byteLength
   }
   try {
-    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(
-      bytes
+    return ok(
+      new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
     )
   } catch {
-    return null
+    return fail('bad_request')
   }
+}
+
+/**
+ * Reads the request body as UTF-8 text, refusing anything over the envelope
+ * ceiling without buffering it. Null means `bad_request`.
+ */
+export const readEnvelopeText = async (
+  request: Request
+): Promise<string | null> => {
+  const text = await readBodyText(request, BUDDIES_LIMITS.requestBytes)
+  return text.ok ? text.value : null
 }
 
 /** Parses the envelope and its payload JSON. Null means `bad_request`. */

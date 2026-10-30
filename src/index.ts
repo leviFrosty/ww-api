@@ -47,6 +47,7 @@ export { RoutePlanningQuota } from "./routePlanning/quotaDO";
 export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
 export { AccountHandoff } from "./accounts/handoffDO";
 export { AccountSync } from "./accounts/syncDO";
+export { SharedSpace } from "./spaces/spaceDO";
 export { ScribeMeter } from "./scribe/meterDO";
 
 export default Sentry.withSentry(

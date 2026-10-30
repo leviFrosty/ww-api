@@ -51,6 +51,11 @@ export const OPENAPI_TAGS = [
       'Anonymous accounts: a random id and a public key, nothing else. An attested session (`POST /accounts/v1/sessions`) gives bearer tokens; before sessions, ops were signed like Buddies ops under the `ww-account/v1` context, which still works while the legacy switch is on.',
   },
   {
+    name: 'Shared Spaces',
+    description:
+      'A blind, end-to-end encrypted store shared by up to 10 members, one per shared car (witness-work ADR 0037). The server holds sealed records under random ids, members as token hashes, wrapped keys, and invites, and never learns what a space is or which accounts are on it. Every op is `POST /spaces/v1/{op}` with a bearer token; ids and member tokens travel in bodies, never URLs. The wire contract is witness-work’s [docs/shared-cars-protocol.md](https://github.com/leviFrosty/witness-work/blob/main/docs/shared-cars-protocol.md).',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',

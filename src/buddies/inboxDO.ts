@@ -1,7 +1,13 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import { acceptedBundleIds } from '../appAttest/appId'
-import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
+import {
+  bytesToBase64Url,
+  bytesToHex,
+  sha256Bytes,
+  timingSafeEqual,
+} from '../crypto'
+import { deleteAllThen, readSeqPage } from '../durableObjectStorage'
 import {
   BUDDIES_LIMITS as LIMITS,
   BUDDIES_LIVE_ACCOUNT_HEADER,
@@ -142,9 +148,6 @@ type BlobRow = {
   /** Null until the object is in R2. */
   writtenAt: number | null
 }
-
-const hex = (bytes: Uint8Array): string =>
-  Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 
 /** `WebSocket.READY_STATE_OPEN`. */
 const SOCKET_OPEN = 1
@@ -891,7 +894,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     const key = buddyBlobKey(call.inboxId, call.blobId)
     const digest = decodeB64u(call.blobId)
     try {
-      await bucket.put(key, body, digest ? { sha256: hex(digest) } : {})
+      await bucket.put(key, body, digest ? { sha256: bytesToHex(digest) } : {})
     } catch (error) {
       const failedAt = Date.now()
       this.#releaseUpload(call.blobId, uploadId, write === 'new', failedAt)
@@ -1895,26 +1898,34 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
       .toArray()
 
-    const events: SyncEvent[] = []
-    let cursor = head
+    // Read in whole chunks (`readSeqPage`): a page cut short must not leave
+    // its cursor open.
     let chars = 0
-    for (const event of this.#sql.exec<SyncEvent>(
-      `SELECT event_id AS eventId, slot_id AS slotId, kind, blob, seq, created_at AS createdAt
-       FROM event WHERE seq > ? AND created_at > ? ORDER BY seq`,
+    const page = readSeqPage(
+      (after, count) =>
+        this.#sql
+          .exec<SyncEvent>(
+            `SELECT event_id AS eventId, slot_id AS slotId, kind, blob, seq, created_at AS createdAt
+             FROM event WHERE seq > ? AND created_at > ? ORDER BY seq LIMIT ?`,
+            after,
+            now - LIMITS.eventRetentionMs,
+            count
+          )
+          .toArray(),
       since,
-      now - LIMITS.eventRetentionMs
-    )) {
-      if (
-        events.length &&
-        (chars + event.blob.length > LIMITS.syncEventChars ||
-          events.length >= ABUSE.syncEvents)
-      ) {
-        cursor = events[events.length - 1].seq
-        break
+      (event, taken) => {
+        if (
+          taken.length &&
+          (chars + event.blob.length > LIMITS.syncEventChars ||
+            taken.length >= ABUSE.syncEvents)
+        )
+          return false
+        chars += event.blob.length
+        return true
       }
-      chars += event.blob.length
-      events.push(event)
-    }
+    )
+    const events = page.rows
+    const cursor = page.more ? events[events.length - 1].seq : head
 
     const cards = this.#sql
       .exec<SyncCard>(
@@ -2297,20 +2308,22 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
-   * `deleteAll()`, then writes `tombstone` back. No other event runs in
-   * between, so no request ever sees a wiped inbox without its binding.
+   * `deleteAll()`, then writes `tombstone` back (`deleteAllThen`). No other
+   * event runs in between, so no request ever sees a wiped inbox without its
+   * binding.
    */
   async #deleteAllButTombstone(tombstone: string | null): Promise<void> {
-    await this.ctx.blockConcurrencyWhile(async () => {
-      await this.ctx.storage.deleteAll()
-      if (tombstone == null) return
-      this.ctx.storage.transactionSync(() => {
-        this.#sql.exec(TOMBSTONE_SCHEMA)
-        this.#sql.exec(
-          'INSERT OR REPLACE INTO owner_tombstone (singleton, owner_key_hash) VALUES (1, ?)',
-          tombstone
-        )
-      })
+    await deleteAllThen(this.ctx, {
+      restore:
+        tombstone == null
+          ? undefined
+          : () => {
+              this.#sql.exec(TOMBSTONE_SCHEMA)
+              this.#sql.exec(
+                'INSERT OR REPLACE INTO owner_tombstone (singleton, owner_key_hash) VALUES (1, ?)',
+                tombstone
+              )
+            },
     })
     this.#schemaReady = false
   }

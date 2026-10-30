@@ -10,6 +10,7 @@ import {
   DatabaseError,
   Sentry,
   captureFailure,
+  captureOperationFailure,
   createSentryConfig,
   isDatabaseError,
   redactContactLinkPayloads,
@@ -332,6 +333,32 @@ describe('Sentry scrubbers', () => {
     })
   })
 
+  it('drops the Shared Spaces live socket’s member and token headers from events and transactions', () => {
+    const headers = () => ({
+      'X-WW-Space-Auth': 'eyJzcGFjZUlkIjoiQUFBQSJ9',
+      'X-WW-Space-Token': 'c2VjcmV0LXRva2VuLWJ5dGVzLXRoYXQtYXJlLTMyLWxvbmc',
+      'X-WW-Space-Member-Token': '{"spaceId":"AAAA","tokenHash":"BBBB"}',
+      'x-ww-spaces': 'kept',
+      'x-ww-space-authority': 'kept',
+      upgrade: 'websocket',
+    })
+    const kept = {
+      'x-ww-spaces': 'kept',
+      'x-ww-space-authority': 'kept',
+      upgrade: 'websocket',
+    }
+    const url = 'https://ww-proxy.test/spaces/v1/live'
+    const error: ErrorEvent = { type: undefined, request: { url, headers: headers() } }
+    const transaction: TransactionEvent = {
+      type: 'transaction',
+      request: { url, headers: headers() },
+    }
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual(kept)
+    expect(
+      (config.beforeSendTransaction!(transaction, {}) as TransactionEvent).request?.headers
+    ).toEqual(kept)
+  })
+
   it('drops bearer, admin, and dev bypass tokens from events and transactions', () => {
     const headers = () => ({
       Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',
@@ -565,6 +592,18 @@ describe('database errors', () => {
       }),
     ])
     expect(leaks(events)).toBe(false)
+  })
+
+  it('captureOperationFailure sends the operation alone, for any error', async () => {
+    const error = new Error(`no such column: ${ACCOUNT_ID}`, {
+      cause: new Error(TOKEN_HASH),
+    })
+    captureOperationFailure(error, 'spaces/put')
+    const [event] = await recorder.events()
+    expect(event.exception?.values).toEqual([
+      expect.objectContaining({ type: 'OperationError', value: 'spaces/put' }),
+    ])
+    expect(leaks(event)).toBe(false)
   })
 
   it('beforeSend redacts a raw query error and drops its cause chain', async () => {
