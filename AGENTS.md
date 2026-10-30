@@ -1715,6 +1715,16 @@ bodies and headers, never URLs.
   and one `put` a slot a minute (429 `rate_limited` with `Retry-After`), both
   read from an R2 prefix listing, so two racing puts can each pass. `put`
   counts against the Buddies photo-upload edge tier, the rest the read tier.
+  Each slot has an `etag` (R2's own, opaque): `list` returns it per slot,
+  `get` sends it as `ETag`, and `put` returns it (body and `ETag`). An
+  optional strong quoted `If-Match: "<etag>"` on `put` writes only while the
+  slot still holds those bytes, so a re-seal after an account key change
+  never rolls back a newer backup or re-creates a deleted one: other bytes or
+  no slot is 412 `precondition_failed` (nothing written, no slot made); a
+  weak `W/"…"`, unquoted, `*`, or list value is 400 `bad_request`. It is
+  checked against the listing and again by R2 (`onlyIf.etagMatches`), so a
+  put landing in between loses too. The per-slot minute limit applies first
+  (429), as in `sync/put`. No header: unchanged (older apps).
   `delete` without `slotId` deletes every slot. Suspended accounts can still
   back up. Without the bucket or `ACCOUNTS_DB`, every op is 503 `disabled`.
 - **`GET /accounts/handoff`** (and the short `/h`) is the page a camera
