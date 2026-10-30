@@ -65,6 +65,10 @@ const OPTIONAL_SECRETS = [
   'MAPKIT_JS_PRIVATE_KEY',
   'MAPKIT_JS_KEY_ID',
   'MAPKIT_JS_ORIGINS',
+  // Web sign-up's Turnstile secret. Unset, the local worker uses Cloudflare's
+  // always-passing test secret; `2x0000000000000000000000000000000AA` always
+  // fails and `3x0000000000000000000000000000000AA` answers "already spent".
+  'TURNSTILE_SECRET_KEY',
 ]
 /** Synthetic, verification-only Apple team id when none is provided. */
 const SYNTHETIC_TEAM_ID = 'VERIFY0000'
@@ -582,6 +586,16 @@ async function doctor() {
     else bad(`passkeys probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
   } catch (error) {
     bad(`passkeys probe failed: ${error.message}`)
+  }
+
+  try {
+    // Web sign-up's switch and Turnstile site key, as the web reads them.
+    const config = await fetchJson(`${state.url}/app/v1/config`, { method: 'GET' })
+    const web = config.body?.webSignup
+    if (web?.enabled && web.turnstileSiteKey) ok(`web sign-up enabled (Turnstile site key ${web.turnstileSiteKey})`)
+    else bad(`web sign-up off: ${JSON.stringify(web ?? config.body)} (KV accounts:web-signup, or Turnstile/passkey secrets missing)`)
+  } catch (error) {
+    bad(`web sign-up probe failed: ${error.message}`)
   }
 
   const configured = Object.entries(state.configured ?? {})

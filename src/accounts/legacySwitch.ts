@@ -25,23 +25,36 @@ export type LegacySwitchEnv = Pick<Environment, 'AUTH_LEGACY'> & {
   NOTES_KV: Pick<KVNamespace, 'get'>
 }
 
-export const isLegacyAuthEnabled = async (
-  env: LegacySwitchEnv
+/**
+ * A KV on/off switch: `"off"`/`"false"` or `"on"`/`"true"` in KV `key`
+ * (edge-cached 60 s), else the same words in `fallback` (a var), else on. A
+ * failed KV read answers `onReadFailure`, logged as `name`.
+ */
+export const readKvSwitch = async (
+  kv: Pick<KVNamespace, 'get'>,
+  key: string,
+  fallback: string | undefined,
+  { onReadFailure, name }: { onReadFailure: boolean; name: string }
 ): Promise<boolean> => {
   let value: string | null = null
   try {
-    value = await env.NOTES_KV.get(AUTH_LEGACY_KEY, {
-      cacheTtl: CACHE_TTL_SECONDS,
-    })
+    value = await kv.get(key, { cacheTtl: CACHE_TTL_SECONDS })
   } catch {
-    console.warn('accounts: legacy switch KV read failed; refusing legacy auth')
-    return false
+    console.warn(`accounts: ${name} KV read failed; ${onReadFailure ? 'on' : 'off'}`)
+    return onReadFailure
   }
   const stored = value?.trim().toLowerCase()
   if (stored && OFF.has(stored)) return false
   if (stored && ON.has(stored)) return true
-  return !OFF.has(env.AUTH_LEGACY?.trim().toLowerCase() ?? '')
+  return !OFF.has(fallback?.trim().toLowerCase() ?? '')
 }
+
+export const isLegacyAuthEnabled = (env: LegacySwitchEnv): Promise<boolean> =>
+  readKvSwitch(env.NOTES_KV, AUTH_LEGACY_KEY, env.AUTH_LEGACY, {
+    // ADR 0038 §11: never back on because KV is down.
+    onReadFailure: false,
+    name: 'legacy switch',
+  })
 
 /** 426 `upgrade_required`, without `Retry-After`: only updating helps. */
 export const upgradeRequiredResponse = (): Response =>

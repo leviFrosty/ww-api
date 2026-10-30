@@ -122,6 +122,7 @@ Only names are listed here; never print values.
 | `ADMIN_API_TOKEN` | admin reset positive tests | generated per state dir |
 | `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
 | `PASSKEY_CHALLENGE_SECRET`, `ACCOUNT_TICKET_SECRET` | passkeys and web sessions (`/accounts/v1/passkeys*`, ticket opens) | generated per state dir |
+| `TURNSTILE_SECRET_KEY` | web sign-up and recovery's Siteverify (`/accounts/v1/web/*`); `2x0000000000000000000000000000000AA` fails every token, `3x…` says "already spent" | unset, so the dev worker uses Cloudflare's always-passing test secret |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |

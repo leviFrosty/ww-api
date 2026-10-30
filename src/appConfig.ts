@@ -1,6 +1,8 @@
 import type { AppContext, Environment } from './types'
 import { parseMinAppVersion } from './notesImport/config'
 import { syncSwitches } from './accounts/syncSwitch'
+import { webSignupAvailable } from './accounts/webSignup'
+import { turnstileSiteKey } from './accounts/turnstile'
 
 /**
  * `GET /app/v1/config` (witness-work ADR 0027, `docs/accounts-protocol.md`,
@@ -52,19 +54,32 @@ export const resolveAppMinVersion = async (
  * without a session knows whether opening one would get it Cloud Sync:
  * `sync: { enabled, entitlement }`. `enabled` is false on a worker without
  * the sync bucket or the accounts database.
+ *
+ * And web sign-up's (witness-work `docs/passkeys-protocol.md`, "Web
+ * sign-up"): `webSignup: { enabled, turnstileSiteKey }`. `enabled` is the
+ * kill switch, false on a worker without what sign-up needs. The site key is
+ * there whenever Turnstile is set up, even with sign-up off, since recovery
+ * on the web uses it too; null otherwise.
  */
 export const handleAppConfigRequest = async (c: AppContext) => {
-  const [minAppVersion, switches] = await Promise.all([
+  const [minAppVersion, switches, webSignupEnabled] = await Promise.all([
     resolveAppMinVersion(c.env),
     syncSwitches(c.env),
+    webSignupAvailable(c.env),
   ])
   const sync = {
     enabled:
       switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null,
     entitlement: switches.entitlement,
   }
+  const webSignup = {
+    enabled: webSignupEnabled,
+    turnstileSiteKey: turnstileSiteKey(c.env),
+  }
   return c.json(
-    minAppVersion ? { ok: true, minAppVersion, sync } : { ok: true, sync },
+    minAppVersion
+      ? { ok: true, minAppVersion, sync, webSignup }
+      : { ok: true, sync, webSignup },
     200,
     { 'Cache-Control': 'no-store' }
   )

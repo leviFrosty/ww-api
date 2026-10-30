@@ -56,6 +56,11 @@ export const OPENAPI_TAGS = [
       'Passkeys of an existing account (witness-work ADR 0038): sign in, step up a web session, and save the account key sealed under a passkey’s PRF output, which the server can’t open. A browser opens its web session with the ticket a sign-in answers. The wire contract is witness-work’s `docs/passkeys-protocol.md`.',
   },
   {
+    name: 'Web sign-up',
+    description:
+      'Accounts on the web (witness-work ADR 0038 §5): create an account with a passkey behind Turnstile and per-network caps, or get a ticket for a web session with a recovery key.',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',

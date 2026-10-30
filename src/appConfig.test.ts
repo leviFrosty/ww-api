@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Environment } from './types'
 import { makeMemoryKv } from './test/memoryKv'
+import {
+  TEST_CHALLENGE_SECRET,
+  TEST_PASSKEY_VARS,
+  TEST_TICKET_SECRET,
+  TEST_TOKEN_SECRET,
+} from './test/buddies'
 import { resolveAppMinVersion } from './appConfig'
 
 vi.mock('cloudflare:workers', () => ({ DurableObject: class {} }))
@@ -33,6 +39,7 @@ describe('GET /app/v1/config', () => {
       ok: true,
       minAppVersion: '1.42.0',
       sync: { enabled: false, entitlement: 'everyone' },
+      webSignup: { enabled: false, turnstileSiteKey: null },
     })
   })
 
@@ -44,6 +51,7 @@ describe('GET /app/v1/config', () => {
     expect(await response.json()).toEqual({
       ok: true,
       sync: { enabled: false, entitlement: 'everyone' },
+      webSignup: { enabled: false, turnstileSiteKey: null },
     })
   })
 
@@ -88,6 +96,59 @@ describe('GET /app/v1/config', () => {
       enabled: false,
       entitlement: 'everyone',
     })
+  })
+
+  it('says whether web sign-up is open, with the Turnstile site key', async () => {
+    const webSignup = async (
+      overrides: Record<string, unknown>,
+      kv: Record<string, string> = {}
+    ) => {
+      const base = await env()
+      for (const [key, value] of Object.entries(kv))
+        await base.NOTES_KV.put(key, value)
+      const response = await app.fetch(
+        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+        { ...base, ...overrides } as unknown as Environment
+      )
+      return ((await response.json()) as { webSignup: unknown }).webSignup
+    }
+    const ready = {
+      ACCOUNTS_DB: {},
+      ACCOUNT_TOKEN_SECRET: TEST_TOKEN_SECRET,
+      PASSKEY_CHALLENGE_SECRET: TEST_CHALLENGE_SECRET,
+      ACCOUNT_TICKET_SECRET: TEST_TICKET_SECRET,
+      ...TEST_PASSKEY_VARS,
+    }
+    const devKey = '1x00000000000000000000AA'
+    // A development worker falls back to Cloudflare's test keys.
+    expect(await webSignup({ ...ready, APP_ATTEST_ENVIRONMENT: 'development' })).toEqual({
+      enabled: true,
+      turnstileSiteKey: devKey,
+    })
+    const production = { ...ready, APP_ATTEST_ENVIRONMENT: 'production' }
+    expect(await webSignup(production)).toEqual({ enabled: false, turnstileSiteKey: null })
+    const configured = {
+      ...production,
+      TURNSTILE_SITE_KEY: '0x4AAAAAAAexample',
+      TURNSTILE_SECRET_KEY: 'secret',
+    }
+    expect(await webSignup(configured)).toEqual({
+      enabled: true,
+      turnstileSiteKey: '0x4AAAAAAAexample',
+    })
+    // Paused: the site key stays, since web recovery uses it too.
+    expect(await webSignup(configured, { 'accounts:web-signup': 'off' })).toEqual({
+      enabled: false,
+      turnstileSiteKey: '0x4AAAAAAAexample',
+    })
+    expect(await webSignup({ ...configured, WEB_SIGNUP: 'off' })).toEqual({
+      enabled: false,
+      turnstileSiteKey: '0x4AAAAAAAexample',
+    })
+    // Without the passkey secrets there's no sign-up to offer.
+    expect(
+      await webSignup({ ...configured, PASSKEY_CHALLENGE_SECRET: undefined })
+    ).toEqual({ enabled: false, turnstileSiteKey: '0x4AAAAAAAexample' })
   })
 
   it('counts against its own per-IP bucket', async () => {

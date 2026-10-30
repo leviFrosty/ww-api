@@ -26,6 +26,7 @@ import { supporterHandlers } from './supporterRoute'
 import { syncHandlers } from './sync'
 import { syncPhotoHandlers } from './syncPhotos'
 import { passkeyHandlers } from './passkeys'
+import { webHandlers } from './webSignup'
 import {
   passkeyAddDocs,
   passkeyAssertDocs,
@@ -35,6 +36,11 @@ import {
   passkeyRemoveDocs,
   passkeyWrapDocs,
 } from './passkeyOpenapi'
+import {
+  webRecoveryDocs,
+  webSignupDocs,
+  webSignupOptionsDocs,
+} from './webSignupOpenapi'
 import {
   accountDocs,
   activityListDocs,
@@ -229,5 +235,10 @@ export const createAccountsRoutes = () => {
   routes.post('/passkeys/wrap', passkeyWrapDocs, passkeyHandlers.wrap)
   routes.get('/passkeys', passkeyListDocs, passkeyHandlers.list)
   routes.post('/passkeys/remove', passkeyRemoveDocs, passkeyHandlers.remove)
+  // Accounts on the web: sign-up behind Turnstile and caps, and a recovery
+  // key's ticket.
+  routes.post('/web/signup/options', webSignupOptionsDocs, webHandlers.signupOptions)
+  routes.post('/web/signup', webSignupDocs, webHandlers.signup)
+  routes.post('/web/recovery', webRecoveryDocs, webHandlers.recovery)
   return routes
 }

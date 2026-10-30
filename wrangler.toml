@@ -146,6 +146,15 @@ AUTH_LEGACY = "off"
 # com.leviwilkerson.jwtime, and the debug key of com.leviwilkerson.jwtimedev.
 PASSKEY_RP_IDS = "app-dev.witnesswork.app,localhost"
 PASSKEY_ORIGINS = '''{"app-dev.witnesswork.app":["https://app-dev.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes","android:apk-key-hash:-sYXRdwJA3hvue3mKpYrOZ9zSPC7b4mbgzJmdZEDO5w"],"localhost":["http://localhost:8081","http://localhost:8082","http://localhost:19006","http://localhost:4173","http://localhost:5173"]}'''
+# Web sign-up (docs/passkeys-protocol.md, "Web sign-up"): the kill switch's
+# fallback when KV `accounts:web-signup` is absent, and the caps. Turnstile:
+# Cloudflare's always-passing test site key until a dev widget exists; the
+# matching test secret is used when the TURNSTILE_SECRET_KEY secret is unset.
+WEB_SIGNUP = "on"
+WEB_SIGNUP_PER_IP_DAY = "3"
+WEB_SIGNUP_PER_ASN_HOUR = "30"
+WEB_RECOVERY_PER_IP_DAY = "10"
+TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor.
 # APP_MIN_VERSION = "1.42.0"
@@ -450,6 +459,16 @@ AUTH_LEGACY = "on"
 # first passkey exists. Repeated (with dev's) under [env.dev.vars].
 PASSKEY_RP_IDS = "app.witnesswork.app"
 PASSKEY_ORIGINS = '''{"app.witnesswork.app":["https://app.witnesswork.app","https://beta.app.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes"]}'''
+# Web sign-up (docs/passkeys-protocol.md, "Web sign-up"): the kill switch's
+# fallback when KV `accounts:web-signup` is absent, and the caps. Sign-up and
+# web recovery stay off here until Turnstile is set up: the production
+# widget's site key below and its secret (`wrangler secret put
+# TURNSTILE_SECRET_KEY`). Repeated under [env.dev.vars].
+WEB_SIGNUP = "on"
+WEB_SIGNUP_PER_IP_DAY = "3"
+WEB_SIGNUP_PER_ASN_HOUR = "30"
+WEB_RECOVERY_PER_IP_DAY = "10"
+# TURNSTILE_SITE_KEY = "0x…"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor. Repeated under [env.dev.vars].
 # APP_MIN_VERSION = "1.42.0"
@@ -578,6 +597,14 @@ MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 #   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
 #   wrangler kv key put --binding NOTES_KV sync:photos off            # photo puts off
 #   wrangler kv key delete --binding NOTES_KV sync:photos             # use SYNC_PHOTOS
+# (add `--env dev` for the dev worker).
+#
+# Web sign-up kill switch (cacheTtl 60): "off" refuses web/signup/options and
+# web/signup with 503 disabled (web/recovery isn't affected); "on" opens them;
+# absent falls back to WEB_SIGNUP. A failed read counts as on, since Turnstile
+# and the caps still apply.
+#   wrangler kv key put --binding NOTES_KV accounts:web-signup off   # pause
+#   wrangler kv key delete --binding NOTES_KV accounts:web-signup    # use the var
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -878,3 +905,8 @@ logs.persist = true
 # passkey routes and ticket sessions answer `disabled`:
 # openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET [--env dev]
 # openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET [--env dev]
+# Web sign-up and recovery (ADR 0038 §5): the Turnstile widget's secret key,
+# from the dashboard (Turnstile → the widget → Settings). Production needs it
+# (and TURNSTILE_SITE_KEY) before web sign-up opens; dev uses Cloudflare's
+# always-passing test secret until its own widget's is set:
+# wrangler secret put TURNSTILE_SECRET_KEY [--env dev]

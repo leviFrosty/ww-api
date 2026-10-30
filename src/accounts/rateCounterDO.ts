@@ -18,6 +18,12 @@ export interface CounterLimit {
   key: string
   limit: number
   windowMs: number
+  /**
+   * Keys whose counts in the window add to this one's, without being
+   * counted: the same caller under yesterday's name, when names are HMACs
+   * under a key that rotates daily.
+   */
+  alsoCount?: string[]
 }
 
 export type CounterAdmission =
@@ -98,13 +104,16 @@ export class AccountRateCounter extends DurableObject<Environment> {
 
   #check(now: number, limits: CounterLimit[]): CounterAdmission {
     let wait = 0
-    for (const { key, limit, windowMs } of limits) {
+    for (const { key, limit, windowMs, alsoCount = [] } of limits) {
       const size = bucketMs(windowMs)
       const first = Math.floor((now - windowMs) / size) + 1
+      const keys = [key, ...alsoCount]
       const rows = this.ctx.storage.sql
         .exec<{ bucket: number; n: number }>(
-          'SELECT bucket, n FROM hits WHERE key = ? AND bucket >= ? ORDER BY bucket',
-          key,
+          `SELECT bucket, SUM(n) AS n FROM hits
+           WHERE key IN (${keys.map(() => '?').join(', ')}) AND bucket >= ?
+           GROUP BY bucket ORDER BY bucket`,
+          ...keys,
           first
         )
         .toArray()

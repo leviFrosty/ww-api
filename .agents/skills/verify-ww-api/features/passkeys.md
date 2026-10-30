@@ -9,6 +9,8 @@ A passkey signs a User in on the web or a new phone and, with the WebAuthn PRF e
 - `web-session` (`POST /accounts/v1/sessions` with `ticket`) opens a `web` session; the same signed request again gets the same session; a fourth web session replaces the least recently active.
 - `step-up` (`challenge` `{purpose:"step-up"}` with a Bearer token, then `assert` with it) records `stepUpAt`; web sessions need one within 5 minutes to add or remove a passkey or delete backups (`step_up_required`).
 - `wrap`, `list`, `remove` (`POST /passkeys/wrap`, `GET /passkeys`, `POST /passkeys/remove`).
+- `web-signup` (`POST /accounts/v1/web/signup/options` with a Turnstile token, then `POST /accounts/v1/web/signup` signed by the new account key) creates the account (`createdVia: web`), its passkey and wrap, and a stepped-up `web` session (`method: signup`); capped at 3 per IP a day and 30 per ASN an hour; KV `accounts:web-signup` `off` pauses it.
+- `web-recovery` (`POST /accounts/v1/web/recovery`, signed by the key a recovery key holds, with a Turnstile token) answers a `recovery` ticket for an existing account (404 `unknown_account` otherwise); 10 per IP a day.
 - Refusals: `passkey_failed` with `reason` (`challenge`, `unknown_credential`, `user_handle`, `origin`, `rp_id`, `user_verification`, `signature`, `counter`, `registration`), `ticket_invalid`, and 429 after 30 failed assertions per IP an hour.
 
 ## How to get to it (user POV)
@@ -20,15 +22,18 @@ A passkey signs a User in on the web or a new phone and, with the WebAuthn PRF e
 
 Preconditions:
 
-- `node scripts/verify/dev.mjs doctor` passes, including `passkeys enabled (RP IDs app-dev.witnesswork.app, localhost)`.
+- `node scripts/verify/dev.mjs doctor` passes, including `passkeys enabled (RP IDs app-dev.witnesswork.app, localhost)` and `web sign-up enabled (Turnstile site key 1x00000000000000000000AA)`.
 
 - **Whole flow with a software authenticator.** Run `pnpm test:e2e src/e2e/passkeys.e2e.test.ts`. Three tests pass and `.verify/artifacts/e2e-passkeys-*.json` holds the exchanges: register (EdDSA, `localhost`, origin `http://localhost:8081`), sign in, web session (and its lost-response repeat), refresh with `appVersion`, device list, step-up, wrap, remove, and the origin/RP ID pair refusals.
 - **A real browser with PRF.** Drive Chromium with the CDP virtual authenticator (`WebAuthn.addVirtualAuthenticator` with `hasPrf`, `hasUserVerification`, `isUserVerified`, `hasResidentKey: true`) on a page served from `http://localhost:8081` (RP ID `localhost`). The page runs `navigator.credentials.create/get` with `extensions.prf.eval.first = UTF-8("ww-account/v1/passkey-prf")` and drops `clientExtensionResults.prf` before the response is posted; the driver posts it. Proof: the wrap saved after the confirming get opens with the PRF output of a later discoverable sign-in, and the key it holds derives `accountPub`.
+- **Web sign-up and recovery.** Run `pnpm test:e2e src/e2e/webSignup.e2e.test.ts` (writes `.verify/artifacts/e2e-web-signup-*.json`): config, sign-up with a wrap against the real Siteverify (test secret), refresh, passkey sign-in, a recovery ticket and its session, the per-IP cap, and the kill switch. In a browser, the Turnstile widget renders with the test site key on `http://localhost:8081` (`render=explicit`, the `action` set) and answers `XXXX.DUMMY.TOKEN.XXXX`; sign up with the virtual authenticator as above, then encode the account key as a recovery key (`WW1-` and Crockford base32 of the key and 2 checksum bytes), read it back, and sign `web/recovery` with the key it derives.
+- **Turnstile refusals.** `node scripts/verify/dev.mjs down`, then `TURNSTILE_SECRET_KEY=2x0000000000000000000000000000000AA node scripts/verify/dev.mjs up`: `web/signup/options` answers 403 `turnstile_failed` `reason: invalid-input-response` (`3x…`: `timeout-or-duplicate`). Restart without it after.
 - **Sign-in challenge.** `curl -s -X POST $URL/accounts/v1/passkeys/challenge -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.5.1" -d '{"purpose":"sign-in","rpId":"localhost"}'` answers `{ok, challengeToken, options}` with `options.rpId` `localhost` and `allowCredentials: []`.
 
 ## Gotchas
 
 - Origins pair with one RP ID: `http://localhost:8081` with `localhost` only, `https://app-dev.witnesswork.app` with `app-dev.witnesswork.app` only. A localhost origin on an `app-dev` challenge is `origin`.
 - The failure budget is per caller IP: send a fresh `cf-connecting-ip` per request (the helpers do), or 30 failures lock you out for up to an hour.
+- `wrangler dev` gives requests your real network's ASN (`request.cf.asn`), so every local sign-up shares one 30-an-hour ASN cap. Keep runs small, or wait an hour; the per-IP cap follows `cf-connecting-ip`.
 - Tickets last 2 minutes and challenges 5 (signup 10); a step-up counts 5 minutes.
 - Each signed passkey or `backup/delete` envelope works once (409 `replay`); sign a fresh one per request, retries included.

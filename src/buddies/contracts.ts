@@ -242,6 +242,8 @@ export const BUDDIES_ERROR_STATUS = {
   passkey_failed: 403,
   /** A web session's ticket that's malformed, expired, used, or for another account. */
   ticket_invalid: 403,
+  /** Turnstile's Siteverify refused the token; `reason` is its first error code. */
+  turnstile_failed: 403,
   /** A web session hasn't passed a step-up in the last 5 minutes. */
   step_up_required: 403,
   /** Reserved (ADR 0039): a session open with a retired account key. */

@@ -202,6 +202,70 @@ export class PasskeyClient {
     return this.send('GET', '/passkeys', undefined, authorization(session.accessToken))
   }
 
+  signupOptions(body: Record<string, unknown>, headers: Record<string, string> = {}) {
+    return this.send('POST', '/web/signup/options', body, headers)
+  }
+
+  async signupWith(
+    key: SigningKey,
+    fields: Record<string, unknown>,
+    headers: Record<string, string> = {}
+  ) {
+    return this.send('POST', '/web/signup', await signedEnvelope('web/signup', key, fields), headers)
+  }
+
+  /** A web sign-up: options (Turnstile), a new soft passkey, and `POST /web/signup`. */
+  async signUp(
+    key: SigningKey,
+    {
+      turnstileToken = 'turnstile-pass',
+      rpId,
+      algorithm = 'ES256',
+      ceremony = {},
+      extra = {},
+      headers = {},
+    }: {
+      turnstileToken?: string
+      rpId?: string
+      algorithm?: PasskeyAlgorithm
+      ceremony?: CeremonyOptions
+      extra?: Record<string, unknown>
+      headers?: Record<string, string>
+    } = {}
+  ) {
+    const options = await this.signupOptions(
+      { turnstileToken, ...(rpId ? { rpId } : {}) },
+      headers
+    )
+    if (options.status !== 200)
+      throw new Error(`web/signup/options: ${options.status} ${JSON.stringify(options.body)}`)
+    const passkey = await SoftPasskey.create(
+      algorithm,
+      options.body.options.rp.id,
+      options.body.userHandle
+    )
+    const response = await passkey.register(options.body.options, ceremony)
+    const signup = await this.signupWith(
+      key,
+      { challengeToken: options.body.challengeToken, response, ...extra },
+      headers
+    )
+    return { passkey, options, response, signup }
+  }
+
+  async recovery(
+    key: SigningKey,
+    turnstileToken: unknown = 'turnstile-pass',
+    headers: Record<string, string> = {}
+  ) {
+    return this.send(
+      'POST',
+      '/web/recovery',
+      await signedEnvelope('web/recovery', key, { turnstileToken }),
+      headers
+    )
+  }
+
   async remove(session: SessionLike, credentialId: string) {
     return this.send(
       'POST',

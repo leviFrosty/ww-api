@@ -27,7 +27,7 @@ import { PASSKEY_FAILURE_REASONS } from './webauthn'
  * is `POST /passkeys/remove` rather than `DELETE /passkeys/{id}`.
  */
 
-const credentialId = b64u('The credential id (`rawId`), base64url')
+export const credentialId = b64u('The credential id (`rawId`), base64url')
 const passkeysOff = {
   503: errorResponse(
     'Passkeys are off on this worker (no accounts database, token secret, RP config, or challenge and ticket secrets).',
@@ -44,7 +44,7 @@ const unauthorized = {
     ['unauthorized']
   ),
 }
-const signedErrors = {
+export const signedErrors = {
   400: errorResponse('Malformed JSON, envelope, or field.', ['bad_request']),
   401: errorResponse(
     'The token is missing, expired, invalid, or its session ended (`unauthorized`); or the envelope’s signature is bad (`bad_signature`) or its `ts` more than 5 minutes off (`stale`).',
@@ -62,14 +62,14 @@ const passkeyFailedSchema = apiErrorSchema
   })
   .meta({ id: 'PasskeyFailedError' })
 
-const passkeyFailed = (description: string) => ({
+export const passkeyFailed = (description: string) => ({
   403: errorResponse(description, ['passkey_failed'], passkeyFailedSchema),
 })
 
 const stepUpRequired =
   'A web session must have passed a step-up (`POST /passkeys/assert` with a `step-up` challenge) or opened in the last 5 minutes (`step_up_required` otherwise); phone sessions are exempt.'
 
-const rpId = z.string().meta({
+export const rpId = z.string().meta({
   description:
     'The RP ID. Absent, it’s the one the request’s `Origin` pairs with (a browser on `http://localhost:8081` gets `localhost` on dev), else the worker’s first (`app.witnesswork.app` on production; `app-dev.witnesswork.app` on dev). One the worker doesn’t list is `bad_request`.',
 })
@@ -81,7 +81,7 @@ const signedWith = (op: string, fields: z.ZodRawShape) =>
     ' Its key must be the token’s own account (`forbidden` otherwise), and each envelope works once (409 `replay`): sign a new one to retry.'
   )
 
-const wrapSchema = z.string().meta({
+export const wrapSchema = z.string().meta({
   description:
     'The account key sealed under the passkey’s PRF output: `b64u(0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305(wrapKey, nonce, accountKey, aad))`, 98 characters (see the protocol’s Keys).',
 })
@@ -91,7 +91,7 @@ const wrapView = z.object({
   keyEpoch: z.number().int().meta({ description: 'The key epoch it was made under.' }),
 })
 
-const challengeToken = z.string().meta({
+export const challengeToken = z.string().meta({
   description:
     'Opaque; send it back with the response. One purpose, one RP ID (and for `step-up` and `register`, one session); 5 minutes; works once.',
 })
@@ -100,12 +100,12 @@ const requestOptions = z.object({}).passthrough().meta({
   description:
     '`PublicKeyCredentialRequestOptionsJSON`: `challenge`, `timeout` (300,000), `rpId`, `allowCredentials`, `userVerification: "required"`. Never `extensions.prf`; the client adds `prf: { eval: { first: salt } }` itself.',
 })
-const creationOptions = z.object({}).passthrough().meta({
+export const creationOptions = z.object({}).passthrough().meta({
   description:
     '`PublicKeyCredentialCreationOptionsJSON`: `rp` (`name: "WitnessWork"`), `user` (the account’s user handle, `name` and `displayName` `WitnessWork <tag>`), `challenge`, `pubKeyCredParams` (EdDSA, ES256, RS256), `timeout` (300,000), `excludeCredentials` (the account’s passkeys), `authenticatorSelection` (`residentKey: "required"`, `userVerification: "required"`), `attestation: "none"`. Never `extensions.prf`.',
 })
 
-const webauthnResponse = (kind: string) =>
+export const webauthnResponse = (kind: string) =>
   z.object({}).passthrough().meta({
     description: `WebAuthn’s \`${kind}\`, base64url throughout, at most 16 KiB (\`too_large\`). Drop \`clientExtensionResults.prf\` before sending; the server never sees PRF output.`,
   })
