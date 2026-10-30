@@ -22,8 +22,11 @@ export type ConsumeResult =
 const SCHEMA = 'CREATE TABLE IF NOT EXISTS optimization (at INTEGER NOT NULL)'
 
 /**
- * One SQLite Durable Object per account id: the timestamps of its route
- * optimizations in the last 24 hours, and nothing else. Single-threaded, so the
+ * One SQLite Durable Object per caller and limit: the timestamps of its
+ * charged calls in the last 24 hours, and nothing else. Route optimizations
+ * (`account:<id>`), directions (`directions:account:<id>`), and MapKit JS
+ * tokens (`mapkit-token:account:<id>`, src/maps/route.ts) each count in their
+ * own instance; the table keeps its first user's name. Single-threaded, so the
  * check and the charge can't race. Every allowed call is charged before HERE is
  * asked, whether or not HERE then finds a route.
  */

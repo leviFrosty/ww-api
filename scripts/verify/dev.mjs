@@ -59,6 +59,12 @@ const OPTIONAL_SECRETS = [
   // Account Supporter status (ADR 0029): point at a local fake RevenueCat
   // (`pnpm test:e2e` serves one there); development workers only.
   'REVENUECAT_API_URL',
+  // MapKit JS tokens (POST /maps/v1/mapkit-tokens): a throwaway P-256 key is
+  // enough locally (Apple never sees it). The PEM goes on one line with `\n`
+  // escapes. Without these the route answers 503 maps_unconfigured.
+  'MAPKIT_JS_PRIVATE_KEY',
+  'MAPKIT_JS_KEY_ID',
+  'MAPKIT_JS_ORIGINS',
 ]
 /** Synthetic, verification-only Apple team id when none is provided. */
 const SYNTHETIC_TEAM_ID = 'VERIFY0000'
