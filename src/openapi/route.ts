@@ -91,7 +91,9 @@ const DOCUMENTATION = {
 
 **Signed requests.** Buddies and accounts ops send \`{ "payload", "signature" }\`: \`payload\` is the request’s fields as base64url-encoded UTF-8 JSON, and \`signature\` is an Ed25519 signature over the op’s context line followed by those exact bytes. Each op lists its decoded \`payload\` fields. Older app builds send the same values as \`p\` and \`s\` (headers \`x-buddies-p\`/\`x-buddies-s\`, \`x-ww-p\`/\`x-ww-s\`), which are still accepted.
 
-**Rate limits.** Places, Notes Import, attestation, route planning, app config, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
+**Rate limits.** Places, Notes Import, attestation, route planning, app config, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.
+
+**CORS.** Only the web app's own origins (an exact list per environment) may call from a browser, on every route. Allowed request headers: \`authorization\`, \`content-type\`, \`if-match\`, \`if-none-match\`, \`sentry-trace\`, \`baggage\`, \`x-ww-*\`, and \`x-buddies-*\`. Exposed response headers: \`ETag\`, \`Retry-After\`, \`Date\`, \`WWW-Authenticate\`, and \`x-ww-updated-at\`. No credentials (cookies). Preflights aren't rate limited; a disallowed origin, method, or header gets 403. Browsers authenticate live sockets with \`Sec-WebSocket-Protocol\` entries (see each socket).`,
     license: { name: 'See repository', url: REPO_URL },
   },
   servers: [

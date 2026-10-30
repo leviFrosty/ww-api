@@ -52,7 +52,12 @@ export type AccountAuthRefusal = {
 }
 
 export type AccountAuthResult =
-  | { ok: true; account: AccountAuth }
+  | {
+      ok: true
+      account: AccountAuth
+      /** When the access token expires, epoch ms. */
+      expiresAt: number
+    }
   | AccountAuthRefusal
 
 export interface RequireAccountOptions {
@@ -74,6 +79,16 @@ export interface RequireAccountOptions {
    * token outlives its session by up to 15 minutes, by design (ADR 0027).
    */
   requireLiveSession?: boolean
+}
+
+export interface AuthenticateAccountOptions extends RequireAccountOptions {
+  /**
+   * The access token from somewhere other than `Authorization` (a browser's
+   * live socket offers it as the `bearer.` subprotocol; src/liveSubprotocol.ts),
+   * or null when that source had none. It's verified and refused exactly as
+   * the header's would be.
+   */
+  token?: string | null
 }
 
 const STATUS_CACHE_MS = 30_000
@@ -154,17 +169,20 @@ export const bearerToken = (header: string | undefined): string | null =>
   /^Bearer +([A-Za-z0-9._~+/-]+=*) *$/i.exec(header ?? '')?.[1] ?? null
 
 /**
- * Verifies the request's bearer token and, with `requireLiveSession`, its
- * session, and with `requireActive`, the account's status; on success sets
- * `c.var.account`.
+ * Verifies the request's bearer token (or `options.token`) and, with
+ * `requireLiveSession`, its session, and with `requireActive`, the account's
+ * status; on success sets `c.var.account`.
  */
 export const authenticateAccount = async (
   c: AppContext,
-  options: RequireAccountOptions = {}
+  options: AuthenticateAccountOptions = {}
 ): Promise<AccountAuthResult> => {
   const keys = await accessTokenKeys(c.env)
   if (!keys) return refuse('disabled')
-  const token = bearerToken(c.req.header('authorization'))
+  const token =
+    options.token !== undefined
+      ? options.token
+      : bearerToken(c.req.header('authorization'))
   const claims = token ? await verifyAccessToken(keys, token) : null
   if (!claims) return refuse('unauthorized')
   const account: AccountAuth = {
@@ -193,7 +211,7 @@ export const authenticateAccount = async (
     if (refused) return refused
   }
   c.set('account', account)
-  return { ok: true, account }
+  return { ok: true, account, expiresAt: claims.expiresAt }
 }
 
 /**

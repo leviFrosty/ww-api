@@ -332,6 +332,24 @@ describe('Sentry scrubbers', () => {
     })
   })
 
+  it('drops a browser live socket’s offer, which holds its token', () => {
+    const error: ErrorEvent = {
+      type: undefined,
+      request: {
+        url: 'https://ww-proxy.test/accounts/v1/sync/live',
+        headers: {
+          'Sec-WebSocket-Protocol': 'ww.v1, bearer.eyJhbGciOiJIUzI1NiJ9.e30.c2ln, slot.AAAAAAAA',
+          'x-ww-sync-expires-at': '1792412100000',
+          origin: 'http://localhost:8081',
+        },
+      },
+    }
+    expect((config.beforeSend!(error, {}) as ErrorEvent).request?.headers).toEqual({
+      'x-ww-sync-expires-at': '1792412100000',
+      origin: 'http://localhost:8081',
+    })
+  })
+
   it('drops bearer, admin, and dev bypass tokens from events and transactions', () => {
     const headers = () => ({
       Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',

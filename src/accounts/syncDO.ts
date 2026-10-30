@@ -10,6 +10,11 @@ import {
 import { isWebSocketUpgrade } from '../buddies/envelope'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
 import { logLimitHit } from '../buddies/limits'
+import {
+  closeExpiredSockets,
+  readLiveExpiry,
+  soonestSocketExpiry,
+} from '../liveSubprotocol'
 import { accountsDb } from './store'
 import { isSessionLive } from './sessionStore'
 import {
@@ -39,6 +44,11 @@ import {
  *
  * Retention (the daily alarm): a slot not written for 30 days whose writer's
  * session has ended, and any slot not written for 400 days, is deleted.
+ *
+ * The alarm also closes browser sockets when their token expires. One alarm
+ * serves both, so it's set for the sooner of the next retention run (kept in
+ * `alarm_schedule`) and the soonest socket expiry, and each run does only
+ * what's due.
  *
  * Privacy: nothing here logs or reports ids, sessions, sizes, or bytes.
  */
@@ -106,6 +116,12 @@ const SCHEMA = [
     at    INTEGER NOT NULL,
     bytes INTEGER NOT NULL
   )`,
+  // When retention runs next (null: not scheduled). An object from before
+  // this table has an alarm that is retention's alone; see #retentionAt.
+  `CREATE TABLE IF NOT EXISTS alarm_schedule (
+    singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    retention_at INTEGER
+  )`,
 ]
 
 const DAY_MS = 24 * 60 * 60_000
@@ -113,11 +129,17 @@ const DAY_MS = 24 * 60 * 60_000
 /** `WebSocket.READY_STATE_OPEN`. */
 const SOCKET_OPEN = 1
 
-/** Stored on each live socket; survives hibernation. */
-type LiveAttachment = { openedAt: number; slotId: string }
+/**
+ * Stored on each live socket; survives hibernation. `expiresAt` (epoch ms)
+ * is a browser socket's token expiry; native sockets have none.
+ */
+type LiveAttachment = { openedAt: number; slotId: string; expiresAt?: number }
 
 const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
   (ws.deserializeAttachment() as LiveAttachment | null) ?? null
+
+const expiryOf = (ws: WebSocket): number | null =>
+  attachmentOf(ws)?.expiresAt ?? null
 
 const closeQuietly = (ws: WebSocket, code: number, reason: string): void => {
   try {
@@ -316,15 +338,26 @@ export class AccountSync extends DurableObject<Environment> {
   // --- Retention -----------------------------------------------------------
 
   /**
+   * Closes browser sockets whose token expired, then runs retention if it's
+   * due, then sets the alarm for whichever comes next.
+   */
+  async alarm(): Promise<void> {
+    if (!this.#ready()) return
+    const now = Date.now()
+    closeExpiredSockets(this.#liveSockets(), expiryOf, now)
+    const retentionAt = this.#retentionAt()
+    if (retentionAt !== null && retentionAt <= now) await this.#retain(now)
+    await this.#reschedule()
+  }
+
+  /**
    * Daily while the account has slots: deletes slots past retention, and
    * objects no slot names (a commit that never came). A failed session read
    * keeps the slot until the next run.
    */
-  async alarm(): Promise<void> {
-    if (!this.#ready()) return
+  async #retain(now: number): Promise<void> {
     const accountId = this.#accountId()
-    if (!accountId) return
-    const now = Date.now()
+    if (!accountId) return this.#setRetentionAt(null)
     const expired: string[] = []
     for (const slot of this.#slots()) {
       const age = now - slot.updatedAt
@@ -358,8 +391,11 @@ export class AccountSync extends DurableObject<Environment> {
     }
     this.#dropExpiredReservations(now)
     this.#sql.exec('DELETE FROM put_log WHERE at <= ?', now - DAY_MS)
-    if (this.#count('SELECT COUNT(*) AS n FROM slot') > 0)
-      await this.ctx.storage.setAlarm(now + SYNC_LIMITS.retentionCheckMs)
+    this.#setRetentionAt(
+      this.#count('SELECT COUNT(*) AS n FROM slot') > 0
+        ? now + SYNC_LIMITS.retentionCheckMs
+        : null
+    )
   }
 
   // --- Live socket ---------------------------------------------------------
@@ -368,19 +404,27 @@ export class AccountSync extends DurableObject<Environment> {
    * `GET sync/live`, forwarded by the Worker after it verified the token,
    * the switches, and the entitlement: the account in
    * `SYNC_HEADERS.account` (which only the Worker sets) and the device's own
-   * slot in `x-ww-slot-id`, so its own puts don't echo back. Says `hello`
-   * with the current `seq`; past the cap the oldest sockets close.
+   * slot in `x-ww-slot-id`, so its own puts don't echo back, and for a
+   * browser socket its token's expiry in `SYNC_HEADERS.expiresAt`, when the
+   * alarm closes it. Says `hello` with the current `seq`; past the cap the
+   * oldest sockets close.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return failure(fail('upgrade_required'))
     const accountId = request.headers.get(SYNC_HEADERS.account)
     const slotId = request.headers.get(SYNC_HEADERS.slotId)
-    if (!accountId || !isSyncSlotId(slotId)) return failure(fail('bad_request'))
+    const expiresAt = readLiveExpiry(request.headers.get(SYNC_HEADERS.expiresAt))
+    if (!accountId || !isSyncSlotId(slotId) || expiresAt === undefined)
+      return failure(fail('bad_request'))
     this.#ensure(accountId)
 
     const [client, server] = Object.values(new WebSocketPair())
     this.ctx.acceptWebSocket(server)
-    const attachment: LiveAttachment = { openedAt: Date.now(), slotId }
+    const attachment: LiveAttachment = {
+      openedAt: Date.now(),
+      slotId,
+      ...(expiresAt == null ? {} : { expiresAt }),
+    }
     server.serializeAttachment(attachment)
     const others = this.#liveSockets()
       .filter((ws) => ws !== server)
@@ -390,6 +434,7 @@ export class AccountSync extends DurableObject<Environment> {
     for (const ws of others.slice(0, Math.max(0, excess)))
       closeQuietly(ws, code, reason)
     this.#signal(server, { type: 'hello', seq: this.#seq() })
+    if (expiresAt != null) await this.#reschedule()
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -418,6 +463,8 @@ export class AccountSync extends DurableObject<Environment> {
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
       )
       .one().n
+    // An object from before a table was added gets it here.
+    if (found > 0) for (const statement of SCHEMA) this.#sql.exec(statement)
     this.#schemaReady = found > 0
     return this.#schemaReady
   }
@@ -520,9 +567,58 @@ export class AccountSync extends DurableObject<Environment> {
     return fail('rate_limited', seconds((usage.oldest ?? now) + DAY_MS - now))
   }
 
+  /** Schedules retention a day out, unless it's already scheduled. */
   async #ensureAlarm(): Promise<void> {
-    if ((await this.ctx.storage.getAlarm()) == null)
-      await this.ctx.storage.setAlarm(Date.now() + SYNC_LIMITS.retentionCheckMs)
+    if ((await this.#adoptLegacyAlarm()) == null)
+      this.#setRetentionAt(Date.now() + SYNC_LIMITS.retentionCheckMs)
+    await this.#reschedule()
+  }
+
+  /**
+   * When retention runs next. An object from before `alarm_schedule` has
+   * no row, and its alarm (if any) was retention's: the row-less answer is
+   * "due now", so that alarm, whenever it fires, still runs retention.
+   */
+  #retentionAt(): number | null {
+    const row = this.#sql
+      .exec<{ at: number | null }>(
+        'SELECT retention_at AS at FROM alarm_schedule WHERE singleton = 1'
+      )
+      .toArray()[0]
+    return row ? row.at : 0
+  }
+
+  #setRetentionAt(at: number | null): void {
+    this.#sql.exec(
+      `INSERT INTO alarm_schedule (singleton, retention_at) VALUES (1, ?)
+       ON CONFLICT (singleton) DO UPDATE SET retention_at = excluded.retention_at`,
+      at
+    )
+  }
+
+  /**
+   * Writes the schedule row for an object from before it, keeping its
+   * pending alarm as the retention time, so an earlier alarm can replace it
+   * without losing it. Returns the retention time.
+   */
+  async #adoptLegacyAlarm(): Promise<number | null> {
+    const hasRow =
+      this.#count('SELECT COUNT(*) AS n FROM alarm_schedule') > 0
+    if (hasRow) return this.#retentionAt()
+    const pending = await this.ctx.storage.getAlarm()
+    this.#setRetentionAt(pending)
+    return pending
+  }
+
+  /** Sets the alarm for the sooner of retention and the soonest socket expiry. */
+  async #reschedule(): Promise<void> {
+    const retentionAt = await this.#adoptLegacyAlarm()
+    const expiry = soonestSocketExpiry(this.#liveSockets(), expiryOf)
+    const due = [retentionAt, expiry].filter((at) => at != null)
+    if (!due.length) return
+    const next = Math.min(...due)
+    if ((await this.ctx.storage.getAlarm()) !== next)
+      await this.ctx.storage.setAlarm(next)
   }
 
   /** A failed read counts as live: the slot waits for the next run. */

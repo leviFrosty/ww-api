@@ -44,6 +44,43 @@ to the dev iOS bundle id `com.leviwilkerson.jwtimedev` (from witness-work
 `app.config.ts`, `IS_DEV` branch) and is the only place
 `NOTES_IMPORT_DEV_BYPASS_TOKEN` should ever be set — **never on prod.**
 
+### Web app origins (CORS)
+
+The web app (witness-work ADR 0038 §10) calls this API cross-origin from a
+browser, so CORS (`src/cors.ts`, registered first in `src/app.ts`) admits an
+exact allow-list per environment, the `WEB_APP_ORIGINS` var (comma-separated;
+`Origin` must equal an entry byte for byte, no wildcards or suffixes):
+
+| Env  | `WEB_APP_ORIGINS` |
+| ---- | ----------------- |
+| prod | `https://app.witnesswork.app`, `https://beta.app.witnesswork.app` |
+| dev  | `https://app-dev.witnesswork.app`, `http://localhost:8081`, `:8082`, `:19006`, `:4173`, `:5173` |
+
+The verify launcher runs `--env dev`, so local web dev servers on those ports
+work against it; the test harness sets `http://localhost:8081` and app-dev.
+Unset, no browser gets in. Native apps send no `Origin` and see no change.
+
+- **Every answer** to an allowed origin, errors included (`apiError`, 401
+  with `WWW-Authenticate`, 404, 426, 429, 503, `onError`'s 500), carries
+  `Access-Control-Allow-Origin: <that origin>`, `Vary: Origin`, and
+  `Access-Control-Expose-Headers: ETag, Retry-After, Date, WWW-Authenticate,
+  x-ww-updated-at`. Never `Access-Control-Allow-Credentials` (no cookies).
+  101 upgrades are left alone; a response with immutable headers is copied.
+  Any other `Origin`, or none: no CORS headers.
+- **Preflights** (`OPTIONS` with `Access-Control-Request-Method`) are
+  answered by the middleware before any limiter, auth, KV read, or Durable
+  Object, so they never count against a limit: 204 with
+  `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`, the
+  requested headers echoed in `Access-Control-Allow-Headers`, and
+  `Access-Control-Max-Age: 7200`, when the origin is allowed and every
+  requested header is `authorization`, `content-type`, `if-match`,
+  `if-none-match`, `sentry-trace`, `baggage`, `x-ww-*`, or `x-buddies-*`,
+  but never `x-ww-admin-token`, and `x-ww-dev-bypass` only on a worker with
+  `NOTES_IMPORT_DEV_BYPASS_TOKEN` set (dev); else 403 with no CORS headers.
+- **Live sockets** from a browser authenticate with `Sec-WebSocket-Protocol`
+  entries instead of headers and must come from an allowed `Origin`; see
+  "Browser live sockets" under [Accounts](#browser-live-sockets).
+
 ### App Attest bundle ids
 
 Prod accepts App Attest keys from two apps: the App Store app
@@ -726,11 +763,13 @@ Links. Clients are iOS and Android
   sends `{"type":"changed","seq":…}` after each write that changes
   `inbox/sync`. Sentry events drop `x-buddies-*` headers. Under `wrangler
   dev`, the TCP connection lingers about 10 s after a server-sent close frame;
-  the frame itself arrives at once.
+  the frame itself arrives at once. Browsers offer `payload.<the
+  x-buddies-payload value>` as a subprotocol entry instead
+  ([Browser live sockets](#browser-live-sockets)).
 - **Privacy**: every id travels in the body (for the live socket, in headers;
   never the URL). Never log or report bodies, headers, blobs,
   ids, account ids, or tokens (access tokens included; Sentry drops
-  `Authorization` and `x-buddies-*`). APNs and FCM requests use the `fetch` captured before
+  `Authorization`, `Sec-WebSocket-Protocol`, and `x-buddies-*`). APNs and FCM requests use the `fetch` captured before
   Sentry wraps the global, so device tokens in APNs URLs stay out of Sentry
   spans (FCM tokens travel only in request bodies). The dev worker's 100%
   Workers traces do record subrequest URLs, APNs included.
@@ -983,13 +1022,56 @@ Building a route on accounts (`src/accounts/auth.ts`):
   sends any method.
 
 **Privacy**: never log or report access or refresh tokens, account ids,
-session ids, or device labels. Sentry drops `Authorization`. Drizzle's
+session ids, or device labels. Sentry drops `Authorization` and
+`Sec-WebSocket-Protocol` (a browser socket's token). Drizzle's
 query errors quote the query's parameters (ids, token hashes), so report a
 caught error with `captureFailure(error, operation)` (`src/sentry.ts`),
 never `Sentry.captureException`: a database error, or one it caused, goes
 out as a `DatabaseError` naming the operation only. As a backstop,
 `beforeSend` cuts `Failed query:`, `params:`, and `D1_…:` text from every
 string and drops the exceptions chained under it.
+
+### Browser live sockets
+
+Browsers can't set headers on a WebSocket (witness-work ADR 0038 §10), so a
+web client authenticates `GET /accounts/v1/sync/live` and
+`GET /buddies/v1/inbox/live` with `Sec-WebSocket-Protocol` entries (code in
+`src/liveSubprotocol.ts`). A request with that header takes this path; one
+without it takes the native header path, unchanged.
+
+| Socket | Offer |
+| --- | --- |
+| Cloud Sync | `ww.v1, bearer.<access token>, slot.<slotId>` |
+| Buddies | `ww.v1, bearer.<access token>, payload.<b64u(UTF-8 JSON { inboxId })>` |
+
+- **Parsing**: a comma-separated list of RFC 9110 tokens, trimmed, at most
+  4,096 characters, each prefix at most once, no unknown entries, and no
+  `Authorization` header alongside; else 400 `bad_request`. No `ww.v1`: 400
+  `bad_request`. Then `Origin` must be in `WEB_APP_ORIGINS`, else 403
+  `forbidden`. Both are checked in the Worker before the token or any Durable
+  Object. Ids never go in the URL.
+- **Then the header path's checks, in its order**: the token through
+  `authenticateAccount`'s `token` option (the same verification and refusals
+  as `Authorization`; a missing `bearer.` entry is 401), the kill switch,
+  edge tier, entitlement, upgrade, slot id or inbox fields, ownership,
+  `not_linked`, suspension. Refusals are the same HTTP answers.
+- **Forwarding**: the DO gets the internal headers it already trusts
+  (`x-ww-sync-account` and `x-ww-slot-id`; `x-buddies-session-account` and
+  `x-buddies-payload`) plus the token's `exp` (epoch ms) in
+  `x-ww-sync-expires-at` / `x-buddies-session-expires-at`. The Worker drops
+  `Sec-WebSocket-Protocol` and `Authorization`, so the token never reaches the
+  DO, and drops a client's copy of the expiry header on the native path.
+- **101**: carries `Sec-WebSocket-Protocol: ww.v1` (a browser fails the
+  handshake otherwise); native upgrades get no subprotocol header.
+- **Expiry**: the DO keeps `expiresAt` in the socket's attachment and closes
+  it with `4004 "expired"` once it passes (the app refreshes and
+  reconnects). Pings are auto-responses that don't wake a hibernated DO, so
+  the DO alarm does it: `BuddyInbox` counts each socket's expiry among its
+  `#nextDeadline` deadlines; `AccountSync` keeps its next retention run in
+  `alarm_schedule.retention_at` and sets the alarm for the sooner of that and
+  the soonest expiry, running retention only when it's due (an object from
+  before the table treats its pending alarm as retention's). Native sockets
+  keep outliving their token, as before.
 
 ### Activity and devices
 
@@ -1287,7 +1369,7 @@ iCloud and Google Drive; each device uses exactly one. Code in
 | `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
 | `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
-| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id`: `hello`, then `changed` |
+| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
 
 - **Storage**: one `AccountSync` SQLite DO per account (binding
   `ACCOUNT_SYNC_INDEX`, `idFromName(accountId)`, migration `v8`) holds each
@@ -1320,8 +1402,8 @@ iCloud and Google Drive; each device uses exactly one. Code in
   `too_large` from `Content-Length` before the body is read), 20 slots an
   account (429 `limit`, new slots only), one put a slot every 2 seconds and
   one at a time, 1,000 puts and 2 GiB an account a rolling day (429
-  `rate_limited` with `Retry-After`), 20 live sockets an account (the oldest
-  closes with `4000 "replaced"`). Put counts in the Buddies write edge tier,
+  `rate_limited` with `Retry-After`), 20 live sockets an account, browser
+  sockets included (the oldest closes with `4000 "replaced"`). Put counts in the Buddies write edge tier,
   the rest in the read tier. Hits log `buddies: limit hit {op: 'sync/put',
   limit}`.
 - **Retention** (the DO's daily alarm, while it has slots): a slot not

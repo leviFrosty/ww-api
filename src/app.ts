@@ -8,6 +8,7 @@ import type { AppEnv, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { apiError, dateHeader } from "./errors";
 import { rateLimit } from "./rateLimit";
+import { cors } from "./cors";
 import { proxyRequestToHereApi } from "./proxy";
 import {
   handleAasaRequest,
@@ -148,6 +149,11 @@ function handleApplicationError(error: Error, context: AppContext) {
   console.error("Application error:", reported);
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
+
+// CORS for the web app's origins (src/cors.ts): answers preflights before
+// every other middleware (no limiter, auth, or KV read sees one) and adds the
+// CORS headers to every answer, errors included. Registered first.
+app.use("*", cors());
 
 // Scribe AI's hard cutover (src/scribe/legacy.ts): every Notes Import route
 // but `GET /notes-import/status` is 426 unless KV `scribe:legacy-notes-import`
