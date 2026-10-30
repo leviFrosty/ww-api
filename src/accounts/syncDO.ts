@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
 import { captureFailure } from '../sentry'
 import {
+  BUDDIES_LIMITS,
   fail,
   ok,
   type BuddiesFailure,
@@ -16,7 +17,8 @@ import {
   soonestSocketExpiry,
 } from '../liveSubprotocol'
 import { accountsDb } from './store'
-import { isSessionLive } from './sessionStore'
+import { isSessionLive, listLiveSessions } from './sessionStore'
+import type { SessionPlatform } from './schema'
 import {
   SYNC_HEADERS,
   SYNC_LIMITS,
@@ -50,6 +52,11 @@ import {
  * `alarm_schedule`) and the soonest socket expiry, and each run does only
  * what's due.
  *
+ * It also holds the account's Cloud Sync request (witness-work ADR 0040 §5):
+ * the time a browser asked the account's phones to switch to Cloud Sync. It
+ * clears itself once every live phone session has written a slot since then,
+ * or `requestLapseMs` after it was last asked for; a browser can withdraw it.
+ *
  * Privacy: nothing here logs or reports ids, sessions, sizes, or bytes.
  */
 
@@ -59,6 +66,13 @@ type SlotRow = {
   size: number
   updatedAt: number
   sessionId: string
+}
+
+/** A slot as `list` gives it to the Worker, which adds the session's state. */
+export type SyncSlotListed = SyncSlotView & {
+  sessionId: string
+  /** The writing session's platform; null for slots put before it was kept. */
+  platform: SessionPlatform | null
 }
 
 export type SyncSlotView = {
@@ -83,6 +97,7 @@ export interface CommitSyncPutArgs {
   size: number
   updatedAt: number
   sessionId: string
+  platform: SessionPlatform
 }
 
 export interface SyncPutView {
@@ -122,7 +137,23 @@ const SCHEMA = [
     singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
     retention_at INTEGER
   )`,
+  `CREATE TABLE IF NOT EXISTS sync_request (
+    singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    requested_at INTEGER NOT NULL,
+    asked_at     INTEGER NOT NULL
+  )`,
+  // Nonces of envelopes that set the request, kept past their `ts` window.
+  `CREATE TABLE IF NOT EXISTS request_nonce (
+    nonce TEXT PRIMARY KEY,
+    at    INTEGER NOT NULL
+  )`,
 ]
+
+/** Columns added to a table after it shipped: `[table, column, definition]`. */
+const ADDED_COLUMNS = [['slot', 'platform', 'TEXT']] as const
+
+/** Sessions that can switch to Cloud Sync when the account asks. */
+const PHONE_PLATFORMS: ReadonlySet<string> = new Set(['ios', 'android', 'dev'])
 
 const DAY_MS = 24 * 60 * 60_000
 
@@ -246,16 +277,18 @@ export class AccountSync extends DurableObject<Environment> {
           return fail('conflict')
         this.#sql.exec('DELETE FROM reservation WHERE slot_id = ?', args.slotId)
         this.#sql.exec(
-          `INSERT INTO slot (slot_id, etag, size, updated_at, session_id)
-           VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO slot (slot_id, etag, size, updated_at, session_id, platform)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT (slot_id) DO UPDATE SET
              etag = excluded.etag, size = excluded.size,
-             updated_at = excluded.updated_at, session_id = excluded.session_id`,
+             updated_at = excluded.updated_at, session_id = excluded.session_id,
+             platform = excluded.platform`,
           args.slotId,
           args.etag,
           args.size,
           args.updatedAt,
-          args.sessionId
+          args.sessionId,
+          args.platform
         )
         const seq = this.#advance()
         return ok({
@@ -287,11 +320,12 @@ export class AccountSync extends DurableObject<Environment> {
 
   // --- Reads ---------------------------------------------------------------
 
-  async list(): Promise<{ seq: number; slots: SyncSlotView[] }> {
+  async list(): Promise<{ seq: number; slots: SyncSlotListed[] }> {
     if (!this.#ready()) return { seq: 0, slots: [] }
     const slots = this.#sql
-      .exec<SyncSlotView>(
-        `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt
+      .exec<SyncSlotListed>(
+        `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt,
+                session_id AS sessionId, platform
          FROM slot ORDER BY slot_id`
       )
       .toArray()
@@ -333,6 +367,62 @@ export class AccountSync extends DurableObject<Environment> {
     })
     this.#broadcast(seq, null)
     return { seq }
+  }
+
+  // --- The Cloud Sync request ---------------------------------------------
+
+  /**
+   * The standing request's time, or null: none, it lapsed, or every live
+   * phone session has written a slot since it was made (it clears itself).
+   */
+  async requestedAt(): Promise<number | null> {
+    if (!this.#ready()) return null
+    return this.#standingRequest(Date.now())
+  }
+
+  /**
+   * Sets the request and answers its time. Asking again while it stands
+   * keeps that time and restarts its `requestLapseMs`. An envelope is good
+   * once: its nonce is kept for twice the `ts` window, and a reuse (a
+   * captured envelope replayed, say after the User withdrew it) is `replay`.
+   */
+  async setRequest(args: {
+    accountId: string
+    nonce: string
+  }): Promise<BuddiesResult<number>> {
+    this.#ensure(args.accountId)
+    const now = Date.now()
+    await this.#standingRequest(now)
+    return this.ctx.storage.transactionSync(() => {
+      this.#sql.exec(
+        'DELETE FROM request_nonce WHERE at <= ?',
+        now - 2 * BUDDIES_LIMITS.timestampSkewMs
+      )
+      if (
+        this.#count('SELECT COUNT(*) AS n FROM request_nonce WHERE nonce = ?', args.nonce)
+      )
+        return fail('replay')
+      this.#sql.exec(
+        'INSERT INTO request_nonce (nonce, at) VALUES (?, ?)',
+        args.nonce,
+        now
+      )
+      const kept = this.#requestRow()?.requestedAt ?? now
+      this.#sql.exec(
+        `INSERT INTO sync_request (singleton, requested_at, asked_at) VALUES (1, ?, ?)
+         ON CONFLICT (singleton) DO UPDATE SET
+           requested_at = excluded.requested_at, asked_at = excluded.asked_at`,
+        kept,
+        now
+      )
+      return ok(kept)
+    })
+  }
+
+  /** Withdraws the request; idempotent. */
+  async clearRequest(): Promise<null> {
+    if (this.#ready()) this.#sql.exec('DELETE FROM sync_request')
+    return null
   }
 
   // --- Retention -----------------------------------------------------------
@@ -456,6 +546,10 @@ export class AccountSync extends DurableObject<Environment> {
     return this.ctx.storage.sql
   }
 
+  /**
+   * Whether this account was ever used. Its first call in an instance adds
+   * tables a newer `SCHEMA` has, so reads of an older object find them.
+   */
   #ready(): boolean {
     if (this.#schemaReady) return true
     const found = this.#sql
@@ -463,21 +557,84 @@ export class AccountSync extends DurableObject<Environment> {
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
       )
       .one().n
-    // An object from before a table was added gets it here.
-    if (found > 0) for (const statement of SCHEMA) this.#sql.exec(statement)
-    this.#schemaReady = found > 0
+    if (found > 0) this.#createTables()
     return this.#schemaReady
+  }
+
+  #createTables(): void {
+    for (const statement of SCHEMA) this.#sql.exec(statement)
+    for (const [table, column, definition] of ADDED_COLUMNS) {
+      const has = this.#sql
+        .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+        .toArray()
+        .some((row) => row.name === column)
+      if (!has)
+        this.#sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    }
+    this.#schemaReady = true
   }
 
   /** Creates the tables and the meta row on first use. */
   #ensure(accountId: string): void {
-    if (!this.#schemaReady) {
-      for (const statement of SCHEMA) this.#sql.exec(statement)
-      this.#schemaReady = true
-    }
+    if (!this.#schemaReady) this.#createTables()
     this.#sql.exec(
       'INSERT OR IGNORE INTO meta (singleton, account_id, seq) VALUES (1, ?, 0)',
       accountId
+    )
+  }
+
+  #requestRow(): { requestedAt: number; askedAt: number } | null {
+    return (
+      this.#sql
+        .exec<{ requestedAt: number; askedAt: number }>(
+          `SELECT requested_at AS requestedAt, asked_at AS askedAt
+           FROM sync_request WHERE singleton = 1`
+        )
+        .toArray()[0] ?? null
+    )
+  }
+
+  /** The request's time while it stands; one that lapsed or was met is dropped. */
+  async #standingRequest(now: number): Promise<number | null> {
+    const row = this.#requestRow()
+    if (!row) return null
+    const met =
+      now - row.askedAt >= SYNC_LIMITS.requestLapseMs ||
+      (await this.#everyPhoneWroteSince(row.requestedAt, now))
+    if (!met) return row.requestedAt
+    // Unless it was withdrawn and asked for anew meanwhile.
+    this.#sql.exec(
+      'DELETE FROM sync_request WHERE requested_at = ?',
+      row.requestedAt
+    )
+    return null
+  }
+
+  /**
+   * Whether every live phone session of the account has written a slot
+   * since `since`. A failed read says no: the request keeps standing.
+   */
+  async #everyPhoneWroteSince(since: number, now: number): Promise<boolean> {
+    const db = this.env.ACCOUNTS_DB
+    const accountId = this.#accountId()
+    if (!db || !accountId) return false
+    let phones: string[]
+    try {
+      phones = (await listLiveSessions(accountsDb(db), accountId, now))
+        .filter((session) => PHONE_PLATFORMS.has(session.platform))
+        .map((session) => session.sessionId)
+    } catch (error) {
+      console.error('sync: session read failed')
+      captureFailure(error, 'sync request sessions')
+      return false
+    }
+    return phones.every(
+      (sessionId) =>
+        this.#count(
+          'SELECT COUNT(*) AS n FROM slot WHERE session_id = ? AND updated_at >= ?',
+          sessionId,
+          since
+        ) > 0
     )
   }
 

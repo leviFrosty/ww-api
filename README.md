@@ -192,10 +192,12 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
 - **`GET /accounts/v1/account`** reads the token's account.
 - Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
   take the bearer token too, as `POST /{op}` with ids in bodies.
-- **Cloud Sync** (`GET /accounts/v1/sync`, `POST /accounts/v1/sync/put|list|get|delete`,
+- **Cloud Sync** (`GET /accounts/v1/sync`, `POST /accounts/v1/sync/put|list|get|delete|request`,
   and the `GET /accounts/v1/sync/live` WebSocket): each device's end-to-end
   encrypted snapshot in a slot, changes streamed to the account's other
-  devices. Behind KV `sync:enabled` and `sync:entitlement`; see `AGENTS.md`.
+  devices, and the web's request that the account's phones turn it on. Free
+  for everyone (witness-work ADR 0040); behind KV `sync:enabled` and
+  `sync:entitlement`; see `AGENTS.md`.
 - **Browsers** (the web app) call from an exact allow-list of origins
   (`WEB_APP_ORIGINS`) with CORS, and open the live sockets (`sync/live`,
   Buddies' `inbox/live`) by offering `Sec-WebSocket-Protocol: ww.v1,

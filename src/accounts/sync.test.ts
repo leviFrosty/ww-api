@@ -8,6 +8,7 @@ import {
   type Harness,
 } from '../test/buddies'
 import {
+  accountEnvelope,
   bearer,
   openTestSession,
   postJson,
@@ -19,8 +20,9 @@ import { RevenueCatError } from '../revenuecat'
 import { createAccountsRoutes } from './route'
 import { resetSyncEntitlementCache } from './sync'
 import { SYNC_LIMITS } from './syncContracts'
-import { accountSupporterStatus } from './supporter'
+import { syncEntitlement } from './syncSwitch'
 import { AccountSync } from './syncDO'
+import { accountSupporterStatus } from './supporter'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -175,7 +177,9 @@ describe('put, list, get, delete', () => {
     expect((await list(s)).body).toEqual({
       ok: true,
       seq: 1,
-      slots: [{ slotId: phone, etag, size: 5_000, updatedAt: START }],
+      slots: [
+        { slotId: phone, etag, size: 5_000, updatedAt: START, platform: 'dev', live: true },
+      ],
     })
 
     const got = await get(s, phone)
@@ -359,9 +363,38 @@ describe('limits', () => {
 })
 
 describe('switches and entitlement', () => {
-  it('is a Supporter benefit by default', async () => {
+  it('is free for everyone by default', async () => {
     const s = await session()
     supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    expect((await put(s, slot())).status).toBe(200)
+    expect(
+      (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(s.accessToken))).body
+    ).toMatchObject({ entitled: true, entitlement: 'everyone', supporter: false })
+  })
+
+  it('resolves who gets it from KV, then the var, else everyone', async () => {
+    const kv = (value?: string) => ({
+      get: async () => value ?? null,
+    })
+    expect(await syncEntitlement({ NOTES_KV: kv() })).toBe('everyone')
+    expect(await syncEntitlement({ NOTES_KV: kv(), SYNC_ENTITLEMENT: 'supporter' })).toBe('supporter')
+    expect(await syncEntitlement({ NOTES_KV: kv('supporter'), SYNC_ENTITLEMENT: 'everyone' })).toBe('supporter')
+    expect(await syncEntitlement({ NOTES_KV: kv('everyone'), SYNC_ENTITLEMENT: 'supporter' })).toBe('everyone')
+    expect(await syncEntitlement({ NOTES_KV: kv(' supporter\n') })).toBe('supporter')
+    expect(await syncEntitlement({ NOTES_KV: kv('Supporter') })).toBe('supporter')
+    // Anything else is the default.
+    expect(await syncEntitlement({ NOTES_KV: kv('nope') })).toBe('everyone')
+    // An unreadable KV falls back to the var.
+    const broken = { get: async () => { throw new Error('kv down') } }
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    expect(await syncEntitlement({ NOTES_KV: broken, SYNC_ENTITLEMENT: 'supporter' })).toBe('supporter')
+    expect(await syncEntitlement({ NOTES_KV: broken })).toBe('everyone')
+  })
+
+  it('is a Supporter benefit again with sync:entitlement supporter', async () => {
+    const s = await session()
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    await h.kv.put('sync:entitlement', 'supporter')
     const refused = await put(s, slot())
     expect(refused.status).toBe(403)
     expect(refused.body).toMatchObject({ code: 'supporter_required' })
@@ -381,20 +414,15 @@ describe('switches and entitlement', () => {
       entitled: false,
       entitlement: 'supporter',
       supporter: false,
+      requestedAt: null,
     })
-  })
-
-  it('is free for everyone with sync:entitlement everyone', async () => {
-    const s = await session()
-    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
-    await h.kv.put('sync:entitlement', 'everyone')
+    supporterStatus.mockResolvedValue({ supporter: true, expiresAt: null, customers: 1 })
+    resetSyncEntitlementCache()
     expect((await put(s, slot())).status).toBe(200)
-    expect(
-      (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(s.accessToken))).body
-    ).toMatchObject({ entitled: true, entitlement: 'everyone', supporter: false })
   })
 
   it('caches the Supporter answer for a minute per account', async () => {
+    await h.kv.put('sync:entitlement', 'supporter')
     const s = await session()
     await put(s, slot())
     await list(s)
@@ -405,6 +433,7 @@ describe('switches and entitlement', () => {
   })
 
   it('says unavailable, not "not a Supporter", when RevenueCat is down', async () => {
+    await h.kv.put('sync:entitlement', 'supporter')
     const s = await session()
     supporterStatus.mockRejectedValue(new RevenueCatError('RevenueCat 500'))
     const refused = await put(s, slot())
@@ -559,6 +588,266 @@ describe('retention', () => {
   })
 })
 
+describe('sync/list sessions', () => {
+  it('says each slot’s writing platform and whether that session is live', async () => {
+    const s = await session()
+    const other = await openTestSession(app as never, h.env, s.key)
+    const phone = slot()
+    const tablet = slot()
+    await put(s, phone)
+    await put(other, tablet)
+    await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(other.accessToken))
+    expect((await list(s)).body.slots).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ slotId: phone, platform: 'dev', live: true }),
+        expect.objectContaining({ slotId: tablet, platform: 'dev', live: false }),
+      ])
+    )
+  })
+
+  it('reads the platform of a slot put before it was kept, and says unknown once its session is gone', async () => {
+    const s = await session()
+    const other = await openTestSession(app as never, h.env, s.key)
+    const phone = slot()
+    const tablet = slot()
+    await put(s, phone)
+    await put(other, tablet)
+    h.syncIndexes.storage(s.accountId).query('UPDATE slot SET platform = NULL')
+    await h.accountsDb!.prepare('DELETE FROM account_sessions WHERE id = ?').bind(other.sessionId).run()
+    expect((await list(s)).body.slots).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ slotId: phone, platform: 'dev', live: true }),
+        expect.objectContaining({ slotId: tablet, platform: null, live: false }),
+      ])
+    )
+  })
+
+  it('adds the column to an index from before it', async () => {
+    const s = await session()
+    const phone = slot()
+    await put(s, phone)
+    const storage = h.syncIndexes.storage(s.accountId)
+    storage.query('ALTER TABLE slot DROP COLUMN platform')
+    h.syncIndexes.restart(s.accountId)
+    expect((await list(s)).body.slots).toEqual([
+      expect.objectContaining({ slotId: phone, platform: 'dev', live: true }),
+    ])
+    advance(2 * SECOND)
+    expect((await put(s, phone)).status).toBe(200)
+    expect(storage.query('SELECT platform FROM slot')).toEqual([{ platform: 'dev' }])
+  })
+
+  it('says live when the sessions can’t be read', async () => {
+    const s = await session()
+    const other = await openTestSession(app as never, h.env, s.key)
+    await put(other, slot())
+    await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(other.accessToken))
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const sessions = await import('./sessionStore')
+    vi.spyOn(sessions, 'sessionStates').mockRejectedValueOnce(new Error('d1 down'))
+    expect((await list(s)).body.slots).toEqual([
+      expect.objectContaining({ platform: 'dev', live: true }),
+    ])
+    expect((await list(s)).body.slots).toEqual([
+      expect.objectContaining({ platform: 'dev', live: false }),
+    ])
+  })
+})
+
+describe('the Cloud Sync request', () => {
+  /** `{ requested: true }` with the account's envelope, unless the body says otherwise. */
+  const ask = async (s: TestSession, body: Record<string, unknown> | unknown[], signer = s.key) =>
+    postJson(
+      app as never,
+      h.env,
+      '/sync/request',
+      !Array.isArray(body) && body.requested === true && !('payload' in body)
+        ? { ...body, ...(await accountEnvelope('sync/request', signer)) }
+        : body,
+      bearer(s.accessToken)
+    )
+  const status = async (s: TestSession) =>
+    (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(s.accessToken))).body
+
+  it('sets, keeps its time when asked again, and is withdrawn', async () => {
+    const s = await session()
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+    expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
+    advance(10 * SECOND)
+    expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
+    expect(await status(s)).toMatchObject({ requestedAt: START })
+    // Any session of the account sees it; withdrawing is bearer only.
+    const web = await openTestSession(app as never, h.env, s.key)
+    expect(await status(web)).toMatchObject({ requestedAt: START })
+    expect((await ask(web, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
+    expect((await ask(web, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+    // Asked again after that: a new time.
+    advance(SECOND)
+    expect((await ask(s, { requested: true })).body).toEqual({
+      ok: true,
+      requestedAt: START + 11 * SECOND,
+    })
+  })
+
+  it('needs the token’s own account’s signature to set', async () => {
+    const s = await session()
+    const other = await session()
+    const forged = await ask(s, { requested: true }, other.key)
+    expect(forged.status).toBe(403)
+    expect(forged.body).toMatchObject({ code: 'forbidden' })
+    const bare = await ask(s, { requested: true, payload: undefined })
+    expect(bare.body).toMatchObject({ code: 'bad_request' })
+    const envelope = await accountEnvelope('sync/request', s.key)
+    const tampered = await ask(s, { requested: true, ...envelope, signature: (await accountEnvelope('sync/request', s.key)).signature })
+    expect(tampered.body).toMatchObject({ code: 'bad_signature' })
+    const otherOp = await accountEnvelope('backup/delete', s.key)
+    expect((await ask(s, { requested: true, ...otherOp })).body).toMatchObject({ code: 'bad_signature' })
+    const stale = await accountEnvelope('sync/request', s.key)
+    advance(10 * 60 * SECOND)
+    const later = await openTestSession(app as never, h.env, s.key)
+    expect((await ask(later, { requested: true, ...stale })).body).toMatchObject({ code: 'stale' })
+    expect(await status(later)).toMatchObject({ requestedAt: null })
+  })
+
+  it('takes an envelope once, so a captured one can’t undo a withdrawal', async () => {
+    const s = await session()
+    const envelope = await accountEnvelope('sync/request', s.key)
+    expect((await ask(s, { requested: true, ...envelope })).body).toEqual({ ok: true, requestedAt: START })
+    expect((await ask(s, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
+    const replayed = await ask(s, { requested: true, ...envelope })
+    expect(replayed.status).toBe(409)
+    expect(replayed.body).toMatchObject({ code: 'replay' })
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+    // Past its window it's stale, so forgetting the nonce then is safe.
+    advance(10 * 60 * SECOND)
+    const later = await openTestSession(app as never, h.env, s.key)
+    expect((await ask(later, { requested: true, ...envelope })).body).toMatchObject({ code: 'stale' })
+    expect((await ask(later, { requested: true })).status).toBe(200)
+  })
+
+  it('keeps accounts apart', async () => {
+    const a = await session()
+    const b = await session()
+    await ask(a, { requested: true })
+    expect(await status(b)).toMatchObject({ requestedAt: null })
+    await ask(b, { requested: false })
+    expect(await status(a)).toMatchObject({ requestedAt: START })
+  })
+
+  it('lapses 30 days after it was last asked for', async () => {
+    let s = await session()
+    await ask(s, { requested: true })
+    advance(20 * DAY)
+    s = await openTestSession(app as never, h.env, s.key)
+    expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
+    advance(30 * DAY - 1)
+    // The token expired meanwhile; the same account signs in again.
+    s = await openTestSession(app as never, h.env, s.key)
+    expect(await status(s)).toMatchObject({ requestedAt: START })
+    advance(1)
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+    // A lapsed request isn't "standing": asking again starts a new one.
+    expect((await ask(s, { requested: true })).body).toEqual({
+      ok: true,
+      requestedAt: START + 50 * DAY,
+    })
+  })
+
+  it('clears itself once every live phone session has written a slot since', async () => {
+    const web = await session()
+    const phone = await openTestSession(app as never, h.env, web.key)
+    const tablet = await openTestSession(app as never, h.env, web.key)
+    const gone = await openTestSession(app as never, h.env, web.key)
+    // A slot written before the request doesn't count.
+    await put(tablet, 'tablet-slot')
+    advance(SECOND)
+    await ask(web, { requested: true })
+    advance(SECOND)
+    await put(phone, 'phone-slot')
+    // The web's own session is a phone session here too (dev); it writes a slot.
+    await put(web, 'web-slot')
+    expect(await status(web)).toMatchObject({ requestedAt: START + SECOND })
+    // An ended session doesn't hold it up.
+    await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(gone.accessToken))
+    expect(await status(web)).toMatchObject({ requestedAt: START + SECOND })
+    advance(2 * SECOND)
+    await put(tablet, 'tablet-slot')
+    expect(await status(web)).toMatchObject({ requestedAt: null })
+  })
+
+  it('keeps standing when the sessions can’t be read', async () => {
+    const s = await session()
+    await ask(s, { requested: true })
+    advance(SECOND)
+    await put(s, slot())
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const sessions = await import('./sessionStore')
+    vi.spyOn(sessions, 'listLiveSessions').mockRejectedValueOnce(new Error('d1 down'))
+    expect(await status(s)).toMatchObject({ requestedAt: START })
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+  })
+
+  it('needs Cloud Sync on and an entitled account to set, never to withdraw', async () => {
+    const s = await session()
+    await ask(s, { requested: true })
+    await h.kv.put('sync:enabled', 'false')
+    const off = await ask(s, { requested: true })
+    expect(off.status).toBe(503)
+    expect(off.body).toMatchObject({ code: 'disabled' })
+    expect(off.headers.get('retry-after')).toBe('60')
+    // The status still says what stands.
+    expect(await status(s)).toMatchObject({ enabled: false, requestedAt: START })
+    expect((await ask(s, { requested: false })).body).toEqual({ ok: true, requestedAt: null })
+
+    await h.kv.put('sync:enabled', 'on')
+    await h.kv.put('sync:entitlement', 'supporter')
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    resetSyncEntitlementCache()
+    const unentitled = await ask(s, { requested: true })
+    expect(unentitled.status).toBe(403)
+    expect(unentitled.body).toMatchObject({ code: 'supporter_required' })
+    expect((await ask(s, { requested: false })).status).toBe(200)
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+  })
+
+  it('works on an account whose index predates it', async () => {
+    const s = await session()
+    await put(s, slot())
+    h.syncIndexes.storage(s.accountId).query('DROP TABLE sync_request')
+    h.syncIndexes.restart(s.accountId)
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+    expect((await ask(s, { requested: true })).body).toEqual({ ok: true, requestedAt: START })
+  })
+
+  it('still answers the status when the request can’t be read', async () => {
+    const s = await session()
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.spyOn(AccountSync.prototype, 'requestedAt').mockRejectedValueOnce(new Error('do down'))
+    expect(await status(s)).toMatchObject({ ok: true, entitled: true, requestedAt: null })
+  })
+
+  it('refuses malformed bodies and requests without a token', async () => {
+    const s = await session()
+    for (const body of [{}, { requested: 'yes' }, { requested: 1 }, { requested: null }, []])
+      expect((await ask(s, body)).body, JSON.stringify(body)).toMatchObject({ code: 'bad_request' })
+    const anonymous = await postJson(app as never, h.env, '/sync/request', {
+      requested: true,
+      ...(await accountEnvelope('sync/request', s.key)),
+    })
+    expect(anonymous.status).toBe(401)
+    expect(await status(s)).toMatchObject({ requestedAt: null })
+  })
+
+  it('counts in the read edge tier', async () => {
+    const s = await session()
+    vi.spyOn(h.env.BUDDIES_READ_LIMITER, 'limit').mockResolvedValueOnce({ success: false })
+    const limited = await ask(s, { requested: true })
+    expect(limited.status).toBe(429)
+    expect(limited.body).toMatchObject({ code: 'rate_limited' })
+  })
+})
+
 describe('privacy', () => {
   it('never logs slot ids, account ids, or tokens', async () => {
     const logs: unknown[] = []
@@ -572,6 +861,8 @@ describe('privacy', () => {
     await list(s)
     await get(s, phone)
     await del(s, { slotId: phone })
+    await postJson(app as never, h.env, '/sync/request', { requested: true, ...(await accountEnvelope('sync/request', s.key)) }, bearer(s.accessToken))
+    await postJson(app as never, h.env, '/sync/request', { requested: false }, bearer(s.accessToken))
     const text = JSON.stringify(logs)
     for (const secret of [phone, s.accountId, s.accessToken])
       expect(text).not.toContain(secret)
@@ -768,6 +1059,7 @@ describe('browser live socket', () => {
       code: 'disabled',
     })
     await h.kv.delete('sync:enabled')
+    await h.kv.put('sync:entitlement', 'supporter')
     supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 1 })
     resetSyncEntitlementCache()
     expect(await browserLive(offer(s, slot()))).toMatchObject({

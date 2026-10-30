@@ -336,8 +336,9 @@ export interface Environment {
   SYNC_ENABLED?: string;
 
   /**
-   * Who gets Cloud Sync when KV `sync:entitlement` is absent: `"everyone"`,
-   * else Supporters only.
+   * Who gets Cloud Sync when KV `sync:entitlement` is absent: `"supporter"`
+   * makes it a Supporter benefit, anything else (or unset) everyone
+   * (witness-work ADR 0040).
    */
   SYNC_ENTITLEMENT?: string;
 

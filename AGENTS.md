@@ -1376,11 +1376,12 @@ iCloud and Google Drive; each device uses exactly one. Code in
 
 | Route | What |
 | --- | --- |
-| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed? }` |
+| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt }` |
 | `POST /accounts/v1/sync/put` | Bearer; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`? → `{ ok, etag, size, updatedAt, seq }` |
-| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt }] }` |
+| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
 | `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
+| `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
 | `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
 
 - **Storage**: one `AccountSync` SQLite DO per account (binding
@@ -1402,12 +1403,15 @@ iCloud and Google Drive; each device uses exactly one. Code in
   and tells every socket.
 - **Switches** (KV in `NOTES_KV`, edge-cached 60 s): `sync:enabled`
   (`true`/`on`, absent → `SYNC_ENABLED`: dev `"true"`, prod `"false"`) and
-  `sync:entitlement` (`everyone` | `supporter`, absent → `SYNC_ENTITLEMENT`,
-  else `supporter`). Off: put, list, get, and live are 503 `disabled`. Not
-  entitled: 403 `supporter_required`, from `accountSupporterStatus` (the
-  account's own status), cached 60 s per isolate per account; RevenueCat
-  unreachable is 503 `unavailable`, never "not a Supporter". Delete and the
-  status always work. `GET /app/v1/config` carries both as `sync: { enabled,
+  `sync:entitlement` (`supporter` makes it a Supporter benefit again, anything
+  else `everyone`; absent → `SYNC_ENTITLEMENT`, `"everyone"` in both
+  environments, else `everyone`). Sync is free (witness-work ADR 0040);
+  `supporter` is only the lever back. Off: put, list, get, live, and setting
+  the request are 503 `disabled`. Not entitled: 403 `supporter_required`,
+  from `accountSupporterStatus` (the account's own status), cached 60 s per
+  isolate per account; RevenueCat unreachable is 503 `unavailable`, never
+  "not a Supporter". Delete, clearing the request, and the status always
+  work. `GET /app/v1/config` carries both as `sync: { enabled,
   entitlement }` for devices without a session. Turning it off refuses new
   sockets and doesn't close open ones.
 - **Limits** (`SYNC_LIMITS`, each with its sizing): 20 MiB a blob (413
@@ -1424,6 +1428,29 @@ iCloud and Google Drive; each device uses exactly one. Code in
   for 400 days. R2's lifecycle rule (400 days on `v1/`, set by
   `scripts/r2-lifecycle.mjs` on every deploy) is the backstop. A failed
   session read keeps the slot until the next run.
+- **Slot sessions**: each slot keeps the platform of the session that last
+  wrote it (`slot.platform`, added to older indexes by `ADDED_COLUMNS`), and
+  `sync/list` adds `platform` and `live` (that session is live, from D1's
+  `sessionStates`). A slot put before the column reads its session's row,
+  and says `platform: null, live: false` once that row is pruned. A failed
+  D1 read says `live: true`, as retention does.
+- **The Cloud Sync request** (witness-work ADR 0040 §5, its
+  `docs/cloud-sync-photos.md`): a browser signed in to an account whose
+  phones aren't on Cloud Sync sets `{ requested: true }` with a self-signed
+  envelope (op `sync/request`) by the token's own account, as
+  `backup/delete` does (`forbidden` for another account's key), so a leaked
+  token alone can't move the User's phones. Each envelope is good once: its
+  nonce is kept in the DO's `request_nonce` for twice the `ts` window, and a
+  reuse is 409 `replay`, so a captured envelope can't undo a withdrawal.
+  Phones read `requestedAt` in
+  `GET /sync` and switch; they never clear it. Asking again keeps
+  `requestedAt` and restarts the 30 days. It clears itself (checked on read)
+  once every live `ios`, `android` or `dev` session has written a slot since
+  `requestedAt` (an account without one clears at once), or 30 days after
+  the last ask; `{ requested: false }` (bearer only) withdraws it. A failed
+  session read keeps it standing. Stored in the `AccountSync` DO's
+  `sync_request` table, not D1, and not in the activity log. Counts in the
+  read tier.
 - **Suspended** accounts keep syncing (nothing reaches another person).
 - **Privacy**: ciphertext only; the server can't read a device name or any
   data. Never log or report slot ids, account ids, session ids, sizes,
@@ -1432,9 +1459,9 @@ iCloud and Google Drive; each device uses exactly one. Code in
 ```bash
 # Turn Cloud Sync on (prod starts off; before the app release that defaults to it)
 wrangler kv key put --binding NOTES_KV sync:enabled true
-# Off (kill switch): refuses put/list/get/live with 503 disabled
+# Off (kill switch): refuses put/list/get/live and setting the request with 503 disabled
 wrangler kv key put --binding NOTES_KV sync:enabled false
-# Make it free for everyone, or a Supporter benefit again
+# Free for everyone (the default, ADR 0040), or a Supporter benefit again
 wrangler kv key put --binding NOTES_KV sync:entitlement everyone
 wrangler kv key put --binding NOTES_KV sync:entitlement supporter
 # Fall back to the SYNC_ENABLED / SYNC_ENTITLEMENT vars

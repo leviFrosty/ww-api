@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import { ACCOUNT_LIMITS, type RefreshToken } from './contracts'
 import {
@@ -471,6 +471,43 @@ export const revokeSession = async (
   return (await isSessionLive(db, input.accountId, input.bySessionId, now))
     ? 'revoked'
     : 'caller_ended'
+}
+
+/**
+ * The platform and liveness of each of the account's sessions in
+ * `sessionIds` whose row still exists (ended rows are pruned in time).
+ */
+export const sessionStates = async (
+  db: AccountsDb,
+  accountId: string,
+  sessionIds: string[],
+  now: number = Date.now()
+): Promise<Map<string, { platform: SessionPlatform; live: boolean }>> => {
+  if (sessionIds.length === 0) return new Map()
+  const rows = await db
+    .select({
+      id: accountSessions.id,
+      platform: accountSessions.platform,
+      revokedAt: accountSessions.revokedAt,
+      expiresAt: accountSessions.expiresAt,
+    })
+    .from(accountSessions)
+    .where(
+      and(
+        eq(accountSessions.accountId, accountId),
+        inArray(accountSessions.id, sessionIds)
+      )
+    )
+    .all()
+  return new Map(
+    rows.map((row) => [
+      row.id,
+      {
+        platform: row.platform,
+        live: row.revokedAt == null && row.expiresAt.getTime() > now,
+      },
+    ])
+  )
 }
 
 /** A live session, as `GET /accounts/v1/sessions` lists it. */

@@ -3,7 +3,12 @@ import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
 import { RevenueCatError } from '../revenuecat'
 import { captureFailure } from '../sentry'
 import { isPlainObject } from '../buddies/contracts'
-import { isWebSocketUpgrade, readBlobBody } from '../buddies/envelope'
+import {
+  isWebSocketUpgrade,
+  parseEnvelope,
+  readBlobBody,
+  readEnvelopeText,
+} from '../buddies/envelope'
 import {
   buddiesErrorResponse,
   buddiesInternalError,
@@ -18,8 +23,10 @@ import {
   readPlainJson,
   type AccountAuth,
   type AuthenticateAccountOptions,
+  parseJsonOrNull,
 } from './auth'
-import { guarded, refuseAtEdge } from './signed'
+import { accountForKey, guarded, refuseAtEdge, verifyEnvelope } from './signed'
+import { sessionStates } from './sessionStore'
 import { accountSupporterStatus } from './supporter'
 import { accountsDb } from './store'
 import {
@@ -39,12 +46,14 @@ import { syncSwitches } from './syncSwitch'
  * Object per account holds the slots' metadata and live sockets; R2
  * (`ACCOUNT_SYNC`) holds the ciphertext.
  *
- * Every route is bearer. `GET /sync` (the account's status) and
- * `sync/delete` always work; `sync/put`, `sync/list`, `sync/get`, and the
- * live socket need the kill switch on (503 `disabled`) and an entitled
- * account (403 `supporter_required`; RevenueCat unreachable is 503
- * `unavailable`, never a "not a Supporter"). A suspended account keeps
- * syncing: sync never reaches another person.
+ * Every route is bearer. `GET /sync` (the account's status), `sync/delete`,
+ * and clearing the Cloud Sync request always work; `sync/put`, `sync/list`,
+ * `sync/get`, the live socket, and setting the request need the kill switch
+ * on (503 `disabled`) and an entitled account (403 `supporter_required`;
+ * RevenueCat unreachable is 503 `unavailable`, never a "not a Supporter").
+ * Everyone is entitled unless KV `sync:entitlement` says `supporter`
+ * (witness-work ADR 0040). A suspended account keeps syncing: sync never
+ * reaches another person.
  *
  * `sync/put` counts against the Buddies write edge tier, the rest against
  * the read tier.
@@ -108,8 +117,8 @@ const caller = async (
 }
 
 /**
- * The switches and the account's entitlement for put, list, get, and live:
- * null admits.
+ * The switches and the account's entitlement for put, list, get, live, and
+ * setting the Cloud Sync request: null admits.
  */
 const refuseUnentitled = async (
   env: Environment,
@@ -162,6 +171,13 @@ const handleStatus = guarded('sync', async (c) => {
     supporterCheckFailed = true
   }
   const entitled = enabled && (entitlement === 'everyone' || supporter)
+  let requestedAt: number | null = null
+  try {
+    requestedAt = await syncIndex(c.env, who.account.accountId).requestedAt()
+  } catch (error) {
+    // The entitlement answer still goes out; the phone reads again later.
+    captureFailure(error, 'sync request read')
+  }
   return c.json({
     ok: true,
     enabled: enabled && unavailableHere(c.env) == null,
@@ -169,7 +185,45 @@ const handleStatus = guarded('sync', async (c) => {
     entitlement,
     supporter,
     ...(supporterCheckFailed ? { supporterCheckFailed: true } : {}),
+    requestedAt,
   })
+})
+
+/**
+ * `sync/request`: `{ requested: true, payload, signature }` asks the
+ * account's phones to switch to Cloud Sync (the web sets it; witness-work
+ * ADR 0040 §5); `{ requested: false }` withdraws it. Setting is bearer and a
+ * self-signed envelope (op `sync/request`) by the token's own account, as
+ * `backup/delete` is, so a leaked token alone can't move the User's phones;
+ * it needs Cloud Sync on and an entitled account. Withdrawing always works.
+ * Not in the activity log: it changes no one's access.
+ */
+const handleSwitchRequest = guarded('sync/request', async (c) => {
+  if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
+  const who = await caller(c, 'read')
+  if ('refusal' in who) return who.refusal
+  const { accountId } = who.account
+  const text = await readEnvelopeText(c.req.raw)
+  const body = parseJsonOrNull(text)
+  if (!isPlainObject(body) || typeof body.requested !== 'boolean')
+    return buddiesErrorResponse('bad_request')
+  let nonce: string | null = null
+  if (body.requested) {
+    const verified = await verifyEnvelope('sync/request', parseEnvelope(text!))
+    if ('refusal' in verified) return verified.refusal
+    const found = await accountForKey(c.env, verified.payload.accountPub)
+    if ('refusal' in found) return found.refusal
+    if (found.account.id !== accountId) return buddiesErrorResponse('forbidden')
+    nonce = verified.payload.nonce
+    const refused =
+      unavailableHere(c.env) ?? (await refuseUnentitled(c.env, accountId))
+    if (refused) return refused
+  }
+  const index = syncIndex(c.env, accountId)
+  if (nonce == null) return c.json({ ok: true, requestedAt: await index.clearRequest() })
+  const set = await index.setRequest({ accountId, nonce })
+  if (!set.ok) return buddiesErrorResponse(set.error)
+  return c.json({ ok: true, requestedAt: set.value })
 })
 
 /**
@@ -187,7 +241,7 @@ const handlePut = guarded('sync/put', async (c) => {
   if (off) return off
   const who = await caller(c, 'write')
   if ('refusal' in who) return who.refusal
-  const { accountId, sessionId } = who.account
+  const { accountId, sessionId, platform } = who.account
   const refused = await refuseUnentitled(c.env, accountId)
   if (refused) return refused
 
@@ -239,6 +293,7 @@ const handlePut = guarded('sync/put', async (c) => {
     size,
     updatedAt,
     sessionId,
+    platform,
   })
   if (!committed.ok) return buddiesErrorResponse(committed.error)
   return c.json({ ok: true, ...committed.value }, 200, {
@@ -246,7 +301,12 @@ const handlePut = guarded('sync/put', async (c) => {
   })
 })
 
-/** `sync/list`: every slot's ETag, size, and server time, and the account's `seq`. */
+/**
+ * `sync/list`: every slot's ETag, size, and server time, the platform of the
+ * session that last wrote it and whether that session is live, and the
+ * account's `seq`. A failed session read says `live: true`, as retention
+ * does, so a pull never fails on it.
+ */
 const handleList = guarded('sync/list', async (c) => {
   const off = unavailableHere(c.env)
   if (off) return off
@@ -255,8 +315,29 @@ const handleList = guarded('sync/list', async (c) => {
   const { accountId } = who.account
   const refused = await refuseUnentitled(c.env, accountId)
   if (refused) return refused
-  const listed = await syncIndex(c.env, accountId).list()
-  return c.json({ ok: true, ...listed })
+  const { seq, slots } = await syncIndex(c.env, accountId).list()
+  let states: Awaited<ReturnType<typeof sessionStates>> | null = null
+  try {
+    states = await sessionStates(
+      accountsDb(c.env.ACCOUNTS_DB!),
+      accountId,
+      [...new Set(slots.map((slot) => slot.sessionId))]
+    )
+  } catch (error) {
+    captureFailure(error, 'sync/list sessions')
+  }
+  return c.json({
+    ok: true,
+    seq,
+    slots: slots.map(({ sessionId, platform, ...slot }) => {
+      const state = states?.get(sessionId)
+      return {
+        ...slot,
+        platform: platform ?? state?.platform ?? null,
+        live: states ? (state?.live ?? false) : true,
+      }
+    }),
+  })
 })
 
 /** `sync/get`: one slot's bytes exactly as put. */
@@ -376,5 +457,6 @@ export const syncHandlers = {
   list: handleList,
   get: handleGet,
   delete: handleDelete,
+  switchRequest: handleSwitchRequest,
   live: handleLive,
 }
