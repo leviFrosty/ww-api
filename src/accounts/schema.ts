@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import {
   index,
   integer,
@@ -287,6 +288,13 @@ export const revenueCatCustomers = sqliteTable('revenuecat_customers', {
    * so concurrent webhook reads can't leave the stale answer behind.
    */
   checkedAt: integer('checked_at', { mode: 'timestamp_ms' }).notNull(),
+  /**
+   * RevenueCat's `original_app_user_id` for the customer, as of `checkedAt`
+   * (null when it named none). Every app user id of one customer shares it,
+   * so a key change's lock and unlink (ADR 0039 §9) match the customer by
+   * `COALESCE(original_app_user_id, app_user_id)`, not by the id linked.
+   */
+  originalAppUserId: text('original_app_user_id'),
 })
 
 /**
@@ -305,11 +313,36 @@ export const accountRevenueCatCustomers = sqliteTable(
       .references(() => revenueCatCustomers.appUserId, { onDelete: 'cascade' }),
     /** The last time an app linked it; every repeat moves it. */
     linkedAt: integer('linked_at', { mode: 'timestamp_ms' }).notNull(),
+    /**
+     * When the account first linked it; never moves while the link lasts. A
+     * key change unlinks the customer only from accounts that linked it later
+     * than the changing account did (ADR 0039 §9).
+     */
+    firstLinkedAt: integer('first_linked_at', { mode: 'timestamp_ms' })
+      .notNull()
+      .default(sql`0`),
   },
   (t) => [
     primaryKey({ columns: [t.accountId, t.appUserId] }),
     index('account_revenuecat_customers_customer_idx').on(t.appUserId),
   ]
+)
+
+/**
+ * RevenueCat customers a key change locked to their account (witness-work
+ * ADR 0039 §9): the old key's sync data reveals the account's app user ids,
+ * so until `lockedUntil` no other account may link them. Pruned once ended.
+ */
+export const revenueCatCustomerLocks = sqliteTable(
+  'revenuecat_customer_locks',
+  {
+    appUserId: text('app_user_id').primaryKey(),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    lockedUntil: integer('locked_until', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [index('revenuecat_customer_locks_until_idx').on(t.lockedUntil)]
 )
 
 /** RevenueCat webhook event ids already handled, kept 30 days. Ids only. */

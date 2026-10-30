@@ -985,7 +985,7 @@ export const accountRekeyDocs = describeRoute({
 
 **Who may:** an attested phone session (\`ios\`, \`android\`, \`dev\`) at any age; a web session at least 24 hours old (\`session_too_new\`) that passed a step-up in the last 5 minutes (\`step_up_required\`). A suspended account may.
 
-**One batch:** the account’s key and epoch are swapped only while they’re still the payload’s (409 \`conflict\` with the account’s \`keyEpoch\` otherwise, so of two devices changing the key at once one wins); the old key is retired for good (\`key_retired\` on every session open); every other session ends (\`session.revoked\`, with this one as actor); this session takes the new epoch and \`device\`; every passkey wrap is deleted and \`passkeyWrap\` stored for the new epoch; the key history is stored; \`account.key_changed\` is logged. Then every Cloud Sync socket of the account closes with \`4005 "key_changed"\`.
+**One batch:** the account’s key and epoch are swapped only while they’re still the payload’s (409 \`conflict\` with the account’s \`keyEpoch\` otherwise, so of two devices changing the key at once one wins); the old key is retired for good (\`key_retired\` on every session open); every other session ends (\`session.revoked\`, with this one as actor); this session takes the new epoch and \`device\`; every passkey wrap is deleted and \`passkeyWrap\` stored for the new epoch; the key history is stored; each RevenueCat customer the account links is unlinked from other accounts that first linked it later, and locked to it for 90 days unless another account linked it as early or earlier (see \`POST /accounts/v1/revenuecat-customers\`); \`account.key_changed\` is logged. Then every Cloud Sync socket of the account closes with \`4005 "key_changed"\`.
 
 The answer’s access token carries the new epoch; the refresh token is unchanged, and its next refresh carries the new epoch too. A lost answer isn’t retried with the same envelope: refresh, then \`GET /account\` says whether the key changed. ${ENDED_SESSION}
 
@@ -1346,6 +1346,7 @@ export const supporterLinkDocs = describeRoute({
 - A customer RevenueCat has never seen isn’t linked; the answer is the account’s status without it.
 - Idempotent. Repeating a link refreshes it and reads RevenueCat again, so it doubles as “check my status now” (after a purchase or a restore).
 - An account keeps at most 5 customers and a customer at most 5 accounts; a new link past either replaces the least recently linked.
+- When an account changes its key, each customer it linked first (no other account linked it as early) is locked to it for 90 days: another account can’t link it (by any of the customer’s app user ids) unless it still links that customer. 409 \`conflict\` with \`reason: "customer_locked"\`.
 
 The app user id is the RevenueCat SDK’s capability for that customer: send only the one the app is logged in as. It travels in the body, never the URL.
 
@@ -1368,6 +1369,11 @@ Works for a suspended account. ${readTier} Each link also reads RevenueCat, so i
       z.object(supporterFields)
     ),
     400: errorResponse('Missing or malformed `appUserId`.', ['bad_request']),
+    409: errorResponse(
+      'Another account changed its key in the last 90 days and the customer is locked to it (`reason: "customer_locked"`); nothing was linked.',
+      ['conflict'],
+      apiErrorSchema.extend({ reason: z.literal('customer_locked') })
+    ),
     ...bearerReadErrors,
     ...revenueCatUnavailable,
   },
