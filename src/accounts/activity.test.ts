@@ -105,6 +105,7 @@ describe('sessions in the activity log', () => {
       id: expect.any(String),
       kind: 'session.opened',
       createdAt: START + MINUTE,
+      method: 'dev',
       session: {
         sessionId: tablet.sessionId,
         platform: 'dev',
@@ -243,6 +244,7 @@ describe('GET /sessions and POST /sessions/revoke', () => {
         {
           sessionId: tablet.sessionId,
           platform: 'dev',
+          method: 'dev',
           device: device('Tablet'),
           current: false,
           createdAt: START + MINUTE,
@@ -252,6 +254,7 @@ describe('GET /sessions and POST /sessions/revoke', () => {
         {
           sessionId: phone.sessionId,
           platform: 'dev',
+          method: 'dev',
           device: device('Phone'),
           current: true,
           createdAt: START,

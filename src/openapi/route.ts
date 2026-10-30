@@ -56,6 +56,11 @@ export const OPENAPI_TAGS = [
       'A blind, end-to-end encrypted store shared by up to 10 members, one per shared car (witness-work ADR 0037). The server holds sealed records under random ids, members as token hashes, wrapped keys, and invites, and never learns what a space is or which accounts are on it. Every op is `POST /spaces/v1/{op}` with a bearer token; ids and member tokens travel in bodies, never URLs. The wire contract is witness-work’s [docs/shared-cars-protocol.md](https://github.com/leviFrosty/witness-work/blob/main/docs/shared-cars-protocol.md).',
   },
   {
+    name: 'Passkeys',
+    description:
+      'Passkeys of an existing account (witness-work ADR 0038): sign in, step up a web session, and save the account key sealed under a passkey’s PRF output, which the server can’t open. A browser opens its web session with the ticket a sign-in answers. The wire contract is witness-work’s `docs/passkeys-protocol.md`.',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',

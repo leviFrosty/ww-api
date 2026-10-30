@@ -127,7 +127,11 @@ describe('legacy on', () => {
 
   it('lets a KV failure through rather than sending every old app to Update Required', async () => {
     env = { ...env, NOTES_KV: { get: async () => Promise.reject(new Error('kv down')) } } as never
-    const response = await call('POST', '/notes-import/kickoff')
+    // A bearer request: a request signed the pre-session way is refused by
+    // the account legacy switch itself, whose failed read counts as off
+    // (ADR 0038 §11).
+    const response = await call('POST', '/notes-import/kickoff', { authorization: 'Bearer x' })
     expect(response.status).not.toBe(426)
+    expect((await call('POST', '/notes-import/kickoff')).status).toBe(426)
   })
 })

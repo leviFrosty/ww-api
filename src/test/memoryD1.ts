@@ -56,6 +56,15 @@ class MemoryD1Statement {
   rows(): Row[] {
     return this.db.prepare(this.query).all(...this.params) as Row[]
   }
+
+  /** What a batch reports for this statement: its rows, or the rows it changed. */
+  batchResult() {
+    const statement = this.db.prepare(this.query)
+    if (statement.columns().length > 0)
+      return { success: true, results: this.rows(), meta: { changes: 0 } }
+    const { changes } = statement.run(...this.params)
+    return { success: true, results: [], meta: { changes: Number(changes) } }
+  }
 }
 
 export class MemoryD1 {
@@ -77,11 +86,7 @@ export class MemoryD1 {
   async batch(statements: MemoryD1Statement[]) {
     this.db.exec('BEGIN')
     try {
-      const results = statements.map((statement) => ({
-        success: true,
-        results: statement.rows(),
-        meta: {},
-      }))
+      const results = statements.map((statement) => statement.batchResult())
       this.db.exec('COMMIT')
       return results
     } catch (error) {
@@ -108,15 +113,17 @@ export const failQueries = (
   const fail = async () => {
     throw new Error(message)
   }
-  // `batch` reads `rows()` synchronously, so it throws there.
+  // `batch` reads `batchResult()` synchronously, so it throws there.
+  const throwing = () => {
+    throw new Error(message)
+  }
   const failing = {
     run: fail,
     all: fail,
     raw: fail,
     first: fail,
-    rows: () => {
-      throw new Error(message)
-    },
+    rows: throwing,
+    batchResult: throwing,
   }
   return vi.spyOn(d1, 'prepare').mockImplementation((query: string) =>
     pattern.test(query)

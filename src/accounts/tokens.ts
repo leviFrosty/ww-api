@@ -106,6 +106,44 @@ export const accessTokenIssuer = (
 const encoder = new TextEncoder()
 const keyCache = new Map<string, Promise<TokenKey>>()
 
+const labelled = (label: string, secret: string) =>
+  sha256Bytes(encoder.encode(`${label}\n${secret}`))
+
+const hmacKey = (bytes: Uint8Array) =>
+  crypto.subtle.importKey(
+    'raw',
+    bytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  )
+
+const derivedKeyCache = new Map<string, Promise<CryptoKey>>()
+
+/**
+ * The HMAC-SHA256 key `label` derives from a Worker secret: the SHA-256 of
+ * `<label>\n<secret>`. Every key the accounts routes take from a secret is
+ * one of these, each kept apart from the others by its label: the refresh
+ * token and activity id keys here, the challenge and ticket keys
+ * (src/accounts/passkeyTokens.ts), and rate counter names
+ * (src/accounts/rateCounter.ts). Cached per isolate.
+ */
+export const derivedHmacKey = (
+  label: string,
+  secret: string
+): Promise<CryptoKey> => {
+  const cacheKey = `${label}\n${secret}`
+  let cached = derivedKeyCache.get(cacheKey)
+  if (!cached) {
+    // Labels can carry a day (rate counter names), so the cache is bounded.
+    if (derivedKeyCache.size >= 64) derivedKeyCache.clear()
+    cached = labelled(label, secret).then(hmacKey)
+    cached.catch(() => derivedKeyCache.delete(cacheKey))
+    derivedKeyCache.set(cacheKey, cached)
+  }
+  return cached
+}
+
 const tokenKey = (secret: string): Promise<TokenKey> => {
   let cached = keyCache.get(secret)
   if (!cached) {
@@ -113,29 +151,18 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
       const digest = await sha256Bytes(
         encoder.encode(`ww-account/v1/token-kid\n${secret}`)
       )
-      const hmac = (bytes: Uint8Array) =>
-        crypto.subtle.importKey(
-          'raw',
-          bytes,
-          { name: 'HMAC', hash: 'SHA-256' },
-          false,
-          ['sign', 'verify']
-        )
-      const labelled = (label: string) =>
-        sha256Bytes(encoder.encode(`${label}\n${secret}`))
-      const derived = (label: string) => labelled(label).then(hmac)
       const [key, macKey, rotationKey, cipherKey, nonceKey] =
         await Promise.all([
-          hmac(encoder.encode(secret)),
-          derived('ww-account/v1/refresh-mac'),
-          derived('ww-account/v1/refresh-rotation'),
-          labelled('ww-account/v1/activity-id-cipher').then((bytes) =>
+          hmacKey(encoder.encode(secret)),
+          derivedHmacKey('ww-account/v1/refresh-mac', secret),
+          derivedHmacKey('ww-account/v1/refresh-rotation', secret),
+          labelled('ww-account/v1/activity-id-cipher', secret).then((bytes) =>
             crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
               'encrypt',
               'decrypt',
             ])
           ),
-          derived('ww-account/v1/activity-id-nonce'),
+          derivedHmacKey('ww-account/v1/activity-id-nonce', secret),
         ])
       return {
         kid: bytesToBase64Url(digest).slice(0, 16),
