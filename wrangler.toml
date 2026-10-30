@@ -121,6 +121,8 @@ APP_ATTEST_ENVIRONMENT = "development"
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtimedev"
 # Deprecated and ignored: Supporter status follows witness-work ADR 0014.
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
+# Count RevenueCat Billing (web) sandbox subscriptions as Supporter; dev only, never in [vars].
+REVENUECAT_COUNT_WEB_SANDBOX = "true"
 # Runtime-limit env fallbacks. Named environments do not inherit [vars], so all
 # five are explicitly repeated here. KV `notes-import:limits` overrides each
 # field independently for this environment.
