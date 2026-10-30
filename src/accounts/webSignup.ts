@@ -3,7 +3,7 @@ import { captureFailure } from '../sentry'
 import { bytesToBase64Url } from '../crypto'
 import { isPlainObject } from '../buddies/contracts'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
-import { buddiesCallerKey, logLimitHit } from '../buddies/limits'
+import { buddiesCallerKey } from '../buddies/limits'
 import { ACCOUNT_LIMITS, isTurnstileToken } from './contracts'
 import { readPlainJson } from './auth'
 import {
@@ -49,7 +49,7 @@ import {
   type TurnstileAction,
 } from './turnstile'
 import { readKvSwitch } from './legacySwitch'
-import { counterName, rateCounter } from './rateCounter'
+import { counterName, rateCounter, refuseOverRateCounter } from './rateCounter'
 import type { CounterLimit } from './rateCounterDO'
 
 /**
@@ -90,9 +90,6 @@ const HOUR_MS = 60 * 60 * 1_000
 const DAY_MS = 24 * HOUR_MS
 
 export const WEB_SIGNUP_KEY = 'accounts:web-signup'
-
-/** How long to wait when the caps' counter can't be reached at sign-up. */
-const CAPS_RETRY_SECONDS = 30
 
 export const WEB_LIMITS = {
   signupsPerIpDay: 3,
@@ -160,9 +157,6 @@ export const capsShardName = async (
   asn: string | null
 ): Promise<string> => `web-caps:${await counterName(env, 'web-caps-shard', asn ?? 'none')}`
 
-const caps = async (c: AppContext) =>
-  rateCounter(c.env, await capsShardName(c.env, callerAsn(c)))
-
 /** One limit on `value`, named under today's key and also counting yesterday's. */
 const capLimit = async (
   env: Environment,
@@ -220,27 +214,17 @@ const recoveryLimits = async (c: AppContext, now: number): Promise<CounterLimit[
   ),
 ]
 
-const overCap = (op: string, retryAfterSeconds: number) => {
-  logLimitHit(op, 'webCaps')
-  return buddiesErrorResponse('rate_limited', { retryAfterSeconds })
-}
-
-/** Checks the caps without counting; an outage lets the request on (the take decides). */
-const peekCaps = async (
+/** Checks (or takes) the caller's caps in its network's counter. */
+const refuseOverCaps = async (
   c: AppContext,
   op: string,
   limits: CounterLimit[],
-  now: number
-): Promise<Response | null> => {
-  try {
-    const checked = await (await caps(c)).peek(now, limits)
-    return checked.ok ? null : overCap(op, checked.retryAfterSeconds)
-  } catch (error) {
-    console.warn('accounts: web caps unavailable; checking later', { op })
-    captureFailure(error, `${op} caps`)
-    return null
-  }
-}
+  use: { now: number; count?: boolean; onOutage?: 'allow' | 'refuse' }
+): Promise<Response | null> =>
+  refuseOverRateCounter(c, await capsShardName(c.env, callerAsn(c)), limits, op, {
+    limitName: 'webCaps',
+    ...use,
+  })
 
 /** The Turnstile check, as a refusal or null. */
 const refuseTurnstile = async (
@@ -281,7 +265,7 @@ const handleSignupOptions = guarded('web/signup/options', async (c) => {
   if (!party) return buddiesErrorResponse('bad_request')
 
   const now = Date.now()
-  const capped = await peekCaps(c, 'web/signup/options', await signupLimits(c, now), now)
+  const capped = await refuseOverCaps(c, 'web/signup/options', await signupLimits(c, now), { now })
   if (capped) return capped
 
   const refused = await refuseTurnstile(c, body.turnstileToken, 'web-signup')
@@ -358,18 +342,16 @@ const handleSignup = guarded('web/signup', async (c) => {
   // caps are what stands in for device integrity on the web.
   const now = Date.now()
   const limits = await signupLimits(c, now)
-  const counter = await caps(c)
-  try {
-    const take = await counter.take(now, limits)
-    if (!take.ok) return overCap('web/signup', take.retryAfterSeconds)
-  } catch (error) {
-    console.warn('accounts: web caps unavailable; refusing sign-up')
-    captureFailure(error, 'web/signup caps')
-    return buddiesErrorResponse('unavailable', { retryAfterSeconds: CAPS_RETRY_SECONDS })
-  }
+  const overCaps = await refuseOverCaps(c, 'web/signup', limits, {
+    now,
+    count: true,
+    onOutage: 'refuse',
+  })
+  if (overCaps) return overCaps
   const refund = async () => {
     try {
-      await counter.refund(now, limits)
+      const shard = await capsShardName(c.env, callerAsn(c))
+      await rateCounter(c.env, shard).refund(now, limits)
     } catch (error) {
       captureFailure(error, 'web/signup caps refund')
     }
@@ -480,17 +462,12 @@ const handleRecovery = guarded('web/recovery', async (c) => {
 
   const now = Date.now()
   const limits = await recoveryLimits(c, now)
-  const capped = await peekCaps(c, 'web/recovery', limits, now)
+  const capped = await refuseOverCaps(c, 'web/recovery', limits, { now })
   if (capped) return capped
   const refused = await refuseTurnstile(c, verified.fields.turnstileToken, 'web-recovery')
   if (refused) return refused
-  try {
-    const take = await (await caps(c)).take(now, limits)
-    if (!take.ok) return overCap('web/recovery', take.retryAfterSeconds)
-  } catch (error) {
-    console.warn('accounts: web caps unavailable; allowing recovery')
-    captureFailure(error, 'web/recovery caps')
-  }
+  const overCaps = await refuseOverCaps(c, 'web/recovery', limits, { now, count: true })
+  if (overCaps) return overCaps
 
   if (!(await claimNonce(setup.db, nonce))) return buddiesErrorResponse('replay')
   const account = await findAccountByPub(setup.db, verified.payload.accountPub)

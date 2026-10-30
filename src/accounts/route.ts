@@ -27,6 +27,7 @@ import { syncHandlers } from './sync'
 import { syncPhotoHandlers } from './syncPhotos'
 import { passkeyHandlers } from './passkeys'
 import { webHandlers } from './webSignup'
+import { approvalHandlers } from './approval'
 import {
   passkeyAddDocs,
   passkeyAssertDocs,
@@ -41,6 +42,15 @@ import {
   webSignupDocs,
   webSignupOptionsDocs,
 } from './webSignupOpenapi'
+import {
+  approvalCancelDocs,
+  approvalClaimDocs,
+  approvalDoneDocs,
+  approvalOpenDocs,
+  approvalReceiveDocs,
+  approvalSendDocs,
+  approvalStatusDocs,
+} from './approvalOpenapi'
 import {
   accountDocs,
   activityListDocs,
@@ -240,5 +250,14 @@ export const createAccountsRoutes = () => {
   routes.post('/web/signup/options', webSignupOptionsDocs, webHandlers.signupOptions)
   routes.post('/web/signup', webSignupDocs, webHandlers.signup)
   routes.post('/web/recovery', webRecoveryDocs, webHandlers.recovery)
+  // Approving a browser from a phone: the handoff with the roles turned
+  // around, `POST /approval/{op}` like it.
+  routes.post('/approval/open', approvalOpenDocs, approvalHandlers.open)
+  routes.post('/approval/claim', approvalClaimDocs, approvalHandlers.claim)
+  routes.post('/approval/status', approvalStatusDocs, approvalHandlers.status)
+  routes.post('/approval/send', approvalSendDocs, approvalHandlers.send)
+  routes.post('/approval/receive', approvalReceiveDocs, approvalHandlers.receive)
+  routes.post('/approval/done', approvalDoneDocs, approvalHandlers.done)
+  routes.post('/approval/cancel', approvalCancelDocs, approvalHandlers.cancel)
   return routes
 }

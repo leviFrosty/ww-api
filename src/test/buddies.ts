@@ -6,6 +6,7 @@ import { AccountHandoff } from '../accounts/handoffDO'
 import { AccountSync } from '../accounts/syncDO'
 import { SharedSpace } from '../spaces/spaceDO'
 import { AccountRateCounter } from '../accounts/rateCounterDO'
+import { AccountApproval } from '../accounts/approvalDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -184,6 +185,7 @@ export interface Harness {
   /** Shared Spaces' `SHARED_SPACE` objects, one per space id. */
   spaces: FakeNamespace<SharedSpace>
   rateCounters: FakeNamespace<AccountRateCounter>
+  approvals: FakeNamespace<AccountApproval>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -356,6 +358,10 @@ export const createHarness = async (
   )
   env.ACCOUNT_RATE_COUNTER =
     rateCounters.namespace as Environment['ACCOUNT_RATE_COUNTER']
+  const approvals = createNamespace(
+    (state) => new AccountApproval(state as never, env as never)
+  )
+  env.ACCOUNT_APPROVAL = approvals.namespace as Environment['ACCOUNT_APPROVAL']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -378,6 +384,7 @@ export const createHarness = async (
     syncIndexes,
     spaces,
     rateCounters,
+    approvals,
     inboxes,
     invites,
     quotas,
