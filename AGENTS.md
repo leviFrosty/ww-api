@@ -1236,6 +1236,9 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
 | `GET /accounts/v1/passkeys` | Bearer; the account's passkeys |
 | `POST /accounts/v1/passkeys/remove` | Bearer + signed `passkey/remove`, step-up |
 | `POST /accounts/v1/sessions` with `ticket` | A browser's web session, in place of attestation |
+| `POST /accounts/v1/web/signup/options` | No auth; Turnstile, caps → the new account's creation options |
+| `POST /accounts/v1/web/signup` | Signed `web/signup` by the new key: account, passkey, wrap, web session |
+| `POST /accounts/v1/web/recovery` | Signed `web/recovery`; Turnstile → a `recovery` ticket |
 
 - **Relying party**: vars `PASSKEY_RP_IDS` (comma list; the first is the
   default and the one Android origins pair with) and `PASSKEY_ORIGINS` (JSON
@@ -1301,6 +1304,40 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
   assertion bodies, user handles, credential ids, wraps, or anything near a
   PRF output (the server never sees one). Sentry drops request bodies
   (`dropRequestBody`). Logs name the op only (`guarded`).
+- **Web sign-up** (`webSignup.ts`, `turnstile.ts`): there's no device
+  integrity on the web, so sign-up has Turnstile (managed widget, actions
+  `web-signup` and `web-recovery`; Siteverify gets `remoteip` and an
+  `idempotency_key`, and the answer's action and hostname, one of
+  `WEB_APP_ORIGINS`' hosts, must match, except under Cloudflare's test
+  secrets on a development worker only), caps, and a kill switch. A
+  `turnstileToken` over 2,048 characters is `bad_request`. Caps live in an
+  `AccountRateCounter` per network (`capsShardName`: `web-caps:` and an HMAC
+  of the ASN, so one request's IP and ASN limits are taken atomically in one
+  object): `WEB_SIGNUP_PER_IP_DAY` (3, IPv6 by /64) and
+  `WEB_SIGNUP_PER_ASN_HOUR` (30, from `request.cf.asn`; skipped without
+  one), checked at `options` (an outage lets it through) and taken at
+  `web/signup` before the D1 batch, given back if the batch fails; an outage
+  there fails closed (503 `unavailable`, `Retry-After: 30`). Recovery:
+  `WEB_RECOVERY_PER_IP_DAY` (10) per IP a day, checked before Siteverify and
+  counted only after it passes, so junk can't lock a shared IP out (an outage
+  lets it through: the envelope proves the key). Names are HMACs of the IP or
+  ASN under a key derived from `ACCOUNT_TICKET_SECRET` and the UTC day
+  (`counterName`, src/accounts/rateCounter.ts), each also counting
+  yesterday's name so the windows still roll; no IP or ASN is stored. They
+  depend on the secret alone, so counts hold across isolates, DO evictions,
+  and restarts. Both envelopes work once (409 `replay`).
+- **Web sign-up kill switch**: KV `accounts:web-signup` (`off`/`on`), then
+  the `WEB_SIGNUP` var, then on; a failed read counts as on (`readKvSwitch`,
+  shared with the legacy switch, whose failed read counts as off). Off refuses
+  `web/signup/options` and `web/signup` with 503 `disabled`; recovery isn't
+  affected. `GET /app/v1/config` answers `webSignup: { enabled,
+  turnstileSiteKey }` (the site key whenever Turnstile is set up, since
+  recovery uses it too).
+
+  ```bash
+  wrangler kv key put --binding NOTES_KV accounts:web-signup off   # pause (add --env dev)
+  wrangler kv key delete --binding NOTES_KV accounts:web-signup    # back to the var
+  ```
 
 Secrets, each a different value per worker, at least 32 characters, never
 `ACCOUNT_TOKEN_SECRET`'s; without either, the passkey routes and ticket
@@ -1317,8 +1354,27 @@ openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET
 openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET
 ```
 
+Turnstile: the widget's site key is the `TURNSTILE_SITE_KEY` var and its
+secret the `TURNSTILE_SECRET_KEY` secret. A development worker without them
+uses Cloudflare's test keys (site key `1x00000000000000000000AA`, secret
+`1x0000000000000000000000000000000AA`, which pass any token for any host);
+production without them has web sign-up and recovery off (`disabled`). To set
+up a widget (dashboard → Turnstile, or the API with a token that has Account ›
+Turnstile › Edit): managed mode, hostnames `app.witnesswork.app` and
+`beta.app.witnesswork.app` for production, `app-dev.witnesswork.app` and
+`localhost` for dev; put the site key in `[vars]` or `[env.dev.vars]`, then:
+
+```bash
+wrangler secret put TURNSTILE_SECRET_KEY --env dev   # paste the widget's secret
+wrangler secret put TURNSTILE_SECRET_KEY             # production (the owner)
+```
+
 The verify launcher sets synthetic ones; `src/e2e/passkeys.e2e.test.ts`
-drives the routes with a software authenticator (`src/test/webauthn.ts`).
+drives the routes with a software authenticator (`src/test/webauthn.ts`), and
+`src/e2e/webSignup.e2e.test.ts` signs up and recovers against the real
+Siteverify with the test keys. `TURNSTILE_SECRET_KEY=2x0000000000000000000000000000000AA
+node scripts/verify/dev.mjs up` makes every token fail (`3x…` answers "already
+spent").
 
 ### Supporter status (RevenueCat)
 

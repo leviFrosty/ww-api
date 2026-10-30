@@ -56,7 +56,7 @@ export const appConfigDocs = describeRoute({
   tags: ['Service'],
   summary: 'App configuration',
   description:
-    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`). No authentication.',
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`) and web sign-up’s (`webSignup`). No authentication.',
   responses: {
     200: jsonResponse(
       'The configuration.',
@@ -85,6 +85,18 @@ export const appConfigDocs = describeRoute({
             description:
               'Cloud Sync’s switches (witness-work ADR 0030), so a device without a session knows whether opening one would get it Cloud Sync. `GET /accounts/v1/sync` gives the account’s own answer.',
           }),
+        webSignup: z
+          .object({
+            enabled: z.boolean().meta({
+              description:
+                'Whether web sign-up is open (KV `accounts:web-signup`, then the `WEB_SIGNUP` var; a failed KV read counts as on). False on a worker without the accounts database, passkeys, or Turnstile. While false, the web says sign-up is paused.',
+            }),
+            turnstileSiteKey: z.string().nullable().meta({
+              description:
+                'The Turnstile site key for the web’s sign-up and recovery widgets (Cloudflare’s test key on development workers without one). Present even while sign-up is off, since recovery uses it too; null without Turnstile.',
+            }),
+          })
+          .meta({ description: 'Web sign-up’s switch and Turnstile site key.' }),
       })
     ),
     ...rateLimitedResponse,

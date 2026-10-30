@@ -32,6 +32,8 @@ export const ACCOUNTS_OPS = [
   'passkey/add',
   'passkey/wrap',
   'passkey/remove',
+  'web/signup',
+  'web/recovery',
 ] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
@@ -95,6 +97,8 @@ export const ACCOUNT_LIMITS = {
   passkeyLabelChars: 512,
   /** A serialized WebAuthn response, characters (`too_large`). */
   passkeyResponseChars: 16 * 1_024,
+  /** A Turnstile token, characters (Cloudflare's cap); longer is `bad_request`. */
+  turnstileTokenChars: 2_048,
   /** The sealed device label, b64u characters. */
   sessionDeviceChars: 512,
   /** Ended sessions (revoked or expired) are deleted after this long. */
@@ -241,6 +245,15 @@ export interface PasskeyAddFields {
   label: string | null
 }
 
+export interface WebSignupFields extends PasskeyAddFields {
+  device: string | null
+  appVersion: string | null
+}
+
+export interface WebRecoveryFields {
+  turnstileToken: unknown
+}
+
 export interface PasskeyWrapFields {
   credentialId: unknown
   wrapId: string
@@ -266,6 +279,12 @@ export const parseAppVersion = (value: unknown): string | null | undefined => {
     ? value
     : undefined
 }
+
+/** A Turnstile token: a non-empty string of at most 2,048 characters. */
+export const isTurnstileToken = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= ACCOUNT_LIMITS.turnstileTokenChars
 
 /** A wrap: b64u of `0x01 ‖ nonce[24] ‖ ciphertext[32] ‖ tag[16]`, 73 bytes. */
 export const parseWrap = (value: unknown): string | null => {
@@ -371,6 +390,15 @@ export const ACCOUNT_FIELD_PARSERS = {
   },
   'passkey/remove': (p: Fields): PasskeyRemoveFields | null =>
     p.credentialId === undefined ? null : { credentialId: p.credentialId },
+  'web/signup': (p: Fields): WebSignupFields | null => {
+    const passkey = ACCOUNT_FIELD_PARSERS['passkey/add'](p)
+    const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
+    const appVersion = parseAppVersion(p.appVersion)
+    if (!passkey || device === undefined || appVersion === undefined) return null
+    return { ...passkey, device, appVersion }
+  },
+  'web/recovery': (p: Fields): WebRecoveryFields | null =>
+    isTurnstileToken(p.turnstileToken) ? { turnstileToken: p.turnstileToken } : null,
 } satisfies Record<AccountsOp, (payload: Fields) => object | null>
 
 export type AccountFields<K extends AccountsOp> = NonNullable<
@@ -433,6 +461,13 @@ export const passkeyResponseTooLarge = (value: unknown): boolean =>
 export const passkeyAddTooLarge = (payload: unknown): boolean =>
   isPlainObject(payload) &&
   (over(payload.label, ACCOUNT_LIMITS.passkeyLabelChars) ||
+    passkeyResponseTooLarge(payload.response))
+
+/** `web/signup`'s passkey label, session device label, or response over its cap (`too_large`). */
+export const webSignupTooLarge = (payload: unknown): boolean =>
+  isPlainObject(payload) &&
+  (over(payload.label, ACCOUNT_LIMITS.passkeyLabelChars) ||
+    over(payload.device, ACCOUNT_LIMITS.sessionDeviceChars) ||
     passkeyResponseTooLarge(payload.response))
 
 // --- Sessions ----------------------------------------------------------------

@@ -41,6 +41,11 @@ ACCOUNT_TOKEN_SECRET=generate_with_openssl_rand_base64_32_local_only
 PASSKEY_CHALLENGE_SECRET=generate_with_openssl_rand_base64_32_local_only
 ACCOUNT_TICKET_SECRET=generate_with_openssl_rand_base64_32_local_only
 
+# Web sign-up and recovery's Turnstile secret. Unset, a development worker
+# uses Cloudflare's always-passing test secret; 2x0000000000000000000000000000000AA
+# fails every token. Production needs the widget's real secret.
+# TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+
 # Dedicated local admin-reset token. Do not reuse the dev-bypass token.
 ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32
 
