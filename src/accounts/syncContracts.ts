@@ -96,3 +96,90 @@ export const parseIfMatch = (header: string | null): SyncIfMatch | undefined => 
   const match = /^(?:W\/)?"([A-Za-z0-9_-]{43})"$/.exec(value)
   return match ? { etag: match[1] } : undefined
 }
+
+/**
+ * Cloud Sync photos (witness-work ADR 0040 §6, `docs/cloud-sync-photos.md`):
+ * end-to-end encrypted blobs stored once under the account, each under an
+ * immutable keyed name, in R2 `ACCOUNT_PHOTOS`.
+ */
+export const SYNC_PHOTO_LIMITS = {
+  /** One photo: an original from a modern phone camera runs to ~10 MiB. */
+  blobBytes: 25 * MIB,
+  /** Live photo blobs an account; `SYNC_PHOTO_LIMIT_BYTES` overrides it. */
+  storageBytes: 2_000_000_000,
+  /** Live photos an account: ~2,000 contacts' and notes' photos, 10 times over. */
+  livePhotos: 20_000,
+  /**
+   * Puts an account a rolling day, `existed` ones included: a first sync of
+   * the largest account fits; a runaway client stops here.
+   */
+  accountPutsPerDay: 20_000,
+  /** Bytes stored by puts an account a rolling day: twice the storage limit. */
+  accountPutBytesPerDay: 4 * 1_024 * MIB,
+  /** Gets an account a rolling day: a few devices each downloading every photo. */
+  accountGetsPerDay: 50_000,
+  /** Space a put reserved is freed this long after it began, if its commit never came. */
+  putReservationMs: 2 * MINUTE_MS,
+  /** A deleted photo's R2 object is purged this long after the delete. */
+  deletedRetentionMs: 30 * DAY_MS,
+  /** An account with no slot this long has its photos deleted by the next alarm. */
+  noSlotMs: DAY_MS,
+  /** Photos a `photos/list` page: a typical account's photos in one page, ~200 KB of JSON. */
+  listPage: 1_000,
+  /** Names a `photos/delete`: one cleanup pass's photos in a few calls. */
+  deleteNames: 100,
+  /** A sealed meta's characters: the padded 256-byte JSON sealed is ~395. */
+  metaChars: 512,
+} as const
+
+/** `b64u(HMAC-SHA256(nameKey, filename))`: what the server knows a photo by. */
+export const SYNC_PHOTO_NAME_PATTERN = /^[A-Za-z0-9_-]{43}$/
+
+export const isSyncPhotoName = (value: unknown): value is string =>
+  typeof value === 'string' && SYNC_PHOTO_NAME_PATTERN.test(value)
+
+/**
+ * The sealed filename, stored as given: unpadded base64url (no length that
+ * leaves one character over, which no bytes encode to), at most `metaChars`.
+ */
+export const isSyncPhotoMeta = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length <= SYNC_PHOTO_LIMITS.metaChars &&
+  value.length % 4 !== 1 &&
+  /^[A-Za-z0-9_-]+$/.test(value)
+
+/** A put's object: `putId` is random per put, so no two puts share a key. */
+export const syncPhotoObjectKey = (
+  accountId: string,
+  name: string,
+  putId: string
+): string => `${syncPrefix(accountId)}${name}/${putId}`
+
+export const SYNC_PHOTO_HEADERS = {
+  name: 'x-ww-photo-name',
+  meta: 'x-ww-photo-meta',
+  sha256: SYNC_HEADERS.sha256,
+  createdAt: 'x-ww-created-at',
+} as const
+
+/** The account's storage limit: `SYNC_PHOTO_LIMIT_BYTES` when it's a positive integer. */
+export const syncPhotoLimitBytes = (env: {
+  SYNC_PHOTO_LIMIT_BYTES?: string
+}): number => {
+  const value = Number(env.SYNC_PHOTO_LIMIT_BYTES?.trim() || NaN)
+  return Number.isSafeInteger(value) && value > 0
+    ? value
+    : SYNC_PHOTO_LIMITS.storageBytes
+}
+
+/** `usage` in every photo answer. */
+export type SyncPhotoUsage = { bytes: number; count: number; limit: number }
+
+export type SyncPhotoView = {
+  name: string
+  size: number
+  sha256: string
+  createdAt: number
+}
+
+export type SyncPhotoListed = SyncPhotoView & { meta: string }

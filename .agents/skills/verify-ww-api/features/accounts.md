@@ -33,6 +33,7 @@ Preconditions:
 ## Gotchas
 
 - Session envelopes (op `session/open`) are Ed25519-signed; use the e2e helpers, not hand-built curl.
+- **Cloud Sync photos.** The e2e file's photo case does slot put → live socket → photo put (`x-ww-slot-id`, the other device gets `changed`) → `existed` → list → get (bytes identical) → delete (`changed`) → usage. For the full state, start the worker with `node scripts/verify/dev.mjs up --photo-limit-bytes 2000`, put a slot (`sync/put`), then put photos past 2,000 bytes: 429 `storage_full` with `usage` and no `Retry-After`. A put on an account with no slot is 409 `no_slot`. `node scripts/verify/dev.mjs kv put sync:photos off` makes puts 503 `photos_disabled`. The local `wrangler dev` proxy waits for a request's whole declared body before the worker sees it, so prove `too_large` with a real 26,214,401-byte body; a deployed worker refuses from `Content-Length`.
 - Restore `sync:entitlement` and `sync:enabled` (`kv delete`) after flipping them; the dev vars are on and free for everyone.
 - Restore `auth:legacy` (`kv delete auth:legacy`) after flipping it, or every legacy accounts and handoff test after it gets 426.
 - Real attestations need a device and the deployed dev worker. Locally only the dev bypass opens sessions, and it reports platform `dev`.

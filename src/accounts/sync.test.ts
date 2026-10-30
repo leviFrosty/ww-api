@@ -415,6 +415,7 @@ describe('switches and entitlement', () => {
       entitlement: 'supporter',
       supporter: false,
       requestedAt: null,
+      photos: true,
     })
     supporterStatus.mockResolvedValue({ supporter: true, expiresAt: null, customers: 1 })
     resetSyncEntitlementCache()

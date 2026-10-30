@@ -80,6 +80,14 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      # The Cloud Sync photo bucket (witness-work ADR 0040): no age rule, only
+      # the multipart abort, since photos are written once.
+      - name: Ensure the Cloud Sync photo bucket
+        run: node scripts/r2-lifecycle.mjs ww-account-photos
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       # Accounts schema (src/accounts/schema.ts) before the code that needs it.
       # Already-applied migrations are skipped. The API token needs D1: Edit.
       - name: Apply accounts database migrations

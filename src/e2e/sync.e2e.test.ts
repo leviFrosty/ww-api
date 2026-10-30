@@ -220,4 +220,68 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
     expect(await status()).toMatchObject({ requestedAt: null })
     expect((await syncOp(session, 'request', { requested: 'yes' })).body.code).toBe('bad_request')
   })
+
+  it.skipIf(!LOCAL_LAUNCHER)(
+    'puts, lists, gets, and deletes a photo, telling the other device',
+    async () => {
+      const session = await openSession()
+      const phone = slot()
+      const tablet = slot()
+      expect((await put(session, phone, randomBytes(64))).status).toBe(200)
+      const tabletLive = await openLive(
+        { ...bearerHeaders(session), upgrade: 'websocket', 'x-ww-slot-id': tablet },
+        '/accounts/v1/sync/live'
+      )
+      expect(tabletLive.status).toBe(101)
+      if (tabletLive.status !== 101) return
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'hello', seq: 1 })
+
+      const name = await sha256B64u(randomBytes(16))
+      const meta = b64u(randomBytes(120))
+      // Small, so it also fits a worker started with a tiny --photo-limit-bytes.
+      const bytes = randomBytes(1_000)
+      const sha256 = await sha256B64u(bytes)
+      const photoPut = (body: Uint8Array) =>
+        httpBytes('/accounts/v1/sync/photos/put', {
+          bytes: body,
+          headers: {
+            ...bearerHeaders(session),
+            'x-ww-photo-name': name,
+            'x-ww-sha256': sha256,
+            'x-ww-photo-meta': meta,
+            'x-ww-slot-id': phone,
+          },
+        })
+      const stored = await photoPut(bytes)
+      expect(stored.status).toBe(200)
+      expect(stored.body).toMatchObject({ ok: true, name, size: 1_000, sha256, existed: false })
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'changed', seq: 2 })
+      expect((await photoPut(randomBytes(10))).body).toMatchObject({ existed: true, size: 1_000 })
+
+      const listed = await syncOp(session, 'photos/list', {})
+      expect(listed.body).toMatchObject({
+        ok: true,
+        photos: [{ name, size: 1_000, sha256, meta }],
+        cursor: null,
+      })
+      const got = await httpBytes('/accounts/v1/sync/photos/get', {
+        json: { name },
+        headers: bearerHeaders(session),
+      })
+      expect(got.status).toBe(200)
+      expect(got.bytes).toEqual(bytes)
+      expect(got.headers.get('etag')).toBe(`"${sha256}"`)
+
+      expect((await syncOp(session, 'photos/delete', { names: [name] })).body).toMatchObject({
+        ok: true,
+        usage: { bytes: 0, count: 0 },
+      })
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'changed', seq: 3 })
+      expect((await syncOp(session, 'photos/get', { name })).status).toBe(404)
+      const usage = await http('GET', '/accounts/v1/sync/photos/usage', { headers: bearerHeaders(session) })
+      expect(usage.body).toMatchObject({ ok: true, usage: { bytes: 0, count: 0 } })
+      tabletLive.connection.end()
+    }
+  )
 })
+

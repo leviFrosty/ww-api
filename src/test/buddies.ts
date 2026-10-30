@@ -122,6 +122,8 @@ export interface HarnessOptions {
   syncBucket?: boolean
   /** The `SPACES_ENABLED` var; `"true"` (dev's) by default. */
   spacesEnabled?: string
+  /** Bind the Cloud Sync photo bucket (`ACCOUNT_PHOTOS`). Default true. */
+  photoBucket?: boolean
   /**
    * Account sessions as on the dev worker (default true): a token secret,
    * `APP_ATTEST_ENVIRONMENT` development, and the dev bypass token.
@@ -146,6 +148,8 @@ export interface Harness {
   backups: MemoryR2
   /** The `ACCOUNT_SYNC` bucket (present even when unbound, for assertions). */
   syncBlobs: MemoryR2
+  /** The `ACCOUNT_PHOTOS` bucket (present even when unbound, for assertions). */
+  photoBlobs: MemoryR2
   handoffs: FakeNamespace<AccountHandoff>
   syncIndexes: FakeNamespace<AccountSync>
   /** Shared Spaces' `SHARED_SPACE` objects, one per space id. */
@@ -227,6 +231,7 @@ export const createHarness = async (
   const r2 = makeMemoryR2()
   const backups = makeMemoryR2()
   const syncBlobs = makeMemoryR2()
+  const photoBlobs = makeMemoryR2()
   const accountsDb = options.accountsDb === false ? null : makeMemoryD1()
 
   const apnsKeys = (await crypto.subtle.generateKey(
@@ -265,6 +270,7 @@ export const createHarness = async (
     ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
     ...(options.syncBucket === false ? {} : { ACCOUNT_SYNC: syncBlobs }),
+    ...(options.photoBucket === false ? {} : { ACCOUNT_PHOTOS: photoBlobs }),
     SYNC_ENABLED: 'true',
     SPACES_ENABLED: options.spacesEnabled ?? 'true',
     WEB_APP_ORIGINS: `https://app-dev.witnesswork.app,${TEST_WEB_ORIGIN}`,
@@ -329,6 +335,7 @@ export const createHarness = async (
     accountsDb,
     backups,
     syncBlobs,
+    photoBlobs,
     handoffs,
     syncIndexes,
     spaces,

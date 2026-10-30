@@ -228,6 +228,13 @@ export const BUDDIES_ERROR_STATUS = {
    * `supporter` and the account isn't a Supporter (witness-work ADR 0030).
    */
   supporter_required: 403,
+  /**
+   * A Cloud Sync `photos/put` past the account's photo storage limit. No
+   * `Retry-After`: only the User freeing space fixes it.
+   */
+  storage_full: 429,
+  /** A Cloud Sync `photos/put` on an account with no slot. */
+  no_slot: 409,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
