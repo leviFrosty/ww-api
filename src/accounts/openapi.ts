@@ -128,7 +128,14 @@ const bearerErrors = {
  * session ended is refused like an expired one.
  */
 const ENDED_SESSION =
-  'A token whose session has ended (signed out, signed out by another device, replaced, or expired) is refused the same way at once, even before the token itself expires: refreshing then fails too, and the app opens a new session.'
+  'A token whose session has ended (signed out, signed out by another device, replaced, or expired) is refused the same way at once, even before the token itself expires: refreshing then fails too, and the app opens a new session. A token from before the session’s key change (its `kep` below the session’s key epoch) is refused with `reason: "key_changed"`: refresh and retry.'
+
+/** 403 `key_retired`: when the key changed. */
+const keyRetiredSchema = apiErrorSchema.extend({
+  changedAt: epochMs('When the key was retired'),
+})
+const KEY_RETIRED =
+  'The account key was retired by a key change (`key_retired`, with `changedAt`): it never opens a session or makes an account again; sign in with the new key.'
 
 const upgradeRequired = {
   426: errorResponse(
@@ -153,6 +160,7 @@ Limits: the Buddies register tier (60 a minute per caller IP) and 2,000 registra
       z.object({ ok: z.literal(true), accountId, status })
     ),
     ...signatureErrors,
+    403: errorResponse(KEY_RETIRED, ['key_retired'], keyRetiredSchema),
     ...upgradeRequired,
     429: errorResponse('Over the per-caller rate or daily quota.', [
       'rate_limited',
@@ -168,6 +176,10 @@ const accountInfoSchema = z.object({
   accountPub: b64u('The account signing key’s public key'),
   status,
   createdAt: epochMs('When the account was registered'),
+  keyEpoch: z.number().int().meta({
+    description:
+      'The account’s key epoch: `0`, raised by one on each key change (`POST /account/rekey`).',
+  }),
   inboxIds: z.array(buddiesId('An inbox linked to the account')),
   statusChanges: z.array(
     z.object({ status, createdAt: epochMs('When it changed') })
@@ -810,6 +822,9 @@ const sessionOpenPayload = z.object({
   capabilities: z.array(z.string()).optional().meta({
     description: 'What the app does, so ww-api knows what it may send it: `sync-everyone` (it turns Cloud Sync on by itself only for a new install; without it, `everyone`’s Cloud Sync is a Supporter benefit for this session). At most 16 names of at most 32 characters (`a-z0-9-`); unknown names are ignored.',
   }),
+  accountId: buddiesId(
+    'The account the device expects: the session opens only if `accountPub` is its current key (404 `unknown_account` otherwise), and never creates an account'
+  ).optional(),
 })
 
 /** `attestation_failed` and the attestation `bad_request`s carry these. */
@@ -871,7 +886,7 @@ export const sessionOpenDocs = describeRoute({
   summary: 'Open a session',
   description: `The one place an account proves it’s the app. First get a challenge from \`POST /attestation/v1/challenge\` with \`purpose: "account-session"\` and both hashes set to the hash of \`accountPub\`: an App Attest v2 \`assert\` challenge on iOS (the install’s key, bound through \`POST /attestation/v1/register\`), or a Play Integrity v1 challenge on Android (\`attestationProvider: "play-integrity"\`). Then send this envelope, self-signed by the account key (op \`session/open\`) and carrying the answer: the signature covers the attestation and the attestation covers \`accountPub\`.
 
-Creates the account when the key has none (it replaces \`account/register\`). A suspended account still gets a session (\`status: suspended\`). Opening an eleventh live phone session for an account ends its oldest.
+Creates the account when the key has none (it replaces \`account/register\`), unless the payload names \`accountId\`: then it opens only into that account, when \`accountPub\` is its current key. A key a key change retired is \`key_retired\` whichever way the session opens, and never makes an account. A suspended account still gets a session (\`status: suspended\`). Opening an eleventh live phone session for an account ends its oldest.
 
 **Web sessions:** a browser sends \`ticket\` (from \`POST /passkeys/assert\`, \`approval/receive\`, or \`web/recovery\`) in place of \`attestation\`. The ticket’s account must be \`accountPub\`’s and exist (a ticket never creates one; \`ticket_invalid\` otherwise). The session’s platform is \`web\`; it lasts 180 days from its last refresh, with no absolute limit, and counts as stepped up when it opens. At most 3 web sessions an account, apart from the phones’ 10: a fourth ends the least recently active (\`session.replaced\`). The same signed request again (same \`nonce\` and ticket) within the ticket’s 2 minutes, after a lost response, gets the same session, a new access token, and the same refresh token (or, if that one was refreshed in the last minute, the token it was replaced by), so the first answer’s refresh token never counts as reused. An \`approval\` ticket opens a session only while the phone session that approved is live. Answers 201 with \`Location: /accounts/v1/sessions/current\`, the session the new access token addresses.
 
@@ -922,9 +937,15 @@ ${fieldTable(playIntegritySessionAttestation)}`
     ),
     401: signatureErrors[401],
     403: errorResponse(
-      'The attestation was refused (there’s no fallback: no attestation, no session), or a browser’s ticket is malformed, expired, used, or for another account (`ticket_invalid`).',
-      ['attestation_failed', 'ticket_invalid'],
-      sessionAttestationErrorSchema
+      `The attestation was refused (there’s no fallback: no attestation, no session), or a browser’s ticket is malformed, expired, used, or for another account (\`ticket_invalid\`). ${KEY_RETIRED}`,
+      ['attestation_failed', 'ticket_invalid', 'key_retired'],
+      sessionAttestationErrorSchema.extend({
+        changedAt: epochMs('`key_retired`: when the key was retired').optional(),
+      })
+    ),
+    404: errorResponse(
+      'The payload named `accountId`, and `accountPub` isn’t that account’s current key.',
+      ['unknown_account']
     ),
     413: errorResponse('`device` is over 512 characters.', ['too_large']),
     429: errorResponse(
@@ -934,6 +955,112 @@ ${fieldTable(playIntegritySessionAttestation)}`
     ),
     ...internal,
     ...sessionsOff,
+  },
+})
+
+const rekeyPayload = {
+  newAccountPub: b64u('The new account signing key’s public key, 32 bytes; not any account’s key or a retired one'),
+  keyEpoch: z.number().int().meta({
+    description: 'The account’s key epoch as the device read it (`GET /account`); the swap happens only while it’s still the account’s.',
+  }),
+  device: b64u('The caller’s device label re-sealed under the new key (AAD `"ww-account/v1/device\\n" + newAccountPub`), at most 512 characters').optional(),
+  history: b64u('The key history, sealed under the new key’s history key; stored opaque, at most 65,536 characters'),
+  passkeyWrap: z
+    .object({
+      credentialId: b64u('The passkey of this session’s step-up'),
+      wrapId: buddiesId('A fresh id for the wrap'),
+      wrap: b64u('The new account key wrapped for the new epoch, 98 characters'),
+    })
+    .optional()
+    .meta({
+      description:
+        'A wrap of the new key from the passkey of this session’s step-up (any platform’s session that passed one); `credentialId` must be that passkey.',
+    }),
+}
+
+export const accountRekeyDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Change the account key',
+  description: `The same account under a new key (witness-work ADR 0039). Bearer with a live session, **and** the current key’s envelope (op \`account/rekey\`, each envelope works once), **and** \`newSignature\`: the new key’s signature over \`ww-account/v1\\naccount/rekey/new\\n\` followed by the same decoded \`payload\` bytes, so nobody can move an account to a key they don’t hold.
+
+**Who may:** an attested phone session (\`ios\`, \`android\`, \`dev\`) at any age; a web session at least 24 hours old (\`session_too_new\`) that passed a step-up in the last 5 minutes (\`step_up_required\`). A suspended account may.
+
+**One batch:** the account’s key and epoch are swapped only while they’re still the payload’s (409 \`conflict\` with the account’s \`keyEpoch\` otherwise, so of two devices changing the key at once one wins); the old key is retired for good (\`key_retired\` on every session open); every other session ends (\`session.revoked\`, with this one as actor); this session takes the new epoch and \`device\`; every passkey wrap is deleted and \`passkeyWrap\` stored for the new epoch; the key history is stored; \`account.key_changed\` is logged. Then every Cloud Sync socket of the account closes with \`4005 "key_changed"\`.
+
+The answer’s access token carries the new epoch; the refresh token is unchanged, and its next refresh carries the new epoch too. A lost answer isn’t retried with the same envelope: refresh, then \`GET /account\` says whether the key changed. ${ENDED_SESSION}
+
+Limits: 3 changes per account a rolling day and 10 a rolling 30 days, and the Buddies register tier (60 a minute per caller IP).`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    signedEnvelopeSchema.extend({
+      newSignature: b64u('The new key’s Ed25519 signature over `ww-account/v1\\naccount/rekey/new\\n` and the decoded payload'),
+    }),
+    `\`signature\` is the current key’s signature over \`ww-account/v1\\naccount/rekey\\n\` followed by the decoded \`payload\` bytes.
+
+**Decoded \`payload\`:**
+
+${fieldTable(z.object({ ...keyPayloadShape, ...rekeyPayload }))}`
+  ),
+  responses: {
+    200: jsonResponse(
+      'The key changed.',
+      z.object({
+        ok: z.literal(true),
+        keyEpoch: z.number().int().meta({ description: 'The new key epoch.' }),
+        accessToken: tokenPair.accessToken,
+        accessExpiresAt: tokenPair.accessExpiresAt,
+      })
+    ),
+    400: errorResponse('Malformed envelope or payload, or the same key twice.', ['bad_request']),
+    401: errorResponse(
+      `The token is missing, expired, or invalid (\`unauthorized\`); a signature is bad (\`bad_signature\`), or \`ts\` is more than 5 minutes off (\`stale\`). ${ENDED_SESSION} A session that ends while the change runs is \`unauthorized\` with its \`reason\` (\`revoked\`, \`replaced\`, \`expired\`), never a \`conflict\`: the key didn’t change.`,
+      ['unauthorized', 'bad_signature', 'stale'],
+      staleErrorSchema
+    ),
+    403: errorResponse(
+      'The envelope’s key isn’t the account’s (`forbidden`), or the web session is younger than 24 hours (`session_too_new`) or needs a step-up (`step_up_required`).',
+      ['forbidden', 'session_too_new', 'step_up_required']
+    ),
+    404: errorResponse('`passkeyWrap` names a credential other than this session’s step-up passkey.', ['not_found']),
+    409: errorResponse(
+      'The key or epoch changed first (`keyEpoch` says the account’s now), the new key is in use or retired, or this envelope was already used (`replay`).',
+      ['conflict', 'replay'],
+      apiErrorSchema.extend({
+        keyEpoch: z.number().int().optional().meta({ description: 'The account’s key epoch now.' }),
+      })
+    ),
+    413: errorResponse('`history` or `device` is over its cap.', ['too_large']),
+    429: errorResponse('Over the per-caller rate, or the account’s key changes a day or 30 days.', ['rate_limited']),
+    ...internal,
+    ...sessionsOff,
+  },
+})
+
+export const accountKeyHistoryDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Read the key history',
+  description: `The key history blob the account’s last key change stored, sealed by the devices under a key from the current account key; the server can’t read it. Needs a live session. Not logged.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse(
+      'The key history.',
+      z.object({
+        ok: z.literal(true),
+        keyEpoch: z.number().int().meta({ description: 'The account’s key epoch.' }),
+        history: z.string().nullable().meta({
+          description: 'The sealed blob, or `null` for an account whose key never changed.',
+        }),
+      })
+    ),
+    401: errorResponse(
+      `Missing, expired, or invalid token (\`WWW-Authenticate: Bearer error="invalid_token"\`). ${ENDED_SESSION}`,
+      ['unauthorized']
+    ),
+    429: errorResponse('Over the per-caller rate.', ['rate_limited']),
+    ...internal,
+    503: errorResponse('Accounts are off on this worker.', ['disabled']),
   },
 })
 
@@ -1462,6 +1589,10 @@ export const syncPutDocs = describeRoute({
 
 \`If-Match: "<etag>"\` puts only while the slot still holds that ETag, and \`If-Match: *\` only while the slot exists (412 \`precondition_failed\` otherwise). Without it the put replaces whatever is there.
 
+**Re-sealing** (\`x-ww-reseal: 1\`): after a key change, a device re-seals every slot, other devices’ too, under the new key. The slot keeps the session and platform that wrote it and its \`updatedAt\`, so retention and the Cloud Sync request see no new write. It needs \`If-Match: "<etag>"\` with the strong ETag the device read (400 \`bad_request\` without one or with a weak \`W/"…"\` one, and 412 when the slot changed since, so a re-seal never overwrites newer bytes), the slot must exist, and it’s allowed only within 7 days of the account’s last key change (403 \`forbidden\`).
+
+Needs a live session: ${ENDED_SESSION}
+
 ${SYNC_ENTITLED}
 
 Limits: 20 MiB a blob, 20 slots an account (new slots only), one put a slot every 2 seconds (and one at a time), 1,000 puts and 2 GiB an account a rolling day, and the Buddies write tier (600 a minute per caller IP). ${syncNotes}
@@ -1497,6 +1628,13 @@ ${ID_IN_BODY}`,
       schema: { type: 'string' as const },
       description: '`"<etag>"` or `*`; see above.',
     },
+    {
+      name: 'x-ww-reseal',
+      in: 'header' as const,
+      required: false,
+      schema: { type: 'string' as const, enum: ['1'] },
+      description: '`1` to re-seal an existing slot after a key change, with a strong quoted-ETag `If-Match`; see above. Any other value is `bad_request`.',
+    },
   ],
   requestBody: { required: true, ...syncBinary('The encrypted snapshot.') },
   responses: {
@@ -1515,12 +1653,15 @@ ${ID_IN_BODY}`,
       ['bad_request']
     ),
     401: bearerReadErrors[401],
-    ...syncUnentitled,
+    403: errorResponse(
+      'Cloud Sync was made a Supporter benefit again (KV `sync:entitlement` is `supporter`) and the account isn’t one (`supporter_required`), or a re-seal came more than 7 days after the account’s last key change (`forbidden`).',
+      ['supporter_required', 'forbidden']
+    ),
     409: errorResponse(
       'The slot was deleted while this put was uploading; nothing was stored.',
       ['conflict']
     ),
-    412: errorResponse('`If-Match` didn’t match the slot.', [
+    412: errorResponse('`If-Match` didn’t match the slot, or a re-seal named a slot that doesn’t exist.', [
       'precondition_failed',
     ]),
     413: errorResponse('Over 20 MiB, refused from `Content-Length`.', [

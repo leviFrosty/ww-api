@@ -189,7 +189,10 @@ const handlePut = guarded('backup/put', async (c) => {
         customMetadata: { uploadedAt: String(now) },
       })
       return c.json({ ok: true, uploadedAt: now })
-    }
+    },
+    // A signed-out device's last token never writes over a backup
+    // re-sealed under a new account key (ADR 0039).
+    { requireLiveSession: true }
   )
 })
 

@@ -5,10 +5,12 @@ import {
   accountInboxes,
   accountStatusEvents,
   accounts,
+  retiredAccountKeys,
   type AccountStatus,
   type AccountStatusReason,
 } from './schema'
 import { activityInsert } from './activity'
+import { buddiesErrorResponse } from '../buddies/errorResponse'
 
 export const accountsDb = (d1: D1Database) => drizzle(d1)
 export type AccountsDb = ReturnType<typeof accountsDb>
@@ -25,12 +27,15 @@ export interface AccountRecord {
   id: string
   accountPub: string
   status: AccountStatus
+  /** Raised by each key change (ADR 0039); `0` for a new account. */
+  keyEpoch: number
 }
 
 const accountColumns = {
   id: accounts.id,
   accountPub: accounts.accountPub,
   status: accounts.status,
+  keyEpoch: accounts.keyEpoch,
 }
 
 export const findAccount = async (
@@ -53,26 +58,97 @@ export const findAccountByPub = async (
     .where(eq(accounts.accountPub, accountPub))
     .get()) ?? null
 
+/** When the account key last changed (epoch ms), or null if it never has. */
+export const findKeyChangedAt = async (
+  db: AccountsDb,
+  accountId: string
+): Promise<number | null> =>
+  (
+    await db
+      .select({ at: accounts.keyChangedAt })
+      .from(accounts)
+      .where(eq(accounts.id, accountId))
+      .get()
+  )?.at?.getTime() ?? null
+
+/** A key a key change retired (ADR 0039). */
+export interface RetiredKey {
+  accountId: string
+  /** The account's key epoch while this was its key. */
+  keyEpoch: number
+  /** When it was retired, epoch ms. */
+  retiredAt: number
+}
+
+export const findRetiredKey = async (
+  db: AccountsDb,
+  accountPub: string
+): Promise<RetiredKey | null> => {
+  const row = await db
+    .select({
+      accountId: retiredAccountKeys.accountId,
+      keyEpoch: retiredAccountKeys.keyEpoch,
+      retiredAt: retiredAccountKeys.retiredAt,
+    })
+    .from(retiredAccountKeys)
+    .where(eq(retiredAccountKeys.accountPub, accountPub))
+    .get()
+  return row ? { ...row, retiredAt: row.retiredAt.getTime() } : null
+}
+
+/** Whether `accountPub` is retired (a condition for a batch's statements). */
+export const isRetiredKey = (accountPub: string) =>
+  sql`EXISTS (SELECT 1 FROM ${retiredAccountKeys}
+    WHERE ${retiredAccountKeys.accountPub} = ${accountPub})`
+
+/** 403 `key_retired`, with when the key changed (`changedAt`, epoch ms). */
+export const keyRetiredResponse = (retired: RetiredKey): Response =>
+  buddiesErrorResponse('key_retired', {
+    extras: { changedAt: retired.retiredAt },
+  })
+
 /**
- * The account for this public key, created with `newId` if there is none.
- * Idempotent: the same key always gets the same account, including when two
- * devices register it at once.
+ * 403 `key_retired` when a key change retired `accountPub` (ADR 0039); null
+ * otherwise. Every way into an account asks before its attestation, ticket,
+ * or Turnstile, and again when its write found the key gone.
+ */
+export const refuseRetiredKey = async (
+  db: AccountsDb,
+  accountPub: string
+): Promise<Response | null> => {
+  const retired = await findRetiredKey(db, accountPub)
+  return retired ? keyRetiredResponse(retired) : null
+}
+
+/**
+ * The account for this public key, created with `newId` if there is none,
+ * or `retired` for a key a key change retired, which never creates one
+ * (checked in the insert itself, so a key retired a moment ago can't slip
+ * in). Idempotent: the same key always gets the same account, including when
+ * two devices register it at once.
  */
 export const registerAccount = async (
   db: AccountsDb,
   accountPub: string,
   newId: () => string
-): Promise<AccountRecord> => {
+): Promise<{ account: AccountRecord } | { retired: RetiredKey }> => {
   const existing = await findAccountByPub(db, accountPub)
-  if (existing) return existing
+  if (existing) return { account: existing }
+  const retiredBefore = await findRetiredKey(db, accountPub)
+  if (retiredBefore) return { retired: retiredBefore }
   // `account.created` only when this insert made the row: a racing device
   // that won leaves no row under this id.
   const id = newId()
   await db.batch([
-    db
-      .insert(accounts)
-      .values({ id, accountPub })
-      .onConflictDoNothing({ target: accounts.accountPub }),
+    // Columns in the table's order (see `activityInsert`): id, account_pub,
+    // status, created_at, passkey_user_handle, key_epoch, created_via,
+    // key_changed_at. The literals are the schema's defaults; an insert-select
+    // because a plain insert can't carry the retired-key condition.
+    db.insert(accounts).select(
+      sql`SELECT ${id}, ${accountPub}, 'active', ${Date.now()}, NULL, 0, 'app', NULL
+        WHERE NOT ${isRetiredKey(accountPub)}
+        ON CONFLICT (account_pub) DO NOTHING`
+    ),
     activityInsert(
       db,
       { accountId: id, kind: 'account.created' },
@@ -80,8 +156,10 @@ export const registerAccount = async (
     ),
   ])
   const account = await findAccountByPub(db, accountPub)
-  if (!account) throw new Error('accounts: registered account is missing')
-  return account
+  if (account) return { account }
+  const retired = await findRetiredKey(db, accountPub)
+  if (retired) return { retired }
+  throw new Error('accounts: registered account is missing')
 }
 
 /** The account that owns this inbox, or null when none has claimed it. */

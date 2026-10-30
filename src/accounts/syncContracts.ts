@@ -43,6 +43,11 @@ export const SYNC_LIMITS = {
   retentionCheckMs: DAY_MS,
   /** A Cloud Sync request lapses this long after it was last asked for. */
   requestLapseMs: 30 * DAY_MS,
+  /**
+   * A re-seal put (`x-ww-reseal: 1`) is allowed this long after the
+   * account's last key change (ADR 0039).
+   */
+  resealWindowMs: 7 * DAY_MS,
 } as const
 
 /** The device's sync id: the `<deviceId>` in `witness-work-<deviceId>.json`. */
@@ -74,6 +79,11 @@ export const SYNC_HEADERS = {
    * client copy is dropped, so a native socket never has one.
    */
   expiresAt: 'x-ww-sync-expires-at',
+  /**
+   * `1` on a `sync/put` that re-seals a slot under a new account key (ADR
+   * 0039): the slot keeps its session, platform, and `updatedAt`.
+   */
+  reseal: 'x-ww-reseal',
 } as const
 
 /** Live socket messages: change notices only, never data. */
@@ -83,6 +93,11 @@ export const SYNC_LIVE_CLOSE = {
   replaced: { code: 4000, reason: 'replaced' },
   /** A browser socket's token expired (`LIVE_EXPIRED_CLOSE`). */
   expired: LIVE_EXPIRED_CLOSE,
+  /**
+   * The account key changed (ADR 0039): every socket of the account closes,
+   * and the device that changed it reconnects with its new token.
+   */
+  keyChanged: { code: 4005, reason: 'key_changed' },
 } as const
 
 /** `If-Match`: a quoted ETag, or `*` (the slot exists). */

@@ -249,6 +249,7 @@ describe('account/info', () => {
         accountPub: account.key.publicKey,
         status: 'active',
         createdAt: START,
+        keyEpoch: 0,
         inboxIds: [owner.inboxId],
         statusChanges: [
           { status: 'suspended', createdAt: START + 60_000 },

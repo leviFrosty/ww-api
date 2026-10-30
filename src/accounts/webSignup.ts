@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import type { AppContext, Environment } from '../types'
 import { captureFailure } from '../sentry'
 import { bytesToBase64Url } from '../crypto'
@@ -13,7 +14,14 @@ import {
   refuseOverDailyQuota,
   verifiedBody,
 } from './signed'
-import { accountsDb, findAccountByPub, newAccountId, type AccountsDb } from './store'
+import {
+  accountsDb,
+  findAccountByPub,
+  isRetiredKey,
+  refuseRetiredKey,
+  newAccountId,
+  type AccountsDb,
+} from './store'
 import { activityInsert } from './activity'
 import { accessTokenKeys, type AccessTokenKeys } from './tokens'
 import { accounts } from './schema'
@@ -325,8 +333,9 @@ const handleSignup = guarded('web/signup', async (c) => {
   if (!claims || claims.purpose !== 'signup' || !claims.accountId || !claims.userHandle)
     return passkeyFailed('challenge')
   if (await findUsedToken(db, claims.id)) return passkeyFailed('challenge')
-  // TODO(ADR 0039): refuse a retired account key (`key_retired`) here too,
-  // once key changes record them.
+  // A retired key never makes an account (ADR 0039).
+  const retired = await refuseRetiredKey(db, accountPub)
+  if (retired) return retired
   if (await findAccountByPub(db, accountPub)) return buddiesErrorResponse('conflict')
 
   const registration = await verifyRegistration(
@@ -360,6 +369,8 @@ const handleSignup = guarded('web/signup', async (c) => {
   const accountId = claims.accountId
   const { statements, issued } = await prepareSession(db, setup.keys.current, {
     accountId,
+    accountPub,
+    keyEpoch: 0,
     platform: 'web',
     device: fields.device,
     method: 'signup',
@@ -373,13 +384,15 @@ const handleSignup = guarded('web/signup', async (c) => {
       db.batch([
         usedTokenInsert(db, nonce),
         usedTokenInsert(db, { id: claims.id, expiresAt: claims.expiresAt }),
-        db.insert(accounts).values({
-          id: accountId,
-          accountPub,
-          passkeyUserHandle: claims.userHandle,
-          createdVia: 'web',
-          createdAt: new Date(now),
-        }),
+        // Never for a retired key, checked in the insert itself: without
+        // the account the rest of the batch fails its foreign keys. Columns
+        // in the table's order (`registerAccount` lists them); the literals
+        // are the defaults, but `created_via` is `web` and the handle is set.
+        db.insert(accounts).select(
+          sql`SELECT ${accountId}, ${accountPub}, 'active', ${now},
+              ${claims.userHandle}, 0, 'web', NULL
+            WHERE NOT ${isRetiredKey(accountPub)}`
+        ),
         activityInsert(db, { accountId, kind: 'account.created' }, { now }),
         passkeyInsert(
           db,
@@ -420,6 +433,8 @@ const handleSignup = guarded('web/signup', async (c) => {
     )
   } catch (error) {
     await refund()
+    const retiredSince = await refuseRetiredKey(db, accountPub)
+    if (retiredSince) return retiredSince
     // A racing sign-up with the same key, or the same credential.
     if (
       (await findAccountByPub(db, accountPub)) ||
@@ -447,7 +462,8 @@ const handleSignup = guarded('web/signup', async (c) => {
  * order: the envelope (used once: `replay`), the cap checked
  * (`WEB_RECOVERY_PER_IP_DAY`, 10 per caller IP a rolling day), Turnstile
  * (`web-recovery`), the cap taken, then the account (404 `unknown_account`:
- * the web never creates an account from a recovery key). Only a request
+ * the web never creates an account from a recovery key; 403 `key_retired`
+ * for a key a key change replaced). Only a request
  * that passed Siteverify counts, so junk can't lock a shared IP out; a
  * counter outage lets it through, since the envelope already proves the key.
  */
@@ -472,7 +488,13 @@ const handleRecovery = guarded('web/recovery', async (c) => {
 
   if (!(await claimNonce(setup.db, nonce))) return buddiesErrorResponse('replay')
   const account = await findAccountByPub(setup.db, verified.payload.accountPub)
-  if (!account) return buddiesErrorResponse('unknown_account')
+  if (!account) {
+    // A recovery key a key change replaced (ADR 0039).
+    return (
+      (await refuseRetiredKey(setup.db, verified.payload.accountPub)) ??
+      buddiesErrorResponse('unknown_account')
+    )
+  }
   const { ticket, claims } = await issueTicket(c.env, {
     kind: 'recovery',
     accountId: account.id,

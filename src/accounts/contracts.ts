@@ -34,6 +34,7 @@ export const ACCOUNTS_OPS = [
   'passkey/remove',
   'web/signup',
   'web/recovery',
+  'account/rekey',
 ] as const
 export type AccountsOp = (typeof ACCOUNTS_OPS)[number]
 
@@ -119,6 +120,13 @@ export const ACCOUNT_LIMITS = {
   approvalFarKm: 200,
   /** Ended sessions (revoked or expired) are deleted after this long. */
   endedSessionRetentionMs: 7 * DAY_MS,
+  /** A key change's sealed key history, characters (`too_large`). */
+  keyHistoryChars: 64 * 1_024,
+  /** A web session this young can't change the account key (`session_too_new`). */
+  keyChangeSessionAgeMs: DAY_MS,
+  /** Key changes per account a rolling day, and a rolling 30 days. */
+  keyChangesPerDay: 3,
+  keyChangesPer30Days: 10,
 } as const
 
 /** A slot's R2 object key; `v1/<accountId>/` lists an account's slots. */
@@ -136,6 +144,16 @@ const concat = (prefix: Uint8Array, rest: Uint8Array): Uint8Array => {
   message.set(rest, prefix.byteLength)
   return message
 }
+
+/**
+ * What the new key signs on `account/rekey` (`newSignature`): the same
+ * payload under its own op line, so neither signature passes for the other.
+ */
+export const REKEY_NEW_KEY_OP = 'account/rekey/new'
+
+/** The bytes `newSignature` covers. */
+export const rekeyNewKeyMessage = (payloadBytes: Uint8Array): Uint8Array =>
+  concat(encoder.encode(`${SIGNING_CONTEXT}${REKEY_NEW_KEY_OP}\n`), payloadBytes)
 
 /** The bytes an account op's signature covers: context, op, then `payload` decoded. */
 export const accountSignedMessage = (
@@ -252,6 +270,11 @@ export interface SessionOpenFields {
   ticket: string | null
   appVersion: string | null
   capabilities: SessionCapability[] | null
+  /**
+   * The account the device expects the key to be (ADR 0039): the session
+   * opens only into it, never creating one.
+   */
+  accountId: string | null
 }
 
 export interface PasskeyAddFields {
@@ -281,6 +304,17 @@ export interface PasskeyWrapFields {
 
 export interface PasskeyRemoveFields {
   credentialId: unknown
+}
+
+export interface AccountRekeyFields {
+  newAccountPub: string
+  keyEpoch: number
+  /** The caller's label re-sealed under the new key. */
+  device: string | null
+  /** The key history, sealed under the new key; stored opaque. */
+  history: string
+  /** A wrap of the new key from the step-up's passkey. */
+  passkeyWrap: { credentialId: unknown; wrapId: string; wrap: string } | null
 }
 
 const APP_VERSION_PATTERN = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/
@@ -414,9 +448,11 @@ export const ACCOUNT_FIELD_PARSERS = {
     const appVersion = parseAppVersion(p.appVersion)
     const capabilities = parseCapabilities(p.capabilities)
     const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
+    const accountId = p.accountId ?? null
+    if (accountId !== null && !isAccountId(accountId)) return null
     if (appVersion === undefined || capabilities === undefined || device === undefined)
       return null
-    return { attestation, device, ticket, appVersion, capabilities }
+    return { attestation, device, ticket, appVersion, capabilities, accountId }
   },
   // The envelope proves the account key: a leaked token alone can't ask.
   'sync/request': (): Fields => ({}),
@@ -457,6 +493,30 @@ export const ACCOUNT_FIELD_PARSERS = {
   },
   'web/recovery': (p: Fields): WebRecoveryFields | null =>
     isTurnstileToken(p.turnstileToken) ? { turnstileToken: p.turnstileToken } : null,
+  'account/rekey': (p: Fields): AccountRekeyFields | null => {
+    const newAccountPub = publicKey(p.newAccountPub)
+    const keyEpoch = p.keyEpoch
+    const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
+    const history = sealed(p.history, ACCOUNT_LIMITS.keyHistoryChars)
+    if (!newAccountPub || !history || device === undefined) return null
+    if (typeof keyEpoch !== 'number' || !Number.isSafeInteger(keyEpoch) || keyEpoch < 0)
+      return null
+    const wrap = p.passkeyWrap
+    if (wrap === undefined || wrap === null)
+      return { newAccountPub, keyEpoch, device, history, passkeyWrap: null }
+    if (!isPlainObject(wrap) || wrap.credentialId === undefined) return null
+    const wrapId = id16(wrap.wrapId)
+    const sealedWrap = parseWrap(wrap.wrap)
+    return wrapId && sealedWrap
+      ? {
+          newAccountPub,
+          keyEpoch,
+          device,
+          history,
+          passkeyWrap: { credentialId: wrap.credentialId, wrapId, wrap: sealedWrap },
+        }
+      : null
+  },
 } satisfies Record<AccountsOp, (payload: Fields) => object | null>
 
 export type AccountFields<K extends AccountsOp> = NonNullable<
@@ -509,6 +569,12 @@ export const handoffBlobTooLarge = (body: unknown): boolean => {
 export const sessionDeviceTooLarge = (payload: unknown): boolean =>
   isPlainObject(payload) &&
   over(payload.device, ACCOUNT_LIMITS.sessionDeviceChars)
+
+/** A key change's history or device label over its cap (`too_large`). */
+export const rekeyTooLarge = (payload: unknown): boolean =>
+  isPlainObject(payload) &&
+  (over(payload.history, ACCOUNT_LIMITS.keyHistoryChars) ||
+    over(payload.device, ACCOUNT_LIMITS.sessionDeviceChars))
 
 /** A serialized WebAuthn response over 16 KiB (`too_large`). */
 export const passkeyResponseTooLarge = (value: unknown): boolean =>

@@ -414,12 +414,13 @@ describe('put, list, get, delete, usage', () => {
     expectExactUsage(s)
   })
 
-  it('needs a live session to delete every photo, not some', async () => {
+  it('needs a live session to put or delete photos', async () => {
     const s = await session()
     const [photo] = await seed(s, 1)
     await requestJson(app as never, h.env, 'DELETE', '/sessions/current', undefined, bearer(s.accessToken))
     expect((await del(s, { all: true })).status).toBe(401)
-    expect((await del(s, { names: [photo] })).status).toBe(200)
+    expect((await del(s, { names: [photo] })).status).toBe(401)
+    expect((await put(s, await name())).status).toBe(401)
   })
 
   it('always reads the body to the end, even when it doesn’t need it', async () => {
