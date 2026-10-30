@@ -89,6 +89,9 @@ export const ACCOUNT_LIMITS = {
   stepUpMs: 5 * MINUTE_MS,
   /** `appVersion`, characters. */
   appVersionChars: 32,
+  /** `capabilities`: entries, and characters each. */
+  capabilities: 16,
+  capabilityChars: 32,
   /** Passkeys per account (`limit`). */
   passkeysPerAccount: 10,
   /** Wraps kept per credential; a fifth replaces the oldest. */
@@ -248,6 +251,7 @@ export interface SessionOpenFields {
   /** A browser's ticket in place of `attestation` (passkeys protocol). */
   ticket: string | null
   appVersion: string | null
+  capabilities: SessionCapability[] | null
 }
 
 export interface PasskeyAddFields {
@@ -261,6 +265,7 @@ export interface PasskeyAddFields {
 export interface WebSignupFields extends PasskeyAddFields {
   device: string | null
   appVersion: string | null
+  capabilities: SessionCapability[] | null
 }
 
 export interface WebRecoveryFields {
@@ -291,6 +296,42 @@ export const parseAppVersion = (value: unknown): string | null | undefined => {
     APP_VERSION_PATTERN.test(value)
     ? value
     : undefined
+}
+
+/**
+ * What an app says it does, on session open and refresh. `sync-everyone`:
+ * it turns Cloud Sync on by itself only for a new install, so `everyone`'s
+ * Cloud Sync may reach it (witness-work ADR 0040 §2).
+ */
+export const SESSION_CAPABILITIES = ['sync-everyone'] as const
+export type SessionCapability = (typeof SESSION_CAPABILITIES)[number]
+
+const CAPABILITY_PATTERN = /^[a-z0-9-]+$/
+
+/**
+ * An optional `capabilities` (an array of at most 16 names of at most 32
+ * characters, `a-z0-9-`): the known ones, once each; null when absent,
+ * undefined when malformed (`bad_request`). Names this server doesn't know
+ * are dropped, so a newer app can send ones it adds later.
+ */
+export const parseCapabilities = (
+  value: unknown
+): SessionCapability[] | null | undefined => {
+  if (value === undefined || value === null) return null
+  if (!Array.isArray(value) || value.length > ACCOUNT_LIMITS.capabilities)
+    return undefined
+  const known = new Set<SessionCapability>()
+  for (const name of value) {
+    if (
+      typeof name !== 'string' ||
+      name.length > ACCOUNT_LIMITS.capabilityChars ||
+      !CAPABILITY_PATTERN.test(name)
+    )
+      return undefined
+    if ((SESSION_CAPABILITIES as readonly string[]).includes(name))
+      known.add(name as SessionCapability)
+  }
+  return [...known]
 }
 
 /** A Turnstile token: a non-empty string of at most 2,048 characters. */
@@ -371,9 +412,11 @@ export const ACCOUNT_FIELD_PARSERS = {
     // A ticket stands in for the attestation; never both.
     if (ticket !== null && attestation !== null) return null
     const appVersion = parseAppVersion(p.appVersion)
+    const capabilities = parseCapabilities(p.capabilities)
     const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
-    if (appVersion === undefined || device === undefined) return null
-    return { attestation, device, ticket, appVersion }
+    if (appVersion === undefined || capabilities === undefined || device === undefined)
+      return null
+    return { attestation, device, ticket, appVersion, capabilities }
   },
   // The envelope proves the account key: a leaked token alone can't ask.
   'sync/request': (): Fields => ({}),
@@ -407,8 +450,10 @@ export const ACCOUNT_FIELD_PARSERS = {
     const passkey = ACCOUNT_FIELD_PARSERS['passkey/add'](p)
     const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
     const appVersion = parseAppVersion(p.appVersion)
-    if (!passkey || device === undefined || appVersion === undefined) return null
-    return { ...passkey, device, appVersion }
+    const capabilities = parseCapabilities(p.capabilities)
+    if (!passkey || device === undefined || appVersion === undefined || capabilities === undefined)
+      return null
+    return { ...passkey, device, appVersion, capabilities }
   },
   'web/recovery': (p: Fields): WebRecoveryFields | null =>
     isTurnstileToken(p.turnstileToken) ? { turnstileToken: p.turnstileToken } : null,

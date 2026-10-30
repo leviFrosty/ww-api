@@ -1,4 +1,5 @@
 import type { Environment } from '../types'
+import type { SessionCapability } from './contracts'
 
 /**
  * Cloud Sync's switches (witness-work ADR 0030), both in `NOTES_KV` and
@@ -72,3 +73,21 @@ export const syncSwitches = async (
   ])
   return { enabled, entitlement }
 }
+
+/** The capability `everyone`'s Cloud Sync needs. */
+export const SYNC_EVERYONE_CAPABILITY: SessionCapability = 'sync-everyone'
+
+/**
+ * The entitlement an app sees: `everyone` reaches only apps (and browsers)
+ * that send the `sync-everyone` capability, which turn Cloud Sync on by
+ * themselves only for a new install. Apps that never send it, at any version,
+ * keep the Supporter rule: they turn it on for any device that never chose
+ * (witness-work ADR 0040 §2).
+ */
+export const entitlementForApp = (
+  entitlement: SyncEntitlement,
+  capabilities: readonly string[] | null | undefined
+): SyncEntitlement =>
+  entitlement === 'everyone' && capabilities?.includes(SYNC_EVERYONE_CAPABILITY)
+    ? 'everyone'
+    : 'supporter'

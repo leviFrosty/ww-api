@@ -30,7 +30,7 @@ afterEach(() => {
 describe('GET /app/v1/config', () => {
   it('serves the minimum version uncached, without authentication', async () => {
     const response = await app.fetch(
-      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config?capabilities=sync-everyone'),
       await env('{"minVersion":"1.42.0"}')
     )
     expect(response.status).toBe(200)
@@ -45,7 +45,7 @@ describe('GET /app/v1/config', () => {
 
   it('leaves minAppVersion out without a floor', async () => {
     const response = await app.fetch(
-      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config?capabilities=sync-everyone'),
       await env()
     )
     expect(await response.json()).toEqual({
@@ -64,7 +64,7 @@ describe('GET /app/v1/config', () => {
       for (const [key, value] of Object.entries(kv))
         await base.NOTES_KV.put(key, value)
       const response = await app.fetch(
-        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config?capabilities=sync-everyone'),
         { ...base, ...overrides } as unknown as Environment
       )
       return ((await response.json()) as { sync: unknown }).sync
@@ -98,6 +98,33 @@ describe('GET /app/v1/config', () => {
     })
   })
 
+  it("keeps everyone from apps that don't send the capability", async () => {
+    const base = { ...(await env()), ACCOUNT_SYNC: {}, ACCOUNTS_DB: {}, SYNC_ENABLED: 'true' }
+    const sync = async (query: string) =>
+      (
+        (await (
+          await app.fetch(
+            new Request(`https://ww-proxy.leviwilkerson.com/app/v1/config${query}`),
+            base as unknown as Environment
+          )
+        ).json()) as { sync: unknown }
+      ).sync
+    // An app that never sends `sync-everyone` must not turn Cloud Sync on by
+    // itself for a device that never chose (ADR 0040 §2), at any version.
+    expect(await sync('')).toEqual({ enabled: true, entitlement: 'supporter' })
+    expect(await sync('?appVersion=1.47.0')).toEqual({ enabled: true, entitlement: 'supporter' })
+    expect(await sync('?capabilities=sync-later')).toEqual({ enabled: true, entitlement: 'supporter' })
+    expect(await sync('?capabilities=sync-everyone')).toEqual({ enabled: true, entitlement: 'everyone' })
+    expect(await sync('?capabilities=sync-later&capabilities=sync-everyone')).toEqual({
+      enabled: true,
+      entitlement: 'everyone',
+    })
+    expect(await sync('?capabilities=sync-later,sync-everyone')).toEqual({
+      enabled: true,
+      entitlement: 'everyone',
+    })
+  })
+
   it('says whether web sign-up is open, with the Turnstile site key', async () => {
     const webSignup = async (
       overrides: Record<string, unknown>,
@@ -107,7 +134,7 @@ describe('GET /app/v1/config', () => {
       for (const [key, value] of Object.entries(kv))
         await base.NOTES_KV.put(key, value)
       const response = await app.fetch(
-        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config'),
+        new Request('https://ww-proxy.leviwilkerson.com/app/v1/config?capabilities=sync-everyone'),
         { ...base, ...overrides } as unknown as Environment
       )
       return ((await response.json()) as { webSignup: unknown }).webSignup
@@ -163,7 +190,7 @@ describe('GET /app/v1/config', () => {
       },
     } as unknown as Environment
     const response = await app.fetch(
-      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config', {
+      new Request('https://ww-proxy.leviwilkerson.com/app/v1/config?capabilities=sync-everyone', {
         headers: { 'cf-connecting-ip': '198.51.100.9' },
       }),
       environment

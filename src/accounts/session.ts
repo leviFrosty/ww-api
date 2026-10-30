@@ -4,6 +4,7 @@ import { buddiesErrorResponse } from '../buddies/errorResponse'
 import {
   ACCOUNT_LIMITS,
   parseAppVersion,
+  parseCapabilities,
   parseRefreshToken,
   type AccountFields,
   type AccountKeyPayload,
@@ -153,6 +154,7 @@ const handleOpen = guarded('session/open', async (c) => {
     device,
     method: platform === 'dev' ? 'dev' : 'attestation',
     appVersion: fields.appVersion,
+    capabilities: fields.capabilities,
   })
   return opened(c, setup.keys, account, issued)
 })
@@ -250,6 +252,7 @@ const openWithTicket = async (
     device: fields.device,
     method: claims.kind,
     appVersion: fields.appVersion,
+    capabilities: fields.capabilities,
     actorSessionId: claims.actorSessionId ?? null,
     stepUpCredentialId,
   })
@@ -273,7 +276,7 @@ const refusedRefresh = (reason: RefreshRefusal): Response =>
   buddiesErrorResponse('unauthorized', { extras: { reason } })
 
 /**
- * `POST /sessions/refresh`: plain JSON `{ refreshToken, appVersion? }`,
+ * `POST /sessions/refresh`: plain JSON `{ refreshToken, appVersion?, capabilities? }`,
  * replaced every time. A malformed token, or one whose MAC doesn't verify,
  * is 401 before any database read. A refusal carries `reason`.
  */
@@ -287,7 +290,9 @@ const handleRefresh = guarded('session/refresh', async (c) => {
   if (!isPlainObject(body) || typeof body.refreshToken !== 'string')
     return buddiesErrorResponse('bad_request')
   const appVersion = parseAppVersion(body.appVersion)
-  if (appVersion === undefined) return buddiesErrorResponse('bad_request')
+  const capabilities = parseCapabilities(body.capabilities)
+  if (appVersion === undefined || capabilities === undefined)
+    return buddiesErrorResponse('bad_request')
   const token = parseRefreshToken(body.refreshToken)
   if (!token) return refusedRefresh('unknown')
   const outcome = await refreshSession(
@@ -295,7 +300,7 @@ const handleRefresh = guarded('session/refresh', async (c) => {
     refreshKeys(setup.keys),
     token,
     Date.now(),
-    appVersion
+    { appVersion, capabilities }
   )
   if ('refused' in outcome) return refusedRefresh(outcome.refused)
   const { issued } = outcome

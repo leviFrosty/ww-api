@@ -114,12 +114,13 @@ describe('POST /sessions with the dev bypass', () => {
     expect(session.refreshToken.split('.')[0]).toBe(session.sessionId)
 
     // Only the account, platform, label, token hashes, how and with which
-    // app version and key epoch it opened, its step-up, and times.
+    // app version, capabilities and key epoch it opened, its step-up, and times.
     const [row] = sessionRows()
     expect(Object.keys(row).sort()).toEqual(
       [
         'account_id',
         'app_version',
+        'capabilities',
         'created_at',
         'device',
         'ended_reason',

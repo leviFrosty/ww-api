@@ -287,7 +287,14 @@ describe('POST /web/signup', () => {
   it('creates the account, passkey, wrap and a stepped-up web session in one go', async () => {
     const wrap = fakeWrap()
     const { key, options, signup, passkey } = await signUp({
-      extra: { wrapId: 'AAAAAAAAAAAAAAAAAAAAAA', wrap, label: 'bGFiZWw', device: 'ZGV2aWNl', appVersion: '1.46.0' },
+      extra: {
+        wrapId: 'AAAAAAAAAAAAAAAAAAAAAA',
+        wrap,
+        label: 'bGFiZWw',
+        device: 'ZGV2aWNl',
+        appVersion: '1.46.0',
+        capabilities: ['sync-everyone'],
+      },
     })
     expect(signup.status).toBe(201)
     expect(signup.headers?.get('location')).toBe('/accounts/v1/sessions/current')
@@ -315,6 +322,7 @@ describe('POST /web/signup', () => {
       platform: 'web',
       method: 'signup',
       app_version: '1.46.0',
+      capabilities: '["sync-everyone"]',
       device: 'ZGV2aWNl',
       step_up_credential_id: passkey.credentialId,
     })

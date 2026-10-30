@@ -903,7 +903,7 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
 | Route | What |
 | --- | --- |
 | `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201 |
-| `POST /accounts/v1/sessions/refresh` | `{ refreshToken }` → new token pair |
+| `POST /accounts/v1/sessions/refresh` | `{ refreshToken, appVersion?, capabilities? }` → new token pair |
 | `DELETE /accounts/v1/sessions/current` | Bearer; end the token's session |
 | `GET /accounts/v1/account` | Bearer; the token's account |
 | `GET /accounts/v1/sessions`, `POST …/sessions/revoke` | Bearer; devices ([Activity and devices](#activity-and-devices)) |
@@ -922,11 +922,15 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   accessToken, accessExpiresAt, refreshToken, sessionExpiresAt }`. A refused
   attestation is 403 `attestation_failed` with the attestation routes'
   `reason` and `action`. Optional sealed `device` label (≤ 512 chars, else
-  `too_large`), stored opaque. An eleventh live session ends the account's
+  `too_large`), stored opaque. Optional `appVersion` and `capabilities`
+  (at most 16 names of ≤ 32 chars, `a-z0-9-`; unknown names dropped,
+  malformed is `bad_request`), stored on the session; `sync-everyone` is
+  the only one so far ([Cloud Sync](#cloud-sync)). An eleventh live session ends the account's
   oldest. Limits: the register edge tier, and 20 a rolling day per account
   key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
   counted before the attestation.
-- **Refresh**: plain JSON `{ refreshToken }`. A refresh token is
+- **Refresh**: plain JSON `{ refreshToken, appVersion?, capabilities? }`;
+  each one sent replaces the session's. A refresh token is
   `<sessionId>.<secret>.<mac>` (b64u, 16, 32, and 32 bytes; opaque to the
   app), so the session is found by id. The MAC is HMAC-SHA256 over
   `<sessionId>.<secret>` under its own key from `ACCOUNT_TOKEN_SECRET` (or
@@ -1231,7 +1235,9 @@ minAppVersion? }`. The value comes from KV `app:min-version`
 absent. Invalid values are logged and ignored, and the KV read is
 edge-cached for 60 seconds. It has its own per-IP bucket (`app`). App
 versions from sessions on read it at launch and on returning to the
-foreground, and show Update Required below it.
+foreground, and show Update Required below it. It also carries Cloud
+Sync's `sync: { enabled, entitlement }`, where `entitlement` is `everyone`
+only when `?capabilities=` (comma-separated) has `sync-everyone`.
 
 KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
 var, then on; edge-cached 60 s). **A failed KV read counts as off**
@@ -1693,7 +1699,15 @@ iCloud and Google Drive; each device uses exactly one. Code in
   `sync:entitlement` (`supporter` makes it a Supporter benefit again, anything
   else `everyone`; absent → `SYNC_ENTITLEMENT`, `"everyone"` in both
   environments, else `everyone`). Sync is free (witness-work ADR 0040);
-  `supporter` is only the lever back. Off: put, list, get, live, and setting
+  `supporter` is only the lever back. `everyone` reaches only apps and
+  browsers that send the `sync-everyone` capability (`capabilities` on
+  session open, refresh and web sign-up, stored on the session; a session
+  with some is cached 60 s per isolate, one without isn't, and a refresh
+  that sends a list clears its isolate's copy; `?capabilities=` on
+  `GET /app/v1/config`). Apps that
+  never send it, at any version, keep the Supporter rule, because they turn
+  Cloud Sync on by themselves for any device that never chose (witness-work
+  ADR 0040 §2). Off: put, list, get, live, and setting
   the request are 503 `disabled`. Not entitled: 403 `supporter_required`,
   from `accountSupporterStatus` (the account's own status), cached 60 s per
   isolate per account; RevenueCat unreachable is 503 `unavailable`, never

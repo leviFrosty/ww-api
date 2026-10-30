@@ -1,6 +1,6 @@
 import type { AppContext, Environment } from './types'
 import { parseMinAppVersion } from './notesImport/config'
-import { syncSwitches } from './accounts/syncSwitch'
+import { entitlementForApp, syncSwitches } from './accounts/syncSwitch'
 import { webSignupAvailable } from './accounts/webSignup'
 import { turnstileSiteKey } from './accounts/turnstile'
 
@@ -53,7 +53,8 @@ export const resolveAppMinVersion = async (
  * Also carries Cloud Sync's switches (witness-work ADR 0030), so a device
  * without a session knows whether opening one would get it Cloud Sync:
  * `sync: { enabled, entitlement }`. `enabled` is false on a worker without
- * the sync bucket or the accounts database.
+ * the sync bucket or the accounts database. `entitlement` is `everyone` only
+ * for a request whose `?capabilities=` (comma-separated) has `sync-everyone`.
  *
  * And web sign-up's (witness-work `docs/passkeys-protocol.md`, "Web
  * sign-up"): `webSignup: { enabled, turnstileSiteKey }`. `enabled` is the
@@ -70,7 +71,12 @@ export const handleAppConfigRequest = async (c: AppContext) => {
   const sync = {
     enabled:
       switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null,
-    entitlement: switches.entitlement,
+    // Apps that never send the capability see `supporter`, so they never
+    // turn Cloud Sync on by themselves (witness-work ADR 0040 §2).
+    entitlement: entitlementForApp(
+      switches.entitlement,
+      c.req.queries('capabilities')?.flatMap((value) => value.split(','))
+    ),
   }
   const webSignup = {
     enabled: webSignupEnabled,

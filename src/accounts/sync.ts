@@ -28,7 +28,7 @@ import {
 } from './auth'
 import { accountForKey, guarded, refuseAtEdge, verifyEnvelope } from './signed'
 import { admitLiveTicket } from './liveTickets'
-import { sessionStates } from './sessionStore'
+import { cachedSessionCapabilities, sessionStates } from './sessionStore'
 import { accountSupporterStatus } from './supporter'
 import { accountsDb } from './store'
 import {
@@ -39,7 +39,12 @@ import {
   parseIfMatch,
   syncObjectKey,
 } from './syncContracts'
-import { isSyncPhotosOn, syncSwitches } from './syncSwitch'
+import {
+  entitlementForApp,
+  isSyncPhotosOn,
+  syncSwitches,
+  type SyncEntitlement,
+} from './syncSwitch'
 
 /**
  * Cloud Sync (witness-work ADR 0030, `docs/accounts-protocol.md`, "Sync"):
@@ -54,7 +59,9 @@ import { isSyncPhotosOn, syncSwitches } from './syncSwitch'
  * on (503 `disabled`) and an entitled account (403 `supporter_required`;
  * RevenueCat unreachable is 503 `unavailable`, never a "not a Supporter").
  * Everyone is entitled unless KV `sync:entitlement` says `supporter`
- * (witness-work ADR 0040). A suspended account keeps syncing: sync never
+ * (witness-work ADR 0040), but only on a session that sent the
+ * `sync-everyone` capability; other sessions keep the Supporter rule
+ * (ADR 0040 §2). A suspended account keeps syncing: sync never
  * reaches another person.
  *
  * `sync/put` counts against the Buddies write edge tier, the rest against
@@ -91,6 +98,36 @@ const cachedSupporter = async (
   return supporter
 }
 
+/**
+ * The capabilities the session last sent, or null (an app that sends none,
+ * or the session can't be read: the Supporter rule still admits Supporters).
+ */
+const callerCapabilities = async (
+  env: Environment,
+  sessionId: string
+): Promise<string[] | null> => {
+  try {
+    return await cachedSessionCapabilities(accountsDb(env.ACCOUNTS_DB!), sessionId)
+  } catch (error) {
+    captureFailure(error, 'sync session capabilities read')
+    return null
+  }
+}
+
+/**
+ * The entitlement this caller's app sees: `everyone` only when its session
+ * sent `sync-everyone` (`entitlementForApp`, witness-work ADR 0040 §2).
+ */
+const callerEntitlement = async (
+  env: Environment,
+  account: Pick<AccountAuth, 'sessionId'>,
+  entitlement: SyncEntitlement
+): Promise<SyncEntitlement> =>
+  // Read only when it decides anything.
+  entitlement === 'everyone'
+    ? entitlementForApp(entitlement, await callerCapabilities(env, account.sessionId))
+    : entitlement
+
 /** The account's sync index. */
 export const syncIndex = (env: Environment, accountId: string) =>
   env.ACCOUNT_SYNC_INDEX.get(env.ACCOUNT_SYNC_INDEX.idFromName(accountId))
@@ -124,10 +161,12 @@ export const caller = async (
  */
 export const refuseUnentitled = async (
   env: Environment,
-  accountId: string
+  account: Pick<AccountAuth, 'accountId' | 'sessionId'>
 ): Promise<Response | null> => {
-  const { enabled, entitlement } = await syncSwitches(env)
+  const { accountId } = account
+  const { enabled, entitlement: switched } = await syncSwitches(env)
   if (!enabled) return buddiesErrorResponse('disabled')
+  const entitlement = await callerEntitlement(env, account, switched)
   if (entitlement === 'everyone') return null
   try {
     return (await cachedSupporter(env, accountId))
@@ -163,7 +202,13 @@ const handleStatus = guarded('sync', async (c) => {
   if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
-  const { enabled, entitlement } = await syncSwitches(c.env)
+  const switches = await syncSwitches(c.env)
+  const { enabled } = switches
+  const entitlement = await callerEntitlement(
+    c.env,
+    who.account,
+    switches.entitlement
+  )
   let supporter = false
   let supporterCheckFailed = false
   try {
@@ -219,7 +264,7 @@ const handleSwitchRequest = guarded('sync/request', async (c) => {
     if (found.account.id !== accountId) return buddiesErrorResponse('forbidden')
     nonce = verified.payload.nonce
     const refused =
-      unavailableHere(c.env) ?? (await refuseUnentitled(c.env, accountId))
+      unavailableHere(c.env) ?? (await refuseUnentitled(c.env, who.account))
     if (refused) return refused
   }
   const index = syncIndex(c.env, accountId)
@@ -245,7 +290,7 @@ const handlePut = guarded('sync/put', async (c) => {
   const who = await caller(c, 'write')
   if ('refusal' in who) return who.refusal
   const { accountId, sessionId, platform } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
 
   const slotId = c.req.header(SYNC_HEADERS.slotId)
@@ -316,7 +361,7 @@ const handleList = guarded('sync/list', async (c) => {
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   const { seq, slots } = await syncIndex(c.env, accountId).list()
   let states: Awaited<ReturnType<typeof sessionStates>> | null = null
@@ -350,7 +395,7 @@ const handleGet = guarded('sync/get', async (c) => {
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   const field = await readSlotField(c, true)
   if ('refusal' in field) return field.refusal
@@ -424,7 +469,7 @@ const handleLive = async (c: AppContext): Promise<Response> => {
     if (browser && !browser.ok) return buddiesErrorResponse(browser.error)
     const off = unavailableHere(c.env)
     if (off) return off
-    let accountId: string
+    let account: AccountAuth
     let slotId: string | undefined
     let ticket: { expiresAt: number; hash: string } | null = null
     if (browser) {
@@ -433,7 +478,7 @@ const handleLive = async (c: AppContext): Promise<Response> => {
       const admitted = await admitLiveTicket(c.env, browser.ticket, 'sync')
       if (!admitted.ok) return admitted.response
       const { claims } = admitted
-      accountId = claims.account.accountId
+      account = claims.account
       slotId = claims.id
       ticket = { expiresAt: claims.tokenExpiresAt, hash: claims.hash }
     } else {
@@ -442,10 +487,11 @@ const handleLive = async (c: AppContext): Promise<Response> => {
       // A browser's token never opens a header socket: nothing would close
       // it when the token expires. Browsers use tickets.
       if (who.account.platform === 'web') return buddiesErrorResponse('forbidden')
-      accountId = who.account.accountId
+      account = who.account
       slotId = c.req.header(SYNC_HEADERS.slotId)
     }
-    const refused = await refuseUnentitled(c.env, accountId)
+    const { accountId } = account
+    const refused = await refuseUnentitled(c.env, account)
     if (refused) return refused
     if (!isWebSocketUpgrade(c.req.raw))
       return buddiesErrorResponse('upgrade_required')

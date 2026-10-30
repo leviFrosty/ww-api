@@ -36,6 +36,13 @@
       "when": 1793382687325,
       "tag": "0004_passkeys",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793386455787,
+      "tag": "0005_session-capabilities",
+      "breakpoints": true
     }
   ]
 }

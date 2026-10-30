@@ -547,8 +547,15 @@ describe('web sessions (POST /sessions with a ticket)', () => {
     const { session, passkey } = await accountWithPasskey()
     const { assert } = await client.signIn(passkey)
     const label = b64u(randomBytes(30))
-    const { reply } = await client.openWeb(session.key, assert.body.ticket, { device: label, appVersion: '1.46.0' })
+    const { reply } = await client.openWeb(session.key, assert.body.ticket, {
+      device: label,
+      appVersion: '1.46.0',
+      capabilities: ['sync-everyone'],
+    })
     expect(reply.status).toBe(201)
+    expect(
+      sql('SELECT capabilities FROM account_sessions WHERE id = ?', reply.body.sessionId)
+    ).toEqual([{ capabilities: '["sync-everyone"]' }])
     expect(reply.body).toEqual({
       ok: true,
       accountId: session.accountId,
