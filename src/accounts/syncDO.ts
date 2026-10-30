@@ -108,12 +108,16 @@ export interface BeginSyncPutArgs {
   slotId: string
   size: number
   ifMatch: SyncIfMatch
+  /** A re-seal (`x-ww-reseal`): the slot must exist, and keeps its writer. */
+  reseal?: boolean
 }
 
 export interface CommitSyncPutArgs {
   accountId: string
   slotId: string
   reservation: string
+  /** Keep the slot's session, platform, and `updatedAt` (`beginPut`'s). */
+  reseal?: boolean
   etag: string
   size: number
   updatedAt: number
@@ -320,7 +324,7 @@ export class AccountSync extends DurableObject<Environment> {
    */
   async beginPut(
     args: BeginSyncPutArgs
-  ): Promise<BuddiesResult<{ reservation: string }>> {
+  ): Promise<BuddiesResult<{ reservation: string; updatedAt: number | null }>> {
     const now = Date.now()
     return this.ctx.storage.transactionSync(() => {
       this.#ensure(args.accountId)
@@ -347,6 +351,8 @@ export class AccountSync extends DurableObject<Environment> {
           ('any' in args.ifMatch || existing.etag === args.ifMatch.etag)
         if (!matches) return fail('precondition_failed')
       }
+      // A re-seal replaces a slot's bytes, never makes one.
+      if (args.reseal && !existing) return fail('precondition_failed')
       if (!existing) {
         const slots =
           this.#count('SELECT COUNT(*) AS n FROM slot') +
@@ -371,7 +377,10 @@ export class AccountSync extends DurableObject<Environment> {
         now,
         existing ? 0 : 1
       )
-      return ok({ reservation })
+      return ok({
+        reservation,
+        updatedAt: args.reseal ? existing!.updatedAt : null,
+      })
     })
   }
 
@@ -389,6 +398,24 @@ export class AccountSync extends DurableObject<Environment> {
         if (!reserved || reserved.token !== args.reservation)
           return fail('conflict')
         this.#sql.exec('DELETE FROM reservation WHERE slot_id = ?', args.slotId)
+        if (args.reseal) {
+          // The same slot under a new account key: its writer and time stay,
+          // so retention and the Cloud Sync request see no new write.
+          const existing = this.#slot(args.slotId)
+          if (!existing) return fail('conflict')
+          this.#sql.exec(
+            'UPDATE slot SET etag = ?, size = ? WHERE slot_id = ?',
+            args.etag,
+            args.size,
+            args.slotId
+          )
+          return ok({
+            etag: args.etag,
+            size: args.size,
+            updatedAt: existing.updatedAt,
+            seq: this.#advance(),
+          })
+        }
         this.#sql.exec(
           `INSERT INTO slot (slot_id, etag, size, updated_at, session_id, platform)
            VALUES (?, ?, ?, ?, ?, ?)
@@ -916,6 +943,16 @@ export class AccountSync extends DurableObject<Environment> {
     this.#signal(server, { type: 'hello', seq: this.#seq() })
     if (expiresAt != null) await this.#reschedule()
     return new Response(null, { status: 101, webSocket: client })
+  }
+
+  /**
+   * Closes every live socket of the account with `4005 "key_changed"` (ADR
+   * 0039), after a key change: the other sessions ended, and the device that
+   * changed the key reconnects with its new token.
+   */
+  async closeForKeyChange(): Promise<void> {
+    const { code, reason } = SYNC_LIVE_CLOSE.keyChanged
+    for (const ws of this.#liveSockets()) closeQuietly(ws, code, reason)
   }
 
   /** Sockets only listen; anything but the auto-answered `ping` is ignored. */
