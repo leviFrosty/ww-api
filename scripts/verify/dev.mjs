@@ -2,7 +2,7 @@
 /**
  * Isolated local ww-api for agent verification (see .agents/skills/verify-ww-api).
  *
- *   node scripts/verify/dev.mjs up [--persist-to <dir>] [--secrets-from <env file>]
+ *   node scripts/verify/dev.mjs up [--persist-to <dir>] [--secrets-from <env file>] [--photo-limit-bytes <n>]
  *   node scripts/verify/dev.mjs doctor
  *   node scripts/verify/dev.mjs url
  *   node scripts/verify/dev.mjs kv <get|put|delete> <key> [value]
@@ -214,7 +214,7 @@ const quoteEnv = (value) => {
     : JSON.stringify(text)
 }
 
-const writeVarsFile = (flags, previousTokens) => {
+const writeVarsFile = (flags, previousTokens, vars = {}) => {
   const fromFile = flags['secrets-from']
     ? readAllowlistedEnvFile(resolve(String(flags['secrets-from'])))
     : {}
@@ -243,6 +243,8 @@ const writeVarsFile = (flags, previousTokens) => {
     ...OPTIONAL_SECRETS.filter((n) => n !== 'APPLE_TEAM_ID' && optional[n]).map(
       (name) => `${name}=${quoteEnv(optional[name])}`
     ),
+    // Non-secret overrides of wrangler.toml vars (`up --photo-limit-bytes`).
+    ...Object.entries(vars).map(([name, value]) => `${name}=${quoteEnv(value)}`),
   ]
   writeFileSync(VARS_PATH, `${lines.join('\n')}\n`, { mode: 0o600 })
   return {
@@ -294,16 +296,41 @@ const tailLog = (lines = 40) => {
   return readFileSync(LOG_PATH, 'utf8').split('\n').slice(-lines).join('\n')
 }
 
+/**
+ * `--photo-limit-bytes <n>`: the worker's `SYNC_PHOTO_LIMIT_BYTES`, so an
+ * account's photo storage fills after a few bytes (Cloud Sync's full state).
+ * Not a secret; recorded in the state file.
+ */
+const photoLimitFlag = (flags) => {
+  const value = flags['photo-limit-bytes']
+  if (value === undefined) return null
+  if (!/^[1-9]\d*$/.test(String(value)))
+    fail('--photo-limit-bytes needs a positive integer')
+  return String(value)
+}
+
 async function up(args) {
   const flags = parseFlags(args)
+  const photoLimitBytes = photoLimitFlag(flags)
   const existing = readState()
-  if (existing && isOurWrangler(existing.pid) && (await healthy(existing.url))) {
+  const sameVars =
+    photoLimitBytes == null || photoLimitBytes === (existing?.photoLimitBytes ?? null)
+  if (
+    existing &&
+    isOurWrangler(existing.pid) &&
+    sameVars &&
+    (await healthy(existing.url))
+  ) {
     console.log(`verify: reusing running worker pid ${existing.pid} at ${existing.url}`)
     console.log(existing.url)
     return
   }
   if (existing && isOurWrangler(existing.pid)) {
-    console.error(`verify: recorded pid ${existing.pid} is alive but unhealthy; restarting it`)
+    console.error(
+      sameVars
+        ? `verify: recorded pid ${existing.pid} is alive but unhealthy; restarting it`
+        : `verify: restarting pid ${existing.pid} with --photo-limit-bytes ${photoLimitBytes}`
+    )
     await killTree(existing.pid)
   }
   if (!existsSync(WRANGLER_BIN)) fail('wrangler is not installed; run `pnpm install --frozen-lockfile`')
@@ -331,7 +358,9 @@ async function up(args) {
 
   const port = await pickPort(HTTP_PORTS)
   const inspectorPort = await pickPort(INSPECTOR_PORTS)
-  const { tokens, configured, revenueCatApiUrl } = writeVarsFile(flags, existing?.tokens)
+  const { tokens, configured, revenueCatApiUrl } = writeVarsFile(flags, existing?.tokens, {
+    ...(photoLimitBytes ? { SYNC_PHOTO_LIMIT_BYTES: photoLimitBytes } : {}),
+  })
 
   const wranglerArgs = [
     WRANGLER_BIN,
@@ -388,6 +417,7 @@ async function up(args) {
     tokens,
     configured,
     revenueCatApiUrl,
+    photoLimitBytes,
   }
   writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
 
@@ -523,6 +553,7 @@ async function doctor() {
     .map(([name, on]) => `${name}=${on ? 'set' : 'unset'}`)
     .join(' ')
   ok(`optional credentials: ${configured || 'none'}`)
+  ok(`photo storage limit: ${state.photoLimitBytes ? `${state.photoLimitBytes} bytes (--photo-limit-bytes)` : 'default'}`)
   ok(`url ${state.url}  log ${state.logPath}  artifacts ${state.artifactsDir}`)
   return finishDoctor(problems)
 }

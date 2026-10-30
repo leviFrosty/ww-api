@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import { BUDDIES_LIMITS, buddyBlobKey } from '../src/buddies/contracts'
 import { backupObjectKey } from '../src/accounts/contracts'
-import { SYNC_LIMITS, syncObjectKey } from '../src/accounts/syncContracts'
+import { SYNC_LIMITS, syncObjectKey, syncPhotoObjectKey } from '../src/accounts/syncContracts'
 import {
   BACKSTOP_DAYS,
   BACKSTOP_RULE_ID,
@@ -10,9 +10,11 @@ import {
   BLOB_PREFIX,
   SYNC_EXPIRY_DAYS,
   SYNC_RULE_ID,
+  MULTIPART_RULE_ID,
   lifecycleRules,
   parseBlocks,
   ruleFor,
+  rulesMatch,
 } from './r2-lifecycle.mjs'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -95,4 +97,22 @@ it('reads wrangler’s labelled blocks', () => {
       action: 'Abort incomplete multipart uploads after 7 days',
     },
   ])
+})
+
+it('gives Cloud Sync photo buckets no age rule, only the multipart abort', () => {
+  for (const bucket of ['ww-account-photos', 'ww-account-photos-dev']) {
+    // Not the snapshots' 400-day family.
+    expect(ruleFor(bucket)).toMatchObject({ bucketPrefix: 'ww-account-photos', days: null })
+    expect(bucket.startsWith('ww-account-sync')).toBe(false)
+    const { rules } = lifecycleRules(bucket)
+    expect(rules).toHaveLength(1)
+    expect(rules[0]).toMatchObject({ id: MULTIPART_RULE_ID, abortMultipartUploadsTransition: expect.anything() })
+    expect(JSON.stringify(rules)).not.toContain('deleteObjectsTransition')
+  }
+  const expected = ruleFor('ww-account-photos')!
+  const multipart = { name: MULTIPART_RULE_ID, enabled: 'Yes', prefix: '(all prefixes)', action: 'Abort incomplete multipart uploads after 7 days' }
+  expect(rulesMatch([multipart], expected)).toBe(true)
+  expect(rulesMatch([multipart, { name: 'x', enabled: 'Yes', prefix: 'v1/', action: 'Expire objects after 400 days' }], expected)).toBe(false)
+  expect(rulesMatch([], expected)).toBe(false)
+  expect(syncPhotoObjectKey('account', 'name', 'put').startsWith(BLOB_PREFIX)).toBe(true)
 })

@@ -1364,6 +1364,10 @@ ${readTier}`,
             'RevenueCat couldn’t be read; `supporter` is false for now. Absent otherwise.',
         }),
         requestedAt: syncRequestedAt,
+        photos: z.boolean().meta({
+          description:
+            'Whether photo puts are on (KV `sync:photos`, then the `SYNC_PHOTOS` var, else on) and this worker has the photo bucket.',
+        }),
       })
     ),
     ...bearerReadErrors,
@@ -1676,5 +1680,189 @@ ${readTier}`,
     429: bearerReadErrors[429],
     ...internal,
     ...syncOff,
+  },
+})
+
+// --- Cloud Sync photos -------------------------------------------------------
+
+const photoName = b64u(
+  'The photo’s keyed name, `HMAC-SHA256(nameKey, filename)`, 32 bytes: immutable, a new revision is a new name'
+)
+const photoUsage = z
+  .object({
+    bytes: z.number().int().meta({ description: 'The live photos’ total blob size.' }),
+    count: z.number().int().meta({ description: 'How many live photos.' }),
+    limit: z.number().int().meta({
+      description: 'The account’s storage limit in bytes (2,000,000,000 unless `SYNC_PHOTO_LIMIT_BYTES` says otherwise).',
+    }),
+  })
+  .meta({ description: 'The account’s photo storage.' })
+const photoView = {
+  name: photoName,
+  size: z.number().int().meta({ description: 'Bytes.' }),
+  sha256: syncEtag,
+  createdAt: epochMs('When the photo became live, the server’s clock'),
+}
+const photoOff = (also: string, photosDisabled: string) => ({
+  503: errorResponse(
+    `${also}${photosDisabled ? ` ${photosDisabled}: \`photos_disabled\`, with \`Retry-After\`.` : ''} No accounts database: \`disabled\`.`,
+    photosDisabled ? ['disabled', 'photos_disabled', 'unavailable'] : ['disabled', 'unavailable']
+  ),
+})
+const PHOTOS_ENTITLED = SYNC_ENTITLED
+const photoSlotHeader = {
+  name: 'x-ww-slot-id',
+  in: 'header' as const,
+  required: false,
+  schema: { type: 'string' as const },
+  description: 'This device’s slot: its own live socket isn’t told of the change.',
+}
+const photoNotes =
+  'Photos are end-to-end encrypted (witness-work ADR 0040 §6, `docs/cloud-sync-photos.md`): the server sees blobs, sizes, digests, sealed metas, keyed names and times, and logs none of them. A suspended account keeps syncing its photos.'
+
+export const syncPhotoPutDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Upload a Cloud Sync photo',
+  description: `Stores a photo’s end-to-end encrypted blob once under its name. The body is the raw blob, at most 25 MiB, with \`x-ww-photo-name\`, \`b64u(SHA-256(body))\` in \`x-ww-sha256\`, the sealed filename in \`x-ww-photo-meta\` (base64url, at most 512 characters), and \`Content-Length\`. The server always reads the body to the end before it answers.
+
+A live name answers \`existed: true\` with the stored photo, writes nothing, and adds no bytes (it still counts as a put). A name deleted within 30 days comes back with the new blob. A put that would take the live photos over the limit is 429 \`storage_full\` with \`usage\`, checked when the put starts (counting other uploads in flight, held up to 2 minutes) and again when it commits. A put whose name is deleted while it uploads is 409 \`conflict\`; on an account with no slot, 409 \`no_slot\`. A stored photo advances \`seq\` and sends \`changed\` to every live socket but \`x-ww-slot-id\`’s.
+
+${SYNC_ENTITLED}
+
+Limits: 25 MiB a blob, 20,000 live photos (new names only), one put a name at a time, 20,000 puts (stored or \`existed\`; refused ones don’t count) and 4 GiB stored an account a rolling day, and the Buddies photo-upload tier (60 a minute per caller IP). ${photoNotes}`,
+  security: [{ bearerAuth: [] }],
+  parameters: [
+    { name: 'x-ww-photo-name', in: 'header' as const, required: true, schema: { type: 'string' as const }, description: 'The photo’s name (43 base64url characters).' },
+    { name: 'x-ww-sha256', in: 'header' as const, required: true, schema: { type: 'string' as const }, description: '`SHA-256(body)`, 32 bytes, base64url.' },
+    { name: 'x-ww-photo-meta', in: 'header' as const, required: true, schema: { type: 'string' as const }, description: 'The sealed filename, base64url, at most 512 characters; stored as given.' },
+    { name: 'Content-Length', in: 'header' as const, required: true, schema: { type: 'integer' as const }, description: 'The body’s length, at most 25 MiB.' },
+    photoSlotHeader,
+  ],
+  requestBody: { required: true, ...syncBinary('The encrypted photo.') },
+  responses: {
+    200: jsonResponse(
+      'Stored, or already there (`existed`).',
+      z.object({
+        ok: z.literal(true),
+        ...photoView,
+        existed: z.boolean().meta({ description: 'The name was already live; nothing was written.' }),
+        usage: photoUsage,
+      })
+    ),
+    400: errorResponse('A missing or malformed header, or a body that doesn’t match its length or `SHA-256`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    409: errorResponse('The name was deleted while this put uploaded (`conflict`), or the account has no slot (`no_slot`); nothing was stored.', ['conflict', 'no_slot']),
+    413: errorResponse('Over 25 MiB, refused from `Content-Length`.', ['too_large']),
+    429: errorResponse(
+      'Storage full (`storage_full`, with `usage`, no `Retry-After`), the live photo cap (`limit`, no `Retry-After`), or a rate (`rate_limited`, with `Retry-After`).',
+      ['storage_full', 'limit', 'rate_limited']
+    ),
+    ...internal,
+    ...photoOff('Cloud Sync is off (`disabled`), or RevenueCat couldn’t be read (`unavailable`).', 'No photo bucket on this worker, or the photos switch KV `sync:photos` is off'),
+  },
+})
+
+export const syncPhotoListDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'List the account’s Cloud Sync photos',
+  description: `Live photos only, ordered by name, at most 1,000 a page, each with its sealed meta. Pass \`cursor\` back for the next page; it’s \`null\` on the last. Every page carries the current \`usage\`.
+
+${PHOTOS_ENTITLED}
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({ cursor: z.string().nullable().optional().meta({ description: 'The previous page’s `cursor`; opaque.' }) }),
+    '`{}` for the first page.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'A page of live photos.',
+      z.object({
+        ok: z.literal(true),
+        photos: z.array(z.object({ ...photoView, meta: z.string().meta({ description: 'The sealed filename, as put.' }) })),
+        cursor: z.string().nullable().meta({ description: 'The next page’s cursor, or `null` on the last page.' }),
+        usage: photoUsage,
+      })
+    ),
+    400: errorResponse('Malformed JSON or `cursor`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    429: bearerReadErrors[429],
+    ...internal,
+    ...photoOff('Cloud Sync is off (`disabled`), or RevenueCat couldn’t be read (`unavailable`).', ''),
+  },
+})
+
+export const syncPhotoGetDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Download a Cloud Sync photo',
+  description: `A live photo’s blob exactly as put. A deleted, purged or unknown name is \`not_found\`.
+
+${PHOTOS_ENTITLED}
+
+Limits: 50,000 gets an account a rolling day (\`rate_limited\`, with \`Retry-After\`), and the Buddies read tier (600 a minute per caller IP).`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(z.object({ name: photoName }), 'The photo to read.'),
+  responses: {
+    200: {
+      ...syncBinary('The encrypted photo.'),
+      headers: {
+        ETag: { description: 'The photo’s `sha256`, quoted.', schema: { type: 'string' as const } },
+        'x-ww-created-at': { description: 'When the photo became live (epoch ms, the server’s clock).', schema: { type: 'integer' as const } },
+        'Cache-Control': { description: '`no-store`.', schema: { type: 'string' as const } },
+      },
+    },
+    400: errorResponse('Malformed JSON or `name`.', ['bad_request']),
+    401: bearerReadErrors[401],
+    ...syncUnentitled,
+    404: errorResponse('No live photo by that name.', ['not_found']),
+    429: errorResponse('Over a rate (`rate_limited`, with `Retry-After`).', ['rate_limited']),
+    ...internal,
+    ...photoOff('Cloud Sync is off (`disabled`), or RevenueCat couldn’t be read (`unavailable`).', 'No photo bucket on this worker'),
+  },
+})
+
+export const syncPhotoDeleteDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Delete Cloud Sync photos',
+  description: `\`{ names }\` (1 to 100) or \`{ all: true }\`. Idempotent: unknown and already deleted names are fine. A deleted photo stops counting at once and is no longer listed or served; its object is purged 30 days later. A delete that deleted something advances \`seq\` and sends \`changed\` to every live socket but \`x-ww-slot-id\`’s. A put of the same name in flight answers \`conflict\`.
+
+Works while Cloud Sync is off and for an account that isn’t entitled. Deleting every photo needs a live session: ${ENDED_SESSION}
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  parameters: [photoSlotHeader],
+  requestBody: jsonBody(
+    z.object({
+      names: z.array(photoName).min(1).max(100).optional(),
+      all: z.literal(true).optional(),
+    }),
+    'Either `names` or `all: true`.'
+  ),
+  responses: {
+    200: jsonResponse('Deleted (or already gone).', z.object({ ok: z.literal(true), usage: photoUsage })),
+    400: errorResponse('Malformed JSON, `names`, or both fields.', ['bad_request']),
+    401: bearerReadErrors[401],
+    429: bearerReadErrors[429],
+    ...internal,
+    ...photoOff('', ''),
+  },
+})
+
+export const syncPhotoUsageDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Read the account’s Cloud Sync photo storage',
+  description: `The live photos’ total size and number, and the account’s limit. Works while Cloud Sync is off and for an account that isn’t entitled.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: jsonResponse('The usage.', z.object({ ok: z.literal(true), usage: photoUsage })),
+    401: bearerReadErrors[401],
+    429: bearerReadErrors[429],
+    ...internal,
+    ...photoOff('', ''),
   },
 })

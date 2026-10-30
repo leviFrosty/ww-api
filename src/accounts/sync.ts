@@ -37,7 +37,7 @@ import {
   parseIfMatch,
   syncObjectKey,
 } from './syncContracts'
-import { syncSwitches } from './syncSwitch'
+import { isSyncPhotosOn, syncSwitches } from './syncSwitch'
 
 /**
  * Cloud Sync (witness-work ADR 0030, `docs/accounts-protocol.md`, "Sync"):
@@ -90,7 +90,7 @@ const cachedSupporter = async (
 }
 
 /** The account's sync index. */
-const syncIndex = (env: Environment, accountId: string) =>
+export const syncIndex = (env: Environment, accountId: string) =>
   env.ACCOUNT_SYNC_INDEX.get(env.ACCOUNT_SYNC_INDEX.idFromName(accountId))
 
 /** Off without the bucket or the accounts database. */
@@ -98,16 +98,16 @@ const unavailableHere = (env: Environment): Response | null =>
   env.ACCOUNT_SYNC && env.ACCOUNTS_DB ? null : buddiesErrorResponse('disabled')
 
 /** The token's account, after the edge tier; or the refusal. */
-const caller = async (
+export const caller = async (
   c: AppContext,
-  tier: 'write' | 'read',
+  tier: 'write' | 'read' | 'photoPut',
   options?: Pick<AuthenticateAccountOptions, 'requireLiveSession' | 'token'>
 ): Promise<
   { account: AccountAuth; expiresAt: number } | { refusal: Response }
 > => {
   const limited = await refuseAtEdge(
     c,
-    tier === 'write' ? 'event/put' : 'inbox/sync'
+    tier === 'write' ? 'event/put' : tier === 'photoPut' ? 'blob/put' : 'inbox/sync'
   )
   if (limited) return { refusal: limited }
   const auth = await authenticateAccount(c, options)
@@ -120,7 +120,7 @@ const caller = async (
  * The switches and the account's entitlement for put, list, get, live, and
  * setting the Cloud Sync request: null admits.
  */
-const refuseUnentitled = async (
+export const refuseUnentitled = async (
   env: Environment,
   accountId: string
 ): Promise<Response | null> => {
@@ -186,6 +186,7 @@ const handleStatus = guarded('sync', async (c) => {
     supporter,
     ...(supporterCheckFailed ? { supporterCheckFailed: true } : {}),
     requestedAt,
+    photos: c.env.ACCOUNT_PHOTOS != null && (await isSyncPhotosOn(c.env)),
   })
 })
 
@@ -386,6 +387,7 @@ const handleDelete = guarded('sync/delete', async (c) => {
   })
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
+  // Every slot takes every photo with it (the index marks them deleted).
   const { seq } = await syncIndex(c.env, accountId).deleteSlots({
     accountId,
     slotId: field.slotId,

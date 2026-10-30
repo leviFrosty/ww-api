@@ -13,10 +13,12 @@ description: Start an isolated local ww-api (Hono on Cloudflare Workers via wran
 node scripts/verify/dev.mjs up                       # prints the base URL as its last line
 node scripts/verify/dev.mjs up --persist-to /tmp/ww-verify-$RUN_ID   # separate state per run
 node scripts/verify/dev.mjs up --secrets-from ~/dev/ww-api/.dev.vars # opt in to real optional keys
+node scripts/verify/dev.mjs up --photo-limit-bytes 2000              # Cloud Sync photo storage fills after 2,000 bytes
 ```
 
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
+- `--photo-limit-bytes <n>` sets the worker's `SYNC_PHOTO_LIMIT_BYTES` (Cloud Sync photo storage per account, 2,000,000,000 by default), so a few small photos reach `storage_full`. `up` with a different value restarts the worker; `up` without the flag reuses whatever runs, and a fresh start uses the default. `doctor` prints the limit in effect.
 - Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, and `BUDDIES_PHOTOS=on`. The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
 - `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, and `ACCOUNT_TOKEN_SECRET` (account sessions), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.

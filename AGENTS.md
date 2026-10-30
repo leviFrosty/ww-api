@@ -1376,13 +1376,18 @@ iCloud and Google Drive; each device uses exactly one. Code in
 
 | Route | What |
 | --- | --- |
-| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt }` |
+| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt, photos }` |
 | `POST /accounts/v1/sync/put` | Bearer; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`? → `{ ok, etag, size, updatedAt, seq }` |
 | `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
 | `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
 | `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
 | `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
+| `POST /accounts/v1/sync/photos/put` | Bearer; raw blob, `x-ww-photo-name`, `x-ww-sha256`, `x-ww-photo-meta`, `Content-Length`, `x-ww-slot-id`? → `{ ok, name, size, sha256, createdAt, existed, usage }` |
+| `POST /accounts/v1/sync/photos/list` | Bearer, `{ cursor? }` → `{ ok, photos: [{ name, size, sha256, createdAt, meta }], cursor, usage }` |
+| `POST /accounts/v1/sync/photos/get` | Bearer, `{ name }` → the blob, `ETag`, `x-ww-created-at` |
+| `POST /accounts/v1/sync/photos/delete` | Bearer, `{ names }` (1–100) or `{ all: true }` (needs a live session); `x-ww-slot-id`? → `{ ok, usage }` |
+| `GET /accounts/v1/sync/photos/usage` | Bearer → `{ ok, usage: { bytes, count, limit } }` |
 
 - **Storage**: one `AccountSync` SQLite DO per account (binding
   `ACCOUNT_SYNC_INDEX`, `idFromName(accountId)`, migration `v8`) holds each
@@ -1451,6 +1456,61 @@ iCloud and Google Drive; each device uses exactly one. Code in
   session read keeps it standing. Stored in the `AccountSync` DO's
   `sync_request` table, not D1, and not in the activity log. Counts in the
   read tier.
+- **Photos** (witness-work ADR 0040 §6, its `docs/cloud-sync-photos.md`;
+  code in `src/accounts/syncPhotos.ts` and `syncDO.ts`): each photo is an
+  end-to-end encrypted blob under an immutable keyed name. The `AccountSync`
+  DO holds a row per name (size, digest, sealed meta, current `put_id`,
+  times, `deleted_at`), the live usage (`photo_state`, kept exact in every
+  transaction), reservations, the purge queue (`photo_purge`), and
+  one-minute rate buckets (`photo_rate`). R2 `ACCOUNT_PHOTOS`
+  (`ww-account-photos` prod, `ww-account-photos-dev` dev) holds each put at
+  `v1/<accountId>/<name>/<putId>`, `putId` random per put.
+  - **Put**: `beginPhotoPut` answers `existed` for a live name (nothing
+    written; it counts as a put with no bytes), else checks one put a name
+    at a time (429 `rate_limited`), a slot exists (409 `no_slot`), 20,000
+    live photos (429 `limit`), the storage limit against live usage plus
+    other uploads' reservations (429 `storage_full` with `usage`, no
+    `Retry-After`; a put a delete cancelled doesn't count), and 4 GiB stored
+    a rolling day, then counts the put and reserves the size. Refused puts
+    don't count. A rate's `Retry-After` waits for the minute buckets that
+    hold enough of it to age out, not just the oldest.
+    The Worker then reads the body (the server always reads it to the end
+    before answering, except a declared size over 25 MiB: 413 `too_large`),
+    checks its digest, writes R2, and `commitPhotoPut` checks the limit and
+    the slot again, makes the name live, advances `seq`, and sends `changed`
+    to every socket but `x-ww-slot-id`'s. A bad body or failed write frees
+    the reservation; one whose commit never comes lapses after 2 minutes.
+  - **Delete** marks the rows deleted (usage drops at once), queues their
+    put's object for the purge 30 days later, cancels any put of those names
+    in flight (its commit answers 409 `conflict` and deletes its own
+    object), advances `seq`, and tells the sockets. A re-put of a deleted
+    name writes a new object, so the purge can't take it. `sync/delete {}`
+    deletes every photo too.
+  - **Alarm** (folded into the daily retention alarm, kept while the account
+    has slots, photos, queued purges, puts in flight, or a sweep pending):
+    an account with no slot for a day (`no_slot_since`, set when the last
+    slot goes, cleared by a slot put, checked again right before deleting)
+    has its photos deleted; queued objects 30 days old are purged; after a
+    put lapsed or an R2 write failed, objects no row, purge entry or
+    reservation names are swept (`photo_state.sweep` is a generation, so a
+    sweep never clears a request made while it ran).
+  - **Switches**: put, list and get need Cloud Sync on and an entitled
+    account. KV `sync:photos` (`off`/`false` off; absent → `SYNC_PHOTOS`, on
+    in both environments, else on) refuses only puts, 503
+    `photos_disabled`. Without the photo bucket, put and get (which need R2)
+    are `photos_disabled`, never `disabled`, and the status says `photos:
+    false`; list, delete and usage read the index and keep working, and the
+    rest of Cloud Sync carries on. Delete and usage always work.
+  - **Limits** (`SYNC_PHOTO_LIMITS`): 25 MiB a blob, 2,000,000,000 bytes an
+    account (`SYNC_PHOTO_LIMIT_BYTES` overrides it; locally `node
+    scripts/verify/dev.mjs up --photo-limit-bytes 2000`), 20,000 live photos,
+    20,000 puts and 4 GiB stored and 50,000 gets an account a rolling day. Put
+    counts in the Buddies photo-upload edge tier (`blob/put`, 60/min), the
+    rest in the read tier. Hits log `buddies: limit hit {op:
+    'sync/photos/put', limit}`.
+  - **R2 lifecycle**: none by age (photos are written once);
+    `scripts/r2-lifecycle.mjs ww-account-photos` keeps only the
+    multipart-abort rule, and `--check` fails if an expiry rule appears.
 - **Suspended** accounts keep syncing (nothing reaches another person).
 - **Privacy**: ciphertext only; the server can't read a device name or any
   data. Never log or report slot ids, account ids, session ids, sizes,
@@ -1469,6 +1529,10 @@ wrangler kv key delete --binding NOTES_KV sync:enabled
 wrangler kv key delete --binding NOTES_KV sync:entitlement
 # Add --env dev to each for the dev worker.
 node scripts/r2-lifecycle.mjs ww-account-sync --check   # read-only bucket check
+# Photo puts off (reads and deletes keep working), and back to the var
+wrangler kv key put --binding NOTES_KV sync:photos off
+wrangler kv key delete --binding NOTES_KV sync:photos
+node scripts/r2-lifecycle.mjs ww-account-photos --check # no age rule, multipart abort only
 ```
 
 ## App Store ratings (paywall social proof)

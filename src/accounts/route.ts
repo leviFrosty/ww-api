@@ -24,6 +24,7 @@ import { sessionHandlers } from './session'
 import { handleActivity } from './activityRoute'
 import { supporterHandlers } from './supporterRoute'
 import { syncHandlers } from './sync'
+import { syncPhotoHandlers } from './syncPhotos'
 import {
   accountDocs,
   activityListDocs,
@@ -51,6 +52,11 @@ import {
   syncGetDocs,
   syncListDocs,
   syncLiveDocs,
+  syncPhotoDeleteDocs,
+  syncPhotoGetDocs,
+  syncPhotoListDocs,
+  syncPhotoPutDocs,
+  syncPhotoUsageDocs,
   syncPutDocs,
   syncSwitchRequestDocs,
   syncStatusDocs,
@@ -195,5 +201,10 @@ export const createAccountsRoutes = () => {
   routes.post('/sync/delete', syncDeleteDocs, syncHandlers.delete)
   routes.post('/sync/request', syncSwitchRequestDocs, syncHandlers.switchRequest)
   routes.get('/sync/live', syncLiveDocs, syncHandlers.live)
+  routes.post('/sync/photos/put', syncPhotoPutDocs, syncPhotoHandlers.put)
+  routes.post('/sync/photos/list', syncPhotoListDocs, syncPhotoHandlers.list)
+  routes.post('/sync/photos/get', syncPhotoGetDocs, syncPhotoHandlers.get)
+  routes.post('/sync/photos/delete', syncPhotoDeleteDocs, syncPhotoHandlers.delete)
+  routes.get('/sync/photos/usage', syncPhotoUsageDocs, syncPhotoHandlers.usage)
   return routes
 }
