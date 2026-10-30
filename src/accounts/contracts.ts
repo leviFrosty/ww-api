@@ -101,6 +101,19 @@ export const ACCOUNT_LIMITS = {
   turnstileTokenChars: 2_048,
   /** The sealed device label, b64u characters. */
   sessionDeviceChars: 512,
+  /** An approval channel lives this long from `approval/open` until claimed. */
+  approvalOpenMs: 75 * 1_000,
+  /** And this long from the claim. */
+  approvalClaimedMs: 5 * MINUTE_MS,
+  /** Wrong `claimToken`s or `browserToken`s before the channel is burned. */
+  approvalBadTokens: 5,
+  /** `approval/open` per caller IP per rolling hour. */
+  approvalOpensPerHour: 60,
+  /** The sealed hello and key, b64u characters. */
+  approvalHelloChars: 1_024,
+  approvalKeyChars: 1_024,
+  /** `far`: farther than this, by haversine, between the two requests. */
+  approvalFarKm: 200,
   /** Ended sessions (revoked or expired) are deleted after this long. */
   endedSessionRetentionMs: 7 * DAY_MS,
 } as const
@@ -519,3 +532,73 @@ export const parseRefreshToken = (value: unknown): RefreshToken | null => {
     ? { sessionId, body: `${sessionId}.${secret}`, mac: macBytes, token: value }
     : null
 }
+
+// --- Approving a browser from a phone (passkeys-protocol.md) -----------------
+
+export interface ApprovalChannelRequest {
+  channelId: string
+}
+
+export interface ApprovalOpenRequest extends ApprovalChannelRequest {
+  verifier: string
+  browserVerifier: string
+  hello: string
+}
+
+export interface ApprovalClaimRequest extends ApprovalChannelRequest {
+  claimToken: string
+  phonePub: string
+}
+
+export interface ApprovalSendRequest extends ApprovalChannelRequest {
+  key: string
+}
+
+export interface ApprovalBrowserRequest extends ApprovalChannelRequest {
+  browserToken: string
+}
+
+export const parseApprovalChannel = (body: unknown): ApprovalChannelRequest | null => {
+  if (!isPlainObject(body)) return null
+  const channelId = id16(body.channelId)
+  return channelId ? { channelId } : null
+}
+
+export const parseApprovalOpen = (body: unknown): ApprovalOpenRequest | null => {
+  const base = parseApprovalChannel(body)
+  if (!base || !isPlainObject(body)) return null
+  const verifier = canonicalBytes(body.verifier, 32)
+  const browserVerifier = canonicalBytes(body.browserVerifier, 32)
+  const hello = sealed(body.hello, ACCOUNT_LIMITS.approvalHelloChars)
+  return verifier && browserVerifier && hello
+    ? { ...base, verifier, browserVerifier, hello }
+    : null
+}
+
+export const parseApprovalClaim = (body: unknown): ApprovalClaimRequest | null => {
+  const base = parseApprovalChannel(body)
+  if (!base || !isPlainObject(body)) return null
+  const claimToken = id16(body.claimToken)
+  const phonePub = publicKey(body.phonePub)
+  return claimToken && phonePub ? { ...base, claimToken, phonePub } : null
+}
+
+export const parseApprovalSend = (body: unknown): ApprovalSendRequest | null => {
+  const base = parseApprovalChannel(body)
+  if (!base || !isPlainObject(body)) return null
+  const key = sealed(body.key, ACCOUNT_LIMITS.approvalKeyChars)
+  return key ? { ...base, key } : null
+}
+
+export const parseApprovalBrowser = (body: unknown): ApprovalBrowserRequest | null => {
+  const base = parseApprovalChannel(body)
+  if (!base || !isPlainObject(body)) return null
+  const browserToken = id16(body.browserToken)
+  return browserToken ? { ...base, browserToken } : null
+}
+
+/** An approval blob over its cap, for `too_large` instead of `bad_request`. */
+export const approvalBlobTooLarge = (body: unknown): boolean =>
+  isPlainObject(body) &&
+  (over(body.hello, ACCOUNT_LIMITS.approvalHelloChars) ||
+    over(body.key, ACCOUNT_LIMITS.approvalKeyChars))

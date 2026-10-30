@@ -63,7 +63,7 @@ const build = (
     if (!RP_ID_PATTERN.test(rpId) || parties.some((p) => p.rpId === rpId)) {
       if (!warned) {
         warned = true
-        console.warn('passkeys: PASSKEY_RP_IDS has an invalid entry; ignoring it')
+        console.warn('accounts: PASSKEY_RP_IDS has an invalid entry; ignoring it')
       }
       continue
     }

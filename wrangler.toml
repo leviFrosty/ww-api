@@ -263,6 +263,12 @@ class_name = "ScribeMeter"
 name = "ACCOUNT_RATE_COUNTER"
 class_name = "AccountRateCounter"
 
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
@@ -336,12 +342,27 @@ new_sqlite_classes = ["AccountSync"]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
 
+# From v10 on, dev's tags differ from production's [[migrations]] below, on
+# purpose. Wrangler matches the Worker's applied tag by name and applies only
+# the steps after it, so each list follows its own Worker's history. Dev
+# applied AccountRateCounter (v10) and AccountApproval (v11) from the web
+# launch branch before Shared Spaces reached dev, so SharedSpace is v12 here
+# and v10 in production. Both lists end at v12, so from v13 on the tags agree
+# again: add a new class at the end of both lists, and never renumber an
+# applied tag (src/durableObjectMigrations.test.ts pins them). A branch whose
+# dev list lacks dev's applied tag (v12 when this was written; ww-api main
+# until the web launch lands) can't deploy here: wrangler replays every step,
+# and the deploy fails.
 [[env.dev.migrations]]
 tag = "v10"
 new_sqlite_classes = ["AccountRateCounter"]
 
 [[env.dev.migrations]]
 tag = "v11"
+new_sqlite_classes = ["AccountApproval"]
+
+[[env.dev.migrations]]
+tag = "v12"
 new_sqlite_classes = ["SharedSpace"]
 
 [[env.dev.ratelimits]]
@@ -863,6 +884,12 @@ class_name = "ScribeMeter"
 name = "ACCOUNT_RATE_COUNTER"
 class_name = "AccountRateCounter"
 
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -901,6 +928,12 @@ new_sqlite_classes = ["AccountSync"]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
 
+# Production's history (ww-proxy was at v9 before these). SharedSpace (v10)
+# landed on main first and the web launch's AccountRateCounter (v11) and
+# AccountApproval (v12) follow it. If main ships first, production goes v9 to
+# v10, then v10 to v12 when the web launch ships; if the web launch ships
+# first, v9 to v12 in one deploy. [env.dev.migrations] replaces this list for
+# dev, which applied them in another order (above).
 [[migrations]]
 tag = "v10"
 new_sqlite_classes = ["SharedSpace"]
@@ -908,6 +941,10 @@ new_sqlite_classes = ["SharedSpace"]
 [[migrations]]
 tag = "v11"
 new_sqlite_classes = ["AccountRateCounter"]
+
+[[migrations]]
+tag = "v12"
+new_sqlite_classes = ["AccountApproval"]
 
 [observability]
 enabled = true

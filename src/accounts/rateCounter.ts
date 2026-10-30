@@ -1,6 +1,10 @@
-import type { Environment } from '../types'
+import type { AppContext, Environment } from '../types'
 import { bytesToBase64Url } from '../crypto'
+import { captureFailure } from '../sentry'
+import { buddiesErrorResponse } from '../buddies/errorResponse'
+import { logLimitHit } from '../buddies/limits'
 import { derivedHmacKey, MIN_TOKEN_SECRET_CHARS } from './tokens'
+import type { CounterLimit } from './rateCounterDO'
 
 /**
  * Names for the accounts routes' rolling counters
@@ -46,3 +50,57 @@ export const rateCounter = (
   env: Pick<Environment, 'ACCOUNT_RATE_COUNTER'>,
   name: string
 ) => env.ACCOUNT_RATE_COUNTER.get(env.ACCOUNT_RATE_COUNTER.idFromName(name))
+
+/** How `refuseOverRateCounter` uses the counter. */
+export interface RateCounterUse {
+  /** The name `limit hit` logs under (`failuresPerHour`, `webCaps`, …). */
+  limitName: string
+  /** Count this request (`take`, all or nothing), or only check (`peek`). */
+  count?: boolean
+  /**
+   * An unreachable counter lets the request on (`allow`, the default), or
+   * refuses it with 503 `unavailable` and `Retry-After` (`refuse`).
+   */
+  onOutage?: 'allow' | 'refuse'
+  /** The time the counts are at (a later refund passes the same). */
+  now?: number
+}
+
+/** `Retry-After` when the counter can't be reached and the use refuses. */
+const OUTAGE_RETRY_SECONDS = 30
+
+/**
+ * Checks (or counts) `limits` in the counter named `name` for `op`. Null
+ * admits; over a limit it's 429 `rate_limited` with a `Retry-After` never
+ * past the window.
+ *
+ * Privacy: logs name the op and limit only, never the name or its value.
+ */
+export const refuseOverRateCounter = async (
+  c: AppContext,
+  name: string,
+  limits: CounterLimit[],
+  op: string,
+  { limitName, count = false, onOutage = 'allow', now = Date.now() }: RateCounterUse
+): Promise<Response | null> => {
+  try {
+    const counter = rateCounter(c.env, name)
+    const result = count
+      ? await counter.take(now, limits)
+      : await counter.peek(now, limits)
+    if (result.ok) return null
+    logLimitHit(op, limitName)
+    return buddiesErrorResponse('rate_limited', {
+      retryAfterSeconds: result.retryAfterSeconds,
+    })
+  } catch (error) {
+    console.warn(
+      `accounts: rate counter unavailable; ${onOutage === 'allow' ? 'allowing' : 'refusing'}`,
+      { op }
+    )
+    captureFailure(error, `${op} rate counter`)
+    return onOutage === 'allow'
+      ? null
+      : buddiesErrorResponse('unavailable', { retryAfterSeconds: OUTAGE_RETRY_SECONDS })
+  }
+}
