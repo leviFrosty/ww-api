@@ -20,11 +20,12 @@ import {
   type PhotoBlob,
   TEST_WEB_ORIGIN,
 } from '../test/buddies'
-import { bearer, openTestSession, type TestSession } from '../test/accounts'
+import { bearer, liveTicket, openTestSession, postJson, type TestSession } from '../test/accounts'
 import { inboxLinkMessage } from '../accounts/contracts'
 import { createAccountsRoutes } from '../accounts/route'
 import { createAccountsAdminRoutes } from '../accounts/admin'
 import { resetAccountStatusCache } from '../accounts/auth'
+import { accessTokenKeys, signAccessToken } from '../accounts/tokens'
 import {
   BUDDIES_CLIENT_HEADER,
   BUDDIES_LIVE_ACCOUNT_HEADER,
@@ -1019,6 +1020,18 @@ describe('bearer live socket', () => {
     expect(live.socket!.closedBy).toEqual({ code: 4003, reason: 'suspended' })
   })
 
+  it('refuses a web token, where nothing would close the socket', async () => {
+    const owner = await BearerOwner.create()
+    const keys = (await accessTokenKeys(h.env as never))!
+    const { accessToken } = await signAccessToken(keys, {
+      accountId: owner.session.accountId,
+      sessionId: owner.session.sessionId,
+      platform: 'web',
+    })
+    const live = await owner.connect(bearer(accessToken))
+    expect(live.status).toBe(403)
+  })
+
   it('refuses a signature header, and ignores an account header from the client', async () => {
     const owner = await BearerOwner.create()
     expect(
@@ -1066,18 +1079,24 @@ describe('bearer live socket', () => {
 })
 
 /**
- * The browser's live socket (witness-work ADR 0038 §10): the token and the
- * fields ride in the `Sec-WebSocket-Protocol` offer, next to `ww.v1`, from
- * an allowed origin.
+ * The browser's live socket (witness-work ADR 0038 §10): a ticket naming the
+ * inbox rides in the `Sec-WebSocket-Protocol` offer, next to `ww.v1`, from
+ * an allowed origin. Never the access token: Cloudflare's logs record that
+ * header.
  */
 describe('browser live socket', () => {
   const MINUTE_MS = 60_000
   const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
 
-  const offer = (owner: BearerOwner, session = owner.session) => [
+  const ticket = (
+    session: TestSession,
+    inboxId: string,
+    socket: 'sync' | 'buddies' = 'buddies'
+  ) => liveTicket(accountsApp, h.env, session, socket, inboxId)
+
+  const offer = async (owner: BearerOwner, session = owner.session) => [
     'ww.v1',
-    `bearer.${session.accessToken}`,
-    `payload.${encodeFields({ inboxId: owner.inboxId })}`,
+    `ticket.${await ticket(session, owner.inboxId)}`,
   ]
 
   const browserLive = (
@@ -1107,9 +1126,24 @@ describe('browser live socket', () => {
     return seen
   }
 
+  it('mints a 30-second ticket for the inbox', async () => {
+    const owner = await BearerOwner.create()
+    const response = await postJson(
+      accountsApp,
+      h.env,
+      '/live/ticket',
+      { socket: 'buddies', id: owner.inboxId },
+      owner.auth
+    )
+    expect(response).toMatchObject({
+      status: 200,
+      body: { ok: true, expiresAt: Math.floor(Date.now() / 1_000) * 1_000 + 30_000 },
+    })
+  })
+
   it('opens with ww.v1 echoed, says hello, and signals changes', async () => {
     const owner = await BearerOwner.create()
-    const live = await browserLive(offer(owner))
+    const live = await browserLive(await offer(owner))
     expect(live.status).toBe(101)
     expect(live.protocol).toBe('ww.v1')
     expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
@@ -1120,67 +1154,86 @@ describe('browser live socket', () => {
   it('works with the legacy switch off: it is always a bearer request', async () => {
     const owner = await BearerOwner.create()
     await legacyOff()
-    expect((await browserLive(offer(owner))).status).toBe(101)
+    expect((await browserLive(await offer(owner))).status).toBe(101)
   })
 
-  it('never forwards the token or the offer to the DO', async () => {
+  it('never forwards the ticket or the offer to the DO', async () => {
     const seen = forwarded()
     const owner = await BearerOwner.create()
-    expect((await browserLive(offer(owner))).status).toBe(101)
+    const minted = await ticket(owner.session, owner.inboxId)
+    expect((await browserLive(['ww.v1', `ticket.${minted}`])).status).toBe(101)
     expect(seen).toHaveLength(1)
     const headers = Object.fromEntries(seen[0].headers.entries())
     expect(headers['sec-websocket-protocol']).toBeUndefined()
     expect(headers.authorization).toBeUndefined()
-    expect(JSON.stringify(headers)).not.toContain(owner.session.accessToken)
+    expect(JSON.stringify(headers)).not.toContain(minted)
     expect(headers[BUDDIES_LIVE_ACCOUNT_HEADER]).toBe(owner.session.accountId)
+    expect(headers['x-buddies-payload']).toBe(encodeFields({ inboxId: owner.inboxId }))
     expect(headers['x-buddies-session-expires-at']).toBe(
       String(owner.session.accessExpiresAt)
     )
+    expect(headers['x-ww-live-ticket']).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(seen[0].url).not.toContain(owner.inboxId)
   })
 
-  it('needs ww.v1 and an allowed Origin, checked before the token and the DO', async () => {
+  it('takes the inbox from the ticket, never a client payload header', async () => {
     const seen = forwarded()
     const owner = await BearerOwner.create()
-    expect(await browserLive(offer(owner).slice(1))).toMatchObject({
+    const other = await BearerOwner.create()
+    const live = await browserLive(await offer(owner), {
+      'x-buddies-payload': encodeFields({ inboxId: other.inboxId }),
+    })
+    expect(live.status).toBe(101)
+    expect(seen[0].headers.get('x-buddies-payload')).toBe(
+      encodeFields({ inboxId: owner.inboxId })
+    )
+  })
+
+  it('needs ww.v1 and an allowed Origin, checked before the ticket and the DO', async () => {
+    const seen = forwarded()
+    const owner = await BearerOwner.create()
+    expect(await browserLive((await offer(owner)).slice(1))).toMatchObject({
       status: 400,
       body: relayError('bad_request'),
       protocol: null,
     })
     for (const origin of ['https://evil.example', 'null']) {
-      expect(await browserLive(offer(owner), { origin })).toMatchObject({
+      expect(await browserLive(await offer(owner), { origin })).toMatchObject({
         status: 403,
         body: relayError('forbidden'),
       })
-      const badToken = offer(owner)
-      badToken[1] = 'bearer.nope'
-      expect(await browserLive(badToken, { origin })).toMatchObject({
+      expect(await browserLive(['ww.v1', 'ticket.nope'], { origin })).toMatchObject({
         status: 403,
         body: relayError('forbidden'),
       })
     }
     const noOrigin = await h.live({
       upgrade: 'websocket',
-      'sec-websocket-protocol': offer(owner).join(', '),
+      'sec-websocket-protocol': (await offer(owner)).join(', '),
     })
     expect(noOrigin).toMatchObject({ status: 403, body: relayError('forbidden') })
     expect(seen).toHaveLength(0)
   })
 
-  it('refuses a bad, expired, or missing token like the header path', async () => {
+  it('refuses a missing, forged, expired, or Cloud Sync ticket with 401', async () => {
     const owner = await BearerOwner.create()
-    const bad = offer(owner)
-    bad[1] = 'bearer.not.a.token'
-    expect(await browserLive(bad)).toMatchObject({
-      status: 401,
-      body: relayError('unauthorized'),
-    })
-    expect(await browserLive([offer(owner)[0], offer(owner)[2]])).toMatchObject({
-      status: 401,
-      body: relayError('unauthorized'),
-    })
-    advance(16 * MINUTE_MS)
-    expect(await browserLive(offer(owner))).toMatchObject({
+    const [, entry] = await offer(owner)
+    for (const protocols of [
+      ['ww.v1'],
+      ['ww.v1', 'ticket.not.a.ticket'],
+      ['ww.v1', `ticket.${owner.session.accessToken}`],
+      ['ww.v1', `${entry.slice(0, -2)}${entry.endsWith('AA') ? 'BB' : 'AA'}`],
+      // A Cloud Sync ticket whose slot id happens to look like an inbox id.
+      ['ww.v1', `ticket.${await ticket(owner.session, owner.inboxId, 'sync')}`],
+    ]) {
+      expect(await browserLive(protocols), protocols[1]?.slice(0, 30)).toMatchObject({
+        status: 401,
+        body: relayError('unauthorized'),
+      })
+    }
+    const later = await offer(owner)
+    advance(31_000)
+    expect(await browserLive(later)).toMatchObject({
       status: 401,
       body: relayError('unauthorized'),
     })
@@ -1188,20 +1241,17 @@ describe('browser live socket', () => {
 
   it('refuses malformed offers with bad_request', async () => {
     const owner = await BearerOwner.create()
-    const [ww, token, payload] = offer(owner)
+    const [ww, entry] = await offer(owner)
     for (const protocols of [
-      [ww, ww, token, payload],
-      [ww, token, token, payload],
-      [ww, token, payload, payload],
-      [ww, '', token, payload],
-      [ww, token, payload, 'chat'],
-      [ww, token, 'payload.'],
-      [ww, token, 'payload.not base64'],
-      [ww, token, `payload.${encodeFields({ inboxId: 'x' })}`],
-      [ww, token, `payload.${encodeFields({ nope: true })}`],
-      [ww, token, payload, `slot.${randomId()}`],
-      [ww, token],
-      [ww, token, payload, `x${'A'.repeat(5_000)}`],
+      [ww, ww, entry],
+      [ww, entry, entry],
+      [ww, '', entry],
+      [ww, entry, 'chat'],
+      [ww, 'ticket.'],
+      [ww, entry, `payload.${encodeFields({ inboxId: owner.inboxId })}`],
+      [ww, `bearer.${owner.session.accessToken}`],
+      [ww, entry, `slot.${randomId()}`],
+      [ww, entry, `x${'A'.repeat(5_000)}`],
     ]) {
       expect(
         await browserLive(protocols),
@@ -1209,9 +1259,9 @@ describe('browser live socket', () => {
       ).toMatchObject({ status: 400, body: relayError('bad_request') })
     }
     expect(
-      await browserLive(offer(owner), { 'x-buddies-signature': 'x' })
+      await browserLive([ww, entry], { 'x-buddies-signature': 'x' })
     ).toMatchObject({ status: 400, body: relayError('bad_request') })
-    expect(await browserLive(offer(owner), owner.auth)).toMatchObject({
+    expect(await browserLive([ww, entry], owner.auth)).toMatchObject({
       status: 400,
       body: relayError('bad_request'),
     })
@@ -1220,21 +1270,21 @@ describe('browser live socket', () => {
   it('runs the header path’s checks: kill switch, ownership, link, suspension', async () => {
     const owner = await BearerOwner.create()
     const other = await BearerOwner.create()
-    expect(await browserLive(offer(owner, other.session))).toMatchObject({
+    // Another account's inbox: the ticket mints, the inbox refuses.
+    expect(await browserLive(await offer(owner, other.session))).toMatchObject({
       status: 403,
       body: relayError('forbidden'),
     })
 
     const unlinked = await BearerOwner.create(false)
-    expect(await browserLive(offer(unlinked))).toMatchObject({
+    expect(await browserLive(await offer(unlinked))).toMatchObject({
       status: 404,
       body: relayError('not_found'),
     })
     const legacy = await Owner.create(h)
     const legacyInbox = [
       'ww.v1',
-      `bearer.${owner.session.accessToken}`,
-      `payload.${encodeFields({ inboxId: legacy.inboxId })}`,
+      `ticket.${await ticket(owner.session, legacy.inboxId)}`,
     ]
     expect(await browserLive(legacyInbox)).toMatchObject({
       status: 409,
@@ -1242,24 +1292,66 @@ describe('browser live socket', () => {
     })
 
     await setStatus(owner.session.accountId, 'suspended')
-    expect(await browserLive(offer(owner))).toMatchObject({
+    expect(await browserLive(await offer(owner))).toMatchObject({
       status: 403,
       body: relayError('suspended'),
     })
     await setStatus(owner.session.accountId, 'active')
 
     await h.kv.put('buddies:enabled', 'false')
-    expect(await browserLive(offer(owner))).toMatchObject({
+    expect(await browserLive(await offer(owner))).toMatchObject({
       status: 503,
       body: relayError('disabled'),
     })
+  })
+
+  it('mints only for a live session; a ticket minted before still opens', async () => {
+    const owner = await BearerOwner.create()
+    const entries = await offer(owner)
+    const response = await accountsApp.request(
+      '/sessions/current',
+      { method: 'DELETE', headers: owner.auth },
+      h.env
+    )
+    expect(response.status).toBe(200)
+    expect(
+      await postJson(
+        accountsApp,
+        h.env,
+        '/live/ticket',
+        { socket: 'buddies', id: owner.inboxId },
+        owner.auth
+      )
+    ).toMatchObject({ status: 401, body: relayError('unauthorized') })
+    // The upgrade checks no session, as the header path doesn't.
+    expect((await browserLive(entries)).status).toBe(101)
+    expect((await owner.connect()).status).toBe(101)
+  })
+
+  it('opens one socket per ticket: a copy is 409 while it is open', async () => {
+    const owner = await BearerOwner.create()
+    const entries = await offer(owner)
+    const first = await browserLive(entries)
+    expect(first.status).toBe(101)
+    const second = await browserLive(await offer(owner))
+    expect(second.status).toBe(101)
+    // A replayed copy pushes no socket off: it never opens.
+    for (let i = 0; i < 15; i++)
+      expect(await browserLive(entries)).toMatchObject({
+        status: 409,
+        body: relayError('conflict'),
+      })
+    expect(first.socket!.closedBy).toBeNull()
+    expect(second.socket!.closedBy).toBeNull()
+    first.socket!.close(1000, '')
+    expect((await browserLive(entries)).status).toBe(101)
   })
 
   it('needs an upgrade like the header path', async () => {
     const owner = await BearerOwner.create()
     const notUpgrade = {
       origin: TEST_WEB_ORIGIN,
-      'sec-websocket-protocol': offer(owner).join(', '),
+      'sec-websocket-protocol': (await offer(owner)).join(', '),
     }
     expect(await h.live(notUpgrade)).toMatchObject({
       status: 426,
@@ -1273,10 +1365,12 @@ describe('browser live socket', () => {
     const live = await owner.connect({
       ...owner.auth,
       'x-buddies-session-expires-at': String(Date.now() + MINUTE_MS),
+      'x-ww-live-ticket': 'A'.repeat(43),
     })
     expect(live.status).toBe(101)
     expect(live.protocol).toBeNull()
     expect(seen[0].headers.get('x-buddies-session-expires-at')).toBeNull()
+    expect(seen[0].headers.get('x-ww-live-ticket')).toBeNull()
     const legacy = await Owner.create(h)
     const signed = await legacy.connect()
     expect(signed.status).toBe(101)
@@ -1293,7 +1387,7 @@ describe('browser live socket', () => {
     const inactivity = storage.alarm()!
     expect(inactivity).toBeGreaterThan(Date.now() + DAY_MS)
 
-    const browser = await browserLive(offer(owner))
+    const browser = await browserLive(await offer(owner))
     const native = await owner.connect()
     expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
 
@@ -1319,7 +1413,7 @@ describe('browser live socket', () => {
       'INSERT OR REPLACE INTO blob_delete_backoff (singleton, failures, retry_at) VALUES (1, 9, ?)',
       retryAt
     )
-    const browser = await browserLive(offer(owner))
+    const browser = await browserLive(await offer(owner))
     expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
     const deletes = () =>
       h.r2.calls.filter((call) => call.startsWith('delete')).length
@@ -1338,10 +1432,10 @@ describe('browser live socket', () => {
   it('schedules the earliest of the inbox’s deadlines and the sockets’ expiries', async () => {
     const owner = await BearerOwner.create()
     const storage = h.inboxes.storage(owner.inboxId)
-    const first = await browserLive(offer(owner))
+    const first = await browserLive(await offer(owner))
     advance(5 * MINUTE_MS)
     const later = await openTestSession(accountsApp, h.env, owner.session.key)
-    const second = await browserLive(offer(owner, later))
+    const second = await browserLive(await offer(owner, later))
     expect(storage.alarm()).toBe(owner.session.accessExpiresAt)
 
     advance(owner.session.accessExpiresAt - Date.now())
@@ -1357,7 +1451,7 @@ describe('browser live socket', () => {
 
   it('counts browser sockets in the inbox’s socket cap', async () => {
     const owner = await BearerOwner.create()
-    const browser = await browserLive(offer(owner))
+    const browser = await browserLive(await offer(owner))
     expect(browser.status).toBe(101)
     advance(1)
     for (let i = 0; i < BUDDIES_LIMITS.liveSockets; i++) {
@@ -1372,12 +1466,18 @@ describe('browser live socket', () => {
     for (const level of ['log', 'warn', 'error', 'info'] as const)
       vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
     const owner = await BearerOwner.create()
-    await browserLive(offer(owner))
-    await browserLive(offer(owner), { origin: 'https://evil.example' })
+    const entries = await offer(owner)
+    await browserLive(entries)
+    await browserLive(entries, { origin: 'https://evil.example' })
     advance(owner.session.accessExpiresAt - Date.now())
     await h.inboxes.fireAlarm(owner.inboxId)
     const text = JSON.stringify(logs)
-    for (const secret of [owner.inboxId, owner.session.accountId, owner.session.accessToken])
+    for (const secret of [
+      owner.inboxId,
+      owner.session.accountId,
+      owner.session.accessToken,
+      entries[1].slice(7),
+    ])
       expect(text).not.toContain(secret)
   })
 })

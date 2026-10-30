@@ -83,8 +83,9 @@ Unset, no browser gets in. Native apps send no `Origin` and see no change.
   `if-none-match`, `sentry-trace`, `baggage`, `x-ww-*`, or `x-buddies-*`,
   but never `x-ww-admin-token`, and `x-ww-dev-bypass` only on a worker with
   `NOTES_IMPORT_DEV_BYPASS_TOKEN` set (dev); else 403 with no CORS headers.
-- **Live sockets** from a browser authenticate with `Sec-WebSocket-Protocol`
-  entries instead of headers and must come from an allowed `Origin`; see
+- **Live sockets** from a browser authenticate with a live ticket in
+  `Sec-WebSocket-Protocol` instead of headers and must come from an allowed
+  `Origin`; see
   "Browser live sockets" under [Accounts](#browser-live-sockets).
 
 ### App Attest bundle ids
@@ -214,8 +215,9 @@ pnpm run deploy:dev
 
 Secrets are per environment: add `--env dev` to `wrangler secret put` to keep
 them off prod (the full list is at the bottom of `wrangler.toml`).
-`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN` and
-`ACCOUNT_TOKEN_SECRET` differ between the two workers.
+`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN`,
+`ACCOUNT_TOKEN_SECRET`, and `LIVE_TICKET_SECRET` differ between the two
+workers.
 
 ## Local iteration (no deploy)
 
@@ -775,8 +777,8 @@ Links. Clients are iOS and Android
   sends `{"type":"changed","seq":…}` after each write that changes
   `inbox/sync`. Sentry events drop `x-buddies-*` headers. Under `wrangler
   dev`, the TCP connection lingers about 10 s after a server-sent close frame;
-  the frame itself arrives at once. Browsers offer `payload.<the
-  x-buddies-payload value>` as a subprotocol entry instead
+  the frame itself arrives at once. Browsers offer a live ticket naming the
+  inbox as a subprotocol entry instead
   ([Browser live sockets](#browser-live-sockets)).
 - **Privacy**: every id travels in the body (for the live socket, in headers;
   never the URL). Never log or report bodies, headers, blobs,
@@ -1038,7 +1040,7 @@ Building a route on accounts (`src/accounts/auth.ts`):
 
 **Privacy**: never log or report access or refresh tokens, account ids,
 session ids, or device labels. Sentry drops `Authorization` and
-`Sec-WebSocket-Protocol` (a browser socket's token). Drizzle's
+`Sec-WebSocket-Protocol` (a browser socket's ticket). Drizzle's
 query errors quote the query's parameters (ids, token hashes), so report a
 caught error with `captureFailure(error, operation)` (`src/sentry.ts`),
 never `Sentry.captureException`: a database error, or one it caused, goes
@@ -1050,37 +1052,102 @@ string and drops the exceptions chained under it.
 
 Browsers can't set headers on a WebSocket (witness-work ADR 0038 §10), so a
 web client authenticates `GET /accounts/v1/sync/live` and
-`GET /buddies/v1/inbox/live` with `Sec-WebSocket-Protocol` entries (code in
-`src/liveSubprotocol.ts`). A request with that header takes this path; one
-without it takes the native header path, unchanged.
+`GET /buddies/v1/inbox/live` with a live ticket in `Sec-WebSocket-Protocol`
+(code in `src/liveSubprotocol.ts` and `src/accounts/liveTickets.ts`). A
+request with that header takes this path; one without it takes the native
+header path, unchanged.
 
-| Socket | Offer |
+**Why a ticket, not the access token:** `wrangler tail`, and so Workers Logs,
+records `Sec-WebSocket-Protocol` in full, while it redacts `Authorization`.
+A 15-minute access token there would be a credential in Cloudflare's logs.
+A ticket that lands there names no id (its claims are encrypted), opens one
+socket kind for one id for 30 seconds, one socket at a time, and calls no
+other route.
+
+| Step | Wire |
 | --- | --- |
-| Cloud Sync | `ww.v1, bearer.<access token>, slot.<slotId>` |
-| Buddies | `ww.v1, bearer.<access token>, payload.<b64u(UTF-8 JSON { inboxId })>` |
+| Mint | `POST /accounts/v1/live/ticket` (Bearer, live session) `{ "socket": "sync" \| "buddies", "id": "<slotId \| inboxId>" }` → `{ "ok": true, "ticket", "expiresAt" }` |
+| Cloud Sync | `Sec-WebSocket-Protocol: ww.v1, ticket.<sync ticket>` |
+| Buddies | `Sec-WebSocket-Protocol: ww.v1, ticket.<buddies ticket>` |
 
-- **Parsing**: a comma-separated list of RFC 9110 tokens, trimmed, at most
-  4,096 characters, each prefix at most once, no unknown entries, and no
-  `Authorization` header alongside; else 400 `bad_request`. No `ww.v1`: 400
-  `bad_request`. Then `Origin` must be in `WEB_APP_ORIGINS`, else 403
-  `forbidden`. Both are checked in the Worker before the token or any Durable
-  Object. Ids never go in the URL.
-- **Then the header path's checks, in its order**: the token through
-  `authenticateAccount`'s `token` option (the same verification and refusals
-  as `Authorization`; a missing `bearer.` entry is 401), the kill switch,
-  edge tier, entitlement, upgrade, slot id or inbox fields, ownership,
-  `not_linked`, suspension. Refusals are the same HTTP answers.
+- **The ticket**: `b64u(iv ‖ AES-256-GCM(UTF-8 JSON claims)).b64u(HMAC-SHA256)`,
+  466 characters: the claims are padded with spaces to 288 bytes, so the
+  length shows neither the socket nor the id's. A random 12-byte IV; the MAC covers the
+  first part. Two keys from the Worker secret `LIVE_TICKET_SECRET`, each the
+  SHA-256 of its own label and the secret (`ww-live/v1/ticket-cipher`,
+  `ww-live/v1/ticket`), as `ACCOUNT_TOKEN_SECRET`'s derived keys are.
+  Claims, epoch seconds: `typ` `ww-live`, `iss`
+  (`ww-api/<APP_ATTEST_ENVIRONMENT>`), `sub` (account), `sid` (session),
+  `platform`, `socket`, `id`, `tokenExp` (the access token's `exp`), and
+  `exp` (30 s after minting, or `tokenExp` if sooner). `expiresAt` in the
+  answer is `exp` in epoch ms. Nothing is stored.
+- **Minting**: `requireLiveSession`, so a signed-out or revoked session
+  mints none (401 `unauthorized`); a token with under a second left is 401
+  too, so the app refreshes it first. Counts against the read edge tier and
+  checks only the id's shape (a sync slot id; a 22-character inbox id), 400
+  `bad_request` otherwise; 503 `disabled` without the secret.
+- **One open socket per ticket, not single-use**: within its 30 seconds a
+  ticket reopens its socket after a drop. But the Worker hands the DO the
+  ticket's hash (b64u SHA-256 of its MAC, `x-ww-live-ticket`; it opens
+  nothing), the DO keeps it in the socket's attachment (already written on
+  connect, so no extra storage write), and refuses a second socket on the
+  same hash while one is open with 409 `conflict`, before it accepts
+  anything. A logged copy so can't open sockets that push the User's own
+  past the cap (`4000`/`4002 "replaced"`). Burning tickets would put a
+  Durable Object or KV write in every connect; sockets carry change notices
+  only, never data.
+- **Session liveness is checked at the mint, not at the upgrade.** Neither
+  socket path checks that the session is still live (the native one never
+  did); a ticket minted just before sign-out still opens within its 30
+  seconds, and the socket closes when the token expires.
+- **The secret**: its own value per worker, never `ACCOUNT_TOKEN_SECRET`'s:
+  `openssl rand -base64 32 | wrangler secret put LIVE_TICKET_SECRET` (add
+  `--env dev` for dev). Shorter than 32 characters (warned once per
+  isolate), or equal to `ACCOUNT_TOKEN_SECRET` or
+  `ACCOUNT_TOKEN_SECRET_PREVIOUS` (warned too), it's ignored and tickets are
+  off (503 `disabled`). There's no previous slot: rotating it fails the
+  tickets minted in the last 30 seconds once, and the app mints another.
+  The verify launcher, `.dev.vars.example`, and the test harness set their
+  own.
+- **Check order on the socket**, all in the Worker before any Durable
+  Object: `Origin` in `WEB_APP_ORIGINS`, else 403 `forbidden`, first, so a
+  foreign page learns nothing of an offer's shape; then the offer's shape,
+  else 400 `bad_request`: a comma-separated list of RFC 9110 tokens,
+  trimmed, at most 2,048 characters, `ww.v1` and `ticket.<ticket>` each
+  once, nothing else, `ww.v1` present, and no `Authorization` header
+  alongside; then the kill switch (503) and, for Cloud Sync, the edge tier
+  (429); then the ticket, else 401 `unauthorized` with the
+  `WWW-Authenticate` a bad token gets; then the header path's checks in its
+  order (Cloud Sync: entitlement, upgrade; Buddies: edge tier, upgrade, the
+  inbox's ownership, `not_linked`, suspension); then the DO's 409
+  `conflict` for an open ticket. No id goes in the URL, and none reads in
+  the offer: the ticket names them, sealed.
+- **Verifying the ticket**: length, two parts, the MAC, before anything is
+  decrypted or parsed; then the seal, `typ`, `iss`, `socket` (the route's: a
+  Buddies ticket never opens Cloud Sync), `exp` and `tokenExp` not passed,
+  `exp` no later than `tokenExp`, `exp` at most 30 s and `tokenExp` at most
+  one access token lifetime (plus its 60 s `iat` skew) from now, each plus
+  5 s of skew, and the claims' shapes. A missing, forged, expired, or
+  other-socket ticket is 401; 503 `disabled` without `LIVE_TICKET_SECRET`.
+- **The browser can't see any of these statuses**: a failed handshake is
+  only a close (1006) to page script. So the web app mints a fresh ticket
+  on every connect, never reuses one, and reconnects with backoff; when
+  the mint itself answers 401, it refreshes its access token first.
 - **Forwarding**: the DO gets the internal headers it already trusts
   (`x-ww-sync-account` and `x-ww-slot-id`; `x-buddies-session-account` and
-  `x-buddies-payload`) plus the token's `exp` (epoch ms) in
-  `x-ww-sync-expires-at` / `x-buddies-session-expires-at`. The Worker drops
-  `Sec-WebSocket-Protocol` and `Authorization`, so the token never reaches the
-  DO, and drops a client's copy of the expiry header on the native path.
+  `x-buddies-payload`, built from the ticket's inbox id) plus `tokenExp`
+  (epoch ms) in `x-ww-sync-expires-at` / `x-buddies-session-expires-at`,
+  and the ticket's hash in `x-ww-live-ticket`. The Worker drops
+  `Sec-WebSocket-Protocol` and `Authorization`, so the ticket never reaches
+  the DO, overwrites a client's `x-ww-slot-id` or `x-buddies-payload` with
+  the ticket's id, and drops a client's copy of the expiry and ticket
+  headers on the native path.
 - **101**: carries `Sec-WebSocket-Protocol: ww.v1` (a browser fails the
   handshake otherwise); native upgrades get no subprotocol header.
-- **Expiry**: the DO keeps `expiresAt` in the socket's attachment and closes
-  it with `4004 "expired"` once it passes (the app refreshes and
-  reconnects). Pings are auto-responses that don't wake a hibernated DO, so
+- **Expiry**: the DO keeps `expiresAt` (the access token's, from the
+  ticket) in the socket's attachment and closes it with `4004 "expired"`
+  once it passes (the app refreshes, mints a ticket, and reconnects).
+  Pings are auto-responses that don't wake a hibernated DO, so
   the DO alarm does it: `BuddyInbox` counts each socket's expiry among its
   `#nextDeadline` deadlines; `AccountSync` keeps its next retention run in
   `alarm_schedule.retention_at` and sets the alarm for the sooner of that and
@@ -1597,6 +1664,7 @@ iCloud and Google Drive; each device uses exactly one. Code in
 | `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
 | `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
 | `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
+| `POST /accounts/v1/live/ticket` | Bearer `{ socket, id }` → `{ ticket, expiresAt }`: a browser's 30-second [live socket ticket](#browser-live-sockets) |
 | `POST /accounts/v1/sync/photos/put` | Bearer; raw blob, `x-ww-photo-name`, `x-ww-sha256`, `x-ww-photo-meta`, `Content-Length`, `x-ww-slot-id`? → `{ ok, name, size, sha256, createdAt, existed, usage }` |
 | `POST /accounts/v1/sync/photos/list` | Bearer, `{ cursor? }` → `{ ok, photos: [{ name, size, sha256, createdAt, meta }], cursor, usage }` |
 | `POST /accounts/v1/sync/photos/get` | Bearer, `{ name }` → the blob, `ETag`, `x-ww-created-at` |

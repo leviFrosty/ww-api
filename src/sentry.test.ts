@@ -332,13 +332,13 @@ describe('Sentry scrubbers', () => {
     })
   })
 
-  it('drops a browser live socket’s offer, which holds its token', () => {
+  it('drops a browser live socket’s offer, which holds its ticket', () => {
     const error: ErrorEvent = {
       type: undefined,
       request: {
         url: 'https://ww-proxy.test/accounts/v1/sync/live',
         headers: {
-          'Sec-WebSocket-Protocol': 'ww.v1, bearer.eyJhbGciOiJIUzI1NiJ9.e30.c2ln, slot.AAAAAAAA',
+          'Sec-WebSocket-Protocol': 'ww.v1, ticket.eyJ0eXAiOiJ3dy1saXZlIn0.c2ln',
           'x-ww-sync-expires-at': '1792412100000',
           origin: 'http://localhost:8081',
         },

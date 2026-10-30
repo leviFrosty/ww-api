@@ -14,6 +14,9 @@ import { logLimitHit } from '../buddies/limits'
 import {
   closeExpiredSockets,
   readLiveExpiry,
+  readLiveTicketHash,
+  isTicketOpen,
+  LIVE_TICKET_HEADER,
   soonestSocketExpiry,
 } from '../liveSubprotocol'
 import { accountsDb } from './store'
@@ -263,15 +266,24 @@ const SOCKET_OPEN = 1
 
 /**
  * Stored on each live socket; survives hibernation. `expiresAt` (epoch ms)
- * is a browser socket's token expiry; native sockets have none.
+ * is a browser socket's token expiry and `ticket` its ticket's hash
+ * (`LIVE_TICKET_HEADER`); native sockets have neither.
  */
-type LiveAttachment = { openedAt: number; slotId: string; expiresAt?: number }
+type LiveAttachment = {
+  openedAt: number
+  slotId: string
+  expiresAt?: number
+  ticket?: string
+}
 
 const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
   (ws.deserializeAttachment() as LiveAttachment | null) ?? null
 
 const expiryOf = (ws: WebSocket): number | null =>
   attachmentOf(ws)?.expiresAt ?? null
+
+const ticketOf = (ws: WebSocket): string | null =>
+  attachmentOf(ws)?.ticket ?? null
 
 const closeQuietly = (ws: WebSocket, code: number, reason: string): void => {
   try {
@@ -863,16 +875,26 @@ export class AccountSync extends DurableObject<Environment> {
    * `SYNC_HEADERS.account` (which only the Worker sets) and the device's own
    * slot in `x-ww-slot-id`, so its own puts don't echo back, and for a
    * browser socket its token's expiry in `SYNC_HEADERS.expiresAt`, when the
-   * alarm closes it. Says `hello` with the current `seq`; past the cap the
-   * oldest sockets close.
+   * alarm closes it, and its ticket's hash in `LIVE_TICKET_HEADER`: while a
+   * socket on that ticket is open, another is 409 `conflict`, so a copied
+   * ticket can't push the account's sockets off. Says `hello` with the
+   * current `seq`; past the cap the oldest sockets close.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return failure(fail('upgrade_required'))
     const accountId = request.headers.get(SYNC_HEADERS.account)
     const slotId = request.headers.get(SYNC_HEADERS.slotId)
     const expiresAt = readLiveExpiry(request.headers.get(SYNC_HEADERS.expiresAt))
-    if (!accountId || !isSyncSlotId(slotId) || expiresAt === undefined)
+    const ticket = readLiveTicketHash(request.headers.get(LIVE_TICKET_HEADER))
+    if (
+      !accountId ||
+      !isSyncSlotId(slotId) ||
+      expiresAt === undefined ||
+      ticket === undefined
+    )
       return failure(fail('bad_request'))
+    if (ticket != null && isTicketOpen(this.#liveSockets(), ticket, ticketOf))
+      return failure(fail('conflict'))
     this.#ensure(accountId)
 
     const [client, server] = Object.values(new WebSocketPair())
@@ -881,6 +903,7 @@ export class AccountSync extends DurableObject<Environment> {
       openedAt: Date.now(),
       slotId,
       ...(expiresAt == null ? {} : { expiresAt }),
+      ...(ticket == null ? {} : { ticket }),
     }
     server.serializeAttachment(attachment)
     const others = this.#liveSockets()

@@ -916,6 +916,9 @@ logs.persist = true
 # Rotation: the old value goes to ACCOUNT_TOKEN_SECRET_PREVIOUS first (verify only;
 # refresh tokens issued under it refresh only while it's set, see AGENTS.md).
 # wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS [--env dev]
+# Browser live socket tickets (POST /accounts/v1/live/ticket); without it, browser
+# live sockets are disabled. Its own value per worker, never ACCOUNT_TOKEN_SECRET's:
+# openssl rand -base64 32 | wrangler secret put LIVE_TICKET_SECRET [--env dev]
 # MapKit JS tokens (witness-work ADR 0037 §8; APPLE_TEAM_ID is the issuer); without
 # both, POST /maps/v1/mapkit-tokens answers 503 maps_unconfigured:
 # wrangler secret put MAPKIT_JS_KEY_ID [--env dev]        # 10-char MapKit JS key id

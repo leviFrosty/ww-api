@@ -20,7 +20,7 @@ node scripts/verify/dev.mjs up --photo-limit-bytes 2000              # Cloud Syn
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
 - `--photo-limit-bytes <n>` sets the worker's `SYNC_PHOTO_LIMIT_BYTES` (Cloud Sync photo storage per account, 2,000,000,000 by default), so a few small photos reach `storage_full`. `up` with a different value restarts the worker; `up` without the flag reuses whatever runs, and a fresh start uses the default. `doctor` prints the limit in effect.
 - Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, `BUDDIES_PHOTOS=on`, `AUTH_LEGACY=off` (requests signed the pre-session way get 426; `pnpm test:e2e` and `pnpm fuzz:buddies` put KV `auth:legacy` = `on` for their run), and the passkey RP IDs `app-dev.witnesswork.app` and `localhost` (origins `http://localhost:8081`, `:8082`, `:19006`, `:4173`, `:5173`). The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
-- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, `ACCOUNT_TOKEN_SECRET` (account sessions), `PASSKEY_CHALLENGE_SECRET` and `ACCOUNT_TICKET_SECRET` (passkeys), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
+- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, `ACCOUNT_TOKEN_SECRET` (account sessions), `PASSKEY_CHALLENGE_SECRET` and `ACCOUNT_TICKET_SECRET` (passkeys), `LIVE_TICKET_SECRET` (browser live socket tickets), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
 ## Doctor
@@ -123,6 +123,7 @@ Only names are listed here; never print values.
 | `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
 | `PASSKEY_CHALLENGE_SECRET`, `ACCOUNT_TICKET_SECRET` | passkeys and web sessions (`/accounts/v1/passkeys*`, ticket opens) | generated per state dir |
 | `TURNSTILE_SECRET_KEY` | web sign-up and recovery's Siteverify (`/accounts/v1/web/*`); `2x0000000000000000000000000000000AA` fails every token, `3x…` says "already spent" | unset, so the dev worker uses Cloudflare's always-passing test secret |
+| `LIVE_TICKET_SECRET` | browser live socket tickets (`POST /accounts/v1/live/ticket`) | generated per state dir |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |

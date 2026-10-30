@@ -178,7 +178,7 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  * credential or an id outright:
  * - `authorization`: bearer tokens.
  * - `sec-websocket-protocol`: a browser live socket's offer, which carries
- *   its bearer token and ids (src/liveSubprotocol.ts).
+ *   its live ticket (src/liveSubprotocol.ts).
  * - `x-ww-admin-token` and `x-ww-dev-bypass`: the admin and dev bypass tokens.
  * - `x-buddies-*`: the Buddies live socket's signed envelope (holds the inbox
  *   id).

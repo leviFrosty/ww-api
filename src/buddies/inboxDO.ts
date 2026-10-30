@@ -59,6 +59,9 @@ import { retryAfterSeconds } from '../errors'
 import {
   closeExpiredSockets,
   readLiveExpiry,
+  readLiveTicketHash,
+  isTicketOpen,
+  LIVE_TICKET_HEADER,
   soonestSocketExpiry,
 } from '../liveSubprotocol'
 
@@ -157,9 +160,10 @@ const SOCKET_OPEN = 1
 
 /**
  * Stored on each live socket; survives hibernation. `expiresAt` (epoch ms)
- * is a browser socket's token expiry; native sockets have none.
+ * is a browser socket's token expiry and `ticket` its ticket's hash
+ * (`LIVE_TICKET_HEADER`); native sockets have neither.
  */
-type LiveAttachment = { openedAt: number; expiresAt?: number }
+type LiveAttachment = { openedAt: number; expiresAt?: number; ticket?: string }
 
 const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
   (ws.deserializeAttachment() as LiveAttachment | null) ?? null
@@ -168,6 +172,9 @@ const openedAt = (ws: WebSocket): number => attachmentOf(ws)?.openedAt ?? 0
 
 const expiryOf = (ws: WebSocket): number | null =>
   attachmentOf(ws)?.expiresAt ?? null
+
+const ticketOf = (ws: WebSocket): string | null =>
+  attachmentOf(ws)?.ticket ?? null
 
 /** Live sockets carry only these tiny signals, never content. */
 type LiveMessage = { type: 'hello' | 'changed'; seq: number }
@@ -996,13 +1003,21 @@ export class BuddyInbox extends DurableObject<Environment> {
    * not owner activity for the 180-day retention. A browser socket's token
    * expiry (`BUDDIES_LIVE_EXPIRES_HEADER`, also set only by the Worker) is
    * one of the alarm's deadlines; the alarm closes it with `4004 "expired"`.
+   * While a socket on the browser's ticket (`LIVE_TICKET_HEADER`, its hash,
+   * set only by the Worker) is open, another is 409 `conflict`, so a copied
+   * ticket can't push the owner's sockets off.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return liveError(fail('upgrade_required'))
     const expiresAt = readLiveExpiry(
       request.headers.get(BUDDIES_LIVE_EXPIRES_HEADER)
     )
-    if (expiresAt === undefined) return liveError(fail('bad_request'))
+    const ticket = readLiveTicketHash(request.headers.get(LIVE_TICKET_HEADER))
+    if (expiresAt === undefined || ticket === undefined)
+      return liveError(fail('bad_request'))
+    // Only a socket that passed every check below holds this ticket.
+    if (ticket != null && isTicketOpen(this.#liveSockets(), ticket, ticketOf))
+      return liveError(fail('conflict'))
     const call = this.#liveCall(request.headers, Date.now())
     if (!call.ok) return liveError(call)
     const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
@@ -1021,6 +1036,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     const attachment: LiveAttachment = {
       openedAt: Date.now(),
       ...(expiresAt == null ? {} : { expiresAt }),
+      ...(ticket == null ? {} : { ticket }),
     }
     server.serializeAttachment(attachment)
     // One socket per device is typical; past the cap the oldest make way.

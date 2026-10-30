@@ -17,6 +17,7 @@ import {
   acceptLiveSubprotocol,
   forwardedLiveRequest,
   readBrowserLive,
+  LIVE_TICKET_HEADER,
 } from '../liveSubprotocol'
 import {
   authenticateAccount,
@@ -26,6 +27,7 @@ import {
   parseJsonOrNull,
 } from './auth'
 import { accountForKey, guarded, refuseAtEdge, verifyEnvelope } from './signed'
+import { admitLiveTicket } from './liveTickets'
 import { sessionStates } from './sessionStore'
 import { accountSupporterStatus } from './supporter'
 import { accountsDb } from './store'
@@ -101,7 +103,7 @@ const unavailableHere = (env: Environment): Response | null =>
 export const caller = async (
   c: AppContext,
   tier: 'write' | 'read' | 'photoPut',
-  options?: Pick<AuthenticateAccountOptions, 'requireLiveSession' | 'token'>
+  options?: Pick<AuthenticateAccountOptions, 'requireLiveSession'>
 ): Promise<
   { account: AccountAuth; expiresAt: number } | { refusal: Response }
 > => {
@@ -401,51 +403,64 @@ const handleDelete = guarded('sync/delete', async (c) => {
  * dropped) and the device's own slot in `x-ww-slot-id`.
  *
  * - Native apps send the token in `Authorization` and the slot id in
- *   `x-ww-slot-id`. Their sockets outlive the token.
- * - Browsers can't set headers on a WebSocket, so they offer `ww.v1`,
- *   `bearer.<token>`, and `slot.<slotId>` in `Sec-WebSocket-Protocol`
- *   (src/liveSubprotocol.ts), from an allowed `Origin`. The token is checked
- *   exactly as the header's would be, then every other check runs in the
- *   same order. The DO gets the token's expiry in `SYNC_HEADERS.expiresAt`
- *   (never the token) and closes the socket with `4004 "expired"` then; the
- *   101 says `Sec-WebSocket-Protocol: ww.v1`.
+ *   `x-ww-slot-id`. Their sockets outlive the token, so a `web` token is
+ *   refused there (403 `forbidden`).
+ * - Browsers can't set headers on a WebSocket, so they offer `ww.v1` and
+ *   `ticket.<ticket>` in `Sec-WebSocket-Protocol` (src/liveSubprotocol.ts),
+ *   from an allowed `Origin`: a `sync` ticket from `POST live/ticket`
+ *   (src/accounts/liveTickets.ts), which names the slot. Origin (403) and
+ *   the offer's shape (400) come first, then the switches, the same edge
+ *   tier, and the ticket (401) in place of the token; then every other check
+ *   runs in the same order. The DO gets the token's expiry from the ticket
+ *   in `SYNC_HEADERS.expiresAt` and the ticket's hash in
+ *   `LIVE_TICKET_HEADER` (never the ticket), refuses a second socket on the
+ *   same ticket while one is open (409 `conflict`), and closes the socket
+ *   with `4004 "expired"` at the expiry; the 101 says
+ *   `Sec-WebSocket-Protocol: ww.v1`.
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
-    const browser = readBrowserLive(c.env, c.req.raw.headers, ['slot'] as const)
+    const browser = readBrowserLive(c.env, c.req.raw.headers)
     if (browser && !browser.ok) return buddiesErrorResponse(browser.error)
     const off = unavailableHere(c.env)
     if (off) return off
-    const who = await caller(
-      c,
-      'read',
-      browser ? { token: browser.token } : undefined
-    )
-    if ('refusal' in who) return who.refusal
-    const { accountId } = who.account
+    let accountId: string
+    let slotId: string | undefined
+    let ticket: { expiresAt: number; hash: string } | null = null
+    if (browser) {
+      const limited = await refuseAtEdge(c, 'inbox/sync')
+      if (limited) return limited
+      const admitted = await admitLiveTicket(c.env, browser.ticket, 'sync')
+      if (!admitted.ok) return admitted.response
+      const { claims } = admitted
+      accountId = claims.account.accountId
+      slotId = claims.id
+      ticket = { expiresAt: claims.tokenExpiresAt, hash: claims.hash }
+    } else {
+      const who = await caller(c, 'read')
+      if ('refusal' in who) return who.refusal
+      // A browser's token never opens a header socket: nothing would close
+      // it when the token expires. Browsers use tickets.
+      if (who.account.platform === 'web') return buddiesErrorResponse('forbidden')
+      accountId = who.account.accountId
+      slotId = c.req.header(SYNC_HEADERS.slotId)
+    }
     const refused = await refuseUnentitled(c.env, accountId)
     if (refused) return refused
     if (!isWebSocketUpgrade(c.req.raw))
       return buddiesErrorResponse('upgrade_required')
-    const slotId = browser
-      ? browser.ids.slot
-      : c.req.header(SYNC_HEADERS.slotId)
     if (!isSyncSlotId(slotId)) return buddiesErrorResponse('bad_request')
-    const index = syncIndex(c.env, accountId)
-    if (browser) {
-      const response = await index.fetch(
-        forwardedLiveRequest(c.req.raw, {
-          [SYNC_HEADERS.account]: accountId,
-          [SYNC_HEADERS.slotId]: slotId,
-          [SYNC_HEADERS.expiresAt]: String(who.expiresAt),
-        })
-      )
-      return acceptLiveSubprotocol(response)
-    }
-    const headers = new Headers(c.req.raw.headers)
-    headers.delete(SYNC_HEADERS.expiresAt)
-    headers.set(SYNC_HEADERS.account, accountId)
-    return await index.fetch(new Request(c.req.raw, { headers }))
+    const response = await syncIndex(c.env, accountId).fetch(
+      forwardedLiveRequest(c.req.raw, {
+        [SYNC_HEADERS.account]: accountId,
+        [SYNC_HEADERS.slotId]: slotId,
+        ...(ticket && {
+          [SYNC_HEADERS.expiresAt]: String(ticket.expiresAt),
+          [LIVE_TICKET_HEADER]: ticket.hash,
+        }),
+      }, [SYNC_HEADERS.expiresAt])
+    )
+    return ticket ? acceptLiveSubprotocol(response) : response
   } catch (error) {
     console.error('accounts: request failed', { op: 'sync/live' })
     captureFailure(error, 'sync/live')

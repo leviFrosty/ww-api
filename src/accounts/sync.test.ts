@@ -10,6 +10,7 @@ import {
 import {
   accountEnvelope,
   bearer,
+  liveTicket,
   openTestSession,
   postJson,
   requestJson,
@@ -23,6 +24,7 @@ import { SYNC_LIMITS } from './syncContracts'
 import { syncEntitlement } from './syncSwitch'
 import { AccountSync } from './syncDO'
 import { accountSupporterStatus } from './supporter'
+import { accessTokenKeys, signAccessToken } from './tokens'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -482,6 +484,20 @@ describe('switches and entitlement', () => {
 })
 
 describe('live socket', () => {
+  it('refuses a web token on the header path, where nothing would close it', async () => {
+    const s = await session()
+    const keys = (await accessTokenKeys(h.env as never))!
+    const { accessToken } = await signAccessToken(keys, {
+      accountId: s.accountId,
+      sessionId: s.sessionId,
+      platform: 'web',
+    })
+    expect(await live({ ...s, accessToken }, slot())).toMatchObject({
+      status: 403,
+      socket: null,
+    })
+  })
+
   it('says hello with the seq, and changed to the account’s other slots', async () => {
     const s = await session()
     const phone = slot()
@@ -872,16 +888,19 @@ describe('privacy', () => {
 
 /**
  * The browser's live socket (witness-work ADR 0038 §10): browsers can't set
- * headers on a WebSocket, so the token and slot ride in the
- * `Sec-WebSocket-Protocol` offer, next to `ww.v1`, from an allowed origin.
+ * headers on a WebSocket, so they mint a ticket naming the slot and offer it
+ * in `Sec-WebSocket-Protocol`, next to `ww.v1`, from an allowed origin. The
+ * access token never goes in that header: Cloudflare's logs record it.
  */
 describe('browser live socket', () => {
   const MINUTE = 60 * SECOND
 
-  const offer = (s: TestSession, slotId: string) => [
+  const ticket = (s: TestSession, slotId: string, socket: 'sync' | 'buddies' = 'sync') =>
+    liveTicket(app as never, h.env, s, socket, slotId)
+
+  const offer = async (s: TestSession, slotId: string) => [
     'ww.v1',
-    `bearer.${s.accessToken}`,
-    `slot.${slotId}`,
+    `ticket.${await ticket(s, slotId)}`,
   ]
 
   const browserLive = async (
@@ -927,11 +946,30 @@ describe('browser live socket', () => {
     return seen
   }
 
+  it('mints a 30-second ticket for the slot', async () => {
+    const s = await session()
+    const response = await postJson(
+      app as never,
+      h.env,
+      '/live/ticket',
+      { socket: 'sync', id: slot() },
+      bearer(s.accessToken)
+    )
+    expect(response.status).toBe(200)
+    const body = response.body as { ok: boolean; ticket: string; expiresAt: number }
+    expect(body).toMatchObject({ ok: true, expiresAt: START + 30 * SECOND })
+    expect(body.ticket).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/)
+    expect(body.ticket).not.toContain(s.accessToken)
+    // Sealed: no id in it, in any form.
+    for (const id of [s.accountId, s.sessionId])
+      expect(body.ticket).not.toContain(id)
+  })
+
   it('opens with ww.v1 echoed, says hello, and honors the slot', async () => {
     const s = await session()
     const phone = slot()
     const tablet = slot()
-    const live = await browserLive(offer(s, phone))
+    const live = await browserLive(await offer(s, phone))
     expect(live.status).toBe(101)
     expect(live.protocol).toBe('ww.v1')
     expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
@@ -947,74 +985,236 @@ describe('browser live socket', () => {
 
   it('takes the entries in any order, with or without spaces', async () => {
     const s = await session()
-    const live = await browserLive(
-      `slot.${slot()},bearer.${s.accessToken} ,  ww.v1`
-    )
+    const live = await browserLive(`ticket.${await ticket(s, slot())} ,  ww.v1`)
     expect(live.status).toBe(101)
     expect(live.protocol).toBe('ww.v1')
   })
 
-  it('never forwards the token or the offer to the DO', async () => {
+  it('never forwards the ticket or the offer to the DO', async () => {
     const seen = forwarded()
     const s = await session()
     const phone = slot()
-    expect((await browserLive(offer(s, phone))).status).toBe(101)
+    const minted = await ticket(s, phone)
+    expect((await browserLive(['ww.v1', `ticket.${minted}`])).status).toBe(101)
     expect(seen).toHaveLength(1)
     const headers = Object.fromEntries(seen[0].headers.entries())
     expect(headers['sec-websocket-protocol']).toBeUndefined()
     expect(headers.authorization).toBeUndefined()
-    expect(JSON.stringify(headers)).not.toContain(s.accessToken)
+    expect(JSON.stringify(headers)).not.toContain(minted)
     expect(headers['x-ww-sync-account']).toBe(s.accountId)
     expect(headers['x-ww-slot-id']).toBe(phone)
     expect(headers['x-ww-sync-expires-at']).toBe(String(s.accessExpiresAt))
+    // The ticket's hash, which can't open anything, so one ticket opens one socket.
+    expect(headers['x-ww-live-ticket']).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(seen[0].url).not.toContain(phone)
   })
 
-  it('needs ww.v1 in the offer', async () => {
+  it('takes the slot from the ticket, never a header', async () => {
+    const seen = forwarded()
     const s = await session()
-    const live = await browserLive([`bearer.${s.accessToken}`, `slot.${slot()}`])
-    expect(live).toMatchObject({ status: 400, code: 'bad_request', protocol: null })
+    const phone = slot()
+    const live = await browserLive(await offer(s, phone), { 'x-ww-slot-id': slot() })
+    expect(live.status).toBe(101)
+    expect(seen[0].headers.get('x-ww-slot-id')).toBe(phone)
   })
 
-  it('refuses a bad, expired, or missing token like the header path', async () => {
+  it('needs ww.v1 in the offer, and echoes it', async () => {
     const s = await session()
-    for (const token of ['nope', `${s.accessToken}x`]) {
-      const live = await browserLive(['ww.v1', `bearer.${token}`, `slot.${slot()}`])
-      expect(live).toMatchObject({ status: 401, code: 'unauthorized' })
+    const [, entry] = await offer(s, slot())
+    expect(await browserLive([entry])).toMatchObject({
+      status: 400,
+      code: 'bad_request',
+      protocol: null,
+    })
+    expect((await browserLive(['ww.v1', entry])).protocol).toBe('ww.v1')
+  })
+
+  it('refuses the access token in place of a ticket', async () => {
+    const s = await session()
+    // The old `bearer.` entry is gone: an unknown entry.
+    expect(await browserLive(['ww.v1', `bearer.${s.accessToken}`])).toMatchObject({
+      status: 400,
+      code: 'bad_request',
+    })
+    expect(await browserLive(['ww.v1', `ticket.${s.accessToken}`])).toMatchObject({
+      status: 401,
+      code: 'unauthorized',
+    })
+  })
+
+  it('refuses a missing, forged, expired, or Buddies ticket with 401', async () => {
+    const s = await session()
+    const minted = await ticket(s, slot())
+    const [claims, mac] = minted.split('.')
+    const flipped = `${claims}.${mac[0] === 'A' ? 'B' : 'A'}${mac.slice(1)}`
+    for (const protocols of [
+      ['ww.v1'],
+      ['ww.v1', 'ticket.nope'],
+      ['ww.v1', `ticket.${flipped}`],
+      ['ww.v1', `ticket.${minted}x`],
+      // A Buddies ticket for a slot-shaped id.
+      ['ww.v1', `ticket.${await ticket(s, randomId(), 'buddies')}`],
+    ]) {
+      const live = await browserLive(protocols)
+      expect(live, protocols.join(', ').slice(0, 60)).toMatchObject({
+        status: 401,
+        code: 'unauthorized',
+      })
       expect(live.authenticate).toContain('Bearer')
     }
-    expect(await browserLive(['ww.v1', `slot.${slot()}`])).toMatchObject({
-      status: 401,
-      code: 'unauthorized',
-    })
-    advance(16 * MINUTE)
-    expect(await browserLive(offer(s, slot()))).toMatchObject({
-      status: 401,
-      code: 'unauthorized',
-    })
   })
 
-  it('needs an allowed Origin, before the token or the DO', async () => {
+  it('refuses a ticket 30 seconds after minting', async () => {
+    const s = await session()
+    const first = await offer(s, slot())
+    const second = await offer(s, slot())
+    advance(29 * SECOND)
+    expect((await browserLive(first)).status).toBe(101)
+    advance(2 * SECOND)
+    expect(await browserLive(second)).toMatchObject({ status: 401, code: 'unauthorized' })
+  })
+
+  it('opens one socket per ticket: a copy is 409 while it is open', async () => {
+    const s = await session()
+    const entries = await offer(s, slot())
+    const first = await browserLive(entries)
+    expect(first.status).toBe(101)
+    // Another ticket of the same session opens beside it.
+    const second = await browserLive(await offer(s, slot()))
+    expect(second.status).toBe(101)
+    // A replayed copy pushes no socket off: it never opens.
+    for (let i = 0; i < 25; i++)
+      expect(await browserLive(entries)).toMatchObject({ status: 409, code: 'conflict' })
+    expect(first.socket!.closedBy).toBeNull()
+    expect(second.socket!.closedBy).toBeNull()
+    // Once the first closes, the same ticket reopens within its 30 seconds.
+    first.socket!.close(1000, '')
+    expect((await browserLive(entries)).status).toBe(101)
+  })
+
+  it('takes a client’s ticket header on neither path', async () => {
+    const seen = forwarded()
+    const s = await session()
+    const first = await browserLive(await offer(s, slot()))
+    const hash = seen[0].headers.get('x-ww-live-ticket')!
+    expect(hash).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(first.status).toBe(101)
+    // A header-path socket naming the open ticket opens, without it.
+    const native = await live(s, slot(), { 'x-ww-live-ticket': hash })
+    expect(native.status).toBe(101)
+    expect(seen[1].headers.get('x-ww-live-ticket')).toBeNull()
+    // A browser one gets its own ticket's hash, never the client's.
+    const other = await browserLive(await offer(s, slot()), { 'x-ww-live-ticket': hash })
+    expect(other.status).toBe(101)
+    expect(seen[2].headers.get('x-ww-live-ticket')).not.toBe(hash)
+  })
+
+  it('mints only for a live session; a ticket minted before still opens', async () => {
+    const s = await session()
+    const entries = await offer(s, slot())
+    const closed = await requestJson(
+      app as never,
+      h.env,
+      'DELETE',
+      '/sessions/current',
+      undefined,
+      bearer(s.accessToken)
+    )
+    expect(closed.status).toBe(200)
+    expect(
+      await postJson(app as never, h.env, '/live/ticket', { socket: 'sync', id: slot() }, bearer(s.accessToken))
+    ).toMatchObject({ status: 401, body: { code: 'unauthorized' } })
+    // The upgrade checks no session, as the header path doesn't: the ticket
+    // lives 30 seconds, and the socket closes when the token expires.
+    expect((await browserLive(entries)).status).toBe(101)
+    expect((await live(s, slot())).status).toBe(101)
+
+    // Revoked from another device: the same.
+    const phone = await session()
+    const lost = await openTestSession(app as never, h.env, phone.key)
+    expect(
+      (await postJson(app as never, h.env, '/sessions/revoke', { sessionId: lost.sessionId }, bearer(phone.accessToken))).status
+    ).toBe(200)
+    expect(
+      await postJson(app as never, h.env, '/live/ticket', { socket: 'buddies', id: randomId() }, bearer(lost.accessToken))
+    ).toMatchObject({ status: 401, body: { code: 'unauthorized' } })
+  })
+
+  it('mints nothing for a token within a second of expiring', async () => {
+    const s = await session()
+    const mint = () =>
+      postJson(app as never, h.env, '/live/ticket', { socket: 'sync', id: slot() }, bearer(s.accessToken))
+    advance(s.accessExpiresAt - Date.now() - 1_500)
+    expect(await mint()).toMatchObject({
+      status: 200,
+      body: { expiresAt: s.accessExpiresAt },
+    })
+    advance(600)
+    expect(await mint()).toMatchObject({ status: 401, body: { code: 'unauthorized' } })
+  })
+
+  it('mints only for a bearer caller and a well-formed request', async () => {
+    const s = await session()
+    const mint = (body: unknown, headers = bearer(s.accessToken)) =>
+      postJson(app as never, h.env, '/live/ticket', body, headers)
+    expect(await mint({ socket: 'sync', id: slot() }, {})).toMatchObject({
+      status: 401,
+      body: { code: 'unauthorized' },
+    })
+    advance(16 * MINUTE)
+    expect(await mint({ socket: 'sync', id: slot() })).toMatchObject({ status: 401 })
+    const later = await session()
+    for (const body of [
+      null,
+      [],
+      {},
+      { socket: 'sync' },
+      { socket: 'chat', id: slot() },
+      { socket: 'sync', id: 'bad slot' },
+      { socket: 'sync', id: 'x' },
+      { socket: 'buddies', id: 'short' },
+      { socket: 'sync', id: 42 },
+    ]) {
+      expect(await mint(body, bearer(later.accessToken)), JSON.stringify(body)).toMatchObject({
+        status: 400,
+        body: { code: 'bad_request' },
+      })
+    }
+  })
+
+  it('answers disabled without a ticket secret, on the route and the socket', async () => {
+    const s = await session()
+    const entries = await offer(s, slot())
+    delete h.env.LIVE_TICKET_SECRET
+    expect(
+      await postJson(app as never, h.env, '/live/ticket', { socket: 'sync', id: slot() }, bearer(s.accessToken))
+    ).toMatchObject({ status: 503, body: { code: 'disabled' } })
+    expect(await browserLive(entries)).toMatchObject({ status: 503, code: 'disabled' })
+    // Native sockets don't need it.
+    expect((await live(s, slot())).status).toBe(101)
+  })
+
+  it('needs an allowed Origin, before the ticket or the DO', async () => {
     const seen = forwarded()
     const s = await session()
     for (const origin of ['https://evil.example', 'null', `${TEST_WEB_ORIGIN}/`]) {
       expect(
-        await browserLive(offer(s, slot()), { origin })
+        await browserLive(await offer(s, slot()), { origin })
       ).toMatchObject({ status: 403, code: 'forbidden' })
-      // A bad token from a bad origin is still the origin's refusal.
+      // A bad ticket from a bad origin is still the origin's refusal.
       expect(
-        await browserLive(['ww.v1', 'bearer.nope', `slot.${slot()}`], { origin })
+        await browserLive(['ww.v1', 'ticket.nope'], { origin })
       ).toMatchObject({ status: 403, code: 'forbidden' })
       // So is a malformed offer: a foreign page learns nothing of its shape.
       expect(
-        await browserLive(['bearer.nope', 'bad entry'], { origin })
+        await browserLive(['ticket.nope', 'bad entry'], { origin })
       ).toMatchObject({ status: 403, code: 'forbidden' })
     }
     const response = (await request('/sync/live', {
       method: 'GET',
       headers: {
         upgrade: 'websocket',
-        'sec-websocket-protocol': offer(s, slot()).join(', '),
+        'sec-websocket-protocol': (await offer(s, slot())).join(', '),
       },
     })) as Response
     expect(response.status).toBe(403)
@@ -1023,23 +1223,20 @@ describe('browser live socket', () => {
 
   it('refuses malformed offers with bad_request', async () => {
     const s = await session()
-    const token = `bearer.${s.accessToken}`
-    const phone = `slot.${slot()}`
+    const [ww, entry] = await offer(s, slot())
     for (const protocols of [
-      ['ww.v1', 'ww.v1', token, phone],
-      ['ww.v1', token, token, phone],
-      ['ww.v1', token, phone, `slot.${slot()}`],
-      ['ww.v1', '', token, phone],
-      ['ww.v1', token, phone, 'chat'],
-      ['ww.v1', token, phone, 'ww.v2'],
-      ['ww.v1', 'bearer.', phone],
-      ['ww.v1', token, 'slot.'],
-      ['ww.v1', token, 'slot.bad slot'],
-      ['ww.v1', token, 'slot.a/b'],
-      ['ww.v1', token, 'slot.x'],
-      ['ww.v1', token, phone, `payload.${'A'.repeat(16)}`],
-      ['ww.v1', token, phone, `x${'A'.repeat(5_000)}`],
-      ['ww.v1', token],
+      [ww, ww, entry],
+      [ww, entry, entry],
+      [ww, entry, `ticket.${await ticket(s, slot())}`],
+      [ww, '', entry],
+      [ww, entry, 'chat'],
+      [ww, entry, 'ww.v2'],
+      [ww, 'ticket.'],
+      [ww, 'ticket'],
+      [ww, entry, `slot.${slot()}`],
+      [ww, entry, `payload.${'A'.repeat(16)}`],
+      [ww, entry, 'ticket.a/b'],
+      [ww, `ticket.${'A'.repeat(5_000)}`],
     ]) {
       const live = await browserLive(protocols)
       expect(live, protocols.join(', ').slice(0, 80)).toMatchObject({
@@ -1048,14 +1245,14 @@ describe('browser live socket', () => {
       })
     }
     expect(
-      await browserLive(offer(s, slot()), { authorization: `Bearer ${s.accessToken}` })
+      await browserLive([ww, entry], { authorization: `Bearer ${s.accessToken}` })
     ).toMatchObject({ status: 400, code: 'bad_request' })
   })
 
   it('runs the switch and entitlement checks the header path runs', async () => {
     const s = await session()
     await h.kv.put('sync:enabled', 'false')
-    expect(await browserLive(offer(s, slot()))).toMatchObject({
+    expect(await browserLive(await offer(s, slot()))).toMatchObject({
       status: 503,
       code: 'disabled',
     })
@@ -1063,7 +1260,7 @@ describe('browser live socket', () => {
     await h.kv.put('sync:entitlement', 'supporter')
     supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 1 })
     resetSyncEntitlementCache()
-    expect(await browserLive(offer(s, slot()))).toMatchObject({
+    expect(await browserLive(await offer(s, slot()))).toMatchObject({
       status: 403,
       code: 'supporter_required',
     })
@@ -1071,7 +1268,7 @@ describe('browser live socket', () => {
       method: 'GET',
       headers: {
         origin: TEST_WEB_ORIGIN,
-        'sec-websocket-protocol': offer(s, slot()).join(', '),
+        'sec-websocket-protocol': (await offer(s, slot())).join(', '),
       },
     })
     expect(plain.status).toBe(403)
@@ -1083,7 +1280,7 @@ describe('browser live socket', () => {
       method: 'GET',
       headers: {
         origin: TEST_WEB_ORIGIN,
-        'sec-websocket-protocol': offer(s, slot()).join(', '),
+        'sec-websocket-protocol': (await offer(s, slot())).join(', '),
       },
     })
     expect(plain.status).toBe(426)
@@ -1112,7 +1309,7 @@ describe('browser live socket', () => {
 
   it('closes with 4004 expired once the token expires; header sockets stay', async () => {
     const s = await session()
-    const browser = await browserLive(offer(s, slot()))
+    const browser = await browserLive(await offer(s, slot()))
     const native = await live(s, slot())
     const storage = h.syncIndexes.storage(s.accountId)
     expect(storage.alarm()).toBe(s.accessExpiresAt)
@@ -1126,12 +1323,12 @@ describe('browser live socket', () => {
 
   it('schedules the earliest expiry, and the next one after it', async () => {
     const first = await session()
-    const firstSocket = await browserLive(offer(first, slot()))
+    const firstSocket = await browserLive(await offer(first, slot()))
     advance(5 * MINUTE)
     // A second session of the same account: refresh-style, a later token.
     const later = await openTestSession(app as never, h.env, first.key)
     expect(later.accountId).toBe(first.accountId)
-    const laterSocket = await browserLive(offer(later, slot()))
+    const laterSocket = await browserLive(await offer(later, slot()))
     const storage = h.syncIndexes.storage(first.accountId)
     expect(storage.alarm()).toBe(first.accessExpiresAt)
 
@@ -1153,7 +1350,7 @@ describe('browser live socket', () => {
     expect(storage.alarm()).toBe(START + DAY)
     const listed = vi.spyOn(h.syncBlobs, 'list')
 
-    const browser = await browserLive(offer(s, slot()))
+    const browser = await browserLive(await offer(s, slot()))
     expect(storage.alarm()).toBe(s.accessExpiresAt)
     advance(s.accessExpiresAt - Date.now())
     await h.syncIndexes.fireAlarm(s.accountId)
@@ -1174,7 +1371,7 @@ describe('browser live socket', () => {
     const storage = h.syncIndexes.storage(s.accountId)
     advance(DAY - 5 * MINUTE)
     const later = await openTestSession(app as never, h.env, s.key)
-    const browser = await browserLive(offer(later, slot()))
+    const browser = await browserLive(await offer(later, slot()))
     // Retention (START + DAY) is sooner than the token's expiry.
     expect(storage.alarm()).toBe(START + DAY)
     const listed = vi.spyOn(h.syncBlobs, 'list')
@@ -1201,7 +1398,7 @@ describe('browser live socket', () => {
     h.syncIndexes.restart(s.accountId)
     const listed = vi.spyOn(h.syncBlobs, 'list')
     const later = await openTestSession(app as never, h.env, s.key)
-    const browser = await browserLive(offer(later, slot()))
+    const browser = await browserLive(await offer(later, slot()))
     expect(storage.alarm()).toBe(later.accessExpiresAt)
 
     advance(later.accessExpiresAt - Date.now())
@@ -1222,7 +1419,7 @@ describe('browser live socket', () => {
       sockets.push((await live(s, slot())).socket!)
       advance(1)
     }
-    const browser = await browserLive(offer(s, slot()))
+    const browser = await browserLive(await offer(s, slot()))
     expect(browser.status).toBe(101)
     expect(sockets[0].closedBy).toEqual({ code: 4000, reason: 'replaced' })
     advance(1)
@@ -1242,12 +1439,13 @@ describe('browser live socket', () => {
       vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
     const s = await session()
     const phone = slot()
-    await browserLive(offer(s, phone))
-    await browserLive(offer(s, phone), { origin: 'https://evil.example' })
+    const entries = await offer(s, phone)
+    await browserLive(entries)
+    await browserLive(entries, { origin: 'https://evil.example' })
     advance(s.accessExpiresAt - Date.now())
     await h.syncIndexes.fireAlarm(s.accountId)
     const text = JSON.stringify(logs)
-    for (const secret of [phone, s.accountId, s.accessToken])
+    for (const secret of [phone, s.accountId, s.accessToken, entries[1].slice(7)])
       expect(text).not.toContain(secret)
   })
 })

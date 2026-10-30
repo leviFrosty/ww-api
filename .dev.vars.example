@@ -45,6 +45,10 @@ ACCOUNT_TICKET_SECRET=generate_with_openssl_rand_base64_32_local_only
 # uses Cloudflare's always-passing test secret; 2x0000000000000000000000000000000AA
 # fails every token. Production needs the widget's real secret.
 # TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+# Signs browser live socket tickets (POST /accounts/v1/live/ticket). At least
+# 32 characters and not ACCOUNT_TOKEN_SECRET's value; without it, browser live
+# sockets answer `disabled`. Local only; generate with: openssl rand -base64 32
+LIVE_TICKET_SECRET=generate_with_openssl_rand_base64_32_local_only
 
 # Dedicated local admin-reset token. Do not reuse the dev-bypass token.
 ADMIN_API_TOKEN=generate_with_openssl_rand_base64_32

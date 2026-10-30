@@ -115,3 +115,26 @@ export const openTestSession = async (
     )
   return { key: signingKey, ...response.body }
 }
+
+/**
+ * Mints a browser live socket ticket (`POST /live/ticket` on the accounts
+ * routes) with the session's access token.
+ */
+export const liveTicket = async (
+  app: Hono<never>,
+  env: Environment,
+  session: Pick<TestSession, 'accessToken'>,
+  socket: 'sync' | 'buddies',
+  id: string
+): Promise<string> => {
+  const response = await postJson(
+    app,
+    env,
+    '/live/ticket',
+    { socket, id },
+    bearer(session.accessToken)
+  )
+  if (response.status !== 200)
+    throw new Error(`live/ticket answered ${response.status}`)
+  return (response.body as { ticket: string }).ticket
+}

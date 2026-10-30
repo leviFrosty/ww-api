@@ -470,6 +470,15 @@ export interface Environment {
   >;
 
   /**
+   * Signs browser live socket tickets (`POST /accounts/v1/live/ticket`,
+   * src/accounts/liveTickets.ts). Secret, at least 32 characters, distinct
+   * per prod/dev worker and from `ACCOUNT_TOKEN_SECRET`. Without it, the
+   * ticket route and browser live sockets answer `disabled`; native sockets
+   * are unaffected.
+   */
+  LIVE_TICKET_SECRET?: string;
+
+  /**
    * Legacy-auth fallback when KV `auth:legacy` is absent: `"off"` refuses the
    * pre-session ways of authenticating with 426 `upgrade_required`; anything
    * else (and unset) accepts them. A failed KV read counts as off.

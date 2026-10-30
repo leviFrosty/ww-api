@@ -132,6 +132,8 @@ export interface HarnessOptions {
 
 /** The harness's `ACCOUNT_TOKEN_SECRET` and dev bypass token. */
 export const TEST_TOKEN_SECRET = 'test-account-token-secret-0123456789abcdef'
+/** The harness's `LIVE_TICKET_SECRET`. */
+export const TEST_LIVE_TICKET_SECRET = 'test-live-ticket-secret-0123456789abcdef'
 export const TEST_DEV_BYPASS = 'test-dev-bypass-token'
 /** A web app origin in the harness's `WEB_APP_ORIGINS` (the dev list's). */
 export const TEST_WEB_ORIGIN = 'http://localhost:8081'
@@ -304,6 +306,7 @@ export const createHarness = async (
       ? {}
       : {
           ACCOUNT_TOKEN_SECRET: TEST_TOKEN_SECRET,
+          LIVE_TICKET_SECRET: TEST_LIVE_TICKET_SECRET,
           APP_ATTEST_ENVIRONMENT: 'development',
           NOTES_IMPORT_DEV_BYPASS_TOKEN: TEST_DEV_BYPASS,
           PASSKEY_CHALLENGE_SECRET: TEST_CHALLENGE_SECRET,
