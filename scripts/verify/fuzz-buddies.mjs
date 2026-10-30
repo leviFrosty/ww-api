@@ -20,6 +20,7 @@
  * generators are skipped (and counted as such). Tokens never reach the report.
  */
 
+import { spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -72,6 +73,16 @@ if (!BASE) {
 if (!Number.isInteger(RUNS) || RUNS < 1) {
   console.error('fuzz: --runs must be a positive integer')
   process.exit(2)
+}
+// Legacy requests are half of what's fuzzed. The dev worker's AUTH_LEGACY is
+// off since the web launch (ADR 0038 §11), so turn them on in the local
+// launcher's KV; a deployed worker is left as it is.
+if (!process.env.WW_API_URL && !argv.some((arg) => arg.startsWith('--url')) && existsSync(join(ROOT, '.verify', 'state.json'))) {
+  const seeded = spawnSync(process.execPath, [join(ROOT, 'scripts/verify/dev.mjs'), 'kv', 'put', 'auth:legacy', 'on'], { cwd: ROOT, encoding: 'utf8' })
+  if (seeded.status !== 0) {
+    console.error(`fuzz: couldn't turn legacy auth on in local KV: ${seeded.stderr}`)
+    process.exit(2)
+  }
 }
 
 // --- Seeded shape randomness (mulberry32), fresh entropy for ids/keys -----

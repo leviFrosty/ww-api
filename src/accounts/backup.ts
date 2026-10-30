@@ -9,20 +9,21 @@ import {
   backupObjectKey,
   backupPrefix,
 } from './contracts'
-import { readPlainJson, type RequireAccountOptions } from './auth'
+import { readPlainJson, type AccountAuth, type RequireAccountOptions } from './auth'
+import { refuseWithoutStepUp } from './stepUp'
 import { recordActivity, recordBackupDownload } from './activity'
 import { accountsDb } from './store'
+import { claimNonce } from './passkeyStore'
 import {
   accountCall,
-  accountForKey,
   guarded,
   plainFields,
   refuseAtEdge,
+  signedForToken,
   verifiedBody,
   verifiedHeaders,
   type AccountCallRead,
   type BearerFields,
-  type Verified,
 } from './signed'
 
 /**
@@ -236,22 +237,23 @@ const handleGet = guarded('backup/get', async (c) =>
 
 /**
  * The bearer form of `backup/delete`: the envelope must verify and be signed
- * by the token's own account (`forbidden` otherwise).
+ * by the token's own account (`forbidden` otherwise), a web session needs a
+ * passkey step-up in the last 5 minutes, and the envelope works once (409
+ * `replay`): its nonce is recorded before anything is deleted, since R2
+ * isn't in a D1 batch.
  */
 const stepUp = async (
   c: AppContext,
-  accountId: string
+  account: AccountAuth
 ): Promise<BearerFields<'backup/delete'>> => {
-  const verified: Verified<'backup/delete'> = await verifiedBody(
-    c,
-    'backup/delete'
-  )
-  if ('refusal' in verified) return verified
-  const found = await accountForKey(c.env, verified.payload.accountPub)
-  if ('refusal' in found) return found
-  return found.account.id === accountId
-    ? { fields: verified.fields }
-    : { refusal: buddiesErrorResponse('forbidden') }
+  const signed = await signedForToken(c, 'backup/delete', account)
+  if ('refusal' in signed) return signed
+  const db = accountsDb(c.env.ACCOUNTS_DB!)
+  const stepUpRefusal = await refuseWithoutStepUp(db, account)
+  if (stepUpRefusal) return { refusal: stepUpRefusal }
+  return (await claimNonce(db, signed.nonce))
+    ? { fields: signed.fields }
+    : { refusal: buddiesErrorResponse('replay') }
 }
 
 /**
@@ -263,7 +265,7 @@ const handleDelete = guarded('backup/delete', async (c) =>
     c,
     'inbox/sync',
     {
-      bearer: (account) => stepUp(c, account.accountId),
+      bearer: (account) => stepUp(c, account),
       legacy: () => verifiedBody(c, 'backup/delete'),
     },
     async (bucket, accountId, { slotId }) => {

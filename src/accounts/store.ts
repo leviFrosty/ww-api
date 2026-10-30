@@ -13,6 +13,10 @@ import { activityInsert } from './activity'
 export const accountsDb = (d1: D1Database) => drizzle(d1)
 export type AccountsDb = ReturnType<typeof accountsDb>
 
+/** Rows a D1 write changed (Drizzle hands back D1's result for writes). */
+export const changes = (result: unknown): number =>
+  (result as { meta?: { changes?: number } }).meta?.changes ?? 0
+
 /** A fresh account id: b64u of 16 random bytes. */
 export const newAccountId = (): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)))

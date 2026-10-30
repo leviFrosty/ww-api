@@ -19,7 +19,7 @@ export const SCRIBE_EVENTS = {
   transcribe: 'api_scribe_transcribe',
 } as const
 
-export type ScribePlatform = 'ios' | 'android' | 'dev'
+export type ScribePlatform = 'ios' | 'android' | 'dev' | 'web'
 
 export interface StepLogFields {
   protocol: number | null

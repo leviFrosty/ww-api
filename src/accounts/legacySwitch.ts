@@ -10,8 +10,10 @@ import { buddiesErrorResponse } from '../buddies/errorResponse'
  * `upgrade_required`, and the app shows Update Required.
  *
  * KV `auth:legacy` in `NOTES_KV`: `"off"` (or `"false"`) turns it off, `"on"`
- * (or `"true"`) on. Absent, unreadable, or anything else falls back to the
- * `AUTH_LEGACY` var the same way, and then to on. Edge-cached for 60 seconds.
+ * (or `"true"`) on. Absent or anything else falls back to the `AUTH_LEGACY`
+ * var the same way, and then to on. A failed read counts as off (witness-work
+ * ADR 0038 §11): the old ways of signing requests never come back because KV
+ * is down. Edge-cached for 60 seconds.
  */
 
 export const AUTH_LEGACY_KEY = 'auth:legacy'
@@ -32,7 +34,8 @@ export const isLegacyAuthEnabled = async (
       cacheTtl: CACHE_TTL_SECONDS,
     })
   } catch {
-    console.warn('accounts: legacy switch KV read failed; using AUTH_LEGACY')
+    console.warn('accounts: legacy switch KV read failed; refusing legacy auth')
+    return false
   }
   const stored = value?.trim().toLowerCase()
   if (stored && OFF.has(stored)) return false

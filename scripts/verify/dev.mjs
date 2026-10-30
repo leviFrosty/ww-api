@@ -223,7 +223,8 @@ const writeVarsFile = (flags, previousTokens, vars = {}) => {
     const value = process.env[name] || fromFile[name]
     if (value) optional[name] = value
   }
-  // Synthetic per-state tokens; reused across restarts so tests keep working.
+  // Synthetic per-state tokens; reused across restarts (and from the persist
+  // dir) so tests and persisted counts keep working.
   const tokens = {
     devBypass: `verify-bypass-${randomBytes(16).toString('hex')}`,
     admin: `verify-admin-${randomBytes(16).toString('hex')}`,
@@ -231,6 +232,9 @@ const writeVarsFile = (flags, previousTokens, vars = {}) => {
     accountToken: `verify-account-token-${randomBytes(24).toString('hex')}`,
     // The RevenueCat webhook's Authorization secret.
     revenueCatWebhook: `verify-revenuecat-${randomBytes(16).toString('hex')}`,
+    // Passkey challenge and ticket MAC keys (ADR 0038).
+    passkeyChallenge: `verify-passkey-challenge-${randomBytes(24).toString('hex')}`,
+    accountTicket: `verify-account-ticket-${randomBytes(24).toString('hex')}`,
     ...previousTokens,
   }
   const lines = [
@@ -239,6 +243,8 @@ const writeVarsFile = (flags, previousTokens, vars = {}) => {
     `ADMIN_API_TOKEN=${quoteEnv(tokens.admin)}`,
     `ACCOUNT_TOKEN_SECRET=${quoteEnv(tokens.accountToken)}`,
     `REVENUECAT_WEBHOOK_AUTHORIZATION=${quoteEnv(tokens.revenueCatWebhook)}`,
+    `PASSKEY_CHALLENGE_SECRET=${quoteEnv(tokens.passkeyChallenge)}`,
+    `ACCOUNT_TICKET_SECRET=${quoteEnv(tokens.accountTicket)}`,
     `APPLE_TEAM_ID=${quoteEnv(optional.APPLE_TEAM_ID ?? SYNTHETIC_TEAM_ID)}`,
     ...OPTIONAL_SECRETS.filter((n) => n !== 'APPLE_TEAM_ID' && optional[n]).map(
       (name) => `${name}=${quoteEnv(optional[name])}`
@@ -358,9 +364,20 @@ async function up(args) {
 
   const port = await pickPort(HTTP_PORTS)
   const inspectorPort = await pickPort(INSPECTOR_PORTS)
-  const { tokens, configured, revenueCatApiUrl } = writeVarsFile(flags, existing?.tokens, {
-    ...(photoLimitBytes ? { SYNC_PHOTO_LIMIT_BYTES: photoLimitBytes } : {}),
-  })
+  // The secrets that key persisted state (session MACs, challenge and
+  // ticket keys, rate counter names) live with that state, so `down` and
+  // `up --persist-to` the same dir finds it all again, as a deployed worker
+  // with stable secrets would; `down --wipe` deletes them with it.
+  const secretsPath = join(persistDir, 'verify-secrets.json')
+  const persisted = existsSync(secretsPath)
+    ? JSON.parse(readFileSync(secretsPath, 'utf8'))
+    : {}
+  const { tokens, configured, revenueCatApiUrl } = writeVarsFile(
+    flags,
+    { ...persisted, ...existing?.tokens },
+    { ...(photoLimitBytes ? { SYNC_PHOTO_LIMIT_BYTES: photoLimitBytes } : {}) }
+  )
+  writeFileSync(secretsPath, `${JSON.stringify(tokens, null, 2)}\n`, { mode: 0o600 })
 
   const wranglerArgs = [
     WRANGLER_BIN,
@@ -485,6 +502,7 @@ async function doctor() {
 
   try {
     // Unknown invite: `not_found` proves the relay is enabled; `disabled` means the kill switch is off.
+    // The kill switch is checked first, so `upgrade_required` (dev's AUTH_LEGACY is off) proves it too.
     const probe = await fetchJson(`${state.url}/buddies/v1/invite/fetch`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.1' },
@@ -493,6 +511,7 @@ async function doctor() {
       }),
     })
     if (probe.status === 404 && probe.body?.error === 'not_found') ok('buddies relay enabled')
+    else if (probe.status === 426) ok('buddies relay enabled (legacy auth off: `kv put auth:legacy on` re-allows it)')
     else if (probe.body?.error === 'disabled')
       bad('buddies disabled: KV buddies:enabled is not "true"; run `node scripts/verify/dev.mjs kv delete buddies:enabled`')
     else bad(`buddies probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
@@ -511,6 +530,7 @@ async function doctor() {
       }),
     })
     if (probe.status === 404 && probe.body?.error === 'not_found') ok('buddies photos enabled')
+    else if (probe.status === 426) ok('buddies photos enabled (legacy auth off)')
     else if (probe.body?.error === 'photos_disabled')
       bad('buddies photos disabled: KV buddies:photos is not "on"; run `node scripts/verify/dev.mjs kv delete buddies:photos`')
     else bad(`buddies photos probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
@@ -547,6 +567,21 @@ async function doctor() {
     else bad(`account sessions probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
   } catch (error) {
     bad(`account sessions probe failed: ${error.message}`)
+  }
+
+  try {
+    // A sign-in challenge: `disabled` means the passkey secrets or RP config are missing.
+    const probe = await fetchJson(`${state.url}/accounts/v1/passkeys/challenge`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.5' },
+      body: JSON.stringify({ purpose: 'sign-in', rpId: 'localhost' }),
+    })
+    if (probe.status === 200 && probe.body?.options?.rpId === 'localhost') ok('passkeys enabled (RP IDs app-dev.witnesswork.app, localhost)')
+    else if (probe.body?.error === 'disabled')
+      bad('passkeys disabled: PASSKEY_CHALLENGE_SECRET / ACCOUNT_TICKET_SECRET missing; restart with `node scripts/verify/dev.mjs down && … up`')
+    else bad(`passkeys probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
+  } catch (error) {
+    bad(`passkeys probe failed: ${error.message}`)
   }
 
   const configured = Object.entries(state.configured ?? {})

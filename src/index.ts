@@ -6,11 +6,13 @@ import { accountsDb } from "./accounts/store";
 import { pruneEndedSessions } from "./accounts/sessionStore";
 import { pruneActivity } from "./accounts/activity";
 import { pruneSupporterRecords } from "./accounts/supporter";
+import { pruneUsedTokens } from "./accounts/passkeyStore";
 
 /**
  * Deletes account sessions that ended over a week ago, activity entries
- * over 400 days old, RevenueCat webhook event ids over 30 days old, and
- * RevenueCat customers no account links; failures only report.
+ * over 400 days old, RevenueCat webhook event ids over 30 days old,
+ * RevenueCat customers no account links, and used passkey challenge and
+ * ticket ids whose tokens expired; failures only report.
  */
 async function pruneAccountSessions(environment: Environment): Promise<void> {
   if (!environment.ACCOUNTS_DB) return;
@@ -33,6 +35,12 @@ async function pruneAccountSessions(environment: Environment): Promise<void> {
     console.error("accounts: pruning supporter records failed");
     captureFailure(error, "supporter prune");
   }
+  try {
+    await pruneUsedTokens(db);
+  } catch (error) {
+    console.error("accounts: pruning used token ids failed");
+    captureFailure(error, "used token prune");
+  }
 }
 
 // Durable Object classes must be re-exported from the entry module so Wrangler
@@ -48,6 +56,7 @@ export { BuddyRegistrationQuota } from "./buddies/registrationQuota";
 export { AccountHandoff } from "./accounts/handoffDO";
 export { AccountSync } from "./accounts/syncDO";
 export { ScribeMeter } from "./scribe/meterDO";
+export { AccountRateCounter } from "./accounts/rateCounterDO";
 
 export default Sentry.withSentry(
   (environment: Environment) => createSentryConfig(environment),

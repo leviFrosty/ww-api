@@ -136,9 +136,16 @@ BUDDIES_ENABLED = "true"
 # Buddies photo blobs fallback when KV `buddies:photos` is absent. On in dev.
 BUDDIES_PHOTOS = "on"
 # Legacy-auth fallback when KV `auth:legacy` is absent (witness-work ADR 0027):
-# "off" refuses pre-session auth with 426 upgrade_required. Named environments
-# don't inherit [vars], so it's repeated here.
-AUTH_LEGACY = "on"
+# "off" refuses pre-session auth with 426 upgrade_required. Off on dev since the
+# web launch (ADR 0038 §11); KV `auth:legacy` = "on" turns it back on here.
+AUTH_LEGACY = "off"
+# Passkeys (witness-work ADR 0038, docs/passkeys-protocol.md): the RP IDs this
+# worker accepts (the first is the default, and the one Android origins pair
+# with), and each RP ID's origins. Checked as pairs, never as two lists.
+# Android: the Play app-signing key and the upload key of
+# com.leviwilkerson.jwtime, and the debug key of com.leviwilkerson.jwtimedev.
+PASSKEY_RP_IDS = "app-dev.witnesswork.app,localhost"
+PASSKEY_ORIGINS = '''{"app-dev.witnesswork.app":["https://app-dev.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes","android:apk-key-hash:-sYXRdwJA3hvue3mKpYrOZ9zSPC7b4mbgzJmdZEDO5w"],"localhost":["http://localhost:8081","http://localhost:8082","http://localhost:19006","http://localhost:4173","http://localhost:5173"]}'''
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor.
 # APP_MIN_VERSION = "1.42.0"
@@ -236,6 +243,10 @@ class_name = "AccountSync"
 name = "SCRIBE_METER"
 class_name = "ScribeMeter"
 
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_RATE_COUNTER"
+class_name = "AccountRateCounter"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
@@ -308,6 +319,10 @@ new_sqlite_classes = ["AccountSync"]
 [[env.dev.migrations]]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
+
+[[env.dev.migrations]]
+tag = "v10"
+new_sqlite_classes = ["AccountRateCounter"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -425,8 +440,16 @@ BUDDIES_ENABLED = "false"
 # (no BUDDIES_PHOTOS fallback here). Not inherited by [env.dev].
 # Legacy-auth fallback when KV `auth:legacy` is absent (witness-work ADR 0027):
 # "off" refuses the pre-session ways of authenticating (account envelopes) with
-# 426 upgrade_required. Repeated under [env.dev.vars].
+# 426 upgrade_required. A failed KV read counts as off (ADR 0038 §11). The web
+# launch runbook writes KV `auth:legacy` = "off" (AGENTS.md). Repeated under
+# [env.dev.vars], where it's "off".
 AUTH_LEGACY = "on"
+# Passkeys (witness-work ADR 0038, docs/passkeys-protocol.md): the RP ID and
+# its origins: the web app, its beta, and the Android app's Play app-signing
+# and upload keys (com.leviwilkerson.jwtime). The RP ID never changes once the
+# first passkey exists. Repeated (with dev's) under [env.dev.vars].
+PASSKEY_RP_IDS = "app.witnesswork.app"
+PASSKEY_ORIGINS = '''{"app.witnesswork.app":["https://app.witnesswork.app","https://beta.app.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes"]}'''
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor. Repeated under [env.dev.vars].
 # APP_MIN_VERSION = "1.42.0"
@@ -769,6 +792,13 @@ class_name = "AccountSync"
 name = "SCRIBE_METER"
 class_name = "ScribeMeter"
 
+# Accounts: rolling-window counters, one per hashed name (failed passkey
+# sign-ins per hashed caller IP; counts only, deleted once out of their
+# window). Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "ACCOUNT_RATE_COUNTER"
+class_name = "AccountRateCounter"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -807,6 +837,10 @@ new_sqlite_classes = ["AccountSync"]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
 
+[[migrations]]
+tag = "v10"
+new_sqlite_classes = ["AccountRateCounter"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1 # optional. default = 1.
@@ -839,3 +873,8 @@ logs.persist = true
 # both, POST /maps/v1/mapkit-tokens answers 503 maps_unconfigured:
 # wrangler secret put MAPKIT_JS_KEY_ID [--env dev]        # 10-char MapKit JS key id
 # wrangler secret put MAPKIT_JS_PRIVATE_KEY [--env dev]   # .p8 PEM contents: < AuthKey_XXXX.p8
+# Passkeys (ADR 0038): the challenge and ticket MAC keys, each its own value per
+# worker, at least 32 characters, never ACCOUNT_TOKEN_SECRET's. Without them the
+# passkey routes and ticket sessions answer `disabled`:
+# openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET [--env dev]
+# openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET [--env dev]

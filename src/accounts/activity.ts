@@ -3,9 +3,10 @@ import {
   accountActivity,
   accountSessions,
   type ActivityKind,
+  type SessionMethod,
   type SessionPlatform,
 } from './schema'
-import type { AccountsDb } from './store'
+import { changes, type AccountsDb } from './store'
 import type { ActivityIdKeys } from './tokens'
 import { sealActivityId } from './activityIds'
 
@@ -47,6 +48,10 @@ export interface ActivityInput {
   actorSessionId?: string | null
   /** The backup slot; null for every slot. */
   slotId?: string | null
+  /** `session.opened`: how the session opened. */
+  method?: SessionMethod | null
+  /** `passkey.*`: the credential. */
+  credentialId?: string | null
 }
 
 export interface ActivityOptions {
@@ -63,7 +68,7 @@ export interface ActivityOptions {
  * `account_activity` yields them in the table's order, starting with a NULL
  * `id` (SQLite assigns it): id, account_id, kind, session_id,
  * session_platform, session_device, actor_session_id, actor_platform,
- * actor_device, slot_id, created_at.
+ * actor_device, slot_id, created_at, method, credential_id.
  */
 export const activityInsert = (
   db: AccountsDb,
@@ -74,7 +79,8 @@ export const activityInsert = (
     sql`SELECT NULL, ${input.accountId}, ${input.kind},
       ${input.sessionId ?? null}, s.platform, s.device,
       ${input.actorSessionId ?? null}, a.platform, a.device,
-      ${input.slotId ?? null}, ${now}
+      ${input.slotId ?? null}, ${now},
+      ${input.method ?? null}, ${input.credentialId ?? null}
     FROM (SELECT 1)
     LEFT JOIN account_sessions AS s
       ON s.id = ${input.sessionId ?? null} AND s.account_id = ${input.accountId}
@@ -134,6 +140,8 @@ export interface ActivityEntry {
   session?: ActivitySessionView
   actor?: ActivitySessionView
   slotId?: string
+  method?: SessionMethod
+  credentialId?: string
 }
 
 const sessionView = (
@@ -196,6 +204,8 @@ export const listActivity = async (
       ...(session ? { session } : {}),
       ...(actor ? { actor } : {}),
       ...(row.slotId != null ? { slotId: row.slotId } : {}),
+      ...(row.method != null ? { method: row.method } : {}),
+      ...(row.credentialId != null ? { credentialId: row.credentialId } : {}),
     }
   })
   return {
@@ -205,9 +215,6 @@ export const listActivity = async (
   }
 }
 
-/** Rows a D1 write changed (Drizzle hands back D1's result for writes). */
-const changes = (result: unknown): number =>
-  (result as { meta?: { changes?: number } }).meta?.changes ?? 0
 
 /** Deletes entries older than 400 days. Run hourly by the cron. */
 export const pruneActivity = async (
