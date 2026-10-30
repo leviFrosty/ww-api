@@ -61,6 +61,11 @@ export const OPENAPI_TAGS = [
       'Accounts on the web (witness-work ADR 0038 §5): create an account with a passkey behind Turnstile and per-network caps, or get a ticket for a web session with a recovery key.',
   },
   {
+    name: 'Approving a browser',
+    description:
+      'A signed-in phone approves a browser by scanning its QR code (witness-work ADR 0038): the handoff with the roles turned around. The browser gets the account key sealed to it and an `approval` ticket for its web session.',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',

@@ -56,6 +56,27 @@ export const bytesToBase64Url = (bytes: Uint8Array): string => {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+/** b64u SHA-256 of a string's UTF-8: what channels store for a key or a claim. */
+export const sha256B64u = async (text: string): Promise<string> =>
+  bytesToBase64Url(await sha256Bytes(encoder.encode(text)))
+
+/**
+ * b64u SHA-256 of a b64u token's bytes, what a channel's verifier holds for
+ * the token (the handoff's and approval's `claimToken`, `browserToken`). A
+ * token that isn't base64url hashes as no bytes, which no verifier matches.
+ */
+export const tokenDigest = async (token: string): Promise<string> => {
+  let bytes: Uint8Array = new Uint8Array()
+  if (/^[A-Za-z0-9_-]*$/.test(token) && token.length % 4 !== 1) {
+    try {
+      bytes = base64ToBytes(token)
+    } catch {
+      // Not base64url.
+    }
+  }
+  return bytesToBase64Url(await sha256Bytes(bytes))
+}
+
 /** Cryptographically-random URL-safe token of `byteLength` random bytes. */
 export const randomToken = (byteLength = 32): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)))

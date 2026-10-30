@@ -4,13 +4,13 @@ import { captureFailure } from '../sentry'
 import { bytesToBase64Url } from '../crypto'
 import { isPlainObject } from '../buddies/contracts'
 import { buddiesErrorResponse } from '../buddies/errorResponse'
-import { buddiesCallerKey, logLimitHit } from '../buddies/limits'
+import { buddiesCallerKey } from '../buddies/limits'
 import { passkeyResponseTooLarge } from './contracts'
 import { authenticateAccount, readPlainJson, type AccountAuth } from './auth'
 import { guarded, refuseAtEdge, signedForToken } from './signed'
 import { accountsDb, changes, type AccountsDb } from './store'
 import { activityInsert } from './activity'
-import { counterName, rateCounter } from './rateCounter'
+import { counterName, rateCounter, refuseOverRateCounter } from './rateCounter'
 import { accessTokenKeys } from './tokens'
 import {
   isAndroidOrigin,
@@ -110,14 +110,11 @@ const randomChallenge = (): string =>
 
 // --- The failure budget ---------------------------------------------------------
 
-const failureCounter = async (c: AppContext) =>
-  rateCounter(
+const failureName = (c: AppContext) =>
+  counterName(
     c.env,
-    await counterName(
-      c.env,
-      'passkey-assert-failures',
-      buddiesCallerKey(c.req.header('CF-Connecting-IP'))
-    )
+    'passkey-assert-failures',
+    buddiesCallerKey(c.req.header('CF-Connecting-IP'))
   )
 
 const FAILURE_KEY = [{ key: 'failures', ...ASSERT_FAILURE_LIMIT }]
@@ -125,25 +122,15 @@ const FAILURE_KEY = [{ key: 'failures', ...ASSERT_FAILURE_LIMIT }]
 /** 429 once the caller has failed 30 assertions this hour; an outage admits. */
 const refuseOverFailureBudget = async (
   c: AppContext
-): Promise<Response | null> => {
-  try {
-    const result = await (await failureCounter(c)).peek(Date.now(), FAILURE_KEY)
-    if (result.ok) return null
-    logLimitHit('passkeys/assert', 'failuresPerHour')
-    return buddiesErrorResponse('rate_limited', {
-      retryAfterSeconds: result.retryAfterSeconds,
-    })
-  } catch (error) {
-    console.warn('passkeys: failure budget unavailable; allowing')
-    captureFailure(error, 'passkeys/assert budget')
-    return null
-  }
-}
+): Promise<Response | null> =>
+  refuseOverRateCounter(c, await failureName(c), FAILURE_KEY, 'passkeys/assert', {
+    limitName: 'failuresPerHour',
+  })
 
 const countFailure = async (c: AppContext): Promise<void> => {
   try {
     // Counted even past the limit, by a key no limit stops.
-    await (await failureCounter(c)).take(Date.now(), [
+    await rateCounter(c.env, await failureName(c)).take(Date.now(), [
       { key: 'failures', limit: Number.MAX_SAFE_INTEGER, windowMs: HOUR_MS },
     ])
   } catch (error) {

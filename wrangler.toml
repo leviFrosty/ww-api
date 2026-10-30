@@ -256,6 +256,12 @@ class_name = "ScribeMeter"
 name = "ACCOUNT_RATE_COUNTER"
 class_name = "AccountRateCounter"
 
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
@@ -332,6 +338,10 @@ new_sqlite_classes = ["ScribeMeter"]
 [[env.dev.migrations]]
 tag = "v10"
 new_sqlite_classes = ["AccountRateCounter"]
+
+[[env.dev.migrations]]
+tag = "v11"
+new_sqlite_classes = ["AccountApproval"]
 
 [[env.dev.ratelimits]]
 name = "RATE_LIMITER"
@@ -826,6 +836,12 @@ class_name = "ScribeMeter"
 name = "ACCOUNT_RATE_COUNTER"
 class_name = "AccountRateCounter"
 
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -867,6 +883,10 @@ new_sqlite_classes = ["ScribeMeter"]
 [[migrations]]
 tag = "v10"
 new_sqlite_classes = ["AccountRateCounter"]
+
+[[migrations]]
+tag = "v11"
+new_sqlite_classes = ["AccountApproval"]
 
 [observability]
 enabled = true

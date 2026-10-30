@@ -1239,6 +1239,8 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
 | `POST /accounts/v1/web/signup/options` | No auth; Turnstile, caps → the new account's creation options |
 | `POST /accounts/v1/web/signup` | Signed `web/signup` by the new key: account, passkey, wrap, web session |
 | `POST /accounts/v1/web/recovery` | Signed `web/recovery`; Turnstile → a `recovery` ticket |
+| `POST /accounts/v1/approval/{open,status,receive,done,cancel}` | The browser: none (`open`) or `browserToken` |
+| `POST /accounts/v1/approval/{claim,status,send,cancel}` | The phone: Bearer of the claiming phone session |
 
 - **Relying party**: vars `PASSKEY_RP_IDS` (comma list; the first is the
   default and the one Android origins pair with) and `PASSKEY_ORIGINS` (JSON
@@ -1326,6 +1328,33 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
   yesterday's name so the windows still roll; no IP or ASN is stored. They
   depend on the secret alone, so counts hold across isolates, DO evictions,
   and restarts. Both envelopes work once (409 `replay`).
+- **Approving a browser from a phone** (`approval.ts`, `approvalDO.ts`): the
+  handoff with the roles turned around, one `AccountApproval` SQLite DO per
+  channel (its own class, migration `v11`: roles, auth, lifetimes, location,
+  and the ticket all differ from `AccountHandoff`). The browser opens it with
+  the verifiers of the phone's `claimToken` and its own `browserToken` and a
+  sealed hello; a phone session claims it (web sessions are `forbidden`); the
+  claiming session sends the sealed key (logs `device.approved`); the
+  browser's first `receive` while `sent` mints an `approval` ticket (the same
+  one until it expires); the web session it opens needs the approving
+  session still live. 75 seconds unclaimed, 5 minutes from the claim; five
+  wrong tokens (claim and browser together) burn a channel in progress, and a
+  finished one counts none and keeps its status. `done` and `cancel` keep
+  only the status, the token verifiers, and a hash of the claiming session
+  (so its phone can still read the status) until the alarm deletes it: the
+  blobs, location, account id, and session id go. The DO keeps the browser's
+  coarse location from `request.cf` (city, region, country, latitude,
+  longitude; never the IP) and `claim` answers it with `far` (another
+  country, or more than 200 km by haversine). `open` is 60 per caller IP an
+  hour (`AccountRateCounter`, an HMAC name). Channel hashes (`sha256B64u`,
+  `tokenDigest`) are shared with the handoff DO in `src/crypto.ts`.
+- **Rate counters**: `refuseOverRateCounter` (src/accounts/rateCounter.ts)
+  checks or takes limits in a named `AccountRateCounter` for the assert
+  failure budget, the web caps, and approval opens: 429 `rate_limited` with
+  `Retry-After`, an outage allowing (or, for web sign-up's take, 503
+  `unavailable`). Docs are split by tag: `passkeyOpenapi.ts` (Passkeys),
+  `webSignupOpenapi.ts` (Web sign-up), `approvalOpenapi.ts` (Approving a
+  browser).
 - **Web sign-up kill switch**: KV `accounts:web-signup` (`off`/`on`), then
   the `WEB_SIGNUP` var, then on; a failed read counts as on (`readKvSwitch`,
   shared with the legacy switch, whose failed read counts as off). Off refuses

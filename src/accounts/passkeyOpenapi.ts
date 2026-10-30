@@ -34,11 +34,11 @@ const passkeysOff = {
     ['disabled']
   ),
 }
-const rateLimited = {
+export const rateLimited = {
   429: errorResponse('Over the per-caller rate.', ['rate_limited']),
 }
-const bearerOnly = [{ bearerAuth: [] }]
-const unauthorized = {
+export const bearerOnly = [{ bearerAuth: [] }]
+export const unauthorized = {
   401: errorResponse(
     'Missing, expired, or invalid token, or a token whose session has ended (`WWW-Authenticate: Bearer error="invalid_token"`).',
     ['unauthorized']

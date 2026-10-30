@@ -589,6 +589,19 @@ async function doctor() {
   }
 
   try {
+    // An empty approval open: 400 means the routes are on, 503 that they're off.
+    const probe = await fetchJson(`${state.url}/accounts/v1/approval/open`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.6' },
+      body: '{}',
+    })
+    if (probe.status === 400) ok('approvals enabled (approval/open validates)')
+    else bad(`approval probe returned ${probe.status} ${JSON.stringify(probe.body)}`)
+  } catch (error) {
+    bad(`approval probe failed: ${error.message}`)
+  }
+
+  try {
     // Web sign-up's switch and Turnstile site key, as the web reads them.
     const config = await fetchJson(`${state.url}/app/v1/config`, { method: 'GET' })
     const web = config.body?.webSignup

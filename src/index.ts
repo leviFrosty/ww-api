@@ -57,6 +57,7 @@ export { AccountHandoff } from "./accounts/handoffDO";
 export { AccountSync } from "./accounts/syncDO";
 export { ScribeMeter } from "./scribe/meterDO";
 export { AccountRateCounter } from "./accounts/rateCounterDO";
+export { AccountApproval } from "./accounts/approvalDO";
 
 export default Sentry.withSentry(
   (environment: Environment) => createSentryConfig(environment),

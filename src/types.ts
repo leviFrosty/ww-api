@@ -460,6 +460,16 @@ export interface Environment {
   >;
 
   /**
+   * One SQLite Durable Object per approval channel (a browser approved from a
+   * phone, docs/passkeys-protocol.md): the browser's verifiers, sealed hello,
+   * and coarse location, the claiming phone session, the sealed key, and the
+   * `approval` ticket, for 75 seconds unclaimed or 5 minutes claimed.
+   */
+  ACCOUNT_APPROVAL: DurableObjectNamespace<
+    import('./accounts/approvalDO').AccountApproval
+  >;
+
+  /**
    * Legacy-auth fallback when KV `auth:legacy` is absent: `"off"` refuses the
    * pre-session ways of authenticating with 426 `upgrade_required`; anything
    * else (and unset) accepts them. A failed KV read counts as off.
