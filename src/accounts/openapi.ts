@@ -807,6 +807,9 @@ const sessionOpenPayload = z.object({
   appVersion: z.string().optional().meta({
     description: 'The app version, `major.minor.patch`, at most 32 characters.',
   }),
+  capabilities: z.array(z.string()).optional().meta({
+    description: 'What the app does, so ww-api knows what it may send it: `sync-everyone` (it turns Cloud Sync on by itself only for a new install; without it, `everyone`’s Cloud Sync is a Supporter benefit for this session). At most 16 names of at most 32 characters (`a-z0-9-`); unknown names are ignored.',
+  }),
 })
 
 /** `attestation_failed` and the attestation `bad_request`s carry these. */
@@ -947,6 +950,9 @@ ${readTier}`,
       refreshToken: refreshTokenSchema('The session’s current refresh token'),
       appVersion: z.string().optional().meta({
         description: 'The app version, `major.minor.patch`, at most 32 characters; the session keeps the latest.',
+      }),
+      capabilities: z.array(z.string()).optional().meta({
+        description: 'Like the open’s `capabilities`; when sent, replaces the session’s.',
       }),
     })
   ),
@@ -1340,7 +1346,7 @@ const syncOff = {
 }
 const syncUnentitled = {
   403: errorResponse(
-    'Cloud Sync was made a Supporter benefit again (KV `sync:entitlement` is `supporter`) and the account isn’t one.',
+    'The account isn’t a Supporter, and Cloud Sync is a Supporter benefit for this session: KV `sync:entitlement` is `supporter`, or the session never sent the `sync-everyone` capability.',
     ['supporter_required']
   ),
 }
@@ -1351,7 +1357,7 @@ const syncRequestedAt = z.number().int().nullable().meta({
 const syncNotes =
   'A suspended account keeps syncing. A slot not written for 30 days whose writer’s session has ended, or not written for 400 days, is deleted.'
 const SYNC_ENTITLED =
-  'Needs Cloud Sync on (KV `sync:enabled`) and an entitled account: everyone (witness-work ADR 0040), unless KV `sync:entitlement` is `supporter`, then Supporters only (the account’s own status, ADR 0029).'
+  'Needs Cloud Sync on (KV `sync:enabled`) and an entitled account: everyone (witness-work ADR 0040) on a session that sent the `sync-everyone` capability, unless KV `sync:entitlement` is `supporter`; otherwise Supporters only (the account’s own status, ADR 0029).'
 const syncBinary = (description: string) => ({
   description,
   content: {
@@ -1383,7 +1389,7 @@ ${readTier}`,
         }),
         entitlement: z.enum(['supporter', 'everyone']).meta({
           description:
-            'Who gets it (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`).',
+            'Who gets it on this session (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`; `supporter` for a session that never sent the `sync-everyone` capability).',
         }),
         supporter: z.boolean().meta({
           description: 'The account’s own Supporter status (ADR 0029).',
@@ -1438,7 +1444,7 @@ ${readTier}`,
       ['unauthorized', 'bad_signature', 'stale']
     ),
     403: errorResponse(
-      'The envelope is signed by another account than the token’s (`forbidden`), or Cloud Sync was made a Supporter benefit again and the account isn’t one (`supporter_required`).',
+      'The envelope is signed by another account than the token’s (`forbidden`), or the account isn’t a Supporter while Cloud Sync is a Supporter benefit for this session (`supporter_required`).',
       ['forbidden', 'supporter_required']
     ),
     404: errorResponse('No account has the envelope’s key.', ['unknown_account']),

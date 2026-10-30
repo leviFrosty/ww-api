@@ -56,7 +56,7 @@ export const appConfigDocs = describeRoute({
   tags: ['Service'],
   summary: 'App configuration',
   description:
-    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`) and web sign-up’s (`webSignup`). No authentication.',
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`) and web sign-up’s (`webSignup`). Query `capabilities` (comma-separated, for example `sync-everyone`): what the app does, as on session open. No authentication.',
   responses: {
     200: jsonResponse(
       'The configuration.',
@@ -78,7 +78,7 @@ export const appConfigDocs = describeRoute({
             }),
             entitlement: z.enum(['supporter', 'everyone']).meta({
               description:
-                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`; witness-work ADR 0040).',
+                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`; witness-work ADR 0040). `everyone` only when `?capabilities=` has `sync-everyone`; otherwise `supporter`.',
             }),
           })
           .meta({

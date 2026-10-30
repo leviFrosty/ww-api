@@ -364,6 +364,7 @@ const handleSignup = guarded('web/signup', async (c) => {
     device: fields.device,
     method: 'signup',
     appVersion: fields.appVersion,
+    capabilities: fields.capabilities,
     stepUpCredentialId: registration.credentialId,
   }, now)
   let outcome: Awaited<ReturnType<typeof batchUsing>>
