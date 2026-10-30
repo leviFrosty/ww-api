@@ -1650,7 +1650,7 @@ export const syncLiveDocs = describeRoute({
 
 Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \`x-ww-slot-id\`, the device’s own slot, so its own puts don’t echo back.
 
-**Browsers** can’t set headers on a WebSocket, so they offer the same values as \`Sec-WebSocket-Protocol\` entries instead: \`ww.v1\`, \`bearer.<access token>\`, and \`slot.<slotId>\` (any order; no \`Authorization\` header). The \`Origin\` must be one of the web app’s (\`WEB_APP_ORIGINS\`), else \`403 forbidden\`, checked before the token; an offer without \`ww.v1\`, with a repeated or unknown entry, or that isn’t a list of tokens is \`400 bad_request\`. The token is checked like the header’s, and the 101 answers \`Sec-WebSocket-Protocol: ww.v1\`. Ids never go in the URL.
+**Browsers** can’t set headers on a WebSocket, so they mint a \`sync\` ticket for their slot with \`POST /accounts/v1/live/ticket\` and offer \`Sec-WebSocket-Protocol: ww.v1, ticket.<ticket>\` instead (any order; no \`Authorization\` or \`x-ww-slot-id\`; never the access token, which Cloudflare’s logs would record). Checked in this order: the \`Origin\` must be one of the web app’s (\`WEB_APP_ORIGINS\`), else \`403 forbidden\`; an offer without \`ww.v1\`, with a repeated or unknown entry, or that isn’t a list of tokens is \`400 bad_request\`; then the switch (\`503\`) and the read tier (\`429\`); a missing, forged, expired (30 s), or Buddies ticket is \`401 unauthorized\`; then the header path’s checks (entitlement, upgrade); and while a socket opened with the same ticket is open, another is \`409 conflict\`. The 101 answers \`Sec-WebSocket-Protocol: ww.v1\`. Page script can’t see these statuses (a refused handshake is only a close), so mint a fresh ticket for every connect, never reuse one, and reconnect with backoff. No id goes in the URL, and the ticket names its ids sealed.
 
 **Server → app messages:**
 
@@ -1659,7 +1659,7 @@ Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \
 
 **Keepalive:** send the text \`ping\` about every 25 s; the server answers \`pong\` without waking the account’s Durable Object. Anything else the app sends is ignored.
 
-**Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account, browser sockets included). \`4004 "expired"\` (browser sockets only): the access token it opened with expired; refresh and reconnect. Header sockets outlive their token. Reconnect with backoff while in the foreground.
+**Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account, browser sockets included). \`4004 "expired"\` (browser sockets only): the access token its ticket was minted with expired; refresh, mint a ticket, and reconnect. Header sockets outlive their token, so a browser session’s (\`web\`) token is refused there with \`403 forbidden\`. Reconnect with backoff while in the foreground.
 
 ${SYNC_ENTITLED} Turning Cloud Sync off refuses new sockets but doesn’t close open ones.
 
@@ -1678,7 +1678,7 @@ ${readTier}`,
       in: 'header' as const,
       required: true,
       schema: { type: 'string' as const },
-      description: 'This device’s slot (its sync id). Browsers send `slot.<slotId>` in `Sec-WebSocket-Protocol` instead.',
+      description: 'This device’s slot (its sync id). Browsers don’t send it: their ticket names the slot.',
     },
     {
       name: 'Sec-WebSocket-Protocol',
@@ -1686,7 +1686,7 @@ ${readTier}`,
       required: false,
       schema: { type: 'string' as const },
       description:
-        'Browsers only: `ww.v1, bearer.<access token>, slot.<slotId>`, in place of `Authorization` and `x-ww-slot-id`. Needs an allowed `Origin`.',
+        'Browsers only: `ww.v1, ticket.<ticket>` (a `sync` ticket from `POST /accounts/v1/live/ticket`), in place of `Authorization` and `x-ww-slot-id`. Needs an allowed `Origin`.',
     },
   ],
   responses: {
@@ -1695,13 +1695,20 @@ ${readTier}`,
         'Switching protocols: the socket is open. A browser upgrade gets `Sec-WebSocket-Protocol: ww.v1`.',
     },
     400: errorResponse(
-      'Missing or malformed `x-ww-slot-id` (or `slot.` entry), or a malformed `Sec-WebSocket-Protocol` offer (no `ww.v1`, a repeated or unknown entry, or with `Authorization` too).',
+      'Missing or malformed `x-ww-slot-id`, or a malformed `Sec-WebSocket-Protocol` offer (no `ww.v1`, a repeated or unknown entry, or with `Authorization` too).',
       ['bad_request']
     ),
-    401: bearerReadErrors[401],
+    401: errorResponse(
+      'Missing, expired, or invalid token (`WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry), or a browser’s missing, forged, expired, or Buddies ticket (mint another).',
+      ['unauthorized']
+    ),
     403: errorResponse(
       'Cloud Sync is a Supporter benefit and the account isn’t one (`supporter_required`), or a browser upgrade’s `Origin` isn’t one of the web app’s (`forbidden`).',
       ['supporter_required', 'forbidden']
+    ),
+    409: errorResponse(
+      'Browsers only: a socket opened with this ticket is still open. Mint another; a copied ticket never opens a second socket.',
+      ['conflict']
     ),
     426: errorResponse('Not a WebSocket upgrade. No `Retry-After`.', [
       'upgrade_required',
@@ -1709,6 +1716,50 @@ ${readTier}`,
     429: bearerReadErrors[429],
     ...internal,
     ...syncOff,
+  },
+})
+
+export const liveTicketDocs = describeRoute({
+  tags: ['Accounts'],
+  summary: 'Mint a browser live socket ticket',
+  description: `A ticket a browser offers to open a live socket, in place of its access token: Cloudflare’s logs record \`Sec-WebSocket-Protocol\` in full, and redact only \`Authorization\`. Offer it as \`Sec-WebSocket-Protocol: ww.v1, ticket.<ticket>\` to \`GET /accounts/v1/sync/live\` (\`socket: "sync"\`, \`id\`: the browser’s own slot) or \`GET /buddies/v1/inbox/live\` (\`socket: "buddies"\`, \`id\`: its inbox), within 30 seconds; mint a new one for every connect.
+
+The ticket is opaque to the app: its claims (the account, session, socket, id, and the access token’s expiry) are encrypted and MACed under the server’s own secret, so it names no id where it’s logged. It opens only that socket for that id, and calls no other route. The socket closes with \`4004 "expired"\` when the access token it was minted with expires. Not single-use, but one socket at a time: within its 30 seconds it reopens its socket after a drop, while a second socket on it is \`409 conflict\`.
+
+Needs a live session: after the device signs out or is revoked, it’s \`401\` (a socket already open stays until its token expires). A token with less than a second left is \`401\` too: refresh it, then mint. Only the id’s shape is checked here; the socket runs every other check when it opens (Cloud Sync’s switch and entitlement, the inbox’s ownership, suspension).
+
+A browser can’t see a refused handshake’s status (page script gets only a close), so mint a fresh ticket for every connect and reconnect with backoff; when this route answers \`401\`, refresh the access token first.
+
+${readTier}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({
+      socket: z.enum(['sync', 'buddies']).meta({ description: 'Which live socket.' }),
+      id: z.string().meta({
+        description: '`sync`: the browser’s own slot id (as `x-ww-slot-id`). `buddies`: its inbox id.',
+      }),
+    }),
+    'The socket and its id.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'The ticket.',
+      z.object({
+        ok: z.literal(true),
+        ticket: z.string().meta({
+          description: 'Opaque, 466 characters of `[A-Za-z0-9_.-]`. A credential: never log it.',
+        }),
+        expiresAt: epochMs('When the ticket stops opening sockets: 30 s after minting, or the access token’s expiry if sooner'),
+      })
+    ),
+    400: errorResponse('Malformed JSON, an unknown `socket`, or an `id` of the wrong shape.', ['bad_request']),
+    401: errorResponse(
+      'Missing, expired, or invalid token, a session that was signed out or revoked, or a token with less than a second left (`WWW-Authenticate: Bearer error="invalid_token"`; refresh once and retry).',
+      ['unauthorized']
+    ),
+    429: bearerReadErrors[429],
+    ...internal,
+    503: errorResponse('No usable `LIVE_TICKET_SECRET` (unset, shorter than 32 characters, or equal to `ACCOUNT_TOKEN_SECRET`), or no token secret on this worker.', ['disabled']),
   },
 })
 

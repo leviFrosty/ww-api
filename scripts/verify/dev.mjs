@@ -234,6 +234,8 @@ const writeVarsFile = (flags, previousTokens, vars = {}) => {
     admin: `verify-admin-${randomBytes(16).toString('hex')}`,
     // Signs session access tokens; tests get theirs from POST /accounts/v1/sessions.
     accountToken: `verify-account-token-${randomBytes(24).toString('hex')}`,
+    // Signs browser live socket tickets (POST /accounts/v1/live/ticket).
+    liveTicket: `verify-live-ticket-${randomBytes(24).toString('hex')}`,
     // The RevenueCat webhook's Authorization secret.
     revenueCatWebhook: `verify-revenuecat-${randomBytes(16).toString('hex')}`,
     // Passkey challenge and ticket MAC keys (ADR 0038).
@@ -246,6 +248,7 @@ const writeVarsFile = (flags, previousTokens, vars = {}) => {
     `NOTES_IMPORT_DEV_BYPASS_TOKEN=${quoteEnv(tokens.devBypass)}`,
     `ADMIN_API_TOKEN=${quoteEnv(tokens.admin)}`,
     `ACCOUNT_TOKEN_SECRET=${quoteEnv(tokens.accountToken)}`,
+    `LIVE_TICKET_SECRET=${quoteEnv(tokens.liveTicket)}`,
     `REVENUECAT_WEBHOOK_AUTHORIZATION=${quoteEnv(tokens.revenueCatWebhook)}`,
     `PASSKEY_CHALLENGE_SECRET=${quoteEnv(tokens.passkeyChallenge)}`,
     `ACCOUNT_TICKET_SECRET=${quoteEnv(tokens.accountTicket)}`,
