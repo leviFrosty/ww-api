@@ -105,6 +105,7 @@ describe('POST /sessions with the dev bypass', () => {
       accountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
       status: 'active',
       sessionId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      platform: 'dev',
       accessToken: expect.stringMatching(/^[\w-]+\.[\w-]+\.[\w-]+$/),
       accessExpiresAt: START + 15 * MINUTE,
       refreshToken: expect.stringMatching(REFRESH_TOKEN),
@@ -112,20 +113,27 @@ describe('POST /sessions with the dev bypass', () => {
     })
     expect(session.refreshToken.split('.')[0]).toBe(session.sessionId)
 
-    // Only the account, platform, label, token hashes, and times.
+    // Only the account, platform, label, token hashes, how and with which
+    // app version and key epoch it opened, its step-up, and times.
     const [row] = sessionRows()
     expect(Object.keys(row).sort()).toEqual(
       [
         'account_id',
+        'app_version',
         'created_at',
         'device',
+        'ended_reason',
         'expires_at',
         'id',
+        'key_epoch',
+        'method',
         'platform',
         'previous_refresh_hash',
         'refresh_hash',
         'revoked_at',
         'rotated_at',
+        'step_up_at',
+        'step_up_credential_id',
       ].sort()
     )
     expect(row).toMatchObject({
@@ -344,6 +352,7 @@ describe('POST /sessions/refresh', () => {
       ok: false,
       error: 'unauthorized',
       code: 'unauthorized',
+      reason: 'unknown',
     })
     expect(unknown.headers.get('www-authenticate')).toBe(
       'Bearer error="invalid_token"'

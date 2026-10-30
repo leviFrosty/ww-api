@@ -254,8 +254,18 @@ function dropDatabaseErrorCauses(event: Event): void {
   });
 }
 
+/**
+ * Request bodies never leave the worker: they hold passkey assertions and
+ * registrations, challenge tokens, tickets, wraps, and sealed labels. The SDK
+ * doesn't attach them today; this keeps it that way.
+ */
+function dropRequestBody(event: Event): void {
+  if (event.request && 'data' in event.request) delete event.request.data;
+}
+
 function scrubEvent<T extends Event>(event: T): T {
   dropSecretHeaders(event);
+  dropRequestBody(event);
   redactQueryStringPairs(event);
   const scrubbed = scrubStrings(event) as T;
   dropDatabaseErrorCauses(scrubbed);

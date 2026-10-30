@@ -1,13 +1,15 @@
 import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
-import { ACCOUNT_LIMITS, type RefreshToken } from './contracts'
+import { ACCOUNT_LIMITS, parseRefreshToken, type RefreshToken } from './contracts'
 import {
   accountActivity,
   accountSessions,
+  type SessionEndReason,
+  type SessionMethod,
   type SessionPlatform,
 } from './schema'
 import { activityInsert, sessionIsLive } from './activity'
-import type { AccountsDb } from './store'
+import { changes, type AccountsDb } from './store'
 import type { RefreshKeys } from './tokens'
 
 /**
@@ -42,8 +44,10 @@ import type { RefreshKeys } from './tokens'
 
 const {
   sessionMs,
+  webSessionMs,
   refreshGraceMs,
   sessionsPerAccount,
+  webSessionsPerAccount,
   endedSessionRetentionMs,
 } = ACCOUNT_LIMITS
 
@@ -101,9 +105,32 @@ const isIssued = async (
   return false
 }
 
-/** A session's first refresh token: a random secret. */
-const firstRefreshToken = (keys: RefreshKeys, sessionId: string) =>
-  issueRefreshToken(keys, `${sessionId}.${bytesToBase64Url(randomBytes(32))}`)
+/**
+ * A session's first refresh token: a random secret, or for a browser's
+ * session (`derived`) one derived from the session id under `rotationKey`,
+ * so a lost-response repeat of its open can hand back the very same token
+ * (`repeatSession`) without storing it.
+ */
+const firstRefreshToken = async (
+  keys: RefreshKeys,
+  sessionId: string,
+  derived = false
+) => {
+  if (!derived)
+    return issueRefreshToken(
+      keys,
+      `${sessionId}.${bytesToBase64Url(randomBytes(32))}`
+    )
+  const secret = await crypto.subtle.sign(
+    'HMAC',
+    keys.rotationKey,
+    encoder.encode(`ww-account/v1/refresh-first\n${sessionId}`)
+  )
+  return issueRefreshToken(
+    keys,
+    `${sessionId}.${bytesToBase64Url(new Uint8Array(secret))}`
+  )
+}
 
 /** The token that replaces `presented`, under one secret's `keys`. */
 const nextRefreshToken = async (keys: RefreshKeys, presented: RefreshToken) => {
@@ -118,9 +145,6 @@ const nextRefreshToken = async (keys: RefreshKeys, presented: RefreshToken) => {
   )
 }
 
-/** Rows a D1 write changed (Drizzle hands back D1's result for writes). */
-const changes = (result: unknown): number =>
-  (result as { meta?: { changes?: number } }).meta?.changes ?? 0
 
 const sessionColumns = {
   id: accountSessions.id,
@@ -131,6 +155,7 @@ const sessionColumns = {
   expiresAt: accountSessions.expiresAt,
   revokedAt: accountSessions.revokedAt,
   rotatedAt: accountSessions.rotatedAt,
+  endedReason: accountSessions.endedReason,
 }
 
 type SessionRow = {
@@ -142,6 +167,7 @@ type SessionRow = {
   expiresAt: Date
   revokedAt: Date | null
   rotatedAt: Date | null
+  endedReason: SessionEndReason | null
 }
 
 const isLive = (row: SessionRow, now: number): boolean =>
@@ -154,32 +180,59 @@ const record = (row: SessionRow): SessionRecord => ({
   expiresAt: row.expiresAt.getTime(),
 })
 
+/** What a new session needs besides its account. */
+export interface NewSession {
+  accountId: string
+  platform: SessionPlatform
+  device: string | null
+  /** How it opened; `attestation` or `dev` for phones. */
+  method: SessionMethod
+  appVersion?: string | null
+  /** `approval`: the phone's session that approved it (the entry's `actor`). */
+  actorSessionId?: string | null
+  /** `passkey`: the credential the sign-in asserted with. */
+  stepUpCredentialId?: string | null
+}
+
 /**
- * Opens a session, then ends the account's oldest live sessions past
- * `sessionsPerAccount`, in one batch. `keys` are the current secret's.
+ * The statements that open a session, for a batch of the caller's own (a
+ * ticket's used id, web sign-up's account): the row, `session.opened`, and
+ * the cap. Phones keep `sessionsPerAccount` live sessions and end the
+ * oldest past it; browsers (`web`) keep `webSessionsPerAccount` of their own
+ * and end the least recently active, each logged `session.replaced`. A web
+ * session lasts `webSessionMs` from its last refresh and counts as stepped
+ * up when it opens. `keys` are the current secret's.
  */
-export const createSession = async (
+export const prepareSession = async (
   db: AccountsDb,
   keys: RefreshKeys,
-  input: {
-    accountId: string
-    platform: SessionPlatform
-    device: string | null
-  },
+  input: NewSession,
   now: number = Date.now()
-): Promise<IssuedSession> => {
+) => {
   const id = bytesToBase64Url(randomBytes(16))
-  const refresh = await firstRefreshToken(keys, id)
-  const expiresAt = now + sessionMs
-  // Every live session but the newest `sessionsPerAccount` (this one among
-  // them). `LIMIT -1` is SQLite's "no limit", which Drizzle can't spell.
-  const overflow = sql`SELECT ${accountSessions.id} FROM ${accountSessions}
-    WHERE ${accountSessions.accountId} = ${input.accountId}
-      AND ${accountSessions.revokedAt} IS NULL
-      AND ${accountSessions.expiresAt} > ${now}
-    ORDER BY ${accountSessions.createdAt} DESC, ${accountSessions.id} DESC
-    LIMIT -1 OFFSET ${sessionsPerAccount}`
-  await db.batch([
+  const web = input.platform === 'web'
+  const refresh = await firstRefreshToken(keys, id, web)
+  const expiresAt = now + (web ? webSessionMs : sessionMs)
+  // Every live session of the same kind but the newest `cap` (this one
+  // among them). `LIMIT -1` is SQLite's "no limit", which Drizzle can't spell.
+  const overflow = web
+    ? sql`SELECT ${accountSessions.id} FROM ${accountSessions}
+        WHERE ${accountSessions.accountId} = ${input.accountId}
+          AND ${accountSessions.revokedAt} IS NULL
+          AND ${accountSessions.expiresAt} > ${now}
+          AND ${accountSessions.platform} = 'web'
+        ORDER BY ${accountSessions.id} = ${id} DESC,
+          COALESCE(${accountSessions.rotatedAt}, ${accountSessions.createdAt}) DESC,
+          ${accountSessions.id} DESC
+        LIMIT -1 OFFSET ${webSessionsPerAccount}`
+    : sql`SELECT ${accountSessions.id} FROM ${accountSessions}
+        WHERE ${accountSessions.accountId} = ${input.accountId}
+          AND ${accountSessions.revokedAt} IS NULL
+          AND ${accountSessions.expiresAt} > ${now}
+          AND ${accountSessions.platform} != 'web'
+        ORDER BY ${accountSessions.createdAt} DESC, ${accountSessions.id} DESC
+        LIMIT -1 OFFSET ${sessionsPerAccount}`
+  const statements = [
     db.insert(accountSessions).values({
       id,
       accountId: input.accountId,
@@ -188,10 +241,21 @@ export const createSession = async (
       refreshHash: refresh.hash,
       createdAt: new Date(now),
       expiresAt: new Date(expiresAt),
+      appVersion: input.appVersion ?? null,
+      method: input.method,
+      keyEpoch: sql`(SELECT key_epoch FROM accounts WHERE id = ${input.accountId})`,
+      stepUpAt: web ? new Date(now) : null,
+      stepUpCredentialId: input.stepUpCredentialId ?? null,
     }),
     activityInsert(
       db,
-      { accountId: input.accountId, kind: 'session.opened', sessionId: id },
+      {
+        accountId: input.accountId,
+        kind: 'session.opened',
+        sessionId: id,
+        actorSessionId: input.actorSessionId ?? null,
+        method: input.method,
+      },
       { now }
     ),
     // `session.replaced` for each session the cap is about to end, before
@@ -200,15 +264,15 @@ export const createSession = async (
     db.insert(accountActivity).select(
       sql`SELECT NULL, account_id, 'session.replaced',
           id, platform, device, ${id}, ${input.platform}, ${input.device},
-          NULL, ${now}
+          NULL, ${now}, NULL, NULL
         FROM account_sessions WHERE id IN (${overflow})`
     ),
     db
       .update(accountSessions)
-      .set({ revokedAt: new Date(now) })
+      .set({ revokedAt: new Date(now), endedReason: 'replaced' })
       .where(sql`${accountSessions.id} IN (${overflow})`),
-  ])
-  return {
+  ] as const
+  const issued: IssuedSession = {
     session: {
       id,
       accountId: input.accountId,
@@ -217,7 +281,66 @@ export const createSession = async (
     },
     refreshToken: refresh.token,
   }
+  return { statements, issued }
 }
+
+/** Opens a session (`prepareSession`) in a batch of its own. */
+export const createSession = async (
+  db: AccountsDb,
+  keys: RefreshKeys,
+  input: NewSession,
+  now: number = Date.now()
+): Promise<IssuedSession> => {
+  const { statements, issued } = await prepareSession(db, keys, input, now)
+  await db.batch(statements)
+  return issued
+}
+
+/**
+ * The same live session again, for a ticket's open repeated after a lost
+ * response, with no write: its first refresh token (derived, so the same
+ * token the first answer carried), or, when that one was refreshed within
+ * the last minute, the token it was replaced by, as a refresh within its
+ * grace would answer. Either way the first answer's token keeps working as
+ * it would for a phone, and never counts as reused. Null when the session
+ * has ended or moved on since (`ticket_invalid`). `keys` are the current
+ * secret's first, then the previous one's.
+ */
+export const repeatSession = async (
+  db: AccountsDb,
+  keys: readonly RefreshKeys[],
+  input: { accountId: string; sessionId: string },
+  now: number = Date.now()
+): Promise<IssuedSession | null> => {
+  const row = await findSession(db, input.sessionId)
+  if (!row || row.accountId !== input.accountId || !isLive(row, now)) return null
+  const inGrace =
+    row.rotatedAt != null && now - row.rotatedAt.getTime() <= refreshGraceMs
+  for (const secretKeys of keys) {
+    const first = await firstRefreshToken(secretKeys, row.id, true)
+    if (timingSafeEqual(first.hash, row.refreshHash))
+      return { session: record(row), refreshToken: first.token }
+    if (
+      inGrace &&
+      row.previousRefreshHash != null &&
+      timingSafeEqual(first.hash, row.previousRefreshHash)
+    ) {
+      const presented = parseRefreshToken(first.token)!
+      for (const rotationKeys of keys) {
+        const next = await nextRefreshToken(rotationKeys, presented)
+        if (timingSafeEqual(next.hash, row.refreshHash))
+          return { session: record(row), refreshToken: next.token }
+      }
+    }
+  }
+  return null
+}
+
+const END_REASONS = {
+  'session.signed_out': 'signed_out',
+  'session.revoked': 'revoked',
+  'session.refresh_reused': 'reused',
+} as const satisfies Record<string, SessionEndReason>
 
 /**
  * Ends a live session and logs why, in one batch. Nothing is logged for a
@@ -241,7 +364,7 @@ const endSession = async (
       ? undefined
       : sessionIsLive(ended.accountId, ended.actorSessionId, now)
   const [, update] = await db.batch([
-    activityInsert(db, ended, {
+    activityInsert(db, { ...ended, method: null }, {
       now,
       onlyIf: actorLive
         ? sql`${sessionIsLive(ended.accountId, ended.sessionId, now)} AND ${actorLive}`
@@ -249,7 +372,7 @@ const endSession = async (
     }),
     db
       .update(accountSessions)
-      .set({ revokedAt: new Date(now) })
+      .set({ revokedAt: new Date(now), endedReason: END_REASONS[ended.kind] })
       .where(
         and(
           eq(accountSessions.id, ended.sessionId),
@@ -296,11 +419,40 @@ const findSession = async (
     .where(eq(accountSessions.id, sessionId))
     .get()) as SessionRow | undefined
 
+/**
+ * Why a refresh was refused (401 `unauthorized`'s `reason`): another device
+ * signed the session out (or it signed itself out), the cap ended it, it
+ * expired, a replaced refresh token came back, or anything else.
+ */
+export const REFRESH_REFUSALS = [
+  'revoked',
+  'replaced',
+  'expired',
+  'reused',
+  'unknown',
+] as const
+export type RefreshRefusal = (typeof REFRESH_REFUSALS)[number]
+
+export type RefreshOutcome = { issued: IssuedSession } | { refused: RefreshRefusal }
+
 /** What a refresh comes to, for one read of the session's row. */
 type RefreshStep =
-  | { done: IssuedSession | null }
+  | { done: RefreshOutcome }
   /** The row changed under this refresh: read it again. */
   | { changed: true }
+
+const endedRefusal = (row: SessionRow, now: number): RefreshRefusal => {
+  if (row.revokedAt == null)
+    return row.expiresAt.getTime() <= now ? 'expired' : 'unknown'
+  switch (row.endedReason) {
+    case 'replaced':
+      return 'replaced'
+    case 'reused':
+      return 'reused'
+    default:
+      return 'revoked'
+  }
+}
 
 /**
  * One refresh of a token this worker issued, against the row as read: the
@@ -316,18 +468,25 @@ const refreshStep = async (
   hash: string,
   row: SessionRow | undefined,
   now: number,
-  raced: boolean
+  raced: boolean,
+  appVersion: string | null
 ): Promise<RefreshStep> => {
-  if (!row || !isLive(row, now)) return { done: null }
+  if (!row) return { done: { refused: 'unknown' } }
+  if (!isLive(row, now)) return { done: { refused: endedRefusal(row, now) } }
 
   if (timingSafeEqual(hash, row.refreshHash)) {
     const next = await nextRefreshToken(keys[0], presented)
+    // A web session lasts 180 days from its last refresh.
+    const expiresAt =
+      row.platform === 'web' ? new Date(now + webSessionMs) : row.expiresAt
     const rotated = await db
       .update(accountSessions)
       .set({
         refreshHash: next.hash,
         previousRefreshHash: hash,
         rotatedAt: new Date(now),
+        expiresAt,
+        ...(appVersion != null ? { appVersion } : {}),
       })
       .where(
         and(
@@ -337,7 +496,14 @@ const refreshStep = async (
         )
       )
     return changes(rotated) === 1
-      ? { done: { session: record(row), refreshToken: next.token } }
+      ? {
+          done: {
+            issued: {
+              session: record({ ...row, expiresAt }),
+              refreshToken: next.token,
+            },
+          },
+        }
       : { changed: true }
   }
 
@@ -353,24 +519,26 @@ const refreshStep = async (
     for (const secretKeys of keys) {
       const next = await nextRefreshToken(secretKeys, presented)
       if (timingSafeEqual(next.hash, row.refreshHash))
-        return { done: { session: record(row), refreshToken: next.token } }
+        return {
+          done: { issued: { session: record(row), refreshToken: next.token } },
+        }
     }
-    return { done: null }
+    return { done: { refused: 'unknown' } }
   }
 
   // Issued by this worker, but replaced over a minute ago, or older still:
   // someone kept a copy. Logged as suspicious (`session.refresh_reused`).
-  if (!raced)
-    await endSession(
-      db,
-      {
-        accountId: row.accountId,
-        sessionId: row.id,
-        kind: 'session.refresh_reused',
-      },
-      now
-    )
-  return { done: null }
+  if (raced) return { done: { refused: 'unknown' } }
+  await endSession(
+    db,
+    {
+      accountId: row.accountId,
+      sessionId: row.id,
+      kind: 'session.refresh_reused',
+    },
+    now
+  )
+  return { done: { refused: 'reused' } }
 }
 
 /**
@@ -387,14 +555,17 @@ const refreshStep = async (
  * with the same token; if the session moved on again in between, it's 401
  * and the session lives, since that token was current a moment ago.
  * `keys` are the current secret's first, then the previous one's if set.
+ * A refusal says why (`RefreshRefusal`). A web session's refresh also moves
+ * its end to 180 days out; `appVersion`, when sent, replaces the stored one.
  */
 export const refreshSession = async (
   db: AccountsDb,
   keys: readonly RefreshKeys[],
   presented: RefreshToken,
-  now: number = Date.now()
-): Promise<IssuedSession | null> => {
-  if (!(await isIssued(keys, presented))) return null
+  now: number = Date.now(),
+  appVersion: string | null = null
+): Promise<RefreshOutcome> => {
+  if (!(await isIssued(keys, presented))) return { refused: 'unknown' }
   const hash = await refreshHash(presented.token)
   for (const raced of [false, true]) {
     const row = await findSession(db, presented.sessionId)
@@ -405,11 +576,12 @@ export const refreshSession = async (
       hash,
       row,
       now,
-      raced
+      raced,
+      appVersion
     )
     if ('done' in step) return step.done
   }
-  return null
+  return { refused: 'unknown' }
 }
 
 /** Ends the account's session; ending an ended one is a no-op. */
@@ -514,6 +686,8 @@ export const sessionStates = async (
 export interface LiveSession {
   sessionId: string
   platform: SessionPlatform
+  method: SessionMethod
+  appVersion?: string
   /** The sealed device label, as the session sent it. */
   device?: string
   createdAt: number
@@ -536,6 +710,8 @@ export const listLiveSessions = async (
       createdAt: accountSessions.createdAt,
       rotatedAt: accountSessions.rotatedAt,
       expiresAt: accountSessions.expiresAt,
+      method: accountSessions.method,
+      appVersion: accountSessions.appVersion,
     })
     .from(accountSessions)
     .where(
@@ -550,6 +726,10 @@ export const listLiveSessions = async (
   return rows.map((row) => ({
     sessionId: row.id,
     platform: row.platform,
+    // Sessions from before passkeys didn't record it; they attested (or
+    // used the development bypass).
+    method: row.method ?? (row.platform === 'dev' ? 'dev' : 'attestation'),
+    ...(row.appVersion != null ? { appVersion: row.appVersion } : {}),
     ...(row.device != null ? { device: row.device } : {}),
     createdAt: row.createdAt.getTime(),
     lastActiveAt: (row.rotatedAt ?? row.createdAt).getTime(),
@@ -577,3 +757,39 @@ export const pruneEndedSessions = async (
       )
   )
 }
+
+/** When the session last stepped up, or null; for the step-up check. */
+export const sessionStepUpAt = async (
+  db: AccountsDb,
+  accountId: string,
+  sessionId: string
+): Promise<number | null> => {
+  const row = await db
+    .select({ stepUpAt: accountSessions.stepUpAt })
+    .from(accountSessions)
+    .where(
+      and(
+        eq(accountSessions.id, sessionId),
+        eq(accountSessions.accountId, accountId)
+      )
+    )
+    .get()
+  return row?.stepUpAt?.getTime() ?? null
+}
+
+/** Records a step-up on a live session (a statement for the assertion's batch). */
+export const stepUpUpdate = (
+  db: AccountsDb,
+  input: { accountId: string; sessionId: string; credentialId: string },
+  now: number
+) =>
+  db
+    .update(accountSessions)
+    .set({ stepUpAt: new Date(now), stepUpCredentialId: input.credentialId })
+    .where(
+      and(
+        eq(accountSessions.id, input.sessionId),
+        eq(accountSessions.accountId, input.accountId),
+        isNull(accountSessions.revokedAt)
+      )
+    )

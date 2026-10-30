@@ -30,6 +30,10 @@ const createdAt = () =>
     .notNull()
     .$defaultFn(() => new Date())
 
+/** Where an account was created: by a phone opening a session, or on the web. */
+export const ACCOUNT_ORIGINS = ['app', 'web'] as const
+export type AccountOrigin = (typeof ACCOUNT_ORIGINS)[number]
+
 export const accounts = sqliteTable('accounts', {
   /** b64u of 16 random bytes, minted here. An identifier, not a secret. */
   id: text('id').primaryKey(),
@@ -39,6 +43,20 @@ export const accounts = sqliteTable('accounts', {
     .notNull()
     .default('active'),
   createdAt: createdAt(),
+  /**
+   * The passkey user handle (`user.id`, witness-work ADR 0038): b64u of 32
+   * random bytes, minted the first time the account needs one, never changed.
+   * Random; names no one.
+   */
+  passkeyUserHandle: text('passkey_user_handle').unique(),
+  /**
+   * Raised when the account key changes (ADR 0039). Passkey wraps and
+   * sessions record the epoch they were made under.
+   */
+  keyEpoch: integer('key_epoch').notNull().default(0),
+  createdVia: text('created_via', { enum: ACCOUNT_ORIGINS })
+    .notNull()
+    .default('app'),
 })
 
 /** Every status change, for appeals and auditing. */
@@ -56,8 +74,32 @@ export const accountStatusEvents = sqliteTable(
   (t) => [index('account_status_events_account_idx').on(t.accountId)]
 )
 
-export const SESSION_PLATFORMS = ['ios', 'android', 'dev'] as const
+export const SESSION_PLATFORMS = ['ios', 'android', 'dev', 'web'] as const
 export type SessionPlatform = (typeof SESSION_PLATFORMS)[number]
+
+/**
+ * How a session opened: an attested phone, the development bypass, or a
+ * browser with a ticket from a passkey, a phone's approval, a recovery key,
+ * or web sign-up (witness-work `docs/passkeys-protocol.md`).
+ */
+export const SESSION_METHODS = [
+  'attestation',
+  'dev',
+  'passkey',
+  'approval',
+  'recovery',
+  'signup',
+] as const
+export type SessionMethod = (typeof SESSION_METHODS)[number]
+
+/** Why a session ended, for a refused refresh's `reason`. */
+export const SESSION_END_REASONS = [
+  'signed_out',
+  'revoked',
+  'replaced',
+  'reused',
+] as const
+export type SessionEndReason = (typeof SESSION_END_REASONS)[number]
 
 /**
  * Attested sessions (witness-work ADR 0027): one row per session opened
@@ -83,9 +125,24 @@ export const accountSessions = sqliteTable(
     previousRefreshHash: text('previous_refresh_hash'),
     rotatedAt: integer('rotated_at', { mode: 'timestamp_ms' }),
     createdAt: createdAt(),
-    /** 90 days after it opened; refreshing never moves it. */
+    /**
+     * Phones: 90 days after it opened; refreshing never moves it. Web: 180
+     * days after its last refresh (sliding, no absolute limit).
+     */
     expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
     revokedAt: integer('revoked_at', { mode: 'timestamp_ms' }),
+    /** The app version it last opened or refreshed with (`major.minor.patch`). */
+    appVersion: text('app_version'),
+    /** How it opened; null for sessions from before passkeys. */
+    method: text('method', { enum: SESSION_METHODS }),
+    /** The account's key epoch when it opened. */
+    keyEpoch: integer('key_epoch').notNull().default(0),
+    /** Its last server-checked step-up (web), or when a web session opened. */
+    stepUpAt: integer('step_up_at', { mode: 'timestamp_ms' }),
+    /** The passkey that step-up asserted with, when one did. */
+    stepUpCredentialId: text('step_up_credential_id'),
+    /** Why it ended, once revoked. */
+    endedReason: text('ended_reason', { enum: SESSION_END_REASONS }),
   },
   (t) => [
     index('account_sessions_account_idx').on(t.accountId),
@@ -113,6 +170,9 @@ export const ACTIVITY_KINDS = [
   'account.reinstated',
   'buddies.inbox_linked',
   'buddies.deleted',
+  'passkey.added',
+  'passkey.removed',
+  'device.approved',
 ] as const
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number]
 
@@ -137,6 +197,10 @@ export const accountActivity = sqliteTable(
     /** The backup slot (`backup.*`); null for "every slot". */
     slotId: text('slot_id'),
     createdAt: createdAt(),
+    /** `session.opened`: how the session opened. */
+    method: text('method', { enum: SESSION_METHODS }),
+    /** `passkey.*`: the credential. */
+    credentialId: text('credential_id'),
   },
   (t) => [
     index('account_activity_account_idx').on(t.accountId, t.id),
@@ -212,4 +276,105 @@ export const revenueCatWebhookEvents = sqliteTable(
     receivedAt: integer('received_at', { mode: 'timestamp_ms' }).notNull(),
   },
   (t) => [index('revenuecat_webhook_events_received_idx').on(t.receivedAt)]
+)
+
+/** The platform a passkey was created from (the session's). */
+export const PASSKEY_PLATFORMS = SESSION_PLATFORMS
+
+/**
+ * Passkeys (witness-work ADR 0038, `docs/passkeys-protocol.md`): WebAuthn
+ * credentials of an account, never an identity of their own. The public key
+ * and what the authenticator last reported; never a PRF output, which the
+ * server never sees.
+ */
+export const passkeys = sqliteTable(
+  'passkeys',
+  {
+    /** b64u of the credential id (`rawId`). */
+    credentialId: text('credential_id').primaryKey(),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** b64u of the COSE public key. */
+    publicKey: text('public_key').notNull(),
+    /** The latest sign counter; synced passkeys stay at 0. */
+    counter: integer('counter').notNull().default(0),
+    /** JSON array of transports, as registration reported them. */
+    transports: text('transports'),
+    /** BE: `singleDevice` or `multiDevice`, as of the latest ceremony. */
+    deviceType: text('device_type', {
+      enum: ['singleDevice', 'multiDevice'],
+    }).notNull(),
+    /** BS, as of the latest ceremony. */
+    backedUp: integer('backed_up', { mode: 'boolean' }).notNull(),
+    /** For a provider name only. */
+    aaguid: text('aaguid'),
+    /** The RP ID it was created for. */
+    rpId: text('rp_id').notNull(),
+    createdPlatform: text('created_platform', {
+      enum: PASSKEY_PLATFORMS,
+    }).notNull(),
+    /** The creating device's label, sealed like a session's. */
+    label: text('label'),
+    createdAt: createdAt(),
+    /** Its last verified assertion. */
+    lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }),
+  },
+  (t) => [index('passkeys_account_idx').on(t.accountId, t.createdAt)]
+)
+
+/**
+ * The account key sealed under a key derived from a passkey's PRF output
+ * (a wrap). Ciphertext only; up to four per credential, since a synced
+ * passkey can answer differently on different devices. ADR 0039 deletes an
+ * account's wraps when its key changes.
+ */
+export const passkeyWraps = sqliteTable(
+  'passkey_wraps',
+  {
+    /**
+     * b64u of 16 random bytes the device made for this wrap; unique per
+     * credential only, so another account's id never conflicts or shows.
+     */
+    wrapId: text('wrap_id').notNull(),
+    credentialId: text('credential_id')
+      .notNull()
+      .references(() => passkeys.credentialId, { onDelete: 'cascade' }),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The account's key epoch the wrap was made under. */
+    keyEpoch: integer('key_epoch').notNull(),
+    /** b64u(0x01 ‖ nonce ‖ XChaCha20-Poly1305), 98 characters. */
+    wrap: text('wrap').notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.credentialId, t.wrapId] }),
+    index('passkey_wraps_credential_idx').on(t.credentialId, t.createdAt),
+    index('passkey_wraps_account_idx').on(t.accountId),
+  ]
+)
+
+/**
+ * Ids of challenges and tickets already used (`docs/passkeys-protocol.md`,
+ * "Challenges and tickets"): both are stateless MACs, so this is what makes
+ * each work once. Written in the same batch as what it authorized; pruned
+ * once expired. A ticket that opened a session names it, with a hash of the
+ * signed request, so the same request again (a lost response) gets that
+ * session back.
+ */
+export const usedTokenIds = sqliteTable(
+  'used_token_ids',
+  {
+    /** b64u of the token's 16-byte id. */
+    id: text('id').primaryKey(),
+    /** When the token itself expires. */
+    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+    /** The session a ticket opened. */
+    sessionId: text('session_id'),
+    /** b64u SHA-256 of the request that used it. */
+    requestHash: text('request_hash'),
+  },
+  (t) => [index('used_token_ids_expires_idx').on(t.expiresAt)]
 )

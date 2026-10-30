@@ -1,0 +1,34 @@
+# Passkeys and web sessions
+
+A passkey signs a User in on the web or a new phone and, with the WebAuthn PRF extension, delivers their account key through a wrap the server can't open. A browser opens a web session with the ticket a passkey sign-in answers; Settings → Account lists and removes passkeys; sensitive actions on the web ask for a fresh passkey tap the server checks (step-up).
+
+## Sub-features
+
+- `register` (`POST /accounts/v1/passkeys/register/options`, then `POST /accounts/v1/passkeys`) stores a passkey for the token's account, with an optional wrap, and logs `passkey.added`.
+- `sign-in` (`POST /accounts/v1/passkeys/challenge` `{purpose:"sign-in"}`, then `POST /accounts/v1/passkeys/assert`) answers the account, the credential's wraps, and a `passkey` ticket (none for an Android origin).
+- `web-session` (`POST /accounts/v1/sessions` with `ticket`) opens a `web` session; the same signed request again gets the same session; a fourth web session replaces the least recently active.
+- `step-up` (`challenge` `{purpose:"step-up"}` with a Bearer token, then `assert` with it) records `stepUpAt`; web sessions need one within 5 minutes to add or remove a passkey or delete backups (`step_up_required`).
+- `wrap`, `list`, `remove` (`POST /passkeys/wrap`, `GET /passkeys`, `POST /passkeys/remove`).
+- Refusals: `passkey_failed` with `reason` (`challenge`, `unknown_credential`, `user_handle`, `origin`, `rp_id`, `user_verification`, `signature`, `counter`, `registration`), `ticket_invalid`, and 429 after 30 failed assertions per IP an hour.
+
+## How to get to it (user POV)
+
+- Web sign-in screen → Sign in with a passkey; web Settings → Account → Passkeys.
+- A phone's Settings → Account → Passkeys → Add a Passkey; onboarding's Save a Passkey.
+
+## Driving it with verify-ww-api
+
+Preconditions:
+
+- `node scripts/verify/dev.mjs doctor` passes, including `passkeys enabled (RP IDs app-dev.witnesswork.app, localhost)`.
+
+- **Whole flow with a software authenticator.** Run `pnpm test:e2e src/e2e/passkeys.e2e.test.ts`. Three tests pass and `.verify/artifacts/e2e-passkeys-*.json` holds the exchanges: register (EdDSA, `localhost`, origin `http://localhost:8081`), sign in, web session (and its lost-response repeat), refresh with `appVersion`, device list, step-up, wrap, remove, and the origin/RP ID pair refusals.
+- **A real browser with PRF.** Drive Chromium with the CDP virtual authenticator (`WebAuthn.addVirtualAuthenticator` with `hasPrf`, `hasUserVerification`, `isUserVerified`, `hasResidentKey: true`) on a page served from `http://localhost:8081` (RP ID `localhost`). The page runs `navigator.credentials.create/get` with `extensions.prf.eval.first = UTF-8("ww-account/v1/passkey-prf")` and drops `clientExtensionResults.prf` before the response is posted; the driver posts it. Proof: the wrap saved after the confirming get opens with the PRF output of a later discoverable sign-in, and the key it holds derives `accountPub`.
+- **Sign-in challenge.** `curl -s -X POST $URL/accounts/v1/passkeys/challenge -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.5.1" -d '{"purpose":"sign-in","rpId":"localhost"}'` answers `{ok, challengeToken, options}` with `options.rpId` `localhost` and `allowCredentials: []`.
+
+## Gotchas
+
+- Origins pair with one RP ID: `http://localhost:8081` with `localhost` only, `https://app-dev.witnesswork.app` with `app-dev.witnesswork.app` only. A localhost origin on an `app-dev` challenge is `origin`.
+- The failure budget is per caller IP: send a fresh `cf-connecting-ip` per request (the helpers do), or 30 failures lock you out for up to an hour.
+- Tickets last 2 minutes and challenges 5 (signup 10); a step-up counts 5 minutes.
+- Each signed passkey or `backup/delete` envelope works once (409 `replay`); sign a fresh one per request, retries included.

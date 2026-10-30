@@ -5,7 +5,7 @@ description: Start an isolated local ww-api (Hono on Cloudflare Workers via wran
 
 # Verify ww-api
 
-`scripts/verify/dev.mjs` runs this checkout's worker with `wrangler dev --env dev --local` on a free port in 8790-8799, its own inspector port (9240-9259), its own persistence dir, and a generated vars file of synthetic tokens. It never uses port 8787 or 9229 (the user's own `wrangler dev`), `.wrangler/state`, or `.dev.vars`. All commands run from the repo root.
+`scripts/verify/dev.mjs` runs this checkout's worker with `wrangler dev --env dev --local` on a free port in 8790-8799, its own inspector port (9240-9259), its own persistence dir, and a generated vars file of synthetic tokens. The tokens that key persisted state are kept in `<persist dir>/verify-secrets.json`, so `down` then `up --persist-to` the same dir finds its sessions and rate counts again. It never uses port 8787 or 9229 (the user's own `wrangler dev`), `.wrangler/state`, or `.dev.vars`. All commands run from the repo root.
 
 ## Launch
 
@@ -19,8 +19,8 @@ node scripts/verify/dev.mjs up --photo-limit-bytes 2000              # Cloud Syn
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
 - `--photo-limit-bytes <n>` sets the worker's `SYNC_PHOTO_LIMIT_BYTES` (Cloud Sync photo storage per account, 2,000,000,000 by default), so a few small photos reach `storage_full`. `up` with a different value restarts the worker; `up` without the flag reuses whatever runs, and a fresh start uses the default. `doctor` prints the limit in effect.
-- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, and `BUDDIES_PHOTOS=on`. The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
-- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, and `ACCOUNT_TOKEN_SECRET` (account sessions), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
+- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, `BUDDIES_PHOTOS=on`, `AUTH_LEGACY=off` (requests signed the pre-session way get 426; `pnpm test:e2e` and `pnpm fuzz:buddies` put KV `auth:legacy` = `on` for their run), and the passkey RP IDs `app-dev.witnesswork.app` and `localhost` (origins `http://localhost:8081`, `:8082`, `:19006`, `:4173`, `:5173`). The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
+- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, `ACCOUNT_TOKEN_SECRET` (account sessions), `PASSKEY_CHALLENGE_SECRET` and `ACCOUNT_TICKET_SECRET` (passkeys), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
 ## Doctor
@@ -107,7 +107,7 @@ After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapsh
 
 ```bash
 node scripts/verify/dev.mjs down          # kill our recorded process group + children, remove state.json and the vars file
-node scripts/verify/dev.mjs down --wipe   # also delete the persisted DO/KV state dir
+node scripts/verify/dev.mjs down --wipe   # also delete the persisted DO/KV state dir (and its synthetic secrets)
 ```
 
 `down` kills only the pid recorded in `.verify/state.json`, its detached process group, and its descendants. It never kills by name. Logs and `.verify/artifacts/` stay. Delete old artifacts yourself when they're no longer needed, because disk space is limited. Run `down` after every failed attempt too, so no ports are stranded.
@@ -121,6 +121,7 @@ Only names are listed here; never print values.
 | `NOTES_IMPORT_DEV_BYPASS_TOKEN` | Notes Import bypass tests | generated per state dir |
 | `ADMIN_API_TOKEN` | admin reset positive tests | generated per state dir |
 | `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
+| `PASSKEY_CHALLENGE_SECRET`, `ACCOUNT_TICKET_SECRET` | passkeys and web sessions (`/accounts/v1/passkeys*`, ticket opens) | generated per state dir |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |

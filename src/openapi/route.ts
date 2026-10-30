@@ -51,6 +51,11 @@ export const OPENAPI_TAGS = [
       'Anonymous accounts: a random id and a public key, nothing else. An attested session (`POST /accounts/v1/sessions`) gives bearer tokens; before sessions, ops were signed like Buddies ops under the `ww-account/v1` context, which still works while the legacy switch is on.',
   },
   {
+    name: 'Passkeys',
+    description:
+      'Passkeys of an existing account (witness-work ADR 0038): sign in, step up a web session, and save the account key sealed under a passkey’s PRF output, which the server can’t open. A browser opens its web session with the ticket a sign-in answers. The wire contract is witness-work’s `docs/passkeys-protocol.md`.',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',

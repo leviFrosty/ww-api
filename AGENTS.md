@@ -942,13 +942,16 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   live session that carries a valid MAC, ends the session. An unknown,
   ended, or expired session is 401 `unauthorized`; a refresh that lost its
   rotation race to a session that has since moved on again is 401 without
-  ending it. Sessions last 90 days from opening and refreshing never
-  extends them. Read edge tier.
+  ending it. Phone sessions last 90 days from opening and refreshing never
+  extends them; a web session (platform `web`, opened with a ticket: see
+  [Passkeys and web sessions](#passkeys-and-web-sessions)) lasts 180 days
+  from its last refresh, with no absolute limit. A refusal carries `reason`
+  (`REFRESH_REFUSALS`). Read edge tier.
 - **Close**: `DELETE /sessions/current`, Bearer, no body; ends the token's
   own session, idempotent. Read tier. Session ids never go in URLs.
 - **Storage**: D1 `account_sessions` (migration
   `migrations/accounts/0001_account-sessions.sql`): id, account, platform
-  (`ios`, `android`, `dev`), sealed device label, SHA-256 of the current
+  (`ios`, `android`, `dev`, `web`), sealed device label, SHA-256 of the current
   and previous refresh token, and times. No install id, App Attest key,
   `accountPub`, or IP. The hourly cron deletes sessions a week after they
   were revoked or expired.
@@ -1164,14 +1167,26 @@ versions from sessions on read it at launch and on returning to the
 foreground, and show Update Required below it.
 
 KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
-var, then on; edge-cached 60 s). While it's on, converted routes also take
-the way they authenticated before sessions. Off, those requests get 426
+var, then on; edge-cached 60 s). **A failed KV read counts as off**
+(witness-work ADR 0038 §11): the old ways of signing requests never come back
+because KV is down. The dev worker's `AUTH_LEGACY` is `off`; production's is
+still `on` until the web launch writes KV `auth:legacy` = `off` (below). The
+e2e suites and the fuzzer turn it on in the local launcher's KV for their run,
+since production still serves legacy requests. While it's on, converted
+routes also take the way they authenticated before sessions. Off, those requests get 426
 `upgrade_required`, `account/register` included, except the iOS
 Notification Service Extension's owner-signed Buddies `inbox/sync`
 (`x-buddies-client: notification-service`) for an inbox with a confirmed
 account link (see Buddies → Authentication).
 
 #### Turning off backward compatibility
+
+This is the web launch's runbook (witness-work ADR 0038 §11): requests signed
+the pre-session way are refused once the web launches, and app versions
+before 1.45.0 (the first that opens sessions) lose Buddies and Notes Import
+until they update. Production's `AUTH_LEGACY` var stays `on`; step 3 is what
+turns it off, and deleting the key turns it back on. Dev is already off by its
+var.
 
 Do these in order. Each step takes up to 60 seconds to reach every colo.
 
@@ -1191,10 +1206,119 @@ wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"
 wrangler kv key put --binding NOTES_KV auth:legacy off
 ```
 
-Add `--env dev` to each for the dev worker. To undo, take them back in
-reverse: `wrangler kv key delete --binding NOTES_KV auth:legacy` (back to
-`AUTH_LEGACY`, on), then put the previous floors back, or delete
-`app:min-version` and `notes-import:min-version` to remove them.
+Add `--env dev` to each for the dev worker (step 3 isn't needed there; its
+var is off). To undo, take them back in reverse: `wrangler kv key delete
+--binding NOTES_KV auth:legacy` (back to `AUTH_LEGACY`: on in production, off
+on dev; `put auth:legacy on` re-allows dev), then put the previous floors
+back, or delete `app:min-version` and `notes-import:min-version` to remove
+them.
+
+### Passkeys and web sessions
+
+Passkeys are credentials of an existing account, never an identity of their
+own (witness-work ADR 0038; the wire contract is its
+`docs/passkeys-protocol.md`, implement it as written and list any deviation
+in the PR). Code in `src/accounts/passkeys.ts` (handlers),
+`passkeyStore.ts` (passkeys, wraps, user handle, used token ids),
+`webauthn.ts` (ceremony checks around `@simplewebauthn/server`),
+`passkeyTokens.ts` (challenges and tickets), `passkeyConfig.ts` (RP pairs),
+`stepUp.ts`, and `rateCounterDO.ts`; docs in `passkeyOpenapi.ts`. Tables
+`passkeys`, `passkey_wraps`, `used_token_ids` (migration
+`migrations/accounts/0004_passkeys.sql`).
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/passkeys/challenge` | `sign-in` (no auth) or `step-up` (Bearer) challenge |
+| `POST /accounts/v1/passkeys/assert` | Sign-in → account, wraps, `passkey` ticket; step-up → `stepUpAt` |
+| `POST /accounts/v1/passkeys/register/options` | Bearer; creation options, mints the user handle |
+| `POST /accounts/v1/passkeys` | Bearer + signed `passkey/add`, step-up |
+| `POST /accounts/v1/passkeys/wrap` | Bearer + signed `passkey/wrap` |
+| `GET /accounts/v1/passkeys` | Bearer; the account's passkeys |
+| `POST /accounts/v1/passkeys/remove` | Bearer + signed `passkey/remove`, step-up |
+| `POST /accounts/v1/sessions` with `ticket` | A browser's web session, in place of attestation |
+
+- **Relying party**: vars `PASSKEY_RP_IDS` (comma list; the first is the
+  default and the one Android origins pair with) and `PASSKEY_ORIGINS` (JSON
+  object from RP ID to its origins, web and `android:apk-key-hash:`). A
+  challenge or creation options without `rpId` get the RP ID the request's
+  `Origin` pairs with, else the first.
+  Production: `app.witnesswork.app`. Dev: `app-dev.witnesswork.app` and
+  `localhost` (the local ports). Origin and RP ID are checked as a pair, and
+  the authenticator data's `rpIdHash` against the challenge's RP ID. A new
+  Android signing key is a var change; the RP ID never changes once the first
+  passkey exists.
+- **Checks and reasons**: `webauthn.ts` checks, in order, the client data's
+  type (a create answering a get is `signature`, a get answering a create
+  `registration`) and challenge (`challenge`), the origin pair (`origin`),
+  `rpIdHash` (`rp_id`), UP (`user_presence`), UV (`user_verification`), the
+  counter (`counter`: synced passkeys' 0 always passes, and the stored
+  counter is `MAX(stored, reported)`, never lowered), then the library
+  verifies the signature (`signature`) or attestation (`registration`). The route checks the
+  credential (`unknown_credential`) and user handle (`user_handle`) first.
+  Failed assertions count against 30 per caller IP an hour
+  (`AccountRateCounter`, named by an HMAC of the IP under a key from
+  `ACCOUNT_TICKET_SECRET`, src/accounts/rateCounter.ts; never a plain hash,
+  which anyone could compute for every IPv4 address). `Retry-After` never
+  passes the end of the window. Rotating `ACCOUNT_TICKET_SECRET` starts the
+  counts over.
+- **Challenges and tickets** are stateless HMACs (`passkeyTokens.ts`) under
+  their own secrets, with `typ`, issuer, id, and expiry. Using one inserts
+  its id into `used_token_ids` in the same D1 batch as what it authorizes
+  (`batchUsing`); the hourly cron prunes expired ids. A ticket's session
+  open records the session and a hash of the signed request, so the same
+  request again within 2 minutes (a lost response) gets the same session and
+  the same refresh token: a web session's first one is derived from its id
+  (`repeatSession`, no write), or, once refreshed within the minute, the
+  token it was replaced by. The first answer's token never counts as
+  `reused`. An `approval` ticket opens a session only while the approving
+  phone's session (`actorSessionId`) is live.
+- **Signed envelopes work once**: `passkey/add`, `passkey/wrap`,
+  `passkey/remove`, and bearer `backup/delete` record their envelope's
+  nonce (per account key, until `ts` + 5 minutes; `envelopeNonce` in
+  `used_token_ids`) in the action's own D1 batch (`backup/delete`: just
+  before R2), so a captured envelope is 409 `replay`. `signedForToken`
+  (`signed.ts`) checks it first. `session/open` doesn't: a phone's
+  attestation is single-use already, and a ticket's repeat is the
+  lost-response path. Legacy (pre-session) envelopes are unchanged.
+- **Caps are atomic**: the 10th passkey is counted in its own insert
+  (`passkeyInsert`), so parallel adds can't pass it.
+- **Wrap ids** are unique per credential (`passkey_wraps`' key is
+  `(credential_id, wrap_id)`), so another account's id never conflicts with
+  or reveals anything about one's own.
+- **Web sessions**: platform `web`, sliding 180 days from the last refresh,
+  at most 3 per account apart from the phones' 10 (least recently active
+  replaced, `session.replaced`), and stepped up when they open. Step-up
+  (`refuseWithoutStepUp`; `STEP_UP_EXEMPT` lists the platforms that skip
+  it: `ios`, `android`, `dev`) is required of web sessions within 5 minutes on
+  passkey add/remove and `backup/delete` (ADR 0039's key change will use it
+  too). Every session records `method`, `app_version`, `key_epoch`, and
+  `step_up_at`; refreshes refused with 401 carry `reason` (`revoked`,
+  `replaced`, `expired`, `reused`, `unknown`; `ended_reason` on the row).
+- **Accounts** gain `passkey_user_handle` (minted with a conditional write),
+  `key_epoch` (ADR 0039 raises it; wraps for another epoch are refused), and
+  `created_via` (`app` or `web`).
+- **Privacy**: never log or report challenge tokens, tickets, registration or
+  assertion bodies, user handles, credential ids, wraps, or anything near a
+  PRF output (the server never sees one). Sentry drops request bodies
+  (`dropRequestBody`). Logs name the op only (`guarded`).
+
+Secrets, each a different value per worker, at least 32 characters, never
+`ACCOUNT_TOKEN_SECRET`'s; without either, the passkey routes and ticket
+sessions answer `disabled`. Keep a copy in 1Password's Agents vault. Rotating
+one invalidates challenges (≤ 10 minutes) or tickets (≤ 2 minutes) in flight,
+and rotating `ACCOUNT_TICKET_SECRET` also starts the rate counters (assert
+failures, web caps) over, nothing else, so there's no previous slot:
+
+```bash
+openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET --env dev
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET --env dev
+# Production (the owner, at the launch):
+openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET
+```
+
+The verify launcher sets synthetic ones; `src/e2e/passkeys.e2e.test.ts`
+drives the routes with a software authenticator (`src/test/webauthn.ts`).
 
 ### Supporter status (RevenueCat)
 
@@ -1571,7 +1695,7 @@ it commented out.
 | `api_notes_import_finished` | Once per started run | `outcome` (`success`, `model_error`, `cancelled`, `interrupted`), `duration_ms`, `notes_chars`; on success: `empty`, `empty_charged`, record counts (`contacts`, `visits`, `time_entries`, `categories`, `warnings`, `publisher_detected`), `imports_remaining`, `model`, `provider`, `input_tokens`, `output_tokens`, `reasoning_tokens` |
 | `api_notes_import_limit_reached` | An authenticated request is refused by an allowance or the concurrency cap | `limit` (`imports`, `refinements`, `active_cap`) |
 
-Every event carries `platform` (`ios`, `android`, `dev`: the session's
+Every event carries `platform` (`ios`, `android`, `dev`, `web`: the session's
 platform on bearer requests, else App Attest, Play Integrity, or the bypass
 header), `transport` (`stream`, `legacy`), `refinement`, `supporter`,
 `has_account` (true on every bearer request), and `environment`. The internal-TestFlight Beta app talks to prod, so its imports

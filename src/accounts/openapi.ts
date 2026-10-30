@@ -23,8 +23,10 @@ import {
   ACCOUNT_STATUS_REASONS,
   ACCOUNT_STATUSES,
   ACTIVITY_KINDS,
+  SESSION_METHODS,
   SESSION_PLATFORMS,
 } from './schema'
+import { REFRESH_REFUSALS } from './sessionStore'
 
 /**
  * OpenAPI descriptions for `/accounts/v1/*` (src/accounts/route.ts) and the
@@ -36,23 +38,39 @@ import {
  * Cloudflare and Sentry record. `ID_IN_BODY` says so on each of them.
  */
 
-const accountId = buddiesId('The account id')
+// Shared with the passkey routes' docs (src/accounts/passkeyOpenapi.ts).
+export const accountId = buddiesId('The account id')
 const status = z.enum(ACCOUNT_STATUSES)
 
-const keySignedBody = (op: string) =>
+export const epochMs = (description: string) =>
+  z.number().int().meta({ description: `${description}, epoch milliseconds.` })
+export const okOnly = jsonResponse('Done.', z.object({ ok: z.literal(true) }))
+export const internal = { 500: errorResponse('Unexpected failure.', ['internal']) }
+export const readTier =
+  'Limits: the Buddies read tier (600 a minute per caller IP).'
+
+/** The account key payload every self-signed envelope carries. */
+export const keyPayloadShape = {
+  accountPub: b64u('Ed25519 public key of the account signing key, 32 bytes'),
+  ts: z.number().int().meta({
+    description:
+      'Client time in epoch milliseconds; must be within 5 minutes of the server’s.',
+  }),
+  nonce: buddiesId('A fresh random nonce'),
+}
+
+/** A signed envelope whose payload adds `fields` to the key payload. */
+export const keySignedWith = (
+  op: string,
+  fields: z.ZodRawShape = {},
+  more = ''
+) =>
   signedBody(
-    z.object({
-      accountPub: b64u(
-        'Ed25519 public key of the account signing key, 32 bytes'
-      ),
-      ts: z.number().int().meta({
-        description:
-          'Client time in epoch milliseconds; must be within 5 minutes of the server’s.',
-      }),
-      nonce: buddiesId('A fresh random nonce'),
-    }),
-    `A signed envelope; \`signature\` is the account key’s signature over \`ww-account/v1\\n${op}\\n\` followed by the decoded \`payload\` bytes.`
+    z.object({ ...keyPayloadShape, ...fields }),
+    `A signed envelope; \`signature\` is the account key’s signature over \`ww-account/v1\\n${op}\\n\` followed by the decoded \`payload\` bytes.${more}`
   )
+
+const keySignedBody = (op: string) => keySignedWith(op)
 
 const signatureErrors = {
   400: errorResponse('Malformed envelope or payload.', ['bad_request']),
@@ -64,15 +82,6 @@ const signatureErrors = {
 }
 
 // --- Bearer tokens and the legacy switch -----------------------------------
-
-const keyPayloadShape = {
-  accountPub: b64u('Ed25519 public key of the account signing key, 32 bytes'),
-  ts: z.number().int().meta({
-    description:
-      'Client time in epoch milliseconds; must be within 5 minutes of the server’s.',
-  }),
-  nonce: buddiesId('A fresh random nonce'),
-}
 
 /** A bearer token, or (while the legacy switch is on) none: the envelope. */
 const bearerOrLegacy: Record<string, string[]>[] = [{ bearerAuth: [] }, {}]
@@ -152,9 +161,6 @@ Limits: the Buddies register tier (60 a minute per caller IP) and 2,000 registra
     503: errorResponse('Accounts are off on this worker.', ['disabled']),
   },
 })
-
-const epochMs = (description: string) =>
-  z.number().int().meta({ description: `${description}, epoch milliseconds.` })
 
 const accountInfoSchema = z.object({
   ok: z.literal(true),
@@ -285,29 +291,9 @@ const claimToken = buddiesId(
 const expiresAt = epochMs('When the channel and everything in it is deleted')
 const handoffStatus = z.enum(['open', 'claimed', 'sent', 'done', 'cancelled'])
 
-/** A signed envelope whose payload adds `fields` to the key payload. */
-const keySignedWith = (op: string, fields: z.ZodRawShape) =>
-  signedBody(
-    z.object({
-      accountPub: b64u(
-        'Ed25519 public key of the account signing key, 32 bytes'
-      ),
-      ts: z.number().int().meta({
-        description:
-          'Client time in epoch milliseconds; must be within 5 minutes of the server’s.',
-      }),
-      nonce: buddiesId('A fresh random nonce'),
-      ...fields,
-    }),
-    `A signed envelope; \`signature\` is the account key’s signature over \`ww-account/v1\\n${op}\\n\` followed by the decoded \`payload\` bytes.`
-  )
-
-const okOnly = jsonResponse('Done.', z.object({ ok: z.literal(true) }))
-const internal = { 500: errorResponse('Unexpected failure.', ['internal']) }
 const accountsOff = {
   503: errorResponse('Accounts are off on this worker.', ['disabled']),
 }
-const readTier = 'Limits: the Buddies read tier (600 a minute per caller IP).'
 const notFound = errorResponse(
   'No such channel, or it expired (10 minutes after `handoff/open`).',
   ['not_found']
@@ -741,7 +727,7 @@ export const backupDeleteDocs = describeRoute({
   summary: 'Delete backups',
   description: `Deletes one slot, or every slot of the account when \`slotId\` is left out (before Delete Buddies replaces the account key). Gone from storage at once; idempotent.
 
-A bearer request **and** a signed envelope: \`signature\` is the account key’s signature over \`ww-account/v1\\nbackup/delete\\n\` followed by the decoded \`payload\` bytes, and the key must be the token’s own account (\`forbidden\` otherwise), so a leaked token alone can’t delete backups. ${ENDED_SESSION} **Legacy** (no \`Authorization\` header): the envelope alone, while the legacy switch is on.
+A bearer request **and** a signed envelope: \`signature\` is the account key’s signature over \`ww-account/v1\\nbackup/delete\\n\` followed by the decoded \`payload\` bytes, and the key must be the token’s own account (\`forbidden\` otherwise), so a leaked token alone can’t delete backups. A web session must have passed a passkey step-up (or opened) in the last 5 minutes (\`step_up_required\`); phone sessions are exempt. Each bearer request’s envelope works once (409 \`replay\`; sign a new one to retry). ${ENDED_SESSION} **Legacy** (no \`Authorization\` header): the envelope alone, while the legacy switch is on.
 
 ${readTier}
 
@@ -754,12 +740,13 @@ ${ID_IN_BODY}`,
     200: okOnly,
     ...bearerErrors,
     403: errorResponse(
-      'The envelope is signed by another account than the token’s.',
-      ['forbidden']
+      'The envelope is signed by another account than the token’s (`forbidden`), or the web session needs a step-up (`step_up_required`).',
+      ['forbidden', 'step_up_required']
     ),
     404: errorResponse('No account has this key; register first.', [
       'unknown_account',
     ]),
+    409: errorResponse('This envelope was already used; sign a new one.', ['replay']),
     ...upgradeRequired,
     429: errorResponse('Over the per-caller rate.', ['rate_limited']),
     ...internal,
@@ -813,6 +800,13 @@ const sessionOpenPayload = z.object({
         'The challenge request’s fields plus `challenge` and the assertion or integrity token (tables below). Required except with the development bypass.',
     }),
   device: b64u('The sealed device label, at most 512 characters').optional(),
+  ticket: z.string().optional().meta({
+    description:
+      'A browser’s ticket in place of `attestation` (`passkey`, `approval`, or `recovery`; at most 512 characters, 2 minutes, for this key’s account). Both is `bad_request`.',
+  }),
+  appVersion: z.string().optional().meta({
+    description: 'The app version, `major.minor.patch`, at most 32 characters.',
+  }),
 })
 
 /** `attestation_failed` and the attestation `bad_request`s carry these. */
@@ -852,9 +846,13 @@ const tokenPair = {
     'The session’s refresh token. Keep it in the platform keystore, not synced; each refresh replaces it'
   ),
   sessionExpiresAt: epochMs(
-    'When the session ends (90 days after it opened; refreshing never extends it)'
+    'When the session ends: 90 days after it opened for phones (refreshing never extends it); for `web`, 180 days after this refresh'
   ),
 }
+
+const sessionPlatformOf = z.enum(SESSION_PLATFORMS).meta({
+  description: 'The session’s platform (the access token’s `platform` claim): `ios`, `android`, `dev`, or `web`.',
+})
 
 const sessionDevBypassHeader = {
   name: 'x-ww-dev-bypass',
@@ -870,7 +868,9 @@ export const sessionOpenDocs = describeRoute({
   summary: 'Open a session',
   description: `The one place an account proves it’s the app. First get a challenge from \`POST /attestation/v1/challenge\` with \`purpose: "account-session"\` and both hashes set to the hash of \`accountPub\`: an App Attest v2 \`assert\` challenge on iOS (the install’s key, bound through \`POST /attestation/v1/register\`), or a Play Integrity v1 challenge on Android (\`attestationProvider: "play-integrity"\`). Then send this envelope, self-signed by the account key (op \`session/open\`) and carrying the answer: the signature covers the attestation and the attestation covers \`accountPub\`.
 
-Creates the account when the key has none (it replaces \`account/register\`). A suspended account still gets a session (\`status: suspended\`). Opening an eleventh live session for an account ends its oldest. Answers 201 with \`Location: /accounts/v1/sessions/current\`, the session the new access token addresses.
+Creates the account when the key has none (it replaces \`account/register\`). A suspended account still gets a session (\`status: suspended\`). Opening an eleventh live phone session for an account ends its oldest.
+
+**Web sessions:** a browser sends \`ticket\` (from \`POST /passkeys/assert\`, \`approval/receive\`, or \`web/recovery\`) in place of \`attestation\`. The ticket’s account must be \`accountPub\`’s and exist (a ticket never creates one; \`ticket_invalid\` otherwise). The session’s platform is \`web\`; it lasts 180 days from its last refresh, with no absolute limit, and counts as stepped up when it opens. At most 3 web sessions an account, apart from the phones’ 10: a fourth ends the least recently active (\`session.replaced\`). The same signed request again (same \`nonce\` and ticket) within the ticket’s 2 minutes, after a lost response, gets the same session, a new access token, and the same refresh token (or, if that one was refreshed in the last minute, the token it was replaced by), so the first answer’s refresh token never counts as reused. An \`approval\` ticket opens a session only while the phone session that approved is live. Answers 201 with \`Location: /accounts/v1/sessions/current\`, the session the new access token addresses.
 
 \`device\` is the device’s label, sealed (Buddies \`seal\` format) under \`HKDF-SHA256(accountKey, "", "ww-account/v1/device", 32)\` with AAD \`"ww-account/v1/device\\n" + accountPub\`; the server stores it and can’t read it.
 
@@ -901,6 +901,7 @@ ${fieldTable(playIntegritySessionAttestation)}`
           accountId,
           status,
           sessionId: buddiesId('The session'),
+          platform: sessionPlatformOf,
           ...tokenPair,
         })
       ),
@@ -918,8 +919,8 @@ ${fieldTable(playIntegritySessionAttestation)}`
     ),
     401: signatureErrors[401],
     403: errorResponse(
-      'The attestation was refused. There’s no fallback: no attestation, no session.',
-      ['attestation_failed'],
+      'The attestation was refused (there’s no fallback: no attestation, no session), or a browser’s ticket is malformed, expired, used, or for another account (`ticket_invalid`).',
+      ['attestation_failed', 'ticket_invalid'],
       sessionAttestationErrorSchema
     ),
     413: errorResponse('`device` is over 512 characters.', ['too_large']),
@@ -944,6 +945,9 @@ ${readTier}`,
   requestBody: jsonBody(
     z.object({
       refreshToken: refreshTokenSchema('The session’s current refresh token'),
+      appVersion: z.string().optional().meta({
+        description: 'The app version, `major.minor.patch`, at most 32 characters; the session keeps the latest.',
+      }),
     })
   ),
   responses: {
@@ -953,8 +957,13 @@ ${readTier}`,
     ),
     400: errorResponse('Malformed JSON, or no `refreshToken`.', ['bad_request']),
     401: errorResponse(
-      'Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does.',
-      ['unauthorized']
+      'Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does. `reason` says why: `revoked` (signed out, by another device or itself), `replaced` (a cap ended it), `expired`, `reused` (a replaced refresh token came back), or `unknown`.',
+      ['unauthorized'],
+      apiErrorSchema.extend({
+        reason: z.enum([...REFRESH_REFUSALS]).meta({
+          description: 'Why the refresh was refused.',
+        }),
+      }).meta({ id: 'RefreshRefusedError' })
     ),
     429: errorResponse('Over the per-caller rate.', ['rate_limited']),
     ...internal,
@@ -1001,7 +1010,8 @@ const bearerReadErrors = {
 }
 
 const sessionPlatform = z.enum(SESSION_PLATFORMS).meta({
-  description: 'What attested the session; `dev` is the development bypass.',
+  description:
+    'What attested the session (`ios`, `android`; `dev` is the development bypass), or `web` for a browser’s session opened with a ticket.',
 })
 const sealedDevice = b64u(
   'The session’s sealed device label, exactly as `POST /accounts/v1/sessions` received it. Only the account’s devices can open it (see that route)'
@@ -1018,7 +1028,16 @@ const liveSessionSchema = z.object({
   lastActiveAt: epochMs(
     'Its last refresh, or when it opened; accurate to about 15 minutes'
   ),
-  expiresAt: epochMs('When it ends (90 days after it opened)'),
+  expiresAt: epochMs(
+    'When it ends: 90 days after it opened for phones; for `web`, 180 days after its last refresh (sliding)'
+  ),
+  method: z.enum(SESSION_METHODS).meta({
+    description:
+      'How it opened: `attestation`, `dev`, or for `web` the ticket’s kind (`passkey`, `approval`, `recovery`) or `signup`.',
+  }),
+  appVersion: z.string().optional().meta({
+    description: 'The app version it last opened or refreshed with; absent when unknown.',
+  }),
 })
 
 export const sessionListDocs = describeRoute({
@@ -1084,7 +1103,14 @@ const activityEntrySchema = z
     }),
     actor: activitySessionSchema.optional().meta({
       description:
-        '`session.revoked` and `session.replaced`: the session that ended `session`.',
+        '`session.revoked` and `session.replaced`: the session that ended `session`. An `approval` `session.opened`: the phone’s session that approved it.',
+    }),
+    method: z.enum(SESSION_METHODS).optional().meta({
+      description:
+        '`session.opened`: how it opened (`attestation`, `dev`, `passkey`, `approval`, `recovery`, `signup`). Absent on entries from before passkeys.',
+    }),
+    credentialId: z.string().optional().meta({
+      description: '`passkey.added` and `passkey.removed`: the credential (base64url).',
     }),
     slotId: buddiesId(
       '`backup.deleted` (absent when every slot was deleted) and `backup.downloaded`: the backup slot'
@@ -1100,10 +1126,10 @@ export const activityListDocs = describeRoute({
 | \`kind\` | When | \`session\` | \`actor\` |
 | --- | --- | --- | --- |
 | \`account.created\` | The account was created | — | — |
-| \`session.opened\` | A device signed in | The new session | — |
+| \`session.opened\` | A device signed in (\`method\` says how) | The new session | \`approval\`: the phone’s session that approved it |
 | \`session.signed_out\` | A device ended its own session | It | — |
 | \`session.revoked\` | Another device signed it out | The one signed out | The one that did it |
-| \`session.replaced\` | An eleventh session ended the oldest | The oldest | The new one |
+| \`session.replaced\` | An eleventh phone session ended the oldest, or a fourth web session the least recently active | The ended one | The new one |
 | \`session.refresh_reused\` | A replaced refresh token came back after its grace minute (possibly stolen); the session ended | It | — |
 | \`handoff.sent\` | The account key was sent to a new phone | The old phone’s | — |
 | \`backup.deleted\` | A backup slot, or every slot, was deleted | The deleting one | — |
@@ -1112,6 +1138,9 @@ export const activityListDocs = describeRoute({
 | \`account.reinstated\` | The account was reinstated | — | — |
 | \`buddies.inbox_linked\` | A Buddies inbox was linked to the account | The linking one | — |
 | \`buddies.deleted\` | The account's Buddies inbox was deleted (Delete My Buddies Data) | The deleting one | — |
+| \`passkey.added\` | A passkey was added (\`credentialId\`) | The adding one (the new one, at web sign-up) | — |
+| \`passkey.removed\` | A passkey was removed (\`credentialId\`) | The removing one | — |
+| \`device.approved\` | A phone approved a browser’s sign-in | The phone’s | — |
 
 \`session\` is absent on handoff, backup, and Buddies entries made with an envelope before sessions. Buddies entries never name a buddy or another account's inbox: only the owner's own link and deletion are logged, never writer ops.
 

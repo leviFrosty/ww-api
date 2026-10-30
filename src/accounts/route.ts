@@ -25,6 +25,16 @@ import { handleActivity } from './activityRoute'
 import { supporterHandlers } from './supporterRoute'
 import { syncHandlers } from './sync'
 import { syncPhotoHandlers } from './syncPhotos'
+import { passkeyHandlers } from './passkeys'
+import {
+  passkeyAddDocs,
+  passkeyAssertDocs,
+  passkeyChallengeDocs,
+  passkeyListDocs,
+  passkeyRegisterOptionsDocs,
+  passkeyRemoveDocs,
+  passkeyWrapDocs,
+} from './passkeyOpenapi'
 import {
   accountDocs,
   activityListDocs,
@@ -206,5 +216,18 @@ export const createAccountsRoutes = () => {
   routes.post('/sync/photos/get', syncPhotoGetDocs, syncPhotoHandlers.get)
   routes.post('/sync/photos/delete', syncPhotoDeleteDocs, syncPhotoHandlers.delete)
   routes.get('/sync/photos/usage', syncPhotoUsageDocs, syncPhotoHandlers.usage)
+  // Passkeys (ADR 0038): the collection is a resource; the ceremonies and
+  // removal are POSTs so credential ids stay out of URLs.
+  routes.post('/passkeys/challenge', passkeyChallengeDocs, passkeyHandlers.challenge)
+  routes.post('/passkeys/assert', passkeyAssertDocs, passkeyHandlers.assert)
+  routes.post(
+    '/passkeys/register/options',
+    passkeyRegisterOptionsDocs,
+    passkeyHandlers.registerOptions
+  )
+  routes.post('/passkeys', passkeyAddDocs, passkeyHandlers.add)
+  routes.post('/passkeys/wrap', passkeyWrapDocs, passkeyHandlers.wrap)
+  routes.get('/passkeys', passkeyListDocs, passkeyHandlers.list)
+  routes.post('/passkeys/remove', passkeyRemoveDocs, passkeyHandlers.remove)
   return routes
 }

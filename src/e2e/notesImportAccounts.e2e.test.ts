@@ -291,7 +291,8 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch (local 
       // Status stays public.
       expect((await http('GET', '/notes-import/status')).status).toBe(200)
     } finally {
-      localKv('delete', 'auth:legacy')
+      // Back to the suites' default: on (see src/test/e2eGlobalSetup.ts).
+      localKv('put', 'auth:legacy', 'on')
     }
     const back = await http('GET', `/notes-import/imp_${'0'.repeat(40)}/result?token=anything`)
     expect(back.status).toBe(401)

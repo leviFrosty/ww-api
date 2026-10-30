@@ -391,9 +391,47 @@ export interface Environment {
   ACCOUNT_TOKEN_SECRET_PREVIOUS?: string;
 
   /**
+   * Passkeys (witness-work ADR 0038): the RP IDs this worker accepts,
+   * comma-separated; the first is the default and the one Android origins
+   * pair with. Without it (or `PASSKEY_ORIGINS`), the passkey routes answer
+   * `disabled`.
+   */
+  PASSKEY_RP_IDS?: string;
+
+  /**
+   * Each RP ID's origins, as a JSON object (or TOML table) from RP ID to an
+   * array of origins (web origins and `android:apk-key-hash:` ones). A
+   * response's origin must pair with its RP ID here.
+   */
+  PASSKEY_ORIGINS?: string | Record<string, string[]>;
+
+  /**
+   * Signs passkey challenge tokens (`ww-challenge`). Secret, at least 32
+   * characters, distinct per worker, never the access token's. Without it,
+   * the passkey routes answer `disabled`.
+   */
+  PASSKEY_CHALLENGE_SECRET?: string;
+
+  /**
+   * Signs the tickets a browser opens a web session with (`ww-ticket`:
+   * passkey, approval, recovery). Secret, at least 32 characters, distinct
+   * per worker. Without it, ticket sessions and the passkey routes answer
+   * `disabled`.
+   */
+  ACCOUNT_TICKET_SECRET?: string;
+
+  /**
+   * Rolling-window counters for the accounts routes (passkey sign-in failures
+   * per IP), one SQLite DO per hashed name (`src/accounts/rateCounterDO.ts`).
+   */
+  ACCOUNT_RATE_COUNTER: DurableObjectNamespace<
+    import('./accounts/rateCounterDO').AccountRateCounter
+  >;
+
+  /**
    * Legacy-auth fallback when KV `auth:legacy` is absent: `"off"` refuses the
    * pre-session ways of authenticating with 426 `upgrade_required`; anything
-   * else (and unset) accepts them.
+   * else (and unset) accepts them. A failed KV read counts as off.
    */
   AUTH_LEGACY?: string;
 

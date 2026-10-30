@@ -4,6 +4,7 @@ import { BuddyInvite } from '../buddies/inviteDO'
 import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { AccountHandoff } from '../accounts/handoffDO'
 import { AccountSync } from '../accounts/syncDO'
+import { AccountRateCounter } from '../accounts/rateCounterDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -133,6 +134,34 @@ export const TEST_TOKEN_SECRET = 'test-account-token-secret-0123456789abcdef'
 export const TEST_DEV_BYPASS = 'test-dev-bypass-token'
 /** A web app origin in the harness's `WEB_APP_ORIGINS` (the dev list's). */
 export const TEST_WEB_ORIGIN = 'http://localhost:8081'
+/** The harness's passkey challenge and ticket secrets. */
+export const TEST_CHALLENGE_SECRET = 'test-passkey-challenge-secret-0123456789ab'
+export const TEST_TICKET_SECRET = 'test-account-ticket-secret-0123456789abcdef'
+
+/** The dev worker's relying parties (wrangler.toml `[env.dev.vars]`). */
+export const TEST_RP_ID = 'app-dev.witnesswork.app'
+export const TEST_ORIGIN = 'https://app-dev.witnesswork.app'
+export const TEST_ANDROID_ORIGIN =
+  'android:apk-key-hash:-sYXRdwJA3hvue3mKpYrOZ9zSPC7b4mbgzJmdZEDO5w'
+export const TEST_LOCAL_ORIGIN = 'http://localhost:8081'
+export const TEST_PASSKEY_VARS = {
+  PASSKEY_RP_IDS: `${TEST_RP_ID},localhost`,
+  PASSKEY_ORIGINS: JSON.stringify({
+    [TEST_RP_ID]: [
+      TEST_ORIGIN,
+      'android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw',
+      'android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes',
+      TEST_ANDROID_ORIGIN,
+    ],
+    localhost: [
+      'http://localhost:8081',
+      'http://localhost:8082',
+      'http://localhost:19006',
+      'http://localhost:4173',
+      'http://localhost:5173',
+    ],
+  }),
+}
 
 export interface Harness {
   env: Environment
@@ -149,6 +178,7 @@ export interface Harness {
   photoBlobs: MemoryR2
   handoffs: FakeNamespace<AccountHandoff>
   syncIndexes: FakeNamespace<AccountSync>
+  rateCounters: FakeNamespace<AccountRateCounter>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -274,6 +304,9 @@ export const createHarness = async (
           ACCOUNT_TOKEN_SECRET: TEST_TOKEN_SECRET,
           APP_ATTEST_ENVIRONMENT: 'development',
           NOTES_IMPORT_DEV_BYPASS_TOKEN: TEST_DEV_BYPASS,
+          PASSKEY_CHALLENGE_SECRET: TEST_CHALLENGE_SECRET,
+          ACCOUNT_TICKET_SECRET: TEST_TICKET_SECRET,
+          ...TEST_PASSKEY_VARS,
         }),
     ...limiters,
     ...(options.apnsConfigured === false
@@ -308,6 +341,11 @@ export const createHarness = async (
   )
   env.ACCOUNT_SYNC_INDEX =
     syncIndexes.namespace as Environment['ACCOUNT_SYNC_INDEX']
+  const rateCounters = createNamespace(
+    (state) => new AccountRateCounter(state as never, env as never)
+  )
+  env.ACCOUNT_RATE_COUNTER =
+    rateCounters.namespace as Environment['ACCOUNT_RATE_COUNTER']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -328,6 +366,7 @@ export const createHarness = async (
     photoBlobs,
     handoffs,
     syncIndexes,
+    rateCounters,
     inboxes,
     invites,
     quotas,

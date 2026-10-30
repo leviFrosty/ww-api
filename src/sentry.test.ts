@@ -350,6 +350,22 @@ describe('Sentry scrubbers', () => {
     })
   })
 
+  it('drops request bodies (passkey responses, tickets, challenge tokens)', () => {
+    const body = JSON.stringify({ challengeToken: 'challenge-secret', response: { id: 'cred' }, ticket: 'ticket-secret' })
+    const error: ErrorEvent = {
+      type: undefined,
+      request: { url: 'https://ww-proxy.test/accounts/v1/passkeys/assert', method: 'POST', data: body },
+    }
+    const transaction: TransactionEvent = {
+      type: 'transaction',
+      request: { url: 'https://ww-proxy.test/accounts/v1/sessions', data: body },
+    }
+    const scrubbedError = config.beforeSend!(error, {}) as ErrorEvent
+    const scrubbedTransaction = config.beforeSendTransaction!(transaction, {}) as TransactionEvent
+    expect(scrubbedError.request).toEqual({ url: 'https://ww-proxy.test/accounts/v1/passkeys/assert', method: 'POST' })
+    expect(JSON.stringify(scrubbedTransaction)).not.toContain('secret')
+  })
+
   it('drops bearer, admin, and dev bypass tokens from events and transactions', () => {
     const headers = () => ({
       Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln',
