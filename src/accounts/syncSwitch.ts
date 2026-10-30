@@ -6,9 +6,10 @@ import type { Environment } from '../types'
  *
  * - `sync:enabled`: `"true"` or `"on"` turns Cloud Sync on, anything else off;
  *   absent (or unreadable), the `SYNC_ENABLED` var decides the same way.
- * - `sync:entitlement`: `"everyone"` makes it free; `"supporter"` (and
- *   anything else) keeps it a Supporter benefit; absent, the
- *   `SYNC_ENTITLEMENT` var, else `supporter`.
+ * - `sync:entitlement`: `"supporter"` makes it a Supporter benefit again
+ *   (the lever back, in any case); `"everyone"` (and anything else) keeps it free, as
+ *   witness-work ADR 0040 decided. Absent (or unreadable), the
+ *   `SYNC_ENTITLEMENT` var decides the same way, else `everyone`.
  */
 
 export const SYNC_ENABLED_KEY = 'sync:enabled'
@@ -44,9 +45,10 @@ export const syncEntitlement = async (
   env: SyncSwitchEnv
 ): Promise<SyncEntitlement> => {
   const value = await read(env, SYNC_ENTITLEMENT_KEY)
-  return (value ?? env.SYNC_ENTITLEMENT ?? '').trim() === 'everyone'
-    ? 'everyone'
-    : 'supporter'
+  return (value ?? env.SYNC_ENTITLEMENT ?? '').trim().toLowerCase() ===
+    'supporter'
+    ? 'supporter'
+    : 'everyone'
 }
 
 /** Both switches, as `GET /app/v1/config` and `GET /accounts/v1/sync` say them. */

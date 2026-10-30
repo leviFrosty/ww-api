@@ -52,6 +52,7 @@ import {
   syncListDocs,
   syncLiveDocs,
   syncPutDocs,
+  syncSwitchRequestDocs,
   syncStatusDocs,
 } from './openapi'
 
@@ -192,6 +193,7 @@ export const createAccountsRoutes = () => {
   routes.post('/sync/list', syncListDocs, syncHandlers.list)
   routes.post('/sync/get', syncGetDocs, syncHandlers.get)
   routes.post('/sync/delete', syncDeleteDocs, syncHandlers.delete)
+  routes.post('/sync/request', syncSwitchRequestDocs, syncHandlers.switchRequest)
   routes.get('/sync/live', syncLiveDocs, syncHandlers.live)
   return routes
 }

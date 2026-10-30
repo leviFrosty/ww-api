@@ -32,7 +32,7 @@ describe('GET /app/v1/config', () => {
     expect(await response.json()).toEqual({
       ok: true,
       minAppVersion: '1.42.0',
-      sync: { enabled: false, entitlement: 'supporter' },
+      sync: { enabled: false, entitlement: 'everyone' },
     })
   })
 
@@ -43,7 +43,7 @@ describe('GET /app/v1/config', () => {
     )
     expect(await response.json()).toEqual({
       ok: true,
-      sync: { enabled: false, entitlement: 'supporter' },
+      sync: { enabled: false, entitlement: 'everyone' },
     })
   })
 
@@ -62,10 +62,17 @@ describe('GET /app/v1/config', () => {
       return ((await response.json()) as { sync: unknown }).sync
     }
     const bound = { ACCOUNT_SYNC: {}, ACCOUNTS_DB: {} }
+    // Free for everyone unless something says otherwise (ADR 0040).
     expect(await config({ ...bound, SYNC_ENABLED: 'true' })).toEqual({
       enabled: true,
-      entitlement: 'supporter',
+      entitlement: 'everyone',
     })
+    expect(
+      await config(
+        { ...bound, SYNC_ENABLED: 'true', SYNC_ENTITLEMENT: 'everyone' },
+        { 'sync:entitlement': 'supporter' }
+      )
+    ).toEqual({ enabled: true, entitlement: 'supporter' })
     // KV wins over the vars, both ways.
     expect(
       await config(
@@ -79,7 +86,7 @@ describe('GET /app/v1/config', () => {
     // Without the bucket there's no Cloud Sync to offer.
     expect(await config({ SYNC_ENABLED: 'true' })).toEqual({
       enabled: false,
-      entitlement: 'supporter',
+      entitlement: 'everyone',
     })
   })
 

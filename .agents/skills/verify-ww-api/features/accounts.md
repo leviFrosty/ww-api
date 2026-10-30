@@ -28,11 +28,11 @@ Preconditions:
 - **Whole flow.** Run `pnpm test:e2e src/e2e/accounts.e2e.test.ts`. Vitest reports `/accounts/v1/sessions (dev bypass)`, `the legacy switch (local KV)`, and `GET /app/v1/config` as passed, and `.verify/artifacts/e2e-accounts-*.json` holds the exchanges.
 - **Sessions on.** Run `curl -s -X POST $URL/accounts/v1/sessions/refresh -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.4.1" -d '{"refreshToken":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'`. The body is `{"ok":false,"error":"unauthorized","code":"unauthorized"}`; `disabled` means no `ACCOUNT_TOKEN_SECRET`.
 - **App config.** Run `node scripts/verify/dev.mjs kv put app:min-version '{"minVersion":"9.8.7"}'`, then `curl -si $URL/app/v1/config`. You get 200, `cache-control: no-store`, and `{"ok":true,"minAppVersion":"9.8.7","sync":{…}}`. Restore it with `node scripts/verify/dev.mjs kv delete app:min-version`.
-- **Cloud Sync.** Run `pnpm test:e2e src/e2e/sync.e2e.test.ts`. It refuses a non-Supporter (`supporter_required`), then sets KV `sync:entitlement everyone` in the local KV and does put → live `changed` → list → get → `If-Match` → the kill switch → delete, and deletes the key again. `.verify/artifacts/e2e-sync-*.json` holds the exchanges.
+- **Cloud Sync.** Run `pnpm test:e2e src/e2e/sync.e2e.test.ts`. It sets KV `sync:entitlement supporter` and refuses a non-Supporter (`supporter_required`), then with `sync:entitlement everyone` does put → live `changed` → list → get → `If-Match` → the kill switch → delete, and the Cloud Sync request's set → repeat → status → clear, and deletes the keys again. `.verify/artifacts/e2e-sync-*.json` holds the exchanges.
 
 ## Gotchas
 
 - Session envelopes (op `session/open`) are Ed25519-signed; use the e2e helpers, not hand-built curl.
-- Restore `sync:entitlement` and `sync:enabled` (`kv delete`) after flipping them; the dev vars are on and Supporters only.
+- Restore `sync:entitlement` and `sync:enabled` (`kv delete`) after flipping them; the dev vars are on and free for everyone.
 - Restore `auth:legacy` (`kv delete auth:legacy`) after flipping it, or every legacy accounts and handoff test after it gets 426.
 - Real attestations need a device and the deployed dev worker. Locally only the dev bypass opens sessions, and it reports platform `dev`.
