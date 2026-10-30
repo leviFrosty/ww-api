@@ -1427,7 +1427,7 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   `ROUTE_PLANNING_QUOTA`, migration `v5`, one instance per caller:
   `account:<accountId>` for bearer, the app user id for legacy, which
   stores only optimization timestamps and deletes itself a day after the
-  newest). Every call that reaches HERE counts, including `no_route` answers.
+  newest; directions and MapKit JS tokens count in their own instances). Every call that reaches HERE counts, including `no_route` answers.
   The per-IP `RATE_LIMITER` also applies.
 - **Kill switch**: KV `route-planning:enabled` in `NOTES_KV`. `"false"` turns
   optimizing off (503 `unavailable`; the app says it's temporarily unavailable);
@@ -1443,6 +1443,27 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   captured before Sentry wraps the global, so the account id (in RevenueCat's
   URL) and the HERE key stay out of trace spans. Nothing logs bodies,
   coordinates, or account ids.
+
+## Maps on the web
+
+The web app's map (witness-work ADR 0037 §8) is MapKit JS in a sandboxed frame
+on `maps.witnesswork.app` (`maps-dev.witnesswork.app` for dev). Contract,
+setup, and decisions: [`docs/maps.md`](docs/maps.md). Code in `src/maps/`.
+
+- `POST /maps/v1/mapkit-tokens`: Bearer (`requireActive`), a 30-minute ES256
+  MapKit JS JWT (`kid`, `typ: JWT`; `iss`, `iat`, `exp`, `origin`, `scope:
+  mapkit_js`). 10 a minute and 500 a day per account, counted in the
+  `RoutePlanningQuota` DO under `mapkit-token:account:<id>`, plus the per-IP
+  `maps` bucket. 503 `maps_unconfigured` until `MAPKIT_JS_PRIVATE_KEY`,
+  `MAPKIT_JS_KEY_ID` (secrets), `APPLE_TEAM_ID`, and a `MAPKIT_JS_ORIGINS`
+  origin are all set. `MAPKIT_JS_ORIGINS` is a var per environment; an
+  `http://localhost` origin counts only under `wrangler dev` (a development
+  worker on a local host) and belongs in `.dev.vars`, never `wrangler.toml`.
+  Never log the token or the key.
+- `GET /places/v1/search`: HERE Discover for points of interest, public in the
+  per-IP `places` bucket like `/autocomplete`. Reads only `q`, `at`, `limit`,
+  `lang`; answers a trimmed shape, never HERE's raw body.
+- Directions for the web are the existing `POST /route-planning/directions`.
 
 ## API docs (OpenAPI + Scalar)
 

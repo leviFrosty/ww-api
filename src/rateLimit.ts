@@ -15,13 +15,14 @@ import { apiError } from './errors'
  * What it still guards: no family gets more than it had (60/min per IP), so
  * the cost ceiling per IP for any one upstream (HERE place search, OpenRouter,
  * HERE routing) is unchanged; only the families no longer starve each other.
- * Address search and geocoding stay in one `places` bucket because both spend
- * HERE transactions. Behind each family sit stronger, identity-keyed limits
- * (Notes Import: App Attest or Play Integrity, allowances, the concurrency
- * cap; Scribe AI: the per-account usage windows and active-step cap;
- * attestation: the per-install challenge cap; route planning: the
- * per-account quota), which a client-supplied install or account id can't
- * replace here: before those checks it is unauthenticated, so keying on it
+ * Address search, geocoding, and point-of-interest search stay in one
+ * `places` bucket because all three spend HERE transactions. Behind each
+ * family sit stronger, identity-keyed limits (Notes Import: App Attest or
+ * Play Integrity, allowances, the concurrency cap; Scribe AI: the per-account
+ * usage windows and active-step cap; attestation: the per-install challenge
+ * cap; route planning and MapKit JS tokens: the per-account quota), which a
+ * client-supplied install or account id can't replace here: before those
+ * checks it is unauthenticated, so keying on it
  * would let one caller mint fresh buckets at will. The attestation routes'
  * old `/notes-import/*` paths still count in `notes-import`.
  */
@@ -37,6 +38,7 @@ export type RateLimitFamily =
   | 'admin'
   | 'app'
   | 'scribe'
+  | 'maps'
 
 /** The bucket key for one family and caller. */
 export const rateLimitKey = (

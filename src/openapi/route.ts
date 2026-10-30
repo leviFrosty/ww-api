@@ -19,7 +19,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Places',
     description:
-      'HERE Geocoding & Search proxy. The worker injects its own `apiKey` and forwards every other query parameter unchanged.',
+      'HERE Geocoding & Search. `/geocode` and `/autocomplete` proxy HERE: the worker injects its own `apiKey` and forwards every other query parameter unchanged. `/places/v1/search` (points of interest) reads only its own parameters and shapes the answer.',
   },
   {
     name: 'Attestation',
@@ -54,6 +54,11 @@ export const OPENAPI_TAGS = [
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',
+  },
+  {
+    name: 'Maps',
+    description:
+      'MapKit JS tokens for the web app’s map, which runs in a sandboxed frame on its own origin and gets only coordinates and pin styles (witness-work ADR 0037 §8).',
   },
   {
     name: 'App Store',
