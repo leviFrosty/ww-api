@@ -431,12 +431,32 @@ export interface Environment {
   // --- Route planning ------------------------------------------------------
 
   /**
-   * One SQLite DO per account id holding only the timestamps of its route
-   * optimizations from the last 24 hours (per-account daily/minute limits).
+   * One SQLite DO per caller and limit holding only the timestamps of its
+   * charged calls from the last 24 hours (per-account daily/minute limits):
+   * route optimizations, directions, and MapKit JS tokens.
    */
   ROUTE_PLANNING_QUOTA: DurableObjectNamespace<
     import('./routePlanning/quotaDO').RoutePlanningQuota
   >;
+
+  // --- Maps (witness-work ADR 0037 §8) -------------------------------------
+
+  /**
+   * MapKit JS key, the `.p8` PKCS#8 PEM (secret). With `MAPKIT_JS_KEY_ID`,
+   * `APPLE_TEAM_ID`, and a frame origin, `POST /maps/v1/mapkit-tokens` mints
+   * tokens; without them it answers 503 `maps_unconfigured`.
+   */
+  MAPKIT_JS_PRIVATE_KEY?: string;
+
+  /** The MapKit JS key's 10-character id (secret), the JWT's `kid`. */
+  MAPKIT_JS_KEY_ID?: string;
+
+  /**
+   * Comma-separated origins of the MapKit JS frame that tokens may name
+   * (`https://maps.witnesswork.app`). `http://localhost` and `127.0.0.1`
+   * origins count only on development workers. The first is the default.
+   */
+  MAPKIT_JS_ORIGINS?: string;
 }
 
 /** Request-scoped values routes share through `c.var`. */

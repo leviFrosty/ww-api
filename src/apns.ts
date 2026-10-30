@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { Environment } from './types'
-import { base64ToBytes, bytesToBase64Url } from './crypto'
+import { importEs256PrivateKey, signEs256Jwt } from './crypto'
 
 /**
  * Worker → APNs delivery (HTTP/2, ES256 provider-token auth). Feature-neutral:
@@ -35,7 +35,6 @@ const RETRY_DELAY_MS = 1_000
 /** Apple: refresh no more than every 20 minutes and no less than every 60. */
 const TOKEN_MAX_AGE_SECONDS = 45 * 60
 const TOKEN_KV_KEY = 'apns:provider-token'
-const encoder = new TextEncoder()
 
 export type ApnsEnv = Pick<
   Environment,
@@ -112,43 +111,16 @@ const readConfig = (env: ApnsEnv): ApnsConfig | null => {
     : null
 }
 
-/**
- * Imports the `.p8` key (PKCS#8 PEM, P-256). Tolerates secrets stored with
- * literal `\n` sequences or without the PEM armor.
- */
-export const importApnsKey = (pem: string): Promise<CryptoKey> => {
-  const base64 = pem
-    .replace(/\\n/g, '\n')
-    .replace(/-----(?:BEGIN|END) [A-Z ]+-----/g, '')
-    .replace(/\s+/g, '')
-  return crypto.subtle.importKey(
-    'pkcs8',
-    base64ToBytes(base64),
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    false,
-    ['sign']
-  )
-}
-
-const encodeJson = (value: unknown): string =>
-  bytesToBase64Url(encoder.encode(JSON.stringify(value)))
-
 /** ES256 JWT: header `{alg, kid}`, claims `{iss, iat}`, P1363 signature. */
 export const createProviderToken = async (
   config: Pick<ApnsConfig, 'keyId' | 'teamId' | 'privateKey'>,
   issuedAt: number
-): Promise<string> => {
-  const header = encodeJson({ alg: 'ES256', kid: config.keyId })
-  const claims = encodeJson({ iss: config.teamId, iat: issuedAt })
-  const signingInput = `${header}.${claims}`
-  const key = await importApnsKey(config.privateKey)
-  const signature = await crypto.subtle.sign(
-    { name: 'ECDSA', hash: 'SHA-256' },
-    key,
-    encoder.encode(signingInput)
+): Promise<string> =>
+  signEs256Jwt(
+    await importEs256PrivateKey(config.privateKey),
+    { kid: config.keyId },
+    { iss: config.teamId, iat: issuedAt }
   )
-  return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`
-}
 
 const parseStoredToken = (raw: string | null): ProviderToken | null => {
   if (!raw) return null

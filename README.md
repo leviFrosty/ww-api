@@ -238,6 +238,24 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 
 **Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
 
+### `/places/v1/search`
+
+Points of interest and addresses near a coordinate, from HERE Discover, for
+the web app's place field. Unlike the two proxies above it reads only `q`,
+`at`, `limit` (1–20, default 5), and `lang`, and answers a trimmed shape
+(`{ ok, items: [{ id, name?, category?, address, latitude, longitude,
+distanceMeters? }] }`). Public, in the `places` per-IP bucket.
+
+```bash
+curl "https://your-worker.workers.dev/places/v1/search?q=coffee&at=39.1031,-84.5120&limit=3"
+```
+
+### `/maps/v1/mapkit-tokens`
+
+`POST` with `Authorization: Bearer <accessToken>`: a 30-minute MapKit JS token
+for the web app's map frame. 503 `maps_unconfigured` until the MapKit JS key
+is set. Both routes are documented in [`docs/maps.md`](docs/maps.md).
+
 ### `/.well-known/apple-app-site-association`
 
 Serves the AASA JSON used by iOS to validate universal links. Lists the prod
@@ -563,9 +581,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   (`application/octet-stream`) on success; its errors use the envelope.
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
-bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`, `scribe`
-(`/scribe/v1/step`, `/scribe/v1/transcribe`), `attestation`,
-`route-planning`, `admin`, and `app` (`/app/v1/*`)
+bucket: `places` (`/geocode`, `/autocomplete`, `/places/v1/*`),
+`notes-import`, `scribe` (`/scribe/v1/step`, `/scribe/v1/transcribe`),
+`attestation`, `route-planning`, `maps` (`/maps/v1/*`), `admin`, and `app`
+(`/app/v1/*`)
 (`src/rateLimit.ts`). The old `/notes-import/*` attestation paths still
 count in `notes-import`. Refusals are 429 `rate_limited` with
 `Retry-After: 60`. Buddies and accounts have their own per-caller tiers.

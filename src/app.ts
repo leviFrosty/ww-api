@@ -78,6 +78,7 @@ import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { handleHandoffPage } from "./accounts/handoffPage";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
+import { createMapsRoutes, createPlacesRoutes } from "./maps/route";
 import { handleRevenueCatWebhook } from "./accounts/revenueCatWebhook";
 import { revenueCatWebhookDocs } from "./accounts/openapi";
 import { mountApiDocs } from "./openapi/route";
@@ -158,6 +159,7 @@ app.use("/notes-import/*", notesImportCutover());
 // Each family counts in its own per-IP bucket (src/rateLimit.ts).
 app.use("/geocode", rateLimit("places"));
 app.use("/autocomplete", rateLimit("places"));
+app.use("/places/*", rateLimit("places"));
 app.use("/notes-import", rateLimit("notes-import"));
 // The usage read counts in the read edge tier instead (in its handler), so
 // opening the composer on every device never spends the imports' bucket.
@@ -172,10 +174,14 @@ app.use("/scribe/v1/step", rateLimit("scribe"));
 app.use("/scribe/v1/transcribe", rateLimit("scribe"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
+app.use("/maps/*", rateLimit("maps"));
 app.use("/app/v1/*", rateLimit("app"));
 
 app.get("/geocode", geocodeDocs, handleGeocodeRequest);
 app.get("/autocomplete", autocompleteDocs, handleAutocompleteRequest);
+// Points of interest for the web app's place field (HERE Discover), shaped
+// rather than passed through.
+app.route("/places/v1", createPlacesRoutes());
 app.get("/health", healthDocs, handleHealthCheckRequest);
 // The app's minimum version (Update Required), read at launch and foreground.
 app.get("/app/v1/config", appConfigDocs, handleAppConfigRequest);
@@ -337,6 +343,9 @@ app.get("/h", shortHandoffPageDocs, handleHandoffPage);
 // Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
 // with per-account limits in the RoutePlanningQuota DO.
 app.route("/route-planning", createRoutePlanningRoutes());
+// MapKit JS tokens for the web app's map frame (witness-work ADR 0037 §8);
+// bearer, with per-account limits.
+app.route("/maps/v1", createMapsRoutes());
 // The OpenAPI document and Scalar reference for every route above.
 mountApiDocs(app);
 app.notFound(handleNotFound);

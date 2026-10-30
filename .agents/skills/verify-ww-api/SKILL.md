@@ -55,7 +55,7 @@ node scripts/verify/dev.mjs kv get app-store-ratings:summary
 node scripts/verify/dev.mjs kv delete buddies:enabled
 ```
 
-- For the isolated local worker, send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Never send synthetic caller IPs to a deployed Worker: Cloudflare rejects them before the request reaches the API. Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/attestation/*`, `/route-planning/*`, and `/admin/*` each count separately), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 60/min for `blob/put`, 600/min for `blob/get`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
+- For the isolated local worker, send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Never send synthetic caller IPs to a deployed Worker: Cloudflare rejects them before the request reaches the API. Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/attestation/*`, `/route-planning/*`, `/maps/*`, and `/admin/*` each count separately; `/places/*` counts with `/geocode`), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 60/min for `blob/put`, 600/min for `blob/get`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
 - Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl. Photo blobs: `photoBlob()` makes sealed-looking bytes with their id and token, `RelayOwner.putBlob` and `getBlob` send them (raw bytes, envelope in headers).
 - KV edits take effect on the next request (no 60 s edge cache locally).
 
@@ -120,13 +120,14 @@ Only names are listed here; never print values.
 | `ADMIN_API_TOKEN` | admin reset positive tests | generated per state dir |
 | `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
-| `HERE_API_KEY` | `/geocode` + `/autocomplete` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
+| `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
+| `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |
 | `OPENROUTER_API_KEY` | real provider health and the paid kickoff | unset; the status probe fails open |
 | `REVENUECAT_API_KEY` | Supporter lookups during a paid kickoff | unset |
 | `WW_API_E2E_ALLOW_PAID=1` | opt-in to an import plus correction (two real model calls; OpenRouter spend) | off |
 | `WW_API_URL`, `WW_API_DEV_BYPASS_TOKEN`, `WW_API_ADMIN_TOKEN` | point e2e at another worker | from `.verify/state.json` |
 
-- Optional keys come from the process env or `up --secrets-from <env file>`. Only the five allowlisted names are read: HERE, OpenRouter, RevenueCat, the Apple team id, and `FCM_SERVICE_ACCOUNT_JSON`.
+- Optional keys come from the process env or `up --secrets-from <env file>`. Only the allowlisted names (`OPTIONAL_SECRETS` in `scripts/verify/dev.mjs`) are read: HERE, OpenRouter, RevenueCat, the Apple team id, `FCM_SERVICE_ACCOUNT_JSON`, PostHog, the fake RevenueCat URL, and the three `MAPKIT_JS_*` names.
 - Unlike APNs (HTTP/2 only, so not from `wrangler dev`), FCM works locally: with `FCM_SERVICE_ACCOUNT_JSON` set, the local relay really sends Buddies alerts to Android emulators with Google Play services. Write the key on one line (`printf 'FCM_SERVICE_ACCOUNT_JSON=%s\n' "$(op document get <id> --vault Agents | jq -c .)" > fcm.env`, mode 600, outside the repo) and pass `--secrets-from fcm.env`; JSON values are written single-quoted to the vars file so dotenv keeps them intact.
 - `SENTRY_DSN` and the APNs keys are never passed, so local fuzzing can't reach Sentry or Apple.
 - CI needs no secrets: `wrangler dev --local` runs without Cloudflare credentials.

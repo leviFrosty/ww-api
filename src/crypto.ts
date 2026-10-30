@@ -59,3 +59,44 @@ export const bytesToBase64Url = (bytes: Uint8Array): string => {
 /** Cryptographically-random URL-safe token of `byteLength` random bytes. */
 export const randomToken = (byteLength = 32): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)))
+
+/**
+ * Imports an ES256 signing key from a PKCS#8 PEM (an Apple `.p8`, P-256).
+ * Tolerates secrets stored with literal (or doubly escaped) `\n` sequences,
+ * on one line, or without the PEM armor.
+ */
+export const importEs256PrivateKey = (pem: string): Promise<CryptoKey> => {
+  const base64 = pem
+    .replace(/\\n/g, '\n')
+    .replace(/-----(?:BEGIN|END) [A-Z ]+-----/g, '')
+    // Base64 has no backslashes or whitespace.
+    .replace(/[\s\\]+/g, '')
+  return crypto.subtle.importKey(
+    'pkcs8',
+    base64ToBytes(base64),
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign']
+  )
+}
+
+const encodeJson = (value: unknown): string =>
+  bytesToBase64Url(encoder.encode(JSON.stringify(value)))
+
+/**
+ * A compact ES256 JWS. WebCrypto's ECDSA signature is already the raw
+ * `r || s` (IEEE P1363) that JOSE wants, so it's encoded as is.
+ */
+export const signEs256Jwt = async (
+  key: CryptoKey,
+  header: Record<string, unknown>,
+  claims: Record<string, unknown>
+): Promise<string> => {
+  const signingInput = `${encodeJson({ alg: 'ES256', ...header })}.${encodeJson(claims)}`
+  const signature = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    key,
+    encoder.encode(signingInput)
+  )
+  return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`
+}

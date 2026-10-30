@@ -103,6 +103,10 @@ SCRIBE_MAX_OUTPUT_TOKENS = "4096"
 SCRIBE_FREE_MONTHLY = "150000"
 SCRIBE_SUPPORTER_SESSION = "540000"
 SCRIBE_SUPPORTER_WEEKLY = "1550000"
+# The MapKit JS frame's origin that POST /maps/v1/mapkit-tokens names in its
+# tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
+# A local frame (http://localhost:<port>) belongs in .dev.vars, never here.
+MAPKIT_JS_ORIGINS = "https://maps-dev.witnesswork.app"
 # Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
 # runs stay out of the production dashboards; uncomment to check delivery
 # (events carry `environment: development`).
@@ -379,6 +383,10 @@ SCRIBE_SUPPORTER_WEEKLY = "1550000"
 # app ships, so not a secret. Remove to turn server analytics off.
 # POSTHOG_HOST defaults to https://us.i.posthog.com. Not inherited by [env.dev].
 POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
+# The MapKit JS frame's origin that POST /maps/v1/mapkit-tokens names in its
+# tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
+# Production never accepts an http:// origin.
+MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state
@@ -722,3 +730,7 @@ logs.persist = true
 # Rotation: the old value goes to ACCOUNT_TOKEN_SECRET_PREVIOUS first (verify only;
 # refresh tokens issued under it refresh only while it's set, see AGENTS.md).
 # wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS [--env dev]
+# MapKit JS tokens (witness-work ADR 0037 §8; APPLE_TEAM_ID is the issuer); without
+# both, POST /maps/v1/mapkit-tokens answers 503 maps_unconfigured:
+# wrangler secret put MAPKIT_JS_KEY_ID [--env dev]        # 10-char MapKit JS key id
+# wrangler secret put MAPKIT_JS_PRIVATE_KEY [--env dev]   # .p8 PEM contents: < AuthKey_XXXX.p8
