@@ -85,6 +85,12 @@ AUTH_LEGACY = "on"
 # `sync:entitlement` are absent. On in dev; Supporters only.
 SYNC_ENABLED = "true"
 SYNC_ENTITLEMENT = "supporter"
+# The web app's origins (witness-work ADR 0038 §10): CORS and browser live
+# sockets admit exactly these (comma-separated, no wildcards). Dev serves
+# app-dev plus the local web dev servers (Expo/Metro 8081-8082, Expo web
+# 19006, Vite preview 4173, Vite dev 5173). Named environments don't inherit
+# [vars], so it's set in both.
+WEB_APP_ORIGINS = "https://app-dev.witnesswork.app,http://localhost:8081,http://localhost:8082,http://localhost:19006,http://localhost:4173,http://localhost:5173"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -354,6 +360,10 @@ AUTH_LEGACY = "on"
 # on, before the app release that defaults to it. Repeated under [env.dev.vars].
 SYNC_ENABLED = "false"
 SYNC_ENTITLEMENT = "supporter"
+# The web app's origins (witness-work ADR 0038 §10): CORS and browser live
+# sockets admit exactly these (comma-separated, no wildcards; never localhost
+# here). Not inherited by [env.dev], which has its own list.
+WEB_APP_ORIGINS = "https://app.witnesswork.app,https://beta.app.witnesswork.app"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status

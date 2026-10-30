@@ -3,6 +3,7 @@
  * "Sync"): slot ids, R2 keys, headers, the live socket's messages, and the
  * abuse limits, each sized from the heaviest real use.
  */
+import { LIVE_EXPIRED_CLOSE } from '../liveSubprotocol'
 
 const SECOND_MS = 1_000
 const MINUTE_MS = 60 * SECOND_MS
@@ -65,6 +66,12 @@ export const SYNC_HEADERS = {
    * Set only by the Worker, from a valid token; any client copy is dropped.
    */
   account: 'x-ww-sync-account',
+  /**
+   * A browser socket's token expiry (epoch ms) on the upgrade the Worker
+   * forwards; the DO closes the socket then. Set only by the Worker; any
+   * client copy is dropped, so a native socket never has one.
+   */
+  expiresAt: 'x-ww-sync-expires-at',
 } as const
 
 /** Live socket messages: change notices only, never data. */
@@ -72,6 +79,8 @@ export type SyncLiveMessage = { type: 'hello' | 'changed'; seq: number }
 
 export const SYNC_LIVE_CLOSE = {
   replaced: { code: 4000, reason: 'replaced' },
+  /** A browser socket's token expired (`LIVE_EXPIRED_CLOSE`). */
+  expired: LIVE_EXPIRED_CLOSE,
 } as const
 
 /** `If-Match`: a quoted ETag, or `*` (the slot exists). */

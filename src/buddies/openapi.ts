@@ -875,17 +875,18 @@ const fieldHeaders = (op: string, fields: z.ZodRawShape) => [
   },
 ]
 
-const { gone, replaced, suspended } = BUDDIES_LIVE_CLOSE
+const { gone, replaced, suspended, expired } = BUDDIES_LIVE_CLOSE
 
 export const buddiesLiveDocs = describeOp({
   summary: 'Live socket (WebSocket)',
   description: paragraphs(
     'Upgrades to a WebSocket that says *that* the owner’s inbox changed, so the app syncs within a second while in the foreground. It never carries content. The request rides in headers, since an upgrade has no body and ids never go in URLs. Opening a socket is not owner activity for the 180-day retention.',
     '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one with no confirmed link.',
+    '**Browsers** can’t set headers on a WebSocket, so they offer `Sec-WebSocket-Protocol` entries instead: `ww.v1`, `bearer.<access token>`, and `payload.<the x-buddies-payload value>` (any order; no `Authorization` header). It’s always a bearer upgrade, checked like one. The `Origin` must be one of the web app’s (`WEB_APP_ORIGINS`), else `forbidden`, checked before the token; an offer without `ww.v1`, with a repeated or unknown entry, or that isn’t a list of tokens is `bad_request`. The 101 answers `Sec-WebSocket-Protocol: ww.v1`. Ids never go in the URL.',
     `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`inbox/live\`) in \`x-buddies-payload\` and \`x-buddies-signature\`, with the same \`stale\` and \`replay\` checks as a POST owner op. ${LEGACY_SWITCH}`,
     '**Server → app messages:**\n\n- `{"type":"hello","seq":N}` right after the upgrade, `N` being the inbox head.\n- `{"type":"changed","seq":N}` after every committed write that changes what `inbox/sync` returns: new events, cards, the roster, a delivered claim, and slot changes. Slot changes don’t advance `seq`, so sync on every `changed`.',
     '**Keepalive:** send the text `ping` about every 25 s; the relay answers `pong` without waking the inbox. Anything else the app sends is ignored.',
-    `**Close codes:** \`${gone.code} "${gone.reason}"\` the inbox was deleted or wiped (sync, which restores it); \`${replaced.code} "${replaced.reason}"\` an ${BUDDIES_LIMITS.liveSockets + 1}th socket opened and closed the oldest (at most ${BUDDIES_LIMITS.liveSockets} per inbox); \`${suspended.code} "${suspended.reason}"\` the inbox’s account was suspended. Reconnect with backoff while in the foreground.`,
+    `**Close codes:** \`${gone.code} "${gone.reason}"\` the inbox was deleted or wiped (sync, which restores it); \`${replaced.code} "${replaced.reason}"\` an ${BUDDIES_LIMITS.liveSockets + 1}th socket opened and closed the oldest (at most ${BUDDIES_LIMITS.liveSockets} per inbox); \`${suspended.code} "${suspended.reason}"\` the inbox’s account was suspended; \`${expired.code} "${expired.reason}"\` (browser sockets only) the access token it opened with expired, so refresh and reconnect. Header sockets outlive their token. Reconnect with backoff while in the foreground.`,
     `${tierLine('read')} The upgrade also counts toward ${OWNER_BUDGET}.`,
     `${KILL_SWITCH_OFF} Turning it off refuses new sockets but doesn’t close open ones.`
   ),
@@ -898,13 +899,24 @@ export const buddiesLiveDocs = describeOp({
       description: 'Must be `websocket`, else `426 upgrade_required`.',
     },
     ...fieldHeaders('inbox/live', { inboxId: buddiesId('Your inbox') }),
+    {
+      name: 'Sec-WebSocket-Protocol',
+      in: 'header' as const,
+      required: false,
+      schema: { type: 'string' as const },
+      description:
+        'Browsers only: `ww.v1, bearer.<access token>, payload.<b64u fields>`, in place of `Authorization` and `x-buddies-payload`. Needs an allowed `Origin`.',
+    },
   ],
   responses: {
-    101: { description: 'Switching protocols: the socket is open.' },
+    101: {
+      description:
+        'Switching protocols: the socket is open. A browser upgrade gets `Sec-WebSocket-Protocol: ww.v1`.',
+    },
     ...refusals({
       ...ownerRefusals('read'),
       bad_request:
-        'Missing or malformed `x-buddies-payload`, a bad payload, or a bearer upgrade with `x-buddies-signature`.',
+        'Missing or malformed `x-buddies-payload` (or `payload.` entry), a bad payload, a bearer upgrade with `x-buddies-signature`, or a malformed `Sec-WebSocket-Protocol` offer.',
       upgrade_required:
         'Not a WebSocket upgrade (`Upgrade: websocket`), or a legacy upgrade after the legacy switch (KV `auth:legacy`) was turned off. No `Retry-After`.',
     }),

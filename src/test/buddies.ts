@@ -96,6 +96,8 @@ export interface LiveResponse {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any
   socket: FakeWebSocket | null
+  /** The `Sec-WebSocket-Protocol` the answer chose, if any. */
+  protocol: string | null
 }
 
 export interface HarnessOptions {
@@ -127,6 +129,8 @@ export interface HarnessOptions {
 /** The harness's `ACCOUNT_TOKEN_SECRET` and dev bypass token. */
 export const TEST_TOKEN_SECRET = 'test-account-token-secret-0123456789abcdef'
 export const TEST_DEV_BYPASS = 'test-dev-bypass-token'
+/** A web app origin in the harness's `WEB_APP_ORIGINS` (the dev list's). */
+export const TEST_WEB_ORIGIN = 'http://localhost:8081'
 
 export interface Harness {
   env: Environment
@@ -257,6 +261,7 @@ export const createHarness = async (
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
     ...(options.syncBucket === false ? {} : { ACCOUNT_SYNC: syncBlobs }),
     SYNC_ENABLED: 'true',
+    WEB_APP_ORIGINS: `https://app-dev.witnesswork.app,${TEST_WEB_ORIGIN}`,
     ...(options.sessions === false
       ? {}
       : {
@@ -393,8 +398,14 @@ export const createHarness = async (
       env,
       executionCtx
     )) as Response & { webSocket?: FakeWebSocket | null }
+    const protocol = response.headers.get('sec-websocket-protocol')
     if (response.status === 101)
-      return { status: 101, body: null, socket: response.webSocket ?? null }
+      return {
+        status: 101,
+        body: null,
+        socket: response.webSocket ?? null,
+        protocol,
+      }
     const text = await response.text()
     let body: unknown = text
     try {
@@ -402,7 +413,7 @@ export const createHarness = async (
     } catch {
       // Not JSON (e.g. Hono's plain 404).
     }
-    return { status: response.status, body, socket: null }
+    return { status: response.status, body, socket: null, protocol }
   }
 
   harness.getBlob = async (payload) => {

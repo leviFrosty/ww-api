@@ -8,7 +8,17 @@ import {
   buddiesErrorResponse,
   buddiesInternalError,
 } from '../buddies/errorResponse'
-import { authenticateAccount, readPlainJson, type AccountAuth } from './auth'
+import {
+  acceptLiveSubprotocol,
+  forwardedLiveRequest,
+  readBrowserLive,
+} from '../liveSubprotocol'
+import {
+  authenticateAccount,
+  readPlainJson,
+  type AccountAuth,
+  type AuthenticateAccountOptions,
+} from './auth'
 import { guarded, refuseAtEdge } from './signed'
 import { accountSupporterStatus } from './supporter'
 import { accountsDb } from './store'
@@ -82,15 +92,19 @@ const unavailableHere = (env: Environment): Response | null =>
 const caller = async (
   c: AppContext,
   tier: 'write' | 'read',
-  options?: { requireLiveSession?: boolean }
-): Promise<{ account: AccountAuth } | { refusal: Response }> => {
+  options?: Pick<AuthenticateAccountOptions, 'requireLiveSession' | 'token'>
+): Promise<
+  { account: AccountAuth; expiresAt: number } | { refusal: Response }
+> => {
   const limited = await refuseAtEdge(
     c,
     tier === 'write' ? 'event/put' : 'inbox/sync'
   )
   if (limited) return { refusal: limited }
   const auth = await authenticateAccount(c, options)
-  return auth.ok ? { account: auth.account } : { refusal: auth.response }
+  return auth.ok
+    ? { account: auth.account, expiresAt: auth.expiresAt }
+    : { refusal: auth.response }
 }
 
 /**
@@ -299,29 +313,56 @@ const handleDelete = guarded('sync/delete', async (c) => {
 })
 
 /**
- * `GET sync/live`: upgrades to the account's live socket. The token and the
- * device's own slot id (`x-ww-slot-id`) ride in headers; the DO gets the
- * verified account in `SYNC_HEADERS.account`, and any copy a client sent is
- * dropped.
+ * `GET sync/live`: upgrades to the account's live socket. The DO gets the
+ * verified account in `SYNC_HEADERS.account` (any copy a client sent is
+ * dropped) and the device's own slot in `x-ww-slot-id`.
+ *
+ * - Native apps send the token in `Authorization` and the slot id in
+ *   `x-ww-slot-id`. Their sockets outlive the token.
+ * - Browsers can't set headers on a WebSocket, so they offer `ww.v1`,
+ *   `bearer.<token>`, and `slot.<slotId>` in `Sec-WebSocket-Protocol`
+ *   (src/liveSubprotocol.ts), from an allowed `Origin`. The token is checked
+ *   exactly as the header's would be, then every other check runs in the
+ *   same order. The DO gets the token's expiry in `SYNC_HEADERS.expiresAt`
+ *   (never the token) and closes the socket with `4004 "expired"` then; the
+ *   101 says `Sec-WebSocket-Protocol: ww.v1`.
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
+    const browser = readBrowserLive(c.env, c.req.raw.headers, ['slot'] as const)
+    if (browser && !browser.ok) return buddiesErrorResponse(browser.error)
     const off = unavailableHere(c.env)
     if (off) return off
-    const who = await caller(c, 'read')
+    const who = await caller(
+      c,
+      'read',
+      browser ? { token: browser.token } : undefined
+    )
     if ('refusal' in who) return who.refusal
     const { accountId } = who.account
     const refused = await refuseUnentitled(c.env, accountId)
     if (refused) return refused
     if (!isWebSocketUpgrade(c.req.raw))
       return buddiesErrorResponse('upgrade_required')
-    if (!isSyncSlotId(c.req.header(SYNC_HEADERS.slotId)))
-      return buddiesErrorResponse('bad_request')
+    const slotId = browser
+      ? browser.ids.slot
+      : c.req.header(SYNC_HEADERS.slotId)
+    if (!isSyncSlotId(slotId)) return buddiesErrorResponse('bad_request')
+    const index = syncIndex(c.env, accountId)
+    if (browser) {
+      const response = await index.fetch(
+        forwardedLiveRequest(c.req.raw, {
+          [SYNC_HEADERS.account]: accountId,
+          [SYNC_HEADERS.slotId]: slotId,
+          [SYNC_HEADERS.expiresAt]: String(who.expiresAt),
+        })
+      )
+      return acceptLiveSubprotocol(response)
+    }
     const headers = new Headers(c.req.raw.headers)
+    headers.delete(SYNC_HEADERS.expiresAt)
     headers.set(SYNC_HEADERS.account, accountId)
-    return await syncIndex(c.env, accountId).fetch(
-      new Request(c.req.raw, { headers })
-    )
+    return await index.fetch(new Request(c.req.raw, { headers }))
   } catch (error) {
     console.error('accounts: request failed', { op: 'sync/live' })
     captureFailure(error, 'sync/live')
