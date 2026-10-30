@@ -322,6 +322,25 @@ export interface Environment {
   ACCOUNT_SYNC?: R2Bucket;
 
   /**
+   * Cloud Sync's photos (witness-work ADR 0040 §6): one end-to-end encrypted
+   * blob per put at `v1/<accountId>/<name>/<putId>`, written once. No age
+   * rule. Without it, `sync/photos/*` answers `photos_disabled`.
+   */
+  ACCOUNT_PHOTOS?: R2Bucket;
+
+  /**
+   * Cloud Sync photos' switch fallback when KV `sync:photos` is absent:
+   * `"off"` (or `"false"`) turns photo puts off, anything else (or unset) on.
+   */
+  SYNC_PHOTOS?: string;
+
+  /**
+   * An account's photo storage limit in bytes, when a positive integer; else
+   * 2,000,000,000. For tests and trying the full state on a local or dev worker.
+   */
+  SYNC_PHOTO_LIMIT_BYTES?: string;
+
+  /**
    * One SQLite DO per account (`idFromName(accountId)`): Cloud Sync's slot
    * metadata, change `seq`, put limits, retention alarm, and live sockets.
    */
