@@ -150,6 +150,10 @@ SYNC_ENTITLEMENT = "everyone"
 # 19006, Vite preview 4173, Vite dev 5173). Named environments don't inherit
 # [vars], so it's set in both.
 WEB_APP_ORIGINS = "https://app-dev.witnesswork.app,http://localhost:8081,http://localhost:8082,http://localhost:19006,http://localhost:4173,http://localhost:5173"
+# Cloud Sync photos' switch fallback when KV `sync:photos` is absent (on).
+# SYNC_PHOTO_LIMIT_BYTES (unset: 2,000,000,000) overrides the per-account photo
+# storage; the verify launcher passes it for a tiny limit locally.
+SYNC_PHOTOS = "on"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -250,6 +254,12 @@ bucket_name = "ww-account-backups-dev"
 [[env.dev.r2_buckets]]
 binding = "ACCOUNT_SYNC"
 bucket_name = "ww-account-sync-dev"
+
+# Cloud Sync photos (witness-work ADR 0040), separate from prod's bucket.
+# `pnpm run deploy:dev` creates it with no age rule (scripts/r2-lifecycle.mjs).
+[[env.dev.r2_buckets]]
+binding = "ACCOUNT_PHOTOS"
+bucket_name = "ww-account-photos-dev"
 
 # Anonymous accounts (witness-work ADR 0024): accounts, their status, and which
 # Buddies inboxes they own. Not inherited, like every binding. Migrations come
@@ -429,6 +439,9 @@ SYNC_ENTITLEMENT = "everyone"
 # sockets admit exactly these (comma-separated, no wildcards; never localhost
 # here). Not inherited by [env.dev], which has its own list.
 WEB_APP_ORIGINS = "https://app.witnesswork.app,https://beta.app.witnesswork.app"
+# Cloud Sync photos' switch fallback when KV `sync:photos` is absent (on).
+# Repeated under [env.dev.vars].
+SYNC_PHOTOS = "on"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -538,6 +551,8 @@ MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 #   wrangler kv key put --binding NOTES_KV sync:entitlement everyone  # free
 #   wrangler kv key put --binding NOTES_KV sync:entitlement supporter # Supporters
 #   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
+#   wrangler kv key put --binding NOTES_KV sync:photos off            # photo puts off
+#   wrangler kv key delete --binding NOTES_KV sync:photos             # use SYNC_PHOTOS
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -675,6 +690,17 @@ bucket_name = "ww-account-backups"
 [[r2_buckets]]
 binding = "ACCOUNT_SYNC"
 bucket_name = "ww-account-sync"
+
+# Cloud Sync photos (witness-work ADR 0040 §6): one end-to-end encrypted blob
+# per put at v1/<accountId>/<name>/<putId>, written once; the AccountSync DO
+# holds the rows and purges deleted photos 30 days later. No age rule: it
+# would delete live photos, which are never rewritten. Every deploy runs
+# scripts/r2-lifecycle.mjs first, which creates the bucket and keeps only the
+# multipart-abort rule. Without the binding, photo routes answer
+# `photos_disabled`. Repeated (with its own bucket) under [env.dev] above.
+[[r2_buckets]]
+binding = "ACCOUNT_PHOTOS"
+bucket_name = "ww-account-photos"
 
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
 # SQLite-backed (event log / active-import set). See

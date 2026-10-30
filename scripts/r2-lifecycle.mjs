@@ -7,6 +7,7 @@
  *   node scripts/r2-lifecycle.mjs ww-buddy-blobs --check   # read-only; exit 1 if anything is off
  *   node scripts/r2-lifecycle.mjs ww-account-backups       # the same for account backups
  *   node scripts/r2-lifecycle.mjs ww-account-sync          # and for Cloud Sync
+ *   node scripts/r2-lifecycle.mjs ww-account-photos        # and Cloud Sync photos
  *
  * Buddies photo buckets (`ww-buddy-blobs*`): the backstop deletes any object a
  * day past the longest a photo can live (`BUDDIES_LIMITS.maxBlobLifetimeMs`,
@@ -21,6 +22,12 @@
  * Cloud Sync buckets (`ww-account-sync*`): a slot not written for 400 days is
  * deleted (witness-work ADR 0030), a backstop to the AccountSync DO's own
  * retention, which deletes sooner. Every `sync/put` rewrites the slot.
+ *
+ * Cloud Sync photo buckets (`ww-account-photos*`): no age rule at all
+ * (witness-work ADR 0040). Each photo is written once and kept while its
+ * account uses Cloud Sync, so an age rule would delete live photos; the
+ * AccountSync DO purges deleted ones. Only the multipart-abort rule is set,
+ * and `--check` fails if any expiry rule appears.
  *
  * `lifecycle set` replaces every rule on the bucket, so R2's default
  * multipart-abort rule is restated here too.
@@ -50,11 +57,17 @@ export const BACKUP_RULE_ID = 'account-backups-expiry'
 export const SYNC_EXPIRY_DAYS = 400
 export const SYNC_RULE_ID = 'account-sync-expiry'
 
-/** Each bucket family's expiry rule, by bucket name prefix. */
+export const MULTIPART_RULE_ID = 'Default Multipart Abort Rule'
+
+/**
+ * Each bucket family's expiry rule, by bucket name prefix; `days: null` for a
+ * family with no age rule (photos are written once).
+ */
 export const BUCKET_RULES = [
   { bucketPrefix: 'ww-buddy-blobs', id: BACKSTOP_RULE_ID, days: BACKSTOP_DAYS },
   { bucketPrefix: 'ww-account-backups', id: BACKUP_RULE_ID, days: BACKUP_EXPIRY_DAYS },
   { bucketPrefix: 'ww-account-sync', id: SYNC_RULE_ID, days: SYNC_EXPIRY_DAYS },
+  { bucketPrefix: 'ww-account-photos', id: null, days: null },
 ]
 
 /** The expiry rule for `bucket`, or null for a bucket this script doesn't know. */
@@ -66,16 +79,20 @@ export const lifecycleRules = (bucket = 'ww-buddy-blobs') => {
   if (!rule) throw new Error(`no lifecycle rule for bucket ${bucket}`)
   return {
     rules: [
+      ...(rule.days == null
+        ? []
+        : [
+            {
+              id: rule.id,
+              enabled: true,
+              conditions: { prefix: BLOB_PREFIX },
+              deleteObjectsTransition: {
+                condition: { type: 'Age', maxAge: rule.days * DAY_SECONDS },
+              },
+            },
+          ]),
       {
-        id: rule.id,
-        enabled: true,
-        conditions: { prefix: BLOB_PREFIX },
-        deleteObjectsTransition: {
-          condition: { type: 'Age', maxAge: rule.days * DAY_SECONDS },
-        },
-      },
-      {
-        id: 'Default Multipart Abort Rule',
+        id: MULTIPART_RULE_ID,
         enabled: true,
         conditions: { prefix: '' },
         abortMultipartUploadsTransition: {
@@ -121,18 +138,31 @@ const bucketExists = (bucket) => {
   return parseBlocks(listed.output).some((fields) => fields.name === bucket)
 }
 
-/** Whether the bucket's rules include its expiry rule at the right age. */
+/**
+ * Whether the bucket's rules (wrangler's listing, parsed) are what its
+ * family needs: its expiry rule at the right age, or, for a family with no
+ * age rule, the multipart-abort rule and no expiry at all.
+ */
+export const rulesMatch = (rules, expected) =>
+  expected.days == null
+    ? rules.some((rule) => rule.name === MULTIPART_RULE_ID) &&
+      !rules.some((rule) => /expire/i.test(rule.action ?? ''))
+    : rules.some(
+        (rule) =>
+          rule.name === expected.id &&
+          rule.enabled === 'Yes' &&
+          rule.prefix === BLOB_PREFIX &&
+          rule.action?.includes(`Expire objects after ${expected.days} days`)
+      )
+
 const backstopSet = (bucket, expected) => {
   const listed = wrangler(['r2', 'bucket', 'lifecycle', 'list', bucket])
   if (!listed.ok) throw new Error(`wrangler r2 bucket lifecycle list failed:\n${listed.output}`)
-  return parseBlocks(listed.output).some(
-    (rule) =>
-      rule.name === expected.id &&
-      rule.enabled === 'Yes' &&
-      rule.prefix === BLOB_PREFIX &&
-      rule.action?.includes(`Expire objects after ${expected.days} days`)
-  )
+  return rulesMatch(parseBlocks(listed.output), expected)
 }
+
+const describeRule = (expected) =>
+  expected.days == null ? 'no expiry, multipart abort only' : `${expected.id}, ${expected.days} days`
 
 const main = () => {
   const [bucket, ...flags] = process.argv.slice(2)
@@ -159,10 +189,10 @@ const main = () => {
 
   if (check) {
     if (!backstopSet(bucket, expected)) {
-      console.error(`r2-lifecycle: ${bucket} lacks ${expected.id} (${BLOB_PREFIX}, ${expected.days} days)`)
+      console.error(`r2-lifecycle: ${bucket}'s rules aren't ${describeRule(expected)}`)
       process.exit(1)
     }
-    console.log(`r2-lifecycle: ${bucket} ok (${expected.id}, ${expected.days} days)`)
+    console.log(`r2-lifecycle: ${bucket} ok (${describeRule(expected)})`)
     return
   }
 
@@ -176,7 +206,7 @@ const main = () => {
     rmSync(dir, { recursive: true, force: true })
   }
   if (!backstopSet(bucket, expected)) throw new Error(`${bucket}'s lifecycle rules did not take`)
-  console.log(`r2-lifecycle: ${bucket} ok (${expected.id}, ${expected.days} days)`)
+  console.log(`r2-lifecycle: ${bucket} ok (${describeRule(expected)})`)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
