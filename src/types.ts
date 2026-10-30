@@ -106,6 +106,13 @@ export interface Environment {
    */
   REVENUECAT_API_URL?: string;
 
+  /**
+   * Development workers only: `"true"` counts RevenueCat Billing (web)
+   * sandbox subscriptions toward Supporter status (witness-work ADR 0014).
+   * Unset, or on production, they're ignored.
+   */
+  REVENUECAT_COUNT_WEB_SANDBOX?: string;
+
   /** Explicit Worker environment; production fails closed if a dev bypass exists. */
   APP_ATTEST_ENVIRONMENT: 'development' | 'production';
 

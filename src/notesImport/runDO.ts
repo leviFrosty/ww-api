@@ -21,6 +21,7 @@ import {
 } from './events'
 import { isEmptyImportResult, type NotesImportContext } from './schema'
 import { resolveTerminalSupporter } from './settlement'
+import { countsWebSandboxSubscriptions } from '../revenuecat'
 import { analyticsEnabled, captureAnalyticsEvent } from '../analytics'
 import {
   notesImportFinishedEvent,
@@ -362,6 +363,7 @@ export class NotesImportRun extends DurableObject<Environment> {
         apiKey: this.env.REVENUECAT_API_KEY,
         appUserId: input.uuid,
         entitlementId: config.entitlementId,
+        countWebSandbox: countsWebSandboxSubscriptions(this.env),
         account: input.account && { accountId: input.uuid, env: this.env },
       })
       const limits = await resolveNotesImportLimits(this.env, this.env.NOTES_KV)

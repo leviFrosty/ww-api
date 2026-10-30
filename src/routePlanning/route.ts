@@ -4,7 +4,11 @@ import type { AppContext, AppEnv, Environment } from '../types'
 import { HTTP_STATUS } from '../config'
 import { Sentry } from '../sentry'
 import { retryAfterHeaders } from '../errors'
-import { isSupporter, RevenueCatError } from '../revenuecat'
+import {
+  countsWebSandboxSubscriptions,
+  isSupporter,
+  RevenueCatError,
+} from '../revenuecat'
 import { authenticateAccount, hasAuthorization } from '../accounts/auth'
 import { isLegacyAuthEnabled } from '../accounts/legacySwitch'
 import { BEARER_CHALLENGE } from '../buddies/errorResponse'
@@ -242,6 +246,7 @@ export const createRoutePlanningRoutes = (
                 apiKey: ctx.env.REVENUECAT_API_KEY,
                 appUserId: quotaName,
                 fetchImpl: deps.fetch,
+                countWebSandbox: countsWebSandboxSubscriptions(ctx.env),
               })
       } catch (error) {
         if (!(error instanceof RevenueCatError)) Sentry.captureException(error)

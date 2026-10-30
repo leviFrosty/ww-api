@@ -190,6 +190,25 @@ describe.skipIf(
     expect(reads.filter((read) => read === id).length).toBe(before + 1)
   })
 
+  it('counts a web sandbox subscription on the dev worker', async () => {
+    // `[env.dev]` sets REVENUECAT_COUNT_WEB_SANDBOX; production ignores it.
+    const id = `e2e-${crypto.randomUUID()}`
+    const end = Date.now() + 30 * 24 * 60 * 60_000
+    const expires_date = new Date(end).toISOString()
+    customers.set(id, {
+      subscriber: {
+        entitlements: { 'Monthly Donator': { expires_date, product_identifier: 'web_monthly' } },
+        subscriptions: { web_monthly: { expires_date, store: 'rc_billing', is_sandbox: true } },
+      },
+    })
+    const session = await openSession()
+    const linked = await http('POST', '/accounts/v1/revenuecat-customers', {
+      headers: bearerHeaders(session),
+      body: { appUserId: id },
+    })
+    expect(linked.body).toEqual({ ok: true, supporter: true, expiresAt: end })
+  })
+
   it('gives up on a RevenueCat that never answers', async () => {
     const id = `e2e-${crypto.randomUUID()}`
     customers.set(id, HANG)

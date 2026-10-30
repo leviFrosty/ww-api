@@ -9,6 +9,8 @@ export interface ResolveTerminalSupporterArgs {
   apiKey: string
   appUserId: string
   entitlementId: string
+  /** `countsWebSandboxSubscriptions(env)`, for the lookup by `appUserId`. */
+  countWebSandbox?: boolean
   /**
    * A bearer run's account: its Supporter status (`isAccountSupporter`, from
    * the account's linked RevenueCat customers) replaces the lookup by
@@ -35,6 +37,7 @@ export const resolveTerminalSupporter = async ({
   apiKey,
   appUserId,
   entitlementId,
+  countWebSandbox = false,
   account,
   checkSupporter = isSupporter,
   checkAccountSupporter = isAccountSupporter,
@@ -45,7 +48,7 @@ export const resolveTerminalSupporter = async ({
   try {
     return account
       ? await checkAccountSupporter(account.env, account.accountId)
-      : await checkSupporter({ apiKey, appUserId, entitlementId })
+      : await checkSupporter({ apiKey, appUserId, entitlementId, countWebSandbox })
   } catch (error) {
     if (!(error instanceof RevenueCatError)) captureException(error)
     return kickoffSupporter
