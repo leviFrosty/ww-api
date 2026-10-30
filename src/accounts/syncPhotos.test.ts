@@ -15,6 +15,7 @@ import {
 import type { FakeWebSocket } from '../test/durableObjects'
 import { createAccountsRoutes } from './route'
 import { resetSyncEntitlementCache } from './sync'
+import { resetSessionCapabilitiesCache } from './sessionStore'
 import { SYNC_LIMITS, SYNC_PHOTO_LIMITS } from './syncContracts'
 import { accountSupporterStatus } from './supporter'
 
@@ -41,6 +42,8 @@ vi.mock('./supporter', async (original) => ({
  * rates, the purge of deleted photos, and the switches.
  */
 
+/** A session from an app that says it turns Cloud Sync on only for new installs. */
+const CURRENT_APP = { appVersion: '1.47.0', capabilities: ['sync-everyone'] }
 const START = Date.UTC(2026, 9, 19, 12)
 const SECOND = 1_000
 const MINUTE = 60 * SECOND
@@ -56,6 +59,7 @@ beforeEach(async () => {
   vi.setSystemTime(START)
   h = await createHarness()
   resetSyncEntitlementCache()
+  resetSessionCapabilitiesCache()
   supporterStatus.mockReset()
   supporterStatus.mockResolvedValue({
     supporter: false,
@@ -155,11 +159,11 @@ const get = async (s: TestSession, photo: string) => {
 
 /** A session of an account with a slot: photos are only for Cloud Sync's devices. */
 const session = async (key?: TestSession['key']) => {
-  const s = await openTestSession(app as never, h.env, key)
+  const s = await openTestSession(app as never, h.env, key, CURRENT_APP)
   if (!key) expect((await slotPut(s, PHONE)).status).toBe(200)
   return s
 }
-const bareSession = () => openTestSession(app as never, h.env)
+const bareSession = () => openTestSession(app as never, h.env, undefined, CURRENT_APP)
 
 const live = async (s: TestSession, slotId: string) => {
   const response = (await request('/sync/live', {
@@ -1146,5 +1150,19 @@ describe('privacy', () => {
     const text = JSON.stringify(logs)
     for (const secret of [photo, sealed, s.accountId, s.accessToken])
       expect(text).not.toContain(secret)
+  })
+})
+
+describe('sessions without sync-everyone', () => {
+  it('refuses photo put, list and get', async () => {
+    const s = await session()
+    const photo = await name()
+    expect((await put(s, photo)).status).toBe(200)
+    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    // The same account's session from an app that never sent the capability.
+    const old = await openTestSession(app as never, h.env, s.key)
+    expect(code((await put(old, await name())).body)).toBe('supporter_required')
+    expect(code((await list(old)).body)).toBe('supporter_required')
+    expect(code((await get(old, photo)).body)).toBe('supporter_required')
   })
 })

@@ -5,6 +5,7 @@ import {
   sqliteTable,
   text,
 } from 'drizzle-orm/sqlite-core'
+import type { SessionCapability } from './contracts'
 
 /**
  * The accounts database (D1 `ACCOUNTS_DB`). It knows each account by a random
@@ -133,6 +134,11 @@ export const accountSessions = sqliteTable(
     revokedAt: integer('revoked_at', { mode: 'timestamp_ms' }),
     /** The app version it last opened or refreshed with (`major.minor.patch`). */
     appVersion: text('app_version'),
+    /**
+     * What the app said it does, on open or its latest refresh that sent
+     * them (`SESSION_CAPABILITIES`); null when it never sent any.
+     */
+    capabilities: text('capabilities', { mode: 'json' }).$type<SessionCapability[]>(),
     /** How it opened; null for sessions from before passkeys. */
     method: text('method', { enum: SESSION_METHODS }),
     /** The account's key epoch when it opened. */

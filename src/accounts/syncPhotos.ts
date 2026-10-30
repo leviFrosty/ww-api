@@ -109,7 +109,7 @@ const putPhoto = async (
   const who = await caller(c, 'photoPut')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   if (!(await isSyncPhotosOn(c.env))) return buddiesErrorResponse('photos_disabled')
 
@@ -184,7 +184,7 @@ const handleList = guarded('sync/photos/list', async (c) => {
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   const body = await readPlainJson(c)
   if (!isPlainObject(body)) return buddiesErrorResponse('bad_request')
@@ -202,7 +202,7 @@ const handleGet = guarded('sync/photos/get', async (c) => {
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   const body = await readPlainJson(c)
   if (!isPlainObject(body) || !isSyncPhotoName(body.name))

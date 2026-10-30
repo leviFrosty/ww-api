@@ -1,6 +1,11 @@
 import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
-import { ACCOUNT_LIMITS, parseRefreshToken, type RefreshToken } from './contracts'
+import {
+  ACCOUNT_LIMITS,
+  parseRefreshToken,
+  type RefreshToken,
+  type SessionCapability,
+} from './contracts'
 import {
   accountActivity,
   accountSessions,
@@ -188,6 +193,7 @@ export interface NewSession {
   /** How it opened; `attestation` or `dev` for phones. */
   method: SessionMethod
   appVersion?: string | null
+  capabilities?: SessionCapability[] | null
   /** `approval`: the phone's session that approved it (the entry's `actor`). */
   actorSessionId?: string | null
   /** `passkey`: the credential the sign-in asserted with. */
@@ -242,6 +248,7 @@ export const prepareSession = async (
       createdAt: new Date(now),
       expiresAt: new Date(expiresAt),
       appVersion: input.appVersion ?? null,
+      capabilities: input.capabilities ?? null,
       method: input.method,
       keyEpoch: sql`(SELECT key_epoch FROM accounts WHERE id = ${input.accountId})`,
       stepUpAt: web ? new Date(now) : null,
@@ -435,6 +442,12 @@ export type RefreshRefusal = (typeof REFRESH_REFUSALS)[number]
 
 export type RefreshOutcome = { issued: IssuedSession } | { refused: RefreshRefusal }
 
+/** What a refresh sent; each null leaves the stored one. */
+export interface RefreshReport {
+  appVersion: string | null
+  capabilities: SessionCapability[] | null
+}
+
 /** What a refresh comes to, for one read of the session's row. */
 type RefreshStep =
   | { done: RefreshOutcome }
@@ -469,7 +482,7 @@ const refreshStep = async (
   row: SessionRow | undefined,
   now: number,
   raced: boolean,
-  appVersion: string | null
+  { appVersion, capabilities }: RefreshReport
 ): Promise<RefreshStep> => {
   if (!row) return { done: { refused: 'unknown' } }
   if (!isLive(row, now)) return { done: { refused: endedRefusal(row, now) } }
@@ -487,6 +500,7 @@ const refreshStep = async (
         rotatedAt: new Date(now),
         expiresAt,
         ...(appVersion != null ? { appVersion } : {}),
+        ...(capabilities != null ? { capabilities } : {}),
       })
       .where(
         and(
@@ -556,14 +570,15 @@ const refreshStep = async (
  * and the session lives, since that token was current a moment ago.
  * `keys` are the current secret's first, then the previous one's if set.
  * A refusal says why (`RefreshRefusal`). A web session's refresh also moves
- * its end to 180 days out; `appVersion`, when sent, replaces the stored one.
+ * its end to 180 days out; `appVersion` and `capabilities`, when sent,
+ * replace the stored ones.
  */
 export const refreshSession = async (
   db: AccountsDb,
   keys: readonly RefreshKeys[],
   presented: RefreshToken,
   now: number = Date.now(),
-  appVersion: string | null = null
+  report: RefreshReport = { appVersion: null, capabilities: null }
 ): Promise<RefreshOutcome> => {
   if (!(await isIssued(keys, presented))) return { refused: 'unknown' }
   const hash = await refreshHash(presented.token)
@@ -577,9 +592,13 @@ export const refreshSession = async (
       row,
       now,
       raced,
-      appVersion
+      report
     )
-    if ('done' in step) return step.done
+    if ('done' in step) {
+      if ('issued' in step.done && report.capabilities != null)
+        forgetSessionCapabilities(presented.sessionId)
+      return step.done
+    }
   }
   return { refused: 'unknown' }
 }
@@ -793,3 +812,47 @@ export const stepUpUpdate = (
         isNull(accountSessions.revokedAt)
       )
     )
+
+const CAPABILITIES_CACHE_MS = 60_000
+const CAPABILITIES_CACHE_ENTRIES = 1_000
+const capabilitiesCache = new Map<
+  string,
+  { capabilities: SessionCapability[]; at: number }
+>()
+
+/** Clears the per-isolate session capabilities cache (tests). */
+export const resetSessionCapabilitiesCache = (): void => capabilitiesCache.clear()
+
+/** Drops one session's cached capabilities (a refresh sent new ones). */
+export const forgetSessionCapabilities = (sessionId: string): void => {
+  capabilitiesCache.delete(sessionId)
+}
+
+/**
+ * The capabilities a session last sent (on open, or a refresh that sent
+ * them); null when it sent none or doesn't exist. Only a session that has
+ * some is cached, per isolate for 60 s, so an app that adds them on refresh
+ * is answered at once. Another isolate may still answer a dropped list for
+ * up to 60 s. Throws when the database can't be read.
+ */
+export const cachedSessionCapabilities = async (
+  db: AccountsDb,
+  sessionId: string
+): Promise<SessionCapability[] | null> => {
+  const now = Date.now()
+  const cached = capabilitiesCache.get(sessionId)
+  if (cached && now - cached.at < CAPABILITIES_CACHE_MS) return cached.capabilities
+  const row = await db
+    .select({ capabilities: accountSessions.capabilities })
+    .from(accountSessions)
+    .where(eq(accountSessions.id, sessionId))
+    .get()
+  const capabilities = row?.capabilities ?? null
+  capabilitiesCache.delete(sessionId)
+  if (capabilities?.length) {
+    if (capabilitiesCache.size >= CAPABILITIES_CACHE_ENTRIES)
+      capabilitiesCache.delete(capabilitiesCache.keys().next().value!)
+    capabilitiesCache.set(sessionId, { capabilities, at: now })
+  }
+  return capabilities
+}
