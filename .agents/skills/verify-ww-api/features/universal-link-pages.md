@@ -9,6 +9,8 @@ Shared contacts (`/contacts#<payload>`), buddy invites (`/buddies/invite#1<secre
 - `contact-locale` localizes `/contacts?lang=es` and `Accept-Language` (`Content-Language` header, `<html lang>`).
 - `contact-legacy` makes `/c/<payload>` render an `href="witnesswork://import-contact/<payload>"` that never appears in a meta tag, and escapes non-base64url payloads.
 - `invite-page` serves `/buddies/invite` (and `/b`) with a strict CSP (`default-src 'none'`), `X-Robots-Tag: noindex, nofollow`, and `Referrer-Policy: no-referrer`.
+- `continue-web` puts a hidden `#continue-web` link (`data-base` = `WEB_APP_ORIGIN` + `/contacts` or `/buddies/invite`) on the contact and invite pages.
+- `apex` serves the website apex (`witnesswork.app`, `dev.witnesswork.app`): an AASA with only the three full-word components, and `#open-app` links to the old host's `/b` and `/h` on the invite and handoff pages. Contract: `docs/link-pages.md`.
 
 ## How to get to it (user POV)
 
@@ -35,3 +37,4 @@ Preconditions:
 - Fragments (`#…`) never reach the server, so curl can't exercise the in-page script. Prove the script path with a browser (or the app's verify loop), not curl.
 - Without a real `APPLE_TEAM_ID`, the AASA uses the synthetic `VERIFY0000`. It proves shape, not that Apple will accept it.
 - Static assets under `public/` (`/assets/*`) are served by the assets binding and bypass the worker.
+- `wrangler dev` hands the worker its env's first route as the request host (`https://api-dev.witnesswork.app/…`), whatever the `Host` header says. To see the apex variant over HTTP, run a second worker on a free port in 8790-8799 with `--local-upstream dev.witnesswork.app` (the same args `dev.mjs` uses, its own `--persist-to` and `--inspector-port`); unit tests in `src/linkHosts.test.ts` cover every host.

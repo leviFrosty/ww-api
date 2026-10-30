@@ -10,10 +10,16 @@ details, primarily the **environments**.
 
 There are two deployed API Workers, defined in `wrangler.toml`:
 
-| Env  | Worker name    | URL                                          | Deploy command        |
-| ---- | -------------- | -------------------------------------------- | --------------------- |
-| prod | `ww-proxy`     | `https://ww-proxy.leviwilkerson.com`         | `pnpm run deploy`     |
-| dev  | `ww-proxy-dev` | `https://ww-proxy-dev.<subdomain>.workers.dev` | `pnpm run deploy:dev` |
+| Env  | Worker name    | URLs                                                                                     | Deploy command        |
+| ---- | -------------- | ---------------------------------------------------------------------------------------- | --------------------- |
+| prod | `ww-proxy`     | `https://api.witnesswork.app`, `https://ww-proxy.leviwilkerson.com`                      | `pnpm run deploy`     |
+| dev  | `ww-proxy-dev` | `https://api-dev.witnesswork.app`, `https://ww-proxy-dev.levi-wilkerson.workers.dev`     | `pnpm run deploy:dev` |
+
+New clients use the `witnesswork.app` hosts (witness-work ADR 0042). The old
+hosts serve the same Workers for good and are never redirected: shipped builds
+call them, and WebSockets don't follow redirects. Each Worker also answers a
+few exact paths on the website apex (`witnesswork.app`, dev
+`dev.witnesswork.app`): the link pages and association files, below.
 
 Three app-update Workers (Hot Updater) are defined separately in
 `wrangler-updates.json`, one per app channel, each with its own D1 database and
@@ -187,8 +193,14 @@ their feature: `/contacts#<payload>`, `/buddies/invite#1…`,
 `/c/<payload>`), `/b#1…`, and `/h#1…`. Those links live on in people's
 messages and screenshots, so **the short paths stay routed and in the AASA for
 good**; a redirect wouldn't do, because iOS decides from the AASA whether a
-tapped URL opens the app. Each page's `og:url` is the path it was served on
-(never a payload).
+tapped URL opens the app. Each page's `og:url` is the path it was served on,
+on the host it was served on (never a payload).
+
+New links use the website apex (`https://witnesswork.app/contacts#…`), where
+only the full-word paths are routed here and the AASA lists only those. The
+contact and Buddies invite pages offer "Continue on the web" (`WEB_APP_ORIGIN`).
+Hosts, routes, fragment formats and the web app's contract:
+[`docs/link-pages.md`](docs/link-pages.md).
 
 The app must parse the readable paths (and Android's intent filters must list
 them) for at least one release before it starts generating them, or people on
@@ -1550,7 +1562,8 @@ setup, and decisions: [`docs/maps.md`](docs/maps.md). Code in `src/maps/`.
 ## API docs (OpenAPI + Scalar)
 
 `GET /docs` is the Scalar API reference and `GET /openapi.json` its OpenAPI
-3.1 document, on both workers (prod: https://ww-proxy.leviwilkerson.com/docs).
+3.1 document, on both workers (prod: https://api.witnesswork.app/docs, also on
+the old host).
 The repo is public, so the docs are too, admin routes included (they still
 need the token).
 

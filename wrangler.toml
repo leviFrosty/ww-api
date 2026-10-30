@@ -20,9 +20,41 @@ upload_source_maps = true
 directory = "./public"
 binding = "ASSETS"
 
+# The old host stays for good, never redirected: shipped builds call it, and
+# links people already sent point at it (witness-work ADR 0042).
 [[routes]]
 pattern = "ww-proxy.leviwilkerson.com"
 custom_domain = true
+
+[[routes]]
+pattern = "api.witnesswork.app"
+custom_domain = true
+
+# The website apex's link pages and association files (docs/link-pages.md).
+# The site Worker is the apex's Custom Domain and serves everything else. Only
+# full-word paths: the short /c, /c/*, /b and /h stay on the old host. A
+# pattern without `*` matches only that URL with no query string, so the
+# pages end in `*` (`?lang=`, `?fbclid=`); src/linkHosts.ts hands the site
+# anything else they catch. Repeated for dev.witnesswork.app under [env.dev].
+[[routes]]
+pattern = "witnesswork.app/.well-known/apple-app-site-association"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/.well-known/assetlinks.json"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/accounts/handoff*"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/contacts*"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/buddies/invite*"
+zone_name = "witnesswork.app"
 
 # Exposes the deployed Worker version (id/tag/timestamp) to the runtime so
 # /health can report the actual build. NOT inherited by named envs — repeated
@@ -39,10 +71,35 @@ binding = "CF_VERSION_METADATA"
 name = "ww-proxy-dev"
 workers_dev = true   # public https://ww-proxy-dev.<subdomain>.workers.dev (device-reachable)
 preview_urls = true
-# Routes ARE inherited by named envs (unlike vars/kv/ratelimits), so without this
-# dev would inherit prod's [[routes]] custom domain and try to steal
-# ww-proxy.leviwilkerson.com on deploy. Empty list = workers.dev URL only.
-routes = []
+
+# Routes ARE inherited by named envs (unlike vars/kv/ratelimits), so dev lists
+# its own complete set; otherwise it would take prod's hosts on deploy. Its
+# apex routes only get traffic once dev.witnesswork.app exists (the site's dev
+# Worker Custom Domain). Patterns as for prod above. Order matters: `wrangler
+# dev` serves locally as the first route's host, so api-dev stays first.
+[[env.dev.routes]]
+pattern = "api-dev.witnesswork.app"
+custom_domain = true
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/.well-known/apple-app-site-association"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/.well-known/assetlinks.json"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/accounts/handoff*"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/contacts*"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/buddies/invite*"
+zone_name = "witnesswork.app"
 
 [env.dev.version_metadata]
 binding = "CF_VERSION_METADATA"
@@ -51,6 +108,8 @@ binding = "CF_VERSION_METADATA"
 crons = ["17 * * * *"]
 
 [env.dev.vars]
+# "Continue on the web" on the contact and Buddies invite pages.
+WEB_APP_ORIGIN = "https://app-dev.witnesswork.app"
 # Named environments do not inherit the production model override.
 NOTES_IMPORT_MODEL = "openai/gpt-6-luna"
 NOTES_IMPORT_REASONING_EFFORT = "low"
@@ -318,6 +377,10 @@ head_sampling_rate = 1
   head_sampling_rate = 1
 
 [vars]
+# "Continue on the web" on the contact and Buddies invite pages: unset in
+# production until the web app is live at https://app.witnesswork.app (the
+# launch runbook sets it then); the link is hidden while it's unset. Dev sets
+# it under [env.dev.vars].
 # Explicit production invariant: development attestations and bypasses fail closed.
 APP_ATTEST_ENVIRONMENT = "production"
 # iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
