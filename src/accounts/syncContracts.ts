@@ -41,6 +41,8 @@ export const SYNC_LIMITS = {
   maxRetentionMs: 400 * DAY_MS,
   /** The retention alarm's period while the account has slots. */
   retentionCheckMs: DAY_MS,
+  /** A Cloud Sync request lapses this long after it was last asked for. */
+  requestLapseMs: 30 * DAY_MS,
 } as const
 
 /** The device's sync id: the `<deviceId>` in `witness-work-<deviceId>.json`. */
