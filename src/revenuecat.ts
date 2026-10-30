@@ -83,6 +83,10 @@ interface RcSubscriberResponse {
      * Tips live in `non_subscriptions` instead, so they never match here.
      */
     subscriptions?: Record<string, RcSubscription>
+    /** The customer's first app user id, whichever id was asked about. */
+    original_app_user_id?: unknown
+    /** Its other app user ids, when RevenueCat lists them. */
+    aliases?: unknown
   }
 }
 
@@ -101,6 +105,13 @@ export interface SupporterStatus {
    * Supporter.
    */
   expiresAt: number | null
+  /**
+   * The customer's `original_app_user_id` and `aliases`, as RevenueCat named
+   * them (unfiltered strings; absent when it named none). ADR 0039 §9 locks
+   * a customer by them.
+   */
+  originalAppUserId?: string
+  aliases?: string[]
 }
 
 /**
@@ -218,12 +229,21 @@ export const fetchSupporterStatus = async ({
     end = Math.max(end, Math.min(entitlementEnd, subscriptionEnd))
   }
 
+  const original = body.subscriber?.original_app_user_id
+  const aliases = Array.isArray(body.subscriber?.aliases)
+    ? body.subscriber.aliases.filter((id): id is string => typeof id === 'string')
+    : []
+  const others = {
+    ...(typeof original === 'string' ? { originalAppUserId: original } : {}),
+    ...(aliases.length ? { aliases } : {}),
+  }
   if (end === -Infinity)
-    return { known: true, supporter: false, expiresAt: null }
+    return { known: true, supporter: false, expiresAt: null, ...others }
   return {
     known: true,
     supporter: true,
     expiresAt: end === Infinity ? null : end,
+    ...others,
   }
 }
 
