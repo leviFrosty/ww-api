@@ -247,6 +247,11 @@ input, `step.ts` the model call, `meter.ts` + `meterDO.ts` metering,
 `status.ts` kill switch and provider health, `legacy.ts` the Notes Import
 cutover).
 
+`app.platform` in the step body is `ios`, `android` or `web` (the browser app);
+anything else is a 400 `bad_request` (rule `app`). Nothing branches on it:
+analytics and limits use the session's platform. The list is
+`SCRIBE_APP_PLATFORMS` in `src/scribe/wire.ts`.
+
 A Cancel or a dropped connection stops the model call through
 `c.req.raw.signal`, which aborts only under the `enable_request_signal`
 compatibility flag in `wrangler.toml`; keep it. The step is then charged as an

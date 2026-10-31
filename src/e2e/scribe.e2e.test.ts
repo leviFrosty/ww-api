@@ -150,6 +150,7 @@ describe.skipIf(!LOCAL)('on an account session', () => {
       [body({ protocol: 2 }), 400, 'bad_request'],
       [body({ conversationId: 'nope' }), 400, 'bad_request'],
       [body({ step: 6 }), 400, 'step_limit'],
+      [body({ app: { version: '1.46.0', platform: 'windows', locale: 'en-US' } }), 400, 'bad_request'],
       [
         body({ tools: [{ ...SCRIBE_TOOLS[0], inputSchema: { type: 'object', properties: { a: { type: 'string' } }, required: [], additionalProperties: false } }] }),
         400,
@@ -165,6 +166,19 @@ describe.skipIf(!LOCAL)('on an account session', () => {
     expect([raw.status, raw.body.code]).toEqual([400, 'bad_request'])
     const usage = await http('GET', '/scribe/v1/usage', { headers: bearer(token) })
     expect(usage.body.windows[0].units.used).toBe(0)
+  })
+
+  it.each(['ios', 'android', 'web'])('accepts app.platform %s past validation', async (platform) => {
+    // The context size is checked right after `app`, so a 413 means the
+    // platform passed (an unknown one is a 400 first).
+    const res = await step(
+      session.accessToken,
+      body({
+        app: { version: '1.46.0', platform, locale: 'en-US' },
+        context: { v: 1, pad: 'x'.repeat(20_000) },
+      })
+    )
+    expect([res.status, res.body.code]).toEqual([413, 'too_large'])
   })
 
   it('refuses with context_full, disabled, and upgrade_required from KV', async () => {
