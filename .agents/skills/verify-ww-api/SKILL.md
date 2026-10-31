@@ -71,14 +71,14 @@ pnpm fuzz:buddies --seed 42 --case 17   # replay one failing case
 
 The seed decides each case's mutation and its parameters. Ids, keys, and nonces are fresh every run, so you can replay a seed against the same persisted state.
 
-There are 28 generators, 9 of them for bearer requests (skipped, and counted as skipped, without a dev bypass token):
+There are 29 generators, 9 of them for bearer requests (skipped, and counted as skipped, without a dev bypass token):
 
 - **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `signature`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
 - **Bad payloads:** a wrong-typed field, a missing field, malformed envelopes (bad JSON, base64, UTF-8), unicode and huge strings.
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
 - **Photo blobs:** `blob/put` → `blob/get` round trip with an idempotent retry, 1 MiB accepted and one byte more `too_large`, a flipped bit (`bad_request`), a stranger's signature, and the same 404 for a wrong token, an unknown blob or inbox, and a deleted blob.
-- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
+- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, `slot/seal` racing the slot's own `event/put`s (each lands and syncs, or is 403 `sealed` and doesn't; then every write is `sealed`, and `slot/leave` still works but keeps the events that landed), per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
 - **Bearer requests** (sessions opened through the dev bypass): bad tokens on every route class (forged, truncated, `alg: none`, a refresh token, other schemes; always 401 `unauthorized` with the challenge, never the envelope), another account's token (403 `forbidden`), an inbox registered before accounts (409 `not_linked`), malformed plain-JSON bodies and envelopes sent with a token (400), `inbox/register` proofs (missing, another account's, forged, for another inbox), bearer `blob/put` headers, writer ops with any session's token, a bearer round trip, and per-account edge limits from rotating addresses.
 
 The oracle checks every request:

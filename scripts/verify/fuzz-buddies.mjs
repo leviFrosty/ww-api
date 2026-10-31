@@ -322,6 +322,7 @@ const validPayload = async (op, ctx) => {
     case 'event/put':
       return { ...base, slotId: writer.slotId, eventId: rid(), kind: 'plan.joined', blob: blob(48), push: false }
     case 'slot/leave':
+    case 'slot/seal':
       return { ...base, slotId: writer.slotId }
     case 'invite/fetch':
       return { inviteId: rid() }
@@ -331,7 +332,7 @@ const validPayload = async (op, ctx) => {
   throw new Error(`no payload for ${op}`)
 }
 
-const WRITER_OPS = new Set(['card/put', 'event/put', 'slot/leave'])
+const WRITER_OPS = new Set(['card/put', 'event/put', 'slot/leave', 'slot/seal'])
 /** Valid payload fields the contract lets a client leave out. */
 const OPTIONAL_FIELDS = new Set(['pushService', 'apnsTopic'])
 const keyFor = (op, ctx) => (WRITER_OPS.has(op) ? ctx.writer.key : ctx.owner.key)
@@ -978,6 +979,39 @@ const GENERATORS = {
     if (stored.length !== 1) throw new FuzzFailure(`dedupe: sync shows ${stored.length} copies of the event`, caseLog.at(-1))
   },
 
+  /**
+   * `slot/seal` racing the slot's own writes: each write lands (and sync
+   * shows it) or is 403 `sealed` (and doesn't); after the seal every write is
+   * `sealed`, sealing again is `ok`, the owner sees `sealed: true`, and
+   * leaving still works but keeps the events that landed.
+   */
+  'sealed-slot': async (rng) => {
+    const owner = await newOwner()
+    const writer = await newWriter(owner)
+    const landedOrSealed = (status, json) => status === 200 || (status === 403 && json?.error === 'sealed')
+    const writes = Array.from({ length: rng.int(1, 6) }, () => ({ eventId: rid(), kind: 'plan.joined', blob: blob(16), push: false }))
+    const [, ...results] = await Promise.all([
+      writer.send('slot/seal', {}),
+      ...writes.map((fields) => writer.send('event/put', fields, landedOrSealed)),
+    ])
+    const sync = await owner.send('inbox/sync', { since: 0 })
+    const stored = new Set(sync.json.events.map((event) => event.eventId))
+    writes.forEach((fields, i) => {
+      if (stored.has(fields.eventId) !== (results[i].status === 200))
+        throw new FuzzFailure(`seal race: event/put answered ${results[i].status} but sync ${stored.has(fields.eventId) ? 'has' : 'lacks'} it`, caseLog.at(-1))
+    })
+    if (sync.json.slots[0]?.sealed !== true) throw new FuzzFailure('sealed slot without sealed: true in sync', caseLog.at(-1))
+    const op = rng.pick(['card/put', 'event/put'])
+    await writer.send(op, (await validPayload(op, { owner, writer })), [403], 'sealed')
+    await writer.send('slot/seal', {})
+    await writer.send('slot/leave', {})
+    const left = await owner.send('inbox/sync', { since: 0 })
+    const kept = new Set(left.json.events.map((event) => event.eventId))
+    if (left.json.slots.length !== 0 || [...stored].some((id) => !kept.has(id)))
+      throw new FuzzFailure('leaving a sealed slot dropped its events (or kept the slot)', caseLog.at(-1))
+    await owner.send('inbox/delete')
+  },
+
   // --- Bearer requests (account sessions) ---------------------------------------
 
   /**
@@ -1014,7 +1048,7 @@ const GENERATORS = {
       const op = rng.pick(OWNER_OPS)
       request = { op, body: await signed(op, bearer.owner.key, await validPayload(op, bearer)) }
     } else if (target === 'writer') {
-      const op = rng.pick(['card/put', 'event/put', 'slot/leave'])
+      const op = rng.pick(['card/put', 'event/put', 'slot/leave', 'slot/seal'])
       request = { op, body: await signed(op, bearer.writer.key, await validPayload(op, bearer)) }
     } else if (target === 'unsigned') {
       const op = rng.pick(['invite/fetch', 'invite/claim'])
@@ -1197,7 +1231,7 @@ const GENERATORS = {
     await keepFresh(bearer.stranger)
     const owner = await newBearerOwner()
     const writer = await newWriter(owner)
-    const op = rng.pick(['card/put', 'event/put', 'slot/leave'])
+    const op = rng.pick(['card/put', 'event/put', 'slot/leave', 'slot/seal'])
     const fields = await validPayload(op, { owner, writer })
     const variant = rng.pick(['any-session', 'any-session', 'bad-writer-signature', 'stale', 'bad-token', 'plain-json'])
     if (variant === 'any-session') {

@@ -30,6 +30,7 @@ export const BUDDIES_WRITER_OPS = [
   'card/put',
   'event/put',
   'slot/leave',
+  'slot/seal',
 ] as const
 
 export const BUDDIES_UNSIGNED_OPS = ['invite/fetch', 'invite/claim'] as const
@@ -155,11 +156,15 @@ export const BUDDIES_OPS: readonly BuddiesOp[] = [
   ...BUDDIES_UNSIGNED_OPS,
 ]
 
-/** Ops that keep working with the kill switch off, so people can always leave. */
+/**
+ * Ops that keep working with the kill switch off, so people can always leave,
+ * and a writer can always seal its slot after a key change.
+ */
 export const BUDDIES_ALWAYS_ALLOWED_OPS: ReadonlySet<BuddiesOp> = new Set([
   'inbox/delete',
   'slot/remove',
   'slot/leave',
+  'slot/seal',
 ])
 
 /**
@@ -205,6 +210,11 @@ export const BUDDIES_ERROR_STATUS = {
    * or a bearer request's own account is (`BUDDIES_SUSPENDED_REFUSED_OPS`).
    */
   suspended: 403,
+  /**
+   * A writer op from a slot its writer sealed (`slot/seal`), but leaving or
+   * sealing again. Final: nothing unseals a slot.
+   */
+  sealed: 403,
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,
   /**
@@ -648,6 +658,7 @@ export interface BuddiesPayloads {
   'card/put': CardPutPayload
   'event/put': EventPutPayload
   'slot/leave': SlotPayload
+  'slot/seal': SlotPayload
   'invite/fetch': InviteFetchPayload
   'invite/claim': InviteClaimPayload
   'inbox/live': InboxFields
@@ -829,6 +840,7 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
     return { ...base, eventId: p.eventId, kind: p.kind, push: p.push }
   },
   'slot/leave': slotFields,
+  'slot/seal': slotFields,
   'invite/fetch': (p) => (isId(p.inviteId) ? { inviteId: p.inviteId } : null),
   'invite/claim': (p) => {
     if (!isId(p.inviteId) || typeof p.claimSecret !== 'string') return null
@@ -921,9 +933,11 @@ export const isAccountCall = <T>(
   call: Signed<T> | AccountCall<T>
 ): call is AccountCall<T> => !('signature' in call)
 
+/** `sealed` only on a slot its writer sealed (`slot/seal`); absent otherwise. */
 export type SyncSlot = {
   slotId: string
   createdAt: number
+  sealed?: true
 }
 
 export type SyncCard = {

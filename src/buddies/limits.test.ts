@@ -165,6 +165,7 @@ describe('edge tiers', () => {
       'card/put': 'write',
       'event/put': 'write',
       'slot/leave': 'write',
+      'slot/seal': 'write',
       'invite/fetch': 'unsigned',
       'invite/claim': 'unsigned',
     })
