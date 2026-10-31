@@ -704,6 +704,31 @@ Links. Clients are iOS and Android
   linked to the account before the change (the app links it first and
   skips the invites if it can't), since another account holding the old
   key could link an unlinked old inbox and name its own successor.
+- **Old-key owner ops** (witness-work ADR 0039): an inbox's owner key comes
+  from the account key, so after a key change whoever holds the old key
+  could keep reading the old inbox with owner-signed requests until the
+  User's device deletes it (never, if that device is gone). So an
+  owner-signed (legacy) owner op, `inbox/live` upgrade, or `blob/put` on an
+  inbox whose `account_inboxes.first_key_epoch` (the epoch it was first
+  linked at; never moves, migration `0009_inbox-first-key-epoch.sql`,
+  backfilled from `key_epoch`) is below its account's `key_epoch` is 401
+  `unauthorized` with `reason: "key_changed"`, for good, legacy switch on
+  or off, the Notification Service Extension's `linkedOnly` sync included
+  (`ownedByOldKey` in `route.ts`, `isOldKeyLink` in `inboxSuccessors.ts`).
+  A registration with the new key's proof moves `key_epoch` up for
+  successors only: the owner key is still the old one's. The old inbox is
+  usable only through bearer owner ops, and the app deletes it with a
+  successor. A legacy `inbox/register` of it is 401 `key_changed` too,
+  proof or not, so the old key can't keep it from ageing out
+  (`checkInboxAccount`, after the signature and quota; a legacy
+  registration while D1 is down still falls back to registering unlinked).
+  It's one D1 read by primary key per such request (a join on `accounts`),
+  after the shape and `ts` checks and before the inbox DO wakes, so no
+  nonce is spent; never cached, and a D1 failure is a 500, never a pass.
+  The Worker can't check the owner signature, so anyone who knows the inbox
+  id learns it predates a key change (buddies learn it from the reconnect
+  anyway). Unlinked inboxes, workers without `ACCOUNTS_DB`, and bearer
+  requests are unchanged.
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
@@ -1594,6 +1619,9 @@ deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
 - **Buddies**: inbox links record the key epoch whose key signed them, and
   `inbox/delete` with `successor` records the new inbox for buddies' reconnect
   checks, only for a link at the current epoch (Buddies → Inbox successor).
+  An inbox first linked at an older epoch refuses owner-signed requests
+  (401 `key_changed`) for good; it's usable only through bearer owner ops,
+  and the app deletes it with a successor (Buddies → Old-key owner ops).
 - **Privacy**: never log or report keys, the history blob, wraps, credential
   ids, account ids, or session ids. The history is sealed by the devices; the
   server stores it opaque.
