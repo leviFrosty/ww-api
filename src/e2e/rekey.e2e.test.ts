@@ -121,11 +121,17 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('changing the account key on the local worker
       body: { refreshToken: other.refreshToken },
     })
     expect(refused.status).toBe(401)
-    expect(refused.body).toMatchObject({ code: 'unauthorized', reason: 'revoked' })
+    expect(refused.body).toMatchObject({
+      code: 'unauthorized',
+      reason: 'key_changed',
+      changedAt: expect.any(Number),
+    })
     // Reopening with the old key is key_retired, and makes no account.
     const reopened = await openWith(phone.key)
     expect(reopened.status).toBe(403)
     expect(reopened.body).toMatchObject({ code: 'key_retired', changedAt: expect.any(Number) })
+    // Both say when the account's key changed.
+    expect(refused.body.changedAt).toBe(reopened.body.changedAt)
     // A device resolving the change opens into the account with the new key.
     const resolved = await openWith(newKey, { accountId: phone.accountId, ...CURRENT_APP })
     expect(resolved.status).toBe(201)
@@ -172,6 +178,25 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('changing the account key on the local worker
       headers: { authorization: `Bearer ${other.accessToken}` },
     })
     expect(endedHistory.status).toBe(401)
+  })
+
+  it('leaves a session signed out before the change as signed out', async () => {
+    const phone = await openSession(undefined, CURRENT_APP)
+    const lost = await openSession(phone.key, CURRENT_APP)
+    // The lost device is signed out first, then the key changes.
+    const signedOut = await http('POST', '/accounts/v1/sessions/revoke', {
+      body: { sessionId: lost.sessionId },
+      headers: { authorization: `Bearer ${phone.accessToken}` },
+    })
+    expect(signedOut.status).toBe(200)
+    const changed = await rekey(phone, await rekeyBody(phone, await SigningKey.generate()))
+    expect(changed.status).toBe(200)
+
+    const refused = await http('POST', '/accounts/v1/sessions/refresh', {
+      body: { refreshToken: lost.refreshToken },
+    })
+    expect(refused.status).toBe(401)
+    expect(refused.body).toMatchObject({ code: 'unauthorized', reason: 'revoked' })
   })
 
   /** Two changes at epoch 0 sent at once; exactly one wins. */

@@ -295,8 +295,9 @@ const handleRekey = guarded('account/rekey', async (c) => {
             committed
           )
         ),
-      // 4. Every other live session ends, logged first. (Columns in the
-      // table's order; see `activityInsert`.)
+      // 4. Every other live session ends as `key_changed`, logged first;
+      // sessions already ended keep why they ended. (Columns in the table's
+      // order; see `activityInsert`.)
       db.insert(accountActivity).select(
         sql`SELECT NULL, s.account_id, 'session.revoked',
             s.id, s.platform, s.device, a.id, a.platform, a.device,
@@ -310,7 +311,7 @@ const handleRekey = guarded('account/rekey', async (c) => {
       ),
       db
         .update(accountSessions)
-        .set({ revokedAt: new Date(now), endedReason: 'revoked' })
+        .set({ revokedAt: new Date(now), endedReason: 'key_changed' })
         .where(others),
       // 5. Every wrap held the old key; the step-up's passkey wraps the new.
       db

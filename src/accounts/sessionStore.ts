@@ -465,18 +465,23 @@ const findSession = async (
 /**
  * Why a refresh was refused (401 `unauthorized`'s `reason`): another device
  * signed the session out (or it signed itself out), the cap ended it, it
- * expired, a replaced refresh token came back, or anything else.
+ * expired, a replaced refresh token came back, the account key changed on
+ * another session while it was live, or anything else.
  */
 export const REFRESH_REFUSALS = [
   'revoked',
   'replaced',
   'expired',
   'reused',
+  'key_changed',
   'unknown',
 ] as const
 export type RefreshRefusal = (typeof REFRESH_REFUSALS)[number]
 
-export type RefreshOutcome = { issued: IssuedSession } | { refused: RefreshRefusal }
+export type RefreshOutcome =
+  | { issued: IssuedSession }
+  /** `changedAt` (epoch ms) with `key_changed`: when the key changed. */
+  | { refused: RefreshRefusal; changedAt?: number }
 
 /** What a refresh sent; each null leaves the stored one. */
 export interface RefreshReport {
@@ -498,6 +503,8 @@ const endedRefusal = (row: SessionRow, now: number): RefreshRefusal => {
       return 'replaced'
     case 'reused':
       return 'reused'
+    case 'key_changed':
+      return 'key_changed'
     default:
       return 'revoked'
   }
@@ -539,7 +546,15 @@ const refreshStep = async (
   { appVersion, capabilities }: RefreshReport
 ): Promise<RefreshStep> => {
   if (!row) return { done: { refused: 'unknown' } }
-  if (!isLive(row, now)) return { done: { refused: endedRefusal(row, now) } }
+  if (!isLive(row, now)) {
+    const refused = endedRefusal(row, now)
+    return {
+      done:
+        refused === 'key_changed' && row.revokedAt
+          ? { refused, changedAt: row.revokedAt.getTime() }
+          : { refused },
+    }
+  }
 
   if (timingSafeEqual(hash, row.refreshHash)) {
     const next = await nextRefreshToken(keys[0], presented)
