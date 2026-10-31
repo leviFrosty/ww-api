@@ -1,4 +1,4 @@
-import { asc, eq, sql } from 'drizzle-orm'
+import { and, asc, eq, lt, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/d1'
 import { bytesToBase64Url } from '../crypto'
 import {
@@ -183,11 +183,16 @@ export const findInboxAccount = async (
  * A new link goes in the account's activity (`buddies.inbox_linked`, naming
  * `sessionId` when a bearer session linked it) in the same batch; the batch
  * is atomic, so an account that loses a race logs nothing.
+ *
+ * `keyEpoch` is the epoch of the key that signed the link's proof, as read
+ * with that key, never re-read here: a key change landing in between leaves
+ * the link at the old epoch, so it can't be a successor (ADR 0039 §5).
  */
 export const linkInbox = async (
   db: AccountsDb,
   inboxId: string,
   accountId: string,
+  keyEpoch: number,
   sessionId: string | null = null
 ): Promise<AccountRecord> => {
   await db.batch([
@@ -201,12 +206,34 @@ export const linkInbox = async (
     ),
     db
       .insert(accountInboxes)
-      .values({ inboxId, accountId })
+      .values({ inboxId, accountId, keyEpoch })
       .onConflictDoNothing({ target: accountInboxes.inboxId }),
   ])
   const owner = await findInboxAccount(db, inboxId)
   if (!owner) throw new Error('accounts: linked inbox is missing')
   return owner
+}
+
+/**
+ * Moves an existing link up to `keyEpoch`, the epoch of the key that signed a
+ * new proof for it (ADR 0039 §5); never down, and never another account's.
+ */
+export const confirmInboxLink = async (
+  db: AccountsDb,
+  inboxId: string,
+  accountId: string,
+  keyEpoch: number
+): Promise<void> => {
+  await db
+    .update(accountInboxes)
+    .set({ keyEpoch })
+    .where(
+      and(
+        eq(accountInboxes.inboxId, inboxId),
+        eq(accountInboxes.accountId, accountId),
+        lt(accountInboxes.keyEpoch, keyEpoch)
+      )
+    )
 }
 
 export const accountInboxIds = async (

@@ -32,7 +32,7 @@ export const BUDDIES_ABUSE_LIMITS = {
     unsigned: { binding: 'BUDDIES_RATE_LIMITER', perMinute: 120 },
     /** Register: once per install, restore, or delete-all; a household restoring ~6 devices at once → 10×. */
     register: { binding: 'BUDDIES_REGISTER_LIMITER', perMinute: 60 },
-    /** Sync + live: a shown invite code polls every 3 s (≤ 40/min with refetches), ~60/min per busy household → 10×. */
+    /** Sync + live (and successor reads, a handful per key change): a shown invite code polls every 3 s (≤ 40/min with refetches), ~60/min per busy household → 10×. */
     read: { binding: 'BUDDIES_READ_LIMITER', perMinute: 600 },
     /** Other signed ops: one edit of a shared recurring Plan fans out ~60 events, cards, and a roster → 10×. */
     write: { binding: 'BUDDIES_WRITE_LIMITER', perMinute: 600 },
@@ -86,6 +86,7 @@ const TIER_BY_OP: Partial<Record<BuddiesRouteOp, BuddiesEdgeTier>> = {
   'inbox/register': 'register',
   'inbox/sync': 'read',
   'inbox/live': 'read',
+  'inbox/successor': 'read',
   'blob/put': 'blobPut',
   'blob/get': 'blobGet',
 }
