@@ -310,9 +310,14 @@ const openWithTicket = async (
   return opened(c, setup.keys, account, issued)
 }
 
-/** 401 `unauthorized` with why (`REFRESH_REFUSALS`). */
-const refusedRefresh = (reason: RefreshRefusal): Response =>
-  buddiesErrorResponse('unauthorized', { extras: { reason } })
+/**
+ * 401 `unauthorized` with why (`REFRESH_REFUSALS`), and for `key_changed`
+ * when the key changed (`changedAt`), as `key_retired` says it.
+ */
+const refusedRefresh = (reason: RefreshRefusal, changedAt?: number): Response =>
+  buddiesErrorResponse('unauthorized', {
+    extras: { reason, ...(changedAt !== undefined && { changedAt }) },
+  })
 
 /**
  * `POST /sessions/refresh`: plain JSON `{ refreshToken, appVersion?, capabilities? }`,
@@ -341,7 +346,7 @@ const handleRefresh = guarded('session/refresh', async (c) => {
     Date.now(),
     { appVersion, capabilities }
   )
-  if ('refused' in outcome) return refusedRefresh(outcome.refused)
+  if ('refused' in outcome) return refusedRefresh(outcome.refused, outcome.changedAt)
   const { issued } = outcome
   return c.json({
     ok: true,
