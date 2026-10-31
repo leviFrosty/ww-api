@@ -137,6 +137,9 @@ export const SESSION_END_REASONS = [
   'revoked',
   'replaced',
   'reused',
+  // Ended by an account key change on another session (witness-work ADR
+  // 0039); only sessions still live at the change.
+  'key_changed',
 ] as const
 export type SessionEndReason = (typeof SESSION_END_REASONS)[number]
 

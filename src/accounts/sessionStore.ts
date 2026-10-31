@@ -465,13 +465,15 @@ const findSession = async (
 /**
  * Why a refresh was refused (401 `unauthorized`'s `reason`): another device
  * signed the session out (or it signed itself out), the cap ended it, it
- * expired, a replaced refresh token came back, or anything else.
+ * expired, a replaced refresh token came back, the account key changed on
+ * another session while it was live, or anything else.
  */
 export const REFRESH_REFUSALS = [
   'revoked',
   'replaced',
   'expired',
   'reused',
+  'key_changed',
   'unknown',
 ] as const
 export type RefreshRefusal = (typeof REFRESH_REFUSALS)[number]
@@ -498,6 +500,8 @@ const endedRefusal = (row: SessionRow, now: number): RefreshRefusal => {
       return 'replaced'
     case 'reused':
       return 'reused'
+    case 'key_changed':
+      return 'key_changed'
     default:
       return 'revoked'
   }

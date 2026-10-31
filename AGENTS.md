@@ -1477,7 +1477,11 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
   passkey add/remove, `backup/delete`, and `account/rekey`. Every session
   records `method`, `app_version`, `key_epoch`, and `step_up_at`; refreshes
   refused with 401 carry `reason` (`revoked`, `replaced`, `expired`,
-  `reused`, `unknown`; `ended_reason` on the row).
+  `reused`, `key_changed`, `unknown`; `ended_reason` on the row).
+  `key_changed` is only a session still live when another session changed
+  the account key; one signed out or revoked before it keeps `revoked`, so a
+  browser can tell a lost device signed out first (wipe) from one the change
+  ended.
 - **Accounts** gain `passkey_user_handle` (minted with a conditional write),
   `key_epoch` (ADR 0039 raises it; wraps for another epoch are refused),
   `created_via` (`app` or `web`), and `key_changed_at`.
@@ -1610,7 +1614,8 @@ deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
   `key_epoch`, also requiring the caller's session live, the new key never
   retired, and the limits), the retired key, the caller's session (new
   epoch, re-sealed `device`), `session.revoked` for and the end of every
-  other session, every wrap deleted and `passkeyWrap` (only the session's
+  other live session (`ended_reason` `key_changed`; already ended ones keep
+  theirs), every wrap deleted and `passkeyWrap` (only the session's
   step-up credential, a phone's too, else 404 `not_found`) stored at the
   new epoch, the history upserted, the account's RevenueCat customers
   locked and unlinked elsewhere (`keyChangeSupporterStatements`, ADR 0039
