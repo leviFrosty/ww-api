@@ -304,6 +304,9 @@ const ownerRefusals = (
 const SENDER_SUSPENDED =
   'Bearer: the token’s account is suspended, so it can’t reach other people (it can still leave). Checked from the account’s status, cached up to 30 s; the inbox never learns which account wrote. A legacy request names no account and isn’t refused.'
 
+const SLOT_SEALED =
+  'The slot’s writer sealed it (`slot/seal`): only `slot/leave` and `slot/seal` still work, for good.'
+
 /** The refusals every writer op shares. */
 const writerRefusals = (extraRateLimit = '') => ({
   bad_request: true as const,
@@ -317,6 +320,7 @@ const writerRefusals = (extraRateLimit = '') => ({
   replay: true as const,
   rate_limited: `${edgeLimited('write')}, ${WRITER_BUDGET} are spent${extraRateLimit}.`,
   disabled: true as const,
+  sealed: SLOT_SEALED,
 })
 
 // --- Ops ------------------------------------------------------------------
@@ -332,6 +336,10 @@ const syncSchema = z.object({
       z.object({
         slotId: z.string(),
         createdAt: z.number().int(),
+        sealed: z.literal(true).optional().meta({
+          description:
+            'Present only once the slot’s writer sealed it (`slot/seal`): it takes no more writes, but its card and events stay until it’s left or removed.',
+        }),
       })
     )
     .meta({
@@ -774,7 +782,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
   'slot/leave': describeOp({
     summary: 'Leave a buddy’s inbox',
     description: paragraphs(
-      'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave.',
+      'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave. A sealed slot (`slot/seal`) keeps its events for the owner until they expire (its card goes), so leaving can’t delete a reconnect invite.',
       SIGNED_BY.writer,
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
@@ -796,6 +804,37 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         ...AUTH_REFUSALS,
         replay: true,
         rate_limited: `${edgeLimited('write')}.`,
+      }),
+    },
+  }),
+
+  'slot/seal': describeOp({
+    summary: 'Seal your slot in a buddy’s inbox',
+    description: paragraphs(
+      'After an account key change (witness-work ADR 0039 §5) the old account key’s holder holds the User’s writer keys too, since they derive from it. The User’s device seals each slot it writes from, before it leaves: from then on every writer op from the slot but `slot/leave` and `slot/seal` is 403 `sealed`, in either form, for good (nothing unseals a slot). A write racing the seal either lands before it or is refused. The slot’s card and events stay, and the owner sees `sealed: true` on it in `inbox/sync` and can still remove it. Idempotent. Stores nothing new: no account, only the flag on the slot.',
+      SIGNED_BY.writer,
+      `${tierLine('write')} Works for a suspended account.`,
+      KILL_SWITCH_EXEMPT
+    ),
+    requestBody: signedBody(
+      signedPayload({
+        inboxId: buddiesId('The recipient’s inbox'),
+        slotId: buddiesId('Your slot in it'),
+      }),
+      'Writer-signed (op `slot/seal`).'
+    ),
+    responses: {
+      200: jsonResponse('Sealed (or already sealed).', okSchema),
+      ...refusals({
+        bad_request: true,
+        bad_signature:
+          'Signature missing, malformed, or not by the slot’s writer key.',
+        stale: true,
+        ...AUTH_REFUSALS,
+        not_found: true,
+        gone: 'The slot doesn’t exist: you left, or the inbox owner removed you. Nothing to seal.',
+        replay: true,
+        rate_limited: `${edgeLimited('write')}, or (sealing again) ${WRITER_BUDGET} are spent; the first seal of an open slot doesn’t count against them.`,
       }),
     },
   }),

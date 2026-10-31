@@ -206,10 +206,13 @@ const SCHEMA = [
      created_at     INTEGER NOT NULL,
      last_active_at INTEGER NOT NULL
    )`,
+  // `sealed`: its writer sealed it (`slot/seal`); never cleared. Inboxes
+  // from before it get the column in place (`#ready`).
   `CREATE TABLE IF NOT EXISTS slot (
      slot_id    TEXT PRIMARY KEY,
      writer_pub TEXT NOT NULL,
-     created_at INTEGER NOT NULL
+     created_at INTEGER NOT NULL,
+     sealed     INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE TABLE IF NOT EXISTS card (
      slot_id    TEXT PRIMARY KEY,
@@ -816,7 +819,10 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
-  /** Idempotent: a missing inbox or slot means there is nothing left to leave. */
+  /**
+   * Idempotent: a missing inbox or slot means there is nothing left to leave.
+   * Leaving a sealed slot keeps its events (`#departSealedSlot`).
+   */
   async leaveSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
     const key = this.#key(call, 'writer')
     if (!key.ok) return ok({})
@@ -828,13 +834,52 @@ export class BuddyInbox extends DurableObject<Environment> {
     )
     if (!valid) return fail('bad_signature')
     let removed = false
-    const result = this.#commit(call, 'writer', key.value, () => {
-      removed = this.#deleteSlot(call.slotId)
-      return ok({})
-    })
+    const result = this.#commit(
+      call,
+      'writer',
+      key.value,
+      () => {
+        removed = this.#sealed(call.slotId)
+          ? this.#departSealedSlot(call.slotId)
+          : this.#deleteSlot(call.slotId)
+        return ok({})
+      },
+      { whileSealed: true }
+    )
     if (removed) this.#broadcastChanged()
     if (!result.ok && (result.error === 'gone' || result.error === 'not_found'))
       return ok({})
+    return result
+  }
+
+  /**
+   * `slot/seal` (witness-work ADR 0039 §5): after a key change, whoever holds
+   * the old account key holds the User's writer keys too, so the User's
+   * device seals each slot it writes from before it leaves. From then on
+   * every writer op from the slot but leaving and sealing again is `sealed`
+   * (`#commit`), for good. The owner still reads what's there and can remove
+   * the slot. Idempotent. Unlike `slot/leave`, a missing inbox or slot is an
+   * error: nothing was sealed.
+   */
+  async sealSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
+    const auth = await this.#authenticate('slot/seal', call, 'writer')
+    if (!auth.ok) return auth
+    let sealed = false
+    const result = this.#commit(
+      call,
+      'writer',
+      auth.value,
+      () => {
+        if (!this.#sealed(call.slotId)) {
+          this.#sql.exec('UPDATE slot SET sealed = 1 WHERE slot_id = ?', call.slotId)
+          sealed = true
+        }
+        return ok({})
+      },
+      { whileSealed: true }
+    )
+    // The owner's `inbox/sync` shows it.
+    if (sealed) this.#broadcastChanged()
     return result
   }
 
@@ -1307,6 +1352,11 @@ export class BuddyInbox extends DurableObject<Environment> {
     }
     if (ref === 'owner' && !SUSPENDED_ALLOWED_OPS.has(op) && this.#suspended())
       return fail('suspended')
+    // The first seal of an open slot skips the budget: whoever else holds
+    // the writer key can spend it, and must not keep the slot open that way.
+    // A re-seal counts, so its nonces stay bounded.
+    if (op === 'slot/seal' && call.slotId && !this.#sealed(call.slotId))
+      return key
     const [budget, limit] =
       ref === 'owner'
         ? [ABUSE.ownerRequests, 'ownerRequests']
@@ -1336,13 +1386,22 @@ export class BuddyInbox extends DurableObject<Environment> {
    * synchronous transaction, so each signed request still takes effect at
    * most once, and only within ±5 minutes. Account calls carry no nonce and
    * record none.
+   *
+   * A writer op from a sealed slot is `sealed` unless `whileSealed` (only
+   * `slot/leave` and `slot/seal`), so a writer op added later is refused by
+   * default. Checked here, in the transaction the write runs in, after the
+   * signature check's await: a write racing `slot/seal` either commits
+   * before it or sees the seal.
    */
   #commit<T>(
     call: AuthCall,
     ref: KeyRef,
     verifiedKey: string,
     work: (now: number) => BuddiesResult<T>,
-    { activity = ref === 'owner' }: { activity?: boolean } = {}
+    {
+      activity = ref === 'owner',
+      whileSealed = false,
+    }: { activity?: boolean; whileSealed?: boolean } = {}
   ): BuddiesResult<T> {
     const now = Date.now()
     return this.ctx.storage.transactionSync((): BuddiesResult<T> => {
@@ -1353,6 +1412,13 @@ export class BuddyInbox extends DurableObject<Environment> {
         ? this.#refuseAccount(call.accountId)?.error
         : this.#admit(call, now)
       if (denied) return fail(denied)
+      if (
+        ref === 'writer' &&
+        !whileSealed &&
+        call.slotId &&
+        this.#sealed(call.slotId)
+      )
+        return fail('sealed')
       if (activity) this.#touch(now)
       const result = work(now)
       if (result.ok) {
@@ -1440,6 +1506,11 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!this.#hasColumn('push_device', 'app_alerts')) {
         this.#sql.exec(
           'ALTER TABLE push_device ADD COLUMN app_alerts INTEGER NOT NULL DEFAULT 0'
+        )
+      }
+      if (!this.#hasColumn('slot', 'sealed')) {
+        this.#sql.exec(
+          'ALTER TABLE slot ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0'
         )
       }
       if (this.#hasTable('device')) this.#migrateDevices()
@@ -1568,6 +1639,16 @@ export class BuddyInbox extends DurableObject<Environment> {
           writerPub: string
         }>('SELECT writer_pub AS writerPub FROM slot WHERE slot_id = ?', slotId)
         .toArray()[0]?.writerPub ?? null
+    )
+  }
+
+  /** Whether the slot's writer sealed it (`slot/seal`). */
+  #sealed(slotId: string): boolean {
+    return (
+      this.#count(
+        'SELECT COUNT(*) AS n FROM slot WHERE slot_id = ? AND sealed = 1',
+        slotId
+      ) > 0
     )
   }
 
@@ -1882,9 +1963,15 @@ export class BuddyInbox extends DurableObject<Environment> {
     return targets
   }
 
-  /** Deletes a slot with its card and events; false when there was none. */
+  /**
+   * Deletes the slot and everything it wrote. True when that changed what
+   * `inbox/sync` returns: the slot existed, or a left sealed slot's events
+   * were still kept.
+   */
   #deleteSlot(slotId: string): boolean {
-    const existed = this.#writerPub(slotId) != null
+    const existed =
+      this.#writerPub(slotId) != null ||
+      this.#count('SELECT COUNT(*) AS n FROM event WHERE slot_id = ?', slotId) > 0
     this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM event WHERE slot_id = ?', slotId)
@@ -1892,6 +1979,22 @@ export class BuddyInbox extends DurableObject<Environment> {
     this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
     return existed
+  }
+
+  /**
+   * `slot/leave` of a sealed slot: the slot goes (no more writes, `gone`),
+   * and so do its card and write bookkeeping, but its events stay readable by
+   * the owner until they expire (`#prune`) or the owner removes the slot id.
+   * Whoever holds a sealed slot's writer key after a key change can't delete
+   * the reconnect invite in it by leaving first. Its `slot_usage` row stays
+   * with the events, so the caps still count them.
+   */
+  #departSealedSlot(slotId: string): boolean {
+    this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
+    return true
   }
 
   // --- Live-socket helpers -------------------------------------------------
@@ -1941,10 +2044,13 @@ export class BuddyInbox extends DurableObject<Environment> {
   #snapshot(since: number, now: number): SyncResponse {
     const head = this.#meta()?.seq ?? 0
     const slots = this.#sql
-      .exec<SyncSlot>(
-        'SELECT slot_id AS slotId, created_at AS createdAt FROM slot ORDER BY created_at, slot_id'
+      .exec<{ slotId: string; createdAt: number; sealed: number }>(
+        'SELECT slot_id AS slotId, created_at AS createdAt, sealed FROM slot ORDER BY created_at, slot_id'
       )
       .toArray()
+      .map(({ sealed, ...slot }): SyncSlot =>
+        sealed ? { ...slot, sealed: true } : slot
+      )
 
     const events: SyncEvent[] = []
     let cursor = head
@@ -2024,6 +2130,10 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
     }
     this.#sql.exec('DELETE FROM event WHERE created_at <= ?', expiry)
+    // A left sealed slot's usage row goes with its last event.
+    this.#sql.exec(
+      'DELETE FROM slot_usage WHERE events = 0 AND slot_id NOT IN (SELECT slot_id FROM slot)'
+    )
     this.#sql.exec(
       'DELETE FROM invite WHERE expires_at <= ?',
       now - LIMITS.inviteGraceMs

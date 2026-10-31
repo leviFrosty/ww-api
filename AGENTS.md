@@ -729,6 +729,33 @@ Links. Clients are iOS and Android
   id learns it predates a key change (buddies learn it from the reconnect
   anyway). Unlinked inboxes, workers without `ACCOUNTS_DB`, and bearer
   requests are unchanged.
+- **Slot seal** (witness-work ADR 0039 §5; the protocol's "Sealing a
+  slot"): the User's writer keys into buddies' inboxes also come from the
+  account key, and a writer op is authorized by the writer signature alone
+  (a bearer token's account is never compared with the slot; a legacy one
+  names none). So after a key change the old key's holder could keep
+  writing as the User until the User's device leaves each slot, which it
+  delays until the buddy claims the reconnect (or 24 h). `slot/seal` is a
+  writer op (`{ inboxId, slotId }` → `{ ok }`; bearer with any session, or
+  legacy while `auth:legacy` is on; kill switch and suspension don't stop
+  it, like `slot/leave`) that sets `slot.sealed = 1` in the inbox DO (column
+  added in place by `#ready`). From then on `#commit` refuses every writer
+  op from that slot with 403 `sealed` unless the caller passes
+  `whileSealed` (only `slot/leave` and `sealSlot`), so a new writer op is
+  refused by default. The check runs inside the write's own transaction,
+  after the signature's await, so a racing write lands before the seal or
+  is refused. Idempotent, final (nothing unseals; `slot/remove` and `slot/leave`
+  still delete it, and a slot added again starts open), `not_found` /
+  `gone` for an unknown inbox / slot. The owner's `inbox/sync` lists the
+  slot with `sealed: true` (absent when open) and live sockets get one
+  `changed`. Nothing else is stored: no account or session. The first seal
+  of an open slot skips the writer's signer budget (`#authenticate`), so a
+  holder of the key can't spend it to keep the slot open; re-seals count. `slot/leave` of
+  a sealed slot (`#departSealedSlot`) drops the slot and its card but keeps
+  its events and their `slot_usage` row until retention prunes them (then
+  `#prune` drops the orphaned usage row), so the old key's holder can't
+  delete the reconnect invite by leaving first; the owner's `slot/remove`
+  of the id still deletes them.
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
