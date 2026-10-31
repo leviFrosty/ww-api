@@ -133,7 +133,7 @@ const bearerErrors = {
  * session ended is refused like an expired one.
  */
 const ENDED_SESSION =
-  'A token whose session has ended (signed out, signed out by another device, replaced, or expired) is refused the same way at once, even before the token itself expires: refreshing then fails too, and the app opens a new session. A token from before the session’s key change (its `kep` below the session’s key epoch) is refused with `reason: "key_changed"`: refresh and retry.';
+  'A token whose session has ended (signed out, signed out by another device, replaced, or expired) is refused the same way at once, even before the token itself expires: refreshing then fails too, and the app opens a new session. `reason: "key_changed"` means two things, by where it comes: on a call, the access token is from before the session’s own key change (its `kep` below the session’s key epoch), so refresh and retry; on a refresh (`POST /sessions/refresh`), the session is over because the account key changed on another session while this one was live, with `changedAt`, so sign in with the new key.';
 
 /** 403 `key_retired`: when the key changed. */
 const keyRetiredSchema = apiErrorSchema.extend({
@@ -1037,7 +1037,7 @@ export const accountRekeyDocs = describeRoute({
 
 **Who may:** an attested phone session (\`ios\`, \`android\`, \`dev\`) at any age; a web session at least 24 hours old (\`session_too_new\`) that passed a step-up in the last 5 minutes (\`step_up_required\`). A suspended account may.
 
-**One batch:** the account’s key and epoch are swapped only while they’re still the payload’s (409 \`conflict\` with the account’s \`keyEpoch\` otherwise, so of two devices changing the key at once one wins); the old key is retired for good (\`key_retired\` on every session open); every other session ends (\`session.revoked\`, with this one as actor); this session takes the new epoch and \`device\`; every passkey wrap is deleted and \`passkeyWrap\` stored for the new epoch; the key history is stored; each RevenueCat customer the account links is unlinked from other accounts that first linked it later, and locked to it for 90 days unless another account linked it as early or earlier (see \`POST /accounts/v1/revenuecat-customers\`); \`account.key_changed\` is logged. Then every Cloud Sync socket of the account closes with \`4005 "key_changed"\`.
+**One batch:** the account’s key and epoch are swapped only while they’re still the payload’s (409 \`conflict\` with the account’s \`keyEpoch\` otherwise, so of two devices changing the key at once one wins); the old key is retired for good (\`key_retired\` on every session open); every other session still live ends (\`session.revoked\`, with this one as actor; \`ended_reason: key_changed\`, so its refresh is refused with \`reason: "key_changed"\` and \`changedAt\`; one already ended keeps why it ended); this session takes the new epoch and \`device\`; every passkey wrap is deleted and \`passkeyWrap\` stored for the new epoch; the key history is stored; each RevenueCat customer the account links is unlinked from other accounts that first linked it later, and locked to it for 90 days unless another account linked it as early or earlier (see \`POST /accounts/v1/revenuecat-customers\`); \`account.key_changed\` is logged. Then every Cloud Sync socket of the account closes with \`4005 "key_changed"\`.
 
 The answer’s access token carries the new epoch; the refresh token is unchanged, and its next refresh carries the new epoch too. A lost answer isn’t retried with the same envelope: refresh, then \`GET /account\` says whether the key changed. ${ENDED_SESSION}
 
@@ -1165,13 +1165,16 @@ ${readTier}`,
       "bad_request",
     ]),
     401: errorResponse(
-      "Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does. `reason` says why: `revoked` (signed out, by another device or itself), `replaced` (a cap ended it), `expired`, `reused` (a replaced refresh token came back), or `unknown`.",
+      "Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does. `reason` says why: `revoked` (signed out, by another device or itself), `replaced` (a cap ended it), `expired`, `reused` (a replaced refresh token came back), `key_changed` (the account key changed on another session while this one was live, with `changedAt`; one signed out before the change stays `revoked`, one already expired `expired`), or `unknown`.",
       ["unauthorized"],
       apiErrorSchema
         .extend({
           reason: z.enum([...REFRESH_REFUSALS]).meta({
             description: "Why the refresh was refused.",
           }),
+          changedAt: epochMs(
+            "With `key_changed`: when the account key changed",
+          ).optional(),
         })
         .meta({ id: "RefreshRefusedError" }),
     ),
