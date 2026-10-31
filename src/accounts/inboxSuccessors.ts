@@ -1,4 +1,4 @@
-import { and, eq, gt, lte, sql, type SQLWrapper } from 'drizzle-orm'
+import { and, eq, gt, lt, lte, sql, type SQLWrapper } from 'drizzle-orm'
 import { accountInboxes, accounts, inboxSuccessors } from './schema'
 import { changes, type AccountsDb } from './store'
 
@@ -28,6 +28,29 @@ const isCurrentLink = (
     WHERE ${accountInboxes.inboxId} = ${inboxId}
       AND ${accountInboxes.accountId} = ${accountId}
       AND ${accountInboxes.keyEpoch} = ${accounts.keyEpoch})`
+
+/**
+ * Whether `inboxId` was first linked to its account at a key epoch below the
+ * account's current one, whatever the link's `keyEpoch` says now. Its owner
+ * key comes from the account key it was linked under, so the relay refuses
+ * its owner-signed requests for good (`src/buddies/route.ts`). One lookup by
+ * primary key on each table.
+ */
+export const isOldKeyLink = async (
+  db: AccountsDb,
+  inboxId: string
+): Promise<boolean> =>
+  (await db
+    .select({ inboxId: accountInboxes.inboxId })
+    .from(accountInboxes)
+    .innerJoin(accounts, eq(accounts.id, accountInboxes.accountId))
+    .where(
+      and(
+        eq(accountInboxes.inboxId, inboxId),
+        lt(accountInboxes.firstKeyEpoch, accounts.keyEpoch)
+      )
+    )
+    .get()) != null
 
 /**
  * Records `successorId` for `inboxId` only while (in the same statement, so a
