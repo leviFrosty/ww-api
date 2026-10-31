@@ -9,6 +9,7 @@ import {
 } from '../openapi/schemas'
 import { DEFAULT_SCRIBE_LIMITS, DEFAULT_SCRIBE_MODEL } from './config'
 import { TRANSCRIBE_MAX_BYTES } from './transcribe'
+import { SCRIBE_APP_PLATFORMS } from './wire'
 
 /**
  * OpenAPI descriptions for Scribe AI (`src/scribe/route.ts`). Doc-only: the
@@ -168,7 +169,9 @@ const stepRequestSchema = z.object({
   }),
   app: z.object({
     version: z.string().meta({ description: '`x.y.z`' }),
-    platform: z.enum(['ios', 'android']),
+    platform: z.enum(SCRIBE_APP_PLATFORMS).meta({
+      description: 'The client: `ios`, `android`, or `web` (the browser app). Analytics use the session’s platform, not this field.',
+    }),
     locale: z.string().meta({ description: 'BCP-47 app Language; the model replies in it.' }),
   }),
   tools: z.array(toolSchema).meta({

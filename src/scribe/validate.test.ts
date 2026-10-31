@@ -291,6 +291,15 @@ describe('validateStepRequest', () => {
     expect(validated.value.tools).toHaveLength(SCRIBE_TOOLS.length)
   })
 
+  it.each(['ios', 'android', 'web'])('accepts app.platform %s', (platform) => {
+    const validated = validateStepRequest(
+      body({ app: { version: '1.46.0', platform, locale: 'en-US' } }),
+      LIMITS
+    )
+    if (!validated.ok) throw new Error(validated.rule)
+    expect(validated.value.app.platform).toBe(platform)
+  })
+
   it.each([
     [{ conversationId: 'abc' }, [400, 'bad_request', 'conversation_id']],
     [{ turnId: '01jaaaaaaaaaaaaaaaaaaaaaaa' }, [400, 'bad_request', 'turn_id']],
@@ -298,7 +307,8 @@ describe('validateStepRequest', () => {
     [{ step: 1.5 }, [400, 'bad_request', 'step']],
     [{ step: 6 }, [400, 'step_limit', 'step_limit']],
     [{ app: { version: '1.46', platform: 'ios', locale: 'en-US' } }, [400, 'bad_request', 'app']],
-    [{ app: { version: '1.46.0', platform: 'web', locale: 'en-US' } }, [400, 'bad_request', 'app']],
+    [{ app: { version: '1.46.0', platform: 'dev', locale: 'en-US' } }, [400, 'bad_request', 'app']],
+    [{ app: { version: '1.46.0', platform: 'IOS', locale: 'en-US' } }, [400, 'bad_request', 'app']],
     [{ context: { ...scribeContext(), v: 2 } }, [400, 'bad_request', 'context']],
     [{ context: { ...scribeContext(), pad: 'x'.repeat(16_384) } }, [413, 'too_large', 'context_bytes']],
     [{ tools: [tool({ access: 'admin' })] }, [400, 'invalid_tools', 'tool_access']],
