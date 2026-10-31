@@ -2075,7 +2075,7 @@ export const syncPhotoPutDocs = describeRoute({
   summary: "Upload a Cloud Sync photo",
   description: `Stores a photo’s end-to-end encrypted blob once under its name. The body is the raw blob, at most 25 MiB, with \`x-ww-photo-name\`, \`b64u(SHA-256(body))\` in \`x-ww-sha256\`, the sealed filename in \`x-ww-photo-meta\` (base64url, at most 512 characters), and \`Content-Length\`. The server always reads the body to the end before it answers.
 
-A live name answers \`existed: true\` with the stored photo, writes nothing, and adds no bytes (it still counts as a put). A name deleted within 30 days comes back with the new blob. A put that would take the live photos over the limit is 429 \`storage_full\` with \`usage\`, checked when the put starts (counting other uploads in flight, held up to 2 minutes) and again when it commits. A put whose name is deleted while it uploads is 409 \`conflict\`; on an account with no slot, 409 \`no_slot\`. A stored photo advances \`seq\` and sends \`changed\` to every live socket but \`x-ww-slot-id\`’s.
+A live name answers \`existed: true\` with the stored photo, writes nothing, and adds no bytes (it still counts as a put). A name deleted within 30 days comes back with the new blob. A put that would take the live photos over the limit is 429 \`storage_full\` with \`usage\`, checked when the put starts (counting other uploads in flight, each held for its reservation: 2 minutes, longer for a large body) and again when it commits. A put whose name is deleted while it uploads is 409 \`conflict\`; on an account with no slot, 409 \`no_slot\`. A stored photo advances \`seq\` and sends \`changed\` to every live socket but \`x-ww-slot-id\`’s.
 
 ${SYNC_ENTITLED}
 

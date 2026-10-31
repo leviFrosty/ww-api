@@ -27,6 +27,7 @@ import {
   SYNC_LIMITS,
   SYNC_LIVE_CLOSE,
   SYNC_PHOTO_LIMITS,
+  photoPutReservationMs,
   isSyncSlotId,
   syncObjectKey,
   syncPhotoLimitBytes,
@@ -551,7 +552,7 @@ export class AccountSync extends DurableObject<Environment> {
         logLimitHit('sync/photos/put', 'nameInFlight')
         return fail(
           'rate_limited',
-          seconds(reserved.at + SYNC_PHOTO_LIMITS.putReservationMs - now)
+          seconds(reserved.at + photoPutReservationMs(reserved.size) - now)
         )
       }
       if (this.#count('SELECT COUNT(*) AS n FROM slot') === 0)
@@ -618,7 +619,7 @@ export class AccountSync extends DurableObject<Environment> {
         this.#sql.exec('DELETE FROM photo_reservation WHERE name = ?', args.name)
         if (
           reserved.cancelled ||
-          now - reserved.at > SYNC_PHOTO_LIMITS.putReservationMs
+          now - reserved.at > photoPutReservationMs(reserved.size)
         )
           return fail('conflict')
         if (this.#count('SELECT COUNT(*) AS n FROM slot') === 0)
@@ -1426,15 +1427,22 @@ export class AccountSync extends DurableObject<Environment> {
   /** Frees lapsed reservations; their puts may have left an object behind. */
   #dropExpiredPhotoReservations(now: number): void {
     if (!this.#ready()) return
-    const dropped = this.#count(
-      'SELECT COUNT(*) AS n FROM photo_reservation WHERE at < ?',
-      now - SYNC_PHOTO_LIMITS.putReservationMs
-    )
-    if (dropped === 0) return
-    this.#sql.exec(
-      'DELETE FROM photo_reservation WHERE at < ?',
-      now - SYNC_PHOTO_LIMITS.putReservationMs
-    )
+    // A reservation lasts as long as its size allows, so a row only past the
+    // shortest one is looked at.
+    const lapsed = this.#sql
+      .exec<{ name: string; at: number; size: number }>(
+        'SELECT name, at, size FROM photo_reservation WHERE at < ?',
+        now - SYNC_PHOTO_LIMITS.putReservationMs
+      )
+      .toArray()
+      .filter((row) => now - row.at > photoPutReservationMs(row.size))
+    if (lapsed.length === 0) return
+    for (const row of lapsed)
+      this.#sql.exec(
+        'DELETE FROM photo_reservation WHERE name = ? AND at = ?',
+        row.name,
+        row.at
+      )
     this.#requestSweep()
   }
 
