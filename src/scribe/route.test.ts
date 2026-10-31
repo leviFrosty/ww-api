@@ -514,6 +514,13 @@ describe('POST /scribe/v1/step refusals', () => {
     expect(reply.body.code).toBe('invalid_tools')
   })
 
+  it('400 bad_request for an unknown app.platform', async () => {
+    const app = { version: '1.46.0', platform: 'windows', locale: 'en-US' }
+    const reply = await refusal(await step(await iosToken(), firstStep(newTurn(), { app })))
+    expect(reply.status).toBe(400)
+    expect(reply.body.code).toBe('bad_request')
+  })
+
   it('400 step_limit at maxStepsPerTurn', async () => {
     const reply = await refusal(await step(await iosToken(), laterStep(newTurn(), 6)))
     expect(reply.status).toBe(400)
@@ -653,6 +660,13 @@ describe('POST /scribe/v1/step stream', () => {
     expect(ok).toBe(true)
     expect(terminal.meter).toEqual(snapshot)
     expect(snapshot.windows[0].units.used).toBe(3_275)
+  })
+
+  it.each(['ios', 'android', 'web'])('streams a step from app.platform %s', async (platform) => {
+    scripts.push(play({ type: 'text-delta', text: 'Ok.' }, ...ending('stop', usage(100, 0, 10, 0, 0))))
+    const app = { version: '1.46.0', platform, locale: 'en-US' }
+    const { terminal } = await runStep(await iosToken(), firstStep(newTurn(), { app }))
+    expect(terminal.type).toBe('done')
   })
 
   it('sends the static prompt, the context, and the offered tools to the model', async () => {
