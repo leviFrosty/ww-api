@@ -660,6 +660,50 @@ Links. Clients are iOS and Android
   through: one more reason to turn `auth:legacy` off before relying on
   suspension. `owner_account` needs no migration (created in
   place at registration, `confirmed` added in place).
+- **Inbox successor** (witness-work ADR 0039 §5; the protocol's "Inbox
+  successor"): after a key change the app deletes its old inbox with
+  `inbox/delete` `{ inboxId, successor }`, and buddies check a
+  `pair.reconnect` with `POST /buddies/v1/inbox/successor` `{ inboxId }` →
+  `{ ok, successor }` (any account's bearer token, read tier, kill switch
+  applies, no legacy form). Code in `src/accounts/inboxSuccessors.ts` and
+  `deleteWithSuccessor`/`handleSuccessor` in `route.ts`; D1 table
+  `inbox_successors` and `account_inboxes.key_epoch` (migration
+  `0008_inbox-successor.sql`, which backfills each link with the epoch its
+  account had when it was linked, from `retired_account_keys`: 0 for every
+  account that never changed its key; a link made within a second after a
+  change counts as the old key's). A link records the epoch of the key
+  that verified its proof (read with that key, so a key change landing in
+  between leaves it at the old epoch), and a later proof by a newer key
+  moves an existing link up (`confirmInboxLink`). Recording is one
+  insert-select (`recordInboxSuccessor`) gated on the deleted inbox being
+  the token's account's (linked, or already replaced by it), the successor
+  being another inbox linked to it at its current epoch with no successor
+  of its own, and the caller's session being live at that epoch, after the
+  successor's DO said it's registered (`isRegistered`, read-only); then the
+  inbox DO deletes, and the deleted inbox's link is dropped
+  (`unlinkReplacedInbox`). An inbox with any successor recorded is never
+  registered again (409 `conflict` in `checkInboxAccount`, bearer or legacy,
+  proof or not; a legacy registration while D1 is down still falls back to
+  registering unlinked, as before). A legacy request naming `successor` is 403
+  `forbidden`, another account's inbox 403, a suspended account 403
+  `suspended` (deleting without a successor still works), an ended session
+  401, a bad successor 409 `conflict` with nothing deleted. The first record wins
+  while it still qualifies (another successor is 409; the same one
+  refreshes it), and one that no longer does (from before a key change) is
+  replaced, in the upsert's own `WHERE`. A repeat answers `ok` once the DO
+  says `not_found` (`buddies.deleted` is logged only for the real
+  deletion), and a DO refusal or a throw drops the record again (a retry
+  records it once more). The read checks every time that the successor is
+  still linked to the same account at its current epoch and that the
+  account isn't suspended, and answers `null` otherwise (so a K1 holder's
+  record from before the change is never vouched for after it), or after
+  90 days; the hourly cron prunes rows 90 days old. It tells anyone with a
+  token who knows the old inbox id that it was replaced, and by which inbox.
+  The guarantee holds only after the key change: buddies who accept a K1
+  holder's reconnect before it aren't recovered, and the old inbox must be
+  linked to the account before the change (the app links it first and
+  skips the invites if it can't), since another account holding the old
+  key could link an unlinked old inbox and name its own successor.
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
@@ -677,8 +721,9 @@ Links. Clients are iOS and Android
     client IP (IPv6 by /64); never the target inbox. The budgets were sized
     per IP, so one account gets the same. `BUDDIES_RATE_LIMITER` 120/min for
     `invite/fetch` + `invite/claim`, `BUDDIES_REGISTER_LIMITER` 60/min for
-    `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync` +
-    `inbox/live`, `BUDDIES_BLOB_PUT_LIMITER` 60/min for `blob/put`,
+    `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync`,
+    `inbox/live`, and `inbox/successor`, `BUDDIES_BLOB_PUT_LIMITER` 60/min
+    for `blob/put`,
     `BUDDIES_BLOB_GET_LIMITER` 600/min for `blob/get`,
     `BUDDIES_WRITE_LIMITER` 600/min for every other op (namespaces 1002-1007
     prod, 2002-2007 dev; `limits.test.ts` keeps `wrangler.toml` equal to the
@@ -1546,6 +1591,9 @@ deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
   counted from `account.key_changed` entries (checked first for
   `Retry-After`, and again in the swap's own statement), plus the register
   edge tier.
+- **Buddies**: inbox links record the key epoch whose key signed them, and
+  `inbox/delete` with `successor` records the new inbox for buddies' reconnect
+  checks, only for a link at the current epoch (Buddies → Inbox successor).
 - **Privacy**: never log or report keys, the history blob, wraps, credential
   ids, account ids, or session ids. The history is sealed by the devices; the
   server stores it opaque.
