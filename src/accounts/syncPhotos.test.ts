@@ -1,22 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  createHarness,
-  randomBytes,
-  sha256B64u,
-  type Harness,
-} from '../test/buddies'
-import {
-  bearer,
-  openTestSession,
-  postJson,
-  requestJson,
-  type TestSession,
-} from '../test/accounts'
+import { createHarness, randomBytes, sha256B64u, type Harness } from '../test/buddies'
+import { bearer, openTestSession, postJson, requestJson, type TestSession } from '../test/accounts'
 import type { FakeWebSocket } from '../test/durableObjects'
 import { createAccountsRoutes } from './route'
 import { resetSyncEntitlementCache } from './sync'
 import { resetSessionCapabilitiesCache } from './sessionStore'
-import { SYNC_LIMITS, SYNC_PHOTO_LIMITS } from './syncContracts'
+import { photoPutReservationMs, SYNC_LIMITS, SYNC_PHOTO_LIMITS } from './syncContracts'
 import { accountSupporterStatus } from './supporter'
 
 vi.mock('cloudflare:workers', () => ({
@@ -79,9 +68,7 @@ const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
  * also serves browser sockets' expiry, so firing it early alone runs nothing.
  */
 const runRetention = async (accountId: string) => {
-  h.syncIndexes
-    .storage(accountId)
-    .query('UPDATE alarm_schedule SET retention_at = ?', Date.now())
+  h.syncIndexes.storage(accountId).query('UPDATE alarm_schedule SET retention_at = ?', Date.now())
   await h.syncIndexes.fireAlarm(accountId)
 }
 const PHONE = 'phone-slot-1'
@@ -90,16 +77,11 @@ const meta = () => Buffer.from(randomBytes(90)).toString('base64url')
 /** The keys of `photo`'s objects (one per put that stored, until purged). */
 const keysOf = (s: TestSession, photo: string) =>
   [...h.photoBlobs.objects.keys()].filter((k) => k.startsWith(`v1/${s.accountId}/${photo}/`))
-const bytesOf = (s: TestSession, photo: string) =>
-  keysOf(s, photo).map((k) => h.photoBlobs.objects.get(k)!.bytes)
+const bytesOf = (s: TestSession, photo: string) => keysOf(s, photo).map((k) => h.photoBlobs.objects.get(k)!.bytes)
 const code = (body: unknown) => (body as { code?: string }).code
 
 const request = (path: string, init: RequestInit) =>
-  (app as { request: typeof fetch }).request(
-    path,
-    { duplex: 'half', ...init } as RequestInit,
-    h.env as never
-  )
+  (app as { request: typeof fetch }).request(path, { duplex: 'half', ...init } as RequestInit, h.env as never)
 
 const put = async (
   s: TestSession,
@@ -134,8 +116,7 @@ const del = (s: TestSession, body: unknown) =>
   postJson(app as never, h.env, '/sync/photos/delete', body, bearer(s.accessToken))
 
 const usage = async (s: TestSession) =>
-  (await requestJson(app as never, h.env, 'GET', '/sync/photos/usage', undefined, bearer(s.accessToken)))
-    .body.usage
+  (await requestJson(app as never, h.env, 'GET', '/sync/photos/usage', undefined, bearer(s.accessToken))).body.usage
 
 const status = async (s: TestSession) =>
   (await requestJson(app as never, h.env, 'GET', '/sync', undefined, bearer(s.accessToken))).body
@@ -149,10 +130,7 @@ const get = async (s: TestSession, photo: string) => {
   return {
     status: response.status,
     headers: response.headers,
-    bytes:
-      response.status === 200
-        ? new Uint8Array(await response.arrayBuffer())
-        : null,
+    bytes: response.status === 200 ? new Uint8Array(await response.arrayBuffer()) : null,
     body: response.status === 200 ? null : await response.json(),
   }
 }
@@ -168,7 +146,11 @@ const bareSession = () => openTestSession(app as never, h.env, undefined, CURREN
 const live = async (s: TestSession, slotId: string) => {
   const response = (await request('/sync/live', {
     method: 'GET',
-    headers: { ...bearer(s.accessToken), upgrade: 'websocket', 'x-ww-slot-id': slotId },
+    headers: {
+      ...bearer(s.accessToken),
+      upgrade: 'websocket',
+      'x-ww-slot-id': slotId,
+    },
   })) as Response & { webSocket?: FakeWebSocket | null }
   return response.webSocket!
 }
@@ -208,19 +190,14 @@ async function slotPut(s: TestSession, slotId: string) {
 const slotDelete = (s: TestSession, body: Record<string, unknown>) =>
   postJson(app as never, h.env, '/sync/delete', body, bearer(s.accessToken))
 
-const slotList = (s: TestSession) =>
-  postJson(app as never, h.env, '/sync/list', {}, bearer(s.accessToken))
+const slotList = (s: TestSession) => postJson(app as never, h.env, '/sync/list', {}, bearer(s.accessToken))
 
 /** Usage must always equal the live rows' sum. */
 const expectExactUsage = (s: TestSession) => {
   const [row] = h.syncIndexes
     .storage(s.accountId)
-    .query(
-      'SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS count FROM photo WHERE deleted_at IS NULL'
-    )
-  return expect(
-    h.syncIndexes.storage(s.accountId).query('SELECT bytes, count FROM photo_state')[0]
-  ).toEqual(row)
+    .query('SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS count FROM photo WHERE deleted_at IS NULL')
+  return expect(h.syncIndexes.storage(s.accountId).query('SELECT bytes, count FROM photo_state')[0]).toEqual(row)
 }
 
 /** Holds the next `ACCOUNT_PHOTOS` put until `release()`. */
@@ -347,7 +324,9 @@ describe('put, list, get, delete, usage', () => {
     })
     expect(h.photoBlobs.calls.filter((call) => call.startsWith('put'))).toHaveLength(1)
     expect(
-      h.syncIndexes.storage(s.accountId).query("SELECT SUM(n) AS n, SUM(bytes) AS bytes FROM photo_rate WHERE kind = 'put'")
+      h.syncIndexes
+        .storage(s.accountId)
+        .query("SELECT SUM(n) AS n, SUM(bytes) AS bytes FROM photo_rate WHERE kind = 'put'")
     ).toEqual([{ n: 2, bytes: 700 }])
     expectExactUsage(s)
   })
@@ -391,7 +370,11 @@ describe('put, list, get, delete, usage', () => {
       names.filter((_, i) => i !== 3).slice(0, 1_000)
     )
     expect(first.body.cursor).toEqual(expect.any(String))
-    expect(first.body.usage).toEqual({ bytes: 10_010, count: 1_001, limit: LIMIT })
+    expect(first.body.usage).toEqual({
+      bytes: 10_010,
+      count: 1_001,
+      limit: LIMIT,
+    })
     const second = await list(s, { cursor: first.body.cursor })
     expect(second.body).toMatchObject({
       photos: [{ name: names[1_001] }],
@@ -472,18 +455,26 @@ describe('change notices', () => {
     expect(phone.messages().at(-1)).toEqual({ type: 'changed', seq: 3 })
     expect(tablet.messages().at(-1)).toEqual({ type: 'changed', seq: 3 })
     await put(s, await name())
-    await del(s, { all: true, }, )
+    await del(s, { all: true })
     expect(tablet.messages().at(-1)).toEqual({ type: 'changed', seq: 5 })
     expect((await slotList(s)).body).toMatchObject({ seq: 5 })
   })
 
   it('refuses a malformed x-ww-slot-id', async () => {
     const s = await session()
-    expect((await put(s, await name(), randomBytes(10), { 'x-ww-slot-id': 'bad' })).body).toMatchObject({ code: 'bad_request' })
-    const response = await postJson(app as never, h.env, '/sync/photos/delete', { all: true }, {
-      ...bearer(s.accessToken),
-      'x-ww-slot-id': 'bad',
+    expect((await put(s, await name(), randomBytes(10), { 'x-ww-slot-id': 'bad' })).body).toMatchObject({
+      code: 'bad_request',
     })
+    const response = await postJson(
+      app as never,
+      h.env,
+      '/sync/photos/delete',
+      { all: true },
+      {
+        ...bearer(s.accessToken),
+        'x-ww-slot-id': 'bad',
+      }
+    )
     expect(response.body).toMatchObject({ code: 'bad_request' })
   })
 })
@@ -520,7 +511,10 @@ describe('storage limit', () => {
     const first = put(s, await name(), randomBytes(600))
     await vi.waitFor(() => expect(h.photoBlobs.put).toHaveBeenCalled())
     const second = await put(s, await name(), randomBytes(600))
-    expect(second.body).toMatchObject({ code: 'storage_full', usage: { bytes: 0, count: 0 } })
+    expect(second.body).toMatchObject({
+      code: 'storage_full',
+      usage: { bytes: 0, count: 0 },
+    })
     held.release()
     expect((await first).status).toBe(200)
     expect(await usage(s)).toEqual({ bytes: 600, count: 1, limit: 1_000 })
@@ -537,7 +531,10 @@ describe('storage limit', () => {
     held.release()
     const refused = await putting
     expect(refused.status).toBe(429)
-    expect(refused.body).toMatchObject({ code: 'storage_full', usage: { bytes: 0, count: 0, limit: 500 } })
+    expect(refused.body).toMatchObject({
+      code: 'storage_full',
+      usage: { bytes: 0, count: 0, limit: 500 },
+    })
     expect(keysOf(s, photo)).toEqual([])
     expect((await get(s, photo)).status).toBe(404)
     expectExactUsage(s)
@@ -556,7 +553,9 @@ describe('storage limit', () => {
       meta: 'bWV0YQ',
     })
     expect(begun.ok).toBe(true)
-    expect((await put(s, await name(), randomBytes(300))).body).toMatchObject({ code: 'storage_full' })
+    expect((await put(s, await name(), randomBytes(300))).body).toMatchObject({
+      code: 'storage_full',
+    })
     // One put a name at a time.
     expect((await put(s, stuck)).body).toMatchObject({ code: 'rate_limited' })
     advance(SYNC_PHOTO_LIMITS.putReservationMs + 1)
@@ -579,6 +578,107 @@ describe('storage limit', () => {
     expectExactUsage(s)
   })
 
+  describe('a put on a slow link', () => {
+    const MIB = 1024 * 1024
+    const beginBig = async (s: TestSession, size: number) => {
+      const index = h.syncIndexes.object(s.accountId)
+      const photo = await name()
+      const begun = await index.beginPhotoPut({
+        accountId: s.accountId,
+        name: photo,
+        size,
+        sha256: await name(),
+        meta: 'bWV0YQ',
+      })
+      if (!begun.ok || !('reservation' in begun.value)) throw new Error('begin')
+      return { index, photo, reservation: begun.value.reservation }
+    }
+
+    it('keeps the reservation of a large put while its body still arrives', async () => {
+      const s = await session()
+      const { index, photo, reservation } = await beginBig(s, 20 * MIB)
+      // At 100 KB/s the body takes more than three minutes.
+      advance(3 * MINUTE + 30 * SECOND)
+      // Still in flight: the name is held, and its retry is told when to come.
+      const retry = await put(s, photo)
+      expect(retry.body).toMatchObject({ code: 'rate_limited' })
+      expect(Number(retry.headers.get('retry-after'))).toBeGreaterThan(60)
+      expect(
+        await index.commitPhotoPut({
+          accountId: s.accountId,
+          name: photo,
+          reservation,
+        })
+      ).toMatchObject({ ok: true })
+    })
+
+    it('sizes the reservation to the body at 50 KiB/s plus a minute, from 2 to 10 minutes', async () => {
+      const s = await session()
+      for (const [size, minutes] of [
+        [1, 2],
+        [5 * MIB, 2.7],
+        [25 * MIB, 9.5],
+      ] as const) {
+        const { index, photo, reservation } = await beginBig(s, size)
+        advance((minutes - 0.1) * MINUTE)
+        expect((await put(s, photo)).body, `${size} held`).toMatchObject({
+          code: 'rate_limited',
+        })
+        advance(0.2 * MINUTE)
+        expect(
+          await index.commitPhotoPut({
+            accountId: s.accountId,
+            name: photo,
+            reservation,
+          }),
+          `${size} lapsed`
+        ).toMatchObject({ ok: false, error: 'conflict' })
+      }
+    })
+
+    it('frees a large put’s space when its window lapses, and not before', async () => {
+      h.env.SYNC_PHOTO_LIMIT_BYTES = String(30 * MIB)
+      const s = await session()
+      const { photo } = await beginBig(s, 25 * MIB)
+      advance(3 * MINUTE)
+      expect((await put(s, await name(), randomBytes(10 * MIB))).body).toMatchObject({
+        code: 'storage_full',
+      })
+      advance(7 * MINUTE)
+      const again = await session(s.key)
+      expect((await put(again, await name(), randomBytes(10 * MIB))).status).toBe(200)
+      expect((await put(again, photo, randomBytes(100))).status).toBe(200)
+    })
+
+    it('stores a put whose R2 write ended minutes after it began', async () => {
+      const s = await session()
+      const original = h.photoBlobs.put.bind(h.photoBlobs)
+      vi.spyOn(h.photoBlobs, 'put').mockImplementationOnce(async (...args) => {
+        advance(150 * SECOND)
+        return original(...args)
+      })
+      const photo = await name()
+      const stored = await put(s, photo, randomBytes(6 * MIB))
+      expect(stored.status).toBe(200)
+      expect(keysOf(s, photo)).toHaveLength(1)
+      expectExactUsage(s)
+    })
+
+    it('refuses a put whose upload outlives its window and stores nothing', async () => {
+      const s = await session()
+      const original = h.photoBlobs.put.bind(h.photoBlobs)
+      vi.spyOn(h.photoBlobs, 'put').mockImplementationOnce(async (...args) => {
+        advance(4 * MINUTE)
+        return original(...args)
+      })
+      const photo = await name()
+      const late = await put(s, photo, randomBytes(6 * MIB))
+      expect(late.status).toBe(409)
+      expect(late.body).toMatchObject({ code: 'conflict' })
+      expect(keysOf(s, photo)).toEqual([])
+    })
+  })
+
   it('frees the space of a put whose body or R2 write failed', async () => {
     h.env.SYNC_PHOTO_LIMIT_BYTES = '1000'
     const s = await session()
@@ -591,6 +691,118 @@ describe('storage limit', () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
     expect((await put(s, await name(), bytes)).status).toBe(500)
     expect((await put(s, await name(), bytes)).status).toBe(200)
+  })
+
+  describe('a put whose body is cut off', () => {
+    /** A put whose connection drops after `sent` bytes of `bytes`. */
+    const cutOff = async (s: TestSession, photo: string, bytes: Uint8Array, sent: number) => {
+      let offset = 0
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset >= sent) {
+            controller.error(new Error('connection lost'))
+            return
+          }
+          controller.enqueue(bytes.slice(offset, offset + 100))
+          offset += 100
+        },
+      })
+      return request('/sync/photos/put', {
+        method: 'POST',
+        headers: {
+          ...bearer(s.accessToken),
+          'content-length': String(bytes.byteLength),
+          'x-ww-photo-name': photo,
+          'x-ww-sha256': await sha256B64u(bytes),
+          'x-ww-photo-meta': meta(),
+        },
+        body: stream,
+      })
+    }
+
+    it('takes an immediate retry of the same name, not a 429 until the window lapses', async () => {
+      const s = await session()
+      const photo = await name()
+      const bytes = randomBytes(800)
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      expect((await cutOff(s, photo, bytes, 300)).status).toBeGreaterThanOrEqual(500)
+      const retry = await put(s, photo, bytes)
+      expect(retry.status).toBe(200)
+      expect(retry.body).toMatchObject({ ok: true, existed: false })
+      expect(bytesOf(s, photo)).toHaveLength(1)
+    })
+
+    it('frees the space it reserved at once', async () => {
+      h.env.SYNC_PHOTO_LIMIT_BYTES = '1000'
+      const s = await session()
+      const bytes = randomBytes(900)
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      expect((await cutOff(s, await name(), bytes, 300)).status).toBeGreaterThanOrEqual(500)
+      // 900 of 1,000 would be reserved still, and this 900 would be refused.
+      const other = await put(s, await name(), bytes)
+      expect(other.status).toBe(200)
+      expect(other.body).toMatchObject({ usage: { bytes: 900 } })
+    })
+
+    it('asks the runtime to finish the release after the client has gone', async () => {
+      const s = await session()
+      const photo = await name()
+      const bytes = randomBytes(800)
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      // A disconnect cancels what a request still has pending unless it is
+      // handed to waitUntil.
+      const waited: Promise<unknown>[] = []
+      const ctx = {
+        waitUntil: (promise: Promise<unknown>) => waited.push(promise),
+        passThroughOnException: () => undefined,
+      }
+      let offset = 0
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset >= 300) {
+            controller.error(new Error('connection lost'))
+            return
+          }
+          controller.enqueue(bytes.slice(offset, offset + 100))
+          offset += 100
+        },
+      })
+      const response = await (app as { request: typeof fetch }).request(
+        '/sync/photos/put',
+        {
+          method: 'POST',
+          duplex: 'half',
+          headers: {
+            ...bearer(s.accessToken),
+            'content-length': String(bytes.byteLength),
+            'x-ww-photo-name': photo,
+            'x-ww-sha256': await sha256B64u(bytes),
+            'x-ww-photo-meta': meta(),
+          },
+          body: stream,
+        } as RequestInit,
+        h.env as never,
+        ctx as never
+      )
+      expect(response.status).toBeGreaterThanOrEqual(500)
+      expect(waited).toHaveLength(1)
+      await Promise.all(waited)
+      expect((await put(s, photo, bytes)).status).toBe(200)
+    })
+
+    it('frees a large put’s reservation before its window lapses', async () => {
+      const s = await session()
+      const photo = await name()
+      const bytes = randomBytes(8 * 1024 * 1024)
+      vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      expect((await cutOff(s, photo, bytes, 100_000)).status).toBeGreaterThanOrEqual(500)
+      const index = h.syncIndexes.object(s.accountId)
+      // Seconds in, nothing of it is held: not the name, not its bytes.
+      advance(5 * SECOND)
+      const retry = await put(s, photo, bytes)
+      expect(retry.status).toBe(200)
+      expect((await index.listPhotos({ cursor: null })).usage.bytes).toBe(bytes.byteLength)
+    })
   })
 
   it('uses 2,000,000,000 bytes unless SYNC_PHOTO_LIMIT_BYTES is a positive integer', async () => {
@@ -806,10 +1018,18 @@ describe('retention', () => {
   it('keeps a sweep asked for while one runs', async () => {
     const s = await session()
     const index = h.syncIndexes.object(s.accountId)
-    await index.abortPhotoPut({ name: await name(), reservation: 'gone', wrote: true })
+    await index.abortPhotoPut({
+      name: await name(),
+      reservation: 'gone',
+      wrote: true,
+    })
     const original = h.photoBlobs.list.bind(h.photoBlobs)
     vi.spyOn(h.photoBlobs, 'list').mockImplementationOnce(async (...args) => {
-      await index.abortPhotoPut({ name: await name(), reservation: 'gone', wrote: true })
+      await index.abortPhotoPut({
+        name: await name(),
+        reservation: 'gone',
+        wrote: true,
+      })
       return original(...args)
     })
     await runRetention(s.accountId)
@@ -822,11 +1042,20 @@ describe('retention', () => {
     const s = await session()
     const index = h.syncIndexes.object(s.accountId)
     const photo = await name()
-    const begun = await index.beginPhotoPut({ accountId: s.accountId, name: photo, size: 4, sha256: photo, meta: 'bQ' })
+    const begun = await index.beginPhotoPut({
+      accountId: s.accountId,
+      name: photo,
+      size: 4,
+      sha256: photo,
+      meta: 'bQ',
+    })
     if (!begun.ok || !('reservation' in begun.value)) throw new Error('begin')
     // The Worker wrote R2, then died before the commit.
     const orphan = `v1/${s.accountId}/${photo}/${begun.value.reservation}`
-    h.photoBlobs.objects.set(orphan, { bytes: randomBytes(4), uploaded: Date.now() })
+    h.photoBlobs.objects.set(orphan, {
+      bytes: randomBytes(4),
+      uploaded: Date.now(),
+    })
     const kept = await name()
     await put(s, kept)
     await runRetention(s.accountId)
@@ -892,7 +1121,9 @@ describe('switches', () => {
   it('falls back to the SYNC_PHOTOS var, else on', async () => {
     const s = await session()
     h.env.SYNC_PHOTOS = 'off'
-    expect((await put(s, await name())).body).toMatchObject({ code: 'photos_disabled' })
+    expect((await put(s, await name())).body).toMatchObject({
+      code: 'photos_disabled',
+    })
     await h.kv.put('sync:photos', 'on')
     expect((await put(s, await name())).status).toBe(200)
     await h.kv.delete('sync:photos')
@@ -989,12 +1220,16 @@ describe('refusals', () => {
       { names: [] },
       { names: 'x' },
       { names: ['bad'] },
-      { names: Array.from({ length: 101 }, (_, i) => `${'a'.repeat(40)}${String(i).padStart(3, '0')}`) },
+      {
+        names: Array.from({ length: 101 }, (_, i) => `${'a'.repeat(40)}${String(i).padStart(3, '0')}`),
+      },
       { all: false },
       { all: true, names: [] },
       [],
     ])
-      expect((await del(s, body)).body, JSON.stringify(body)).toMatchObject({ code: 'bad_request' })
+      expect((await del(s, body)).body, JSON.stringify(body)).toMatchObject({
+        code: 'bad_request',
+      })
     expect((await list(s, { cursor: 7 })).status).toBe(400)
   })
 
@@ -1036,10 +1271,17 @@ describe('refusals', () => {
     const s = await session()
     h.syncIndexes
       .storage(s.accountId)
-      .query("INSERT INTO photo_rate VALUES ('put', ?, ?, 0)", Math.floor(START / MINUTE), SYNC_PHOTO_LIMITS.accountPutsPerDay)
+      .query(
+        "INSERT INTO photo_rate VALUES ('put', ?, ?, 0)",
+        Math.floor(START / MINUTE),
+        SYNC_PHOTO_LIMITS.accountPutsPerDay
+      )
     const over = await put(s, await name())
     expect(over.status).toBe(429)
-    expect(over.body).toMatchObject({ code: 'rate_limited', retryAfter: 24 * 60 * 60 + 60 })
+    expect(over.body).toMatchObject({
+      code: 'rate_limited',
+      retryAfter: 24 * 60 * 60 + 60,
+    })
     expect(over.headers.get('retry-after')).toBe(String(24 * 60 * 60 + 60))
     advance(DAY + MINUTE)
     const again = await session(s.key)
@@ -1054,15 +1296,28 @@ describe('refusals', () => {
     storage.query("INSERT INTO photo_rate VALUES ('put', ?, 0, 50)", now - 600)
     storage.query("INSERT INTO photo_rate VALUES ('put', ?, ?, 0)", now - 300, SYNC_PHOTO_LIMITS.accountPutsPerDay)
     const over = await put(s, await name())
-    expect(over.body).toMatchObject({ code: 'rate_limited', retryAfter: (DAY - 300 * MINUTE + MINUTE) / SECOND })
+    expect(over.body).toMatchObject({
+      code: 'rate_limited',
+      retryAfter: (DAY - 300 * MINUTE + MINUTE) / SECOND,
+    })
     // Bytes: the oldest bucket frees 50, the put needs 100 freed.
-    storage.query("DELETE FROM photo_rate")
+    storage.query('DELETE FROM photo_rate')
     storage.query("INSERT INTO photo_rate VALUES ('put', ?, 1, 50)", now - 600)
-    storage.query("INSERT INTO photo_rate VALUES ('put', ?, 1, ?)", now - 300, SYNC_PHOTO_LIMITS.accountPutBytesPerDay - 150)
+    storage.query(
+      "INSERT INTO photo_rate VALUES ('put', ?, 1, ?)",
+      now - 300,
+      SYNC_PHOTO_LIMITS.accountPutBytesPerDay - 150
+    )
     const heavy = await put(s, await name(), randomBytes(200))
-    expect(heavy.body).toMatchObject({ code: 'rate_limited', retryAfter: (DAY - 300 * MINUTE + MINUTE) / SECOND })
+    expect(heavy.body).toMatchObject({
+      code: 'rate_limited',
+      retryAfter: (DAY - 300 * MINUTE + MINUTE) / SECOND,
+    })
     const light = await put(s, await name(), randomBytes(120))
-    expect(light.body).toMatchObject({ code: 'rate_limited', retryAfter: (DAY - 600 * MINUTE + MINUTE) / SECOND })
+    expect(light.body).toMatchObject({
+      code: 'rate_limited',
+      retryAfter: (DAY - 600 * MINUTE + MINUTE) / SECOND,
+    })
   })
 
   it('counts stored and existed puts, not refused ones', async () => {
@@ -1074,7 +1329,9 @@ describe('refusals', () => {
     await put(s, await name(), randomBytes(600))
     await put(s, await name(), randomBytes(10), { 'x-ww-photo-meta': '!' })
     expect(
-      h.syncIndexes.storage(s.accountId).query("SELECT SUM(n) AS n, SUM(bytes) AS bytes FROM photo_rate WHERE kind = 'put'")
+      h.syncIndexes
+        .storage(s.accountId)
+        .query("SELECT SUM(n) AS n, SUM(bytes) AS bytes FROM photo_rate WHERE kind = 'put'")
     ).toEqual([{ n: 2, bytes: 600 }])
   })
 
@@ -1082,10 +1339,18 @@ describe('refusals', () => {
     const s = await session()
     h.syncIndexes
       .storage(s.accountId)
-      .query("INSERT INTO photo_rate VALUES ('put', ?, 1, ?)", Math.floor(START / MINUTE), SYNC_PHOTO_LIMITS.accountPutBytesPerDay - 150)
-    expect((await put(s, await name(), randomBytes(200))).body).toMatchObject({ code: 'rate_limited' })
+      .query(
+        "INSERT INTO photo_rate VALUES ('put', ?, 1, ?)",
+        Math.floor(START / MINUTE),
+        SYNC_PHOTO_LIMITS.accountPutBytesPerDay - 150
+      )
+    expect((await put(s, await name(), randomBytes(200))).body).toMatchObject({
+      code: 'rate_limited',
+    })
     expect((await put(s, await name(), randomBytes(100))).status).toBe(200)
-    expect((await put(s, await name(), randomBytes(100))).body).toMatchObject({ code: 'rate_limited' })
+    expect((await put(s, await name(), randomBytes(100))).body).toMatchObject({
+      code: 'rate_limited',
+    })
   })
 
   it('caps gets an account a rolling day', async () => {
@@ -1094,7 +1359,11 @@ describe('refusals', () => {
     await put(s, photo)
     h.syncIndexes
       .storage(s.accountId)
-      .query("INSERT INTO photo_rate VALUES ('get', ?, ?, 0)", Math.floor(START / MINUTE) - 1, SYNC_PHOTO_LIMITS.accountGetsPerDay - 1)
+      .query(
+        "INSERT INTO photo_rate VALUES ('get', ?, ?, 0)",
+        Math.floor(START / MINUTE) - 1,
+        SYNC_PHOTO_LIMITS.accountGetsPerDay - 1
+      )
     expect((await get(s, photo)).status).toBe(200)
     const over = await get(s, photo)
     expect(over.status).toBe(429)
@@ -1107,10 +1376,15 @@ describe('refusals', () => {
 
   it('counts puts in the photo-upload edge tier and the rest in the read tier', async () => {
     const s = await session()
-    vi.spyOn(h.env.BUDDIES_BLOB_PUT_LIMITER, 'limit').mockResolvedValueOnce({ success: false })
+    vi.spyOn(h.env.BUDDIES_BLOB_PUT_LIMITER, 'limit').mockResolvedValueOnce({
+      success: false,
+    })
     const limited = await put(s, await name())
     expect(limited.status).toBe(429)
-    expect(limited.body).toMatchObject({ code: 'rate_limited', retryAfter: 60 })
+    expect(limited.body).toMatchObject({
+      code: 'rate_limited',
+      retryAfter: 60,
+    })
     const read = vi.spyOn(h.env.BUDDIES_READ_LIMITER, 'limit')
     await list(s)
     await usage(s)
@@ -1149,8 +1423,7 @@ describe('privacy', () => {
     advance(SYNC_LIMITS.retentionCheckMs * 31)
     await runRetention(s.accountId)
     const text = JSON.stringify(logs)
-    for (const secret of [photo, sealed, s.accountId, s.accessToken])
-      expect(text).not.toContain(secret)
+    for (const secret of [photo, sealed, s.accountId, s.accessToken]) expect(text).not.toContain(secret)
   })
 })
 
@@ -1159,11 +1432,28 @@ describe('sessions without sync-everyone', () => {
     const s = await session()
     const photo = await name()
     expect((await put(s, photo)).status).toBe(200)
-    supporterStatus.mockResolvedValue({ supporter: false, expiresAt: null, customers: 0 })
+    supporterStatus.mockResolvedValue({
+      supporter: false,
+      expiresAt: null,
+      customers: 0,
+    })
     // The same account's session from an app that never sent the capability.
     const old = await openTestSession(app as never, h.env, s.key)
     expect(code((await put(old, await name())).body)).toBe('supporter_required')
     expect(code((await list(old)).body)).toBe('supporter_required')
     expect(code((await get(old, photo)).body)).toBe('supporter_required')
+  })
+})
+
+// The window table in witness-work's docs/cloud-sync-photos.md ("The window").
+// The app waits the same window (less 10 s for a put), and its tests hold the
+// same numbers, so the two formulas can't drift.
+describe('the put reservation window', () => {
+  it.each([
+    [1, 120_000],
+    [5 * 1_024 * 1_024, 162_400],
+    [25 * 1_024 * 1_024, 572_000],
+  ])('is %i bytes → %i ms', (size, windowMs) => {
+    expect(photoPutReservationMs(size)).toBe(windowMs)
   })
 })

@@ -2009,8 +2009,12 @@ iCloud and Google Drive; each device uses exactly one. Code in
     before answering, except a declared size over 25 MiB: 413 `too_large`),
     checks its digest, writes R2, and `commitPhotoPut` checks the limit and
     the slot again, makes the name live, advances `seq`, and sends `changed`
-    to every socket but `x-ww-slot-id`'s. A bad body or failed write frees
-    the reservation; one whose commit never comes lapses after 2 minutes.
+    to every socket but `x-ww-slot-id`'s. A bad body, a body that
+    fails to arrive (the link dropped, the app was killed) or a failed write
+    frees the reservation and the name at once, so the retry is accepted and
+    the bytes stop counting; one whose commit never comes lapses after a minute
+    plus the body at 50 KiB/s (`photoPutReservationMs`): 2 minutes for a
+    small photo, about 9½ for 25 MiB, so a large upload survives a slow link.
   - **Delete** marks the rows deleted (usage drops at once), queues their
     put's object for the purge 30 days later, cancels any put of those names
     in flight (its commit answers 409 `conflict` and deletes its own
