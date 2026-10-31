@@ -426,7 +426,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         unknown_account: '`account.accountId` doesn’t exist.',
         replay: true,
         conflict:
-          'The inbox is registered (or was, before a wipe) with a different `ownerPub`, or is linked to a different account.',
+          'The inbox is registered (or was, before a wipe) with a different `ownerPub`, is linked to a different account, or was replaced by a successor after a key change (never registered again).',
         rate_limited: `${edgeLimited('register')}, or the caller’s ${count(BUDDIES_ABUSE_LIMITS.registrationsPerDay)} registrations a day are spent (\`Retry-After\` until the oldest leaves the window).`,
         disabled: `${DEFAULT_REASONS.disabled} Also a bearer request on a worker without the accounts database.`,
       }),
@@ -475,15 +475,29 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     description: paragraphs(
       'Wipes the inbox (slots, cards, events, devices, roster, photo blobs) and every open invite it created, closing its live sockets with 4001. Only a hash of the owner key is kept, so only that key can register the `inboxId` again.',
       SIGNED_BY.owner,
+      '**`successor`** (after an account key change, witness-work ADR 0039 §5): names the inbox that replaces this one, which buddies then read with `inbox/successor` to check a reconnect invite. Bearer only, from a session of the account the inbox is linked to (not suspended: `suspended`) that is still live at the account’s key epoch. It must be another registered inbox linked to the same account at its current key epoch (linked, or registered again, with a proof by the current key) with no successor of its own, else `conflict` and nothing is deleted. Once deleted, the inbox’s account link is dropped and it can never be registered again (`inbox/register` answers `conflict`). The first successor recorded stays while it still qualifies (another one is `conflict`); one that no longer does (recorded before a key change) is replaced. The successor is recorded first and kept 90 days, and dropped again if the inbox refuses the deletion or can’t be reached; repeating the request answers `ok` once the inbox is gone. Without it, nothing changes.',
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
     ),
-    requestBody: ownerBody('inbox/delete', { inboxId }),
+    requestBody: ownerBody('inbox/delete', {
+      inboxId,
+      successor: buddiesId(
+        'The inbox that replaces this one after a key change. Bearer only'
+      ).optional(),
+    }),
     responses: {
       200: jsonResponse('Deleted.', okSchema),
-      ...refusals(
-        ownerRefusals('write', { killSwitch: false, suspendable: false })
-      ),
+      ...refusals({
+        ...ownerRefusals('write', { killSwitch: false, suspendable: false }),
+        unauthorized: `${DEFAULT_REASONS.unauthorized} With \`successor\`, also a token whose session ended (a key change ends every other session) or is behind the account’s key epoch.`,
+        forbidden: `${DEFAULT_REASONS.forbidden} Also \`successor\` in a legacy request.`,
+        suspended:
+          'With `successor`: the inbox’s account is suspended. Deleting without one still works.',
+        conflict:
+          '`successor` is this inbox, isn’t registered (deleted or wiped), isn’t linked to the same account at its current key epoch, has a successor of its own, or differs from a successor already recorded that still qualifies. Nothing is deleted.',
+        disabled:
+          'With `successor`, on a worker without the accounts database.',
+      }),
     },
   }),
 
@@ -990,6 +1004,39 @@ export const buddiesBlobPutDocs = describeOp({
       too_large: `\`bytes\`, \`Content-Length\`, or the streamed body is over ${kib(BUDDIES_LIMITS.blobBytes)}.`,
       rate_limited: `${edgeLimited('blobPut')}, ${OWNER_BUDGET} are spent, or a per-inbox cap is hit (\`Retry-After\` until the soonest live blob expires or the oldest upload leaves the day).`,
       photos_disabled: true,
+    }),
+  },
+})
+
+export const buddiesSuccessorDocs = describeRoute({
+  tags: TAGS,
+  security: [{ bearerAuth: [] }],
+  summary: 'Read an inbox’s successor',
+  description: paragraphs(
+    'The inbox that replaced `inboxId` after its account’s key changed (witness-work ADR 0039 §5), as `inbox/delete` with `successor` recorded it, or `null`. A buddy accepts a `pair.reconnect` from the old inbox only when this names the offered inbox. Checked at every read: `null` unless the recorded successor is still linked to the same account at the account’s current key epoch and the account isn’t suspended (so one recorded before a key change, by anyone holding the old key, is never vouched for after it), and for an inbox nobody replaced or one recorded over 90 days ago. Anyone with a token who knows the old `inboxId` learns that it was replaced, and by which inbox.',
+    '**Bearer only:** `Authorization: Bearer <access token>` of any account, and `{ "inboxId" }` as plain JSON (an envelope is `bad_request`). No legacy form: without the header it’s `unauthorized`.',
+    tierLine('read'),
+    KILL_SWITCH_OFF
+  ),
+  requestBody: jsonBody(
+    z.object({ inboxId: buddiesId('The replaced (old) inbox') }),
+    'Plain JSON.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'The successor, or `null`.',
+      z.object({
+        ok: z.literal(true),
+        successor: buddiesId('The inbox that replaced it')
+          .nullable()
+          .meta({ description: 'The inbox that replaced it, or `null`.' }),
+      })
+    ),
+    ...refusals({
+      bad_request: true,
+      unauthorized: `${DEFAULT_REASONS.unauthorized} Also a request without one.`,
+      rate_limited: `${edgeLimited('read')}.`,
+      disabled: `${DEFAULT_REASONS.disabled} Also a worker without the accounts database.`,
     }),
   },
 })

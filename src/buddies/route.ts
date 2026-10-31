@@ -18,6 +18,7 @@ import {
   BUDDIES_OWNER_OPS,
   BUDDIES_PAYLOAD_PARSERS,
   BUDDIES_PHOTO_OPS,
+  BUDDIES_SUCCESSOR_OP,
   BUDDIES_SUSPENDED_REFUSED_OPS,
   BUDDIES_UNSIGNED_OPS,
   buddyBlobKey,
@@ -56,10 +57,19 @@ import {
 import { inboxLinkMessage } from '../accounts/contracts'
 import {
   accountsDb,
+  confirmInboxLink,
   findAccount,
   findInboxAccount,
   linkInbox,
 } from '../accounts/store'
+import { liveSessionKeyEpoch } from '../accounts/sessionStore'
+import {
+  findInboxSuccessor,
+  findSuccessorAccount,
+  forgetInboxSuccessor,
+  recordInboxSuccessor,
+  unlinkReplacedInbox,
+} from '../accounts/inboxSuccessors'
 import {
   authenticateAccount,
   hasAuthorization,
@@ -95,12 +105,14 @@ import {
   buddiesBlobPutDocs,
   buddiesLiveDocs,
   buddiesOpDocs,
+  buddiesSuccessorDocs,
 } from './openapi'
 
 /**
  * `POST /buddies/v1/{op}` — the Buddies relay (docs/buddies-protocol.md) —
  * `GET /buddies/v1/inbox/live`, the owner's live socket, and the photo blob
- * routes `POST /buddies/v1/blob/put` (raw body) and `blob/get` (raw answer).
+ * routes `POST /buddies/v1/blob/put` (raw body) and `blob/get` (raw answer),
+ * and `POST /buddies/v1/inbox/successor`, a bearer read.
  *
  * Authentication (witness-work ADR 0027, "Authentication (sessions)" in the
  * protocol): a request with an `Authorization` header is a bearer request.
@@ -267,22 +279,33 @@ type SignedRunners = {
 
 /** The accounts side of `inbox/register`; see `registerInbox`. */
 type InboxAccount =
-  | { ok: true; linked: string | null; claim: string | null }
+  | {
+      ok: true
+      linked: string | null
+      claim: string | null
+      /** The key epoch of the key that verified the proof; null without one. */
+      keyEpoch: number | null
+    }
   | BuddiesFailure
 
 /**
  * Checks `inbox/register` against the accounts database (witness-work ADR
  * 0024). `linked` is the account the inbox already belongs to; `claim` is the
  * account a valid proof names, when the inbox isn't linked yet. A suspended
- * account's inbox is refused, with or without a proof.
+ * account's inbox is refused, with or without a proof, and so is an inbox
+ * with a successor recorded (`conflict`). `keyEpoch` is the
+ * account's epoch as read with the key that verified the proof (ADR 0039).
  */
 const checkInboxAccount = async (
   db: ReturnType<typeof accountsDb>,
   call: Signed<BuddiesPayloads['inbox/register']>
 ): Promise<InboxAccount> => {
+  // A replaced inbox (ADR 0039 §5) is never registered again.
+  if (await findSuccessorAccount(db, call.inboxId)) return fail('conflict')
   const linked = await findInboxAccount(db, call.inboxId)
   if (linked?.status === 'suspended') return fail('suspended')
-  if (!call.account) return { ok: true, linked: linked?.id ?? null, claim: null }
+  if (!call.account)
+    return { ok: true, linked: linked?.id ?? null, claim: null, keyEpoch: null }
   const account = await findAccount(db, call.account.accountId)
   if (!account) return fail('unknown_account')
   const valid = await verifyEd25519(
@@ -293,9 +316,10 @@ const checkInboxAccount = async (
   if (!valid) return fail('bad_signature')
   if (linked && linked.id !== account.id) return fail('conflict')
   if (account.status === 'suspended') return fail('suspended')
+  const { keyEpoch } = account
   return linked
-    ? { ok: true, linked: linked.id, claim: null }
-    : { ok: true, linked: null, claim: account.id }
+    ? { ok: true, linked: linked.id, claim: null, keyEpoch }
+    : { ok: true, linked: null, claim: account.id, keyEpoch }
 }
 
 /**
@@ -328,6 +352,11 @@ const refuseBearerRegistration = (
  * account's claim may have won: `conflict`). If either step fails, the inbox
  * keeps answering bearer owner requests `not_linked` until a registration
  * gets through; registering again is idempotent.
+ *
+ * The link records the key epoch of the key that signed its proof, and a
+ * later proof by a newer key moves an existing link up to that epoch: only a
+ * link at the account's current epoch can be an inbox's successor (ADR 0039
+ * §5), so a link the old key made can't be one after a key change.
  */
 const registerInbox = async (
   env: Environment,
@@ -336,7 +365,12 @@ const registerInbox = async (
 ): Promise<Outcome> => {
   const db = env.ACCOUNTS_DB ? accountsDb(env.ACCOUNTS_DB) : null
   if (account && !db) return fail('disabled')
-  let check: InboxAccount = { ok: true, linked: null, claim: null }
+  let check: InboxAccount = {
+    ok: true,
+    linked: null,
+    claim: null,
+    keyEpoch: null,
+  }
   if (db) {
     try {
       check = await checkInboxAccount(db, call)
@@ -350,13 +384,23 @@ const registerInbox = async (
   const stub = inbox(env, call.inboxId)
   const result = await stub.register(call, check.linked)
   if (!result.ok) return result
-  if (db && check.claim) {
+  if (db && check.linked && check.keyEpoch != null) {
+    try {
+      await confirmInboxLink(db, call.inboxId, check.linked, check.keyEpoch)
+    } catch (error) {
+      if (account) throw error
+      console.warn('buddies: confirming an inbox link failed')
+      captureFailure(error, 'inbox/register')
+    }
+  }
+  if (db && check.claim && check.keyEpoch != null) {
     let owner
     try {
       owner = await linkInbox(
         db,
         call.inboxId,
         check.claim,
+        check.keyEpoch,
         account?.sessionId ?? null
       )
     } catch (error) {
@@ -550,6 +594,9 @@ const runSigned = async <K extends BuddiesSignedOp>(
     const sync = call.value as unknown as Signed<SyncPayload>
     return syncInbox(env, sync, true)
   }
+  // A successor is recorded for a bearer session of the inbox's account only.
+  if (op === 'inbox/delete' && 'successor' in call.value)
+    return fail('forbidden')
   if (op === 'inbox/register') {
     const register = call.value as unknown as Signed<
       BuddiesPayloads['inbox/register']
@@ -563,6 +610,77 @@ const runSigned = async <K extends BuddiesSignedOp>(
   if (op === 'inbox/delete' && outcome.ok)
     await recordBuddiesDeleted(env, call.value.inboxId, null)
   return outcome
+}
+
+/**
+ * A bearer `inbox/delete` naming `successor`, the inbox that replaces this one
+ * after a key change (witness-work ADR 0039 §5). The inbox must be the token's
+ * account's: linked to it, or, once deleted and unlinked, replaced by it
+ * (`forbidden`). The account must not be suspended (`suspended`; deleting
+ * without a successor still works), and the token's session must still be
+ * live at the account's key epoch (`unauthorized`: a key change ends every
+ * other session, though their access tokens verify for minutes more).
+ *
+ * The successor must be registered (not deleted or wiped), another inbox
+ * linked to the same account at its current key epoch, and not replaced
+ * itself (no cycles), else `conflict` and nothing is deleted; so is naming
+ * another successor than one already recorded that still qualifies (one
+ * that doesn't, from before a key change, is replaced). It's recorded before
+ * the inbox is deleted; if the inbox refuses, or the call to it throws, the
+ * record goes too. Once the inbox is gone its link is dropped: a replaced
+ * inbox is never registered again (`registerInbox`). A repeat answers `ok`
+ * once the inbox is gone (`not_found` from the inbox), refreshing the
+ * record; `buddies.deleted` is logged only for the deletion itself.
+ */
+const deleteWithSuccessor = async (
+  env: Environment,
+  inboxId: string,
+  successorId: string,
+  account: AccountAuth
+): Promise<Outcome> => {
+  if (!env.ACCOUNTS_DB) return fail('disabled')
+  const db = accountsDb(env.ACCOUNTS_DB)
+  const linked = await findInboxAccount(db, inboxId)
+  const ownerId = linked?.id ?? (await findSuccessorAccount(db, inboxId))
+  if (ownerId !== account.accountId) return fail('forbidden')
+  const owner = linked ?? (await findAccount(db, ownerId))
+  if (!owner) return fail('forbidden')
+  if (owner.status === 'suspended') return fail('suspended')
+  const sessionEpoch = await liveSessionKeyEpoch(
+    db,
+    account.accountId,
+    account.sessionId
+  )
+  if (sessionEpoch !== owner.keyEpoch) return fail('unauthorized')
+  if (!(await inbox(env, successorId).isRegistered(successorId)))
+    return fail('conflict')
+  const now = Date.now()
+  const recorded = await recordInboxSuccessor(db, {
+    inboxId,
+    successorId,
+    accountId: account.accountId,
+    sessionId: account.sessionId,
+    now,
+  })
+  if (!recorded) return fail('conflict')
+  let result: BuddiesResult<unknown>
+  try {
+    result = await inbox(env, inboxId).deleteInbox({
+      inboxId,
+      accountId: account.accountId,
+    })
+  } catch (error) {
+    // A retry records it again, and answers `ok` if the inbox did go.
+    await forgetInboxSuccessor(db, inboxId, successorId, now)
+    throw error
+  }
+  if (!result.ok && result.error !== 'not_found') {
+    await forgetInboxSuccessor(db, inboxId, successorId, now)
+    return result
+  }
+  await unlinkReplacedInbox(db, inboxId, account.accountId)
+  if (result.ok) await recordBuddiesDeleted(env, inboxId, account)
+  return ok({ body: {} })
 }
 
 /**
@@ -580,6 +698,12 @@ const runByAccount = async <K extends BuddiesOwnerOp>(
   if (!isPlainObject(body) || isEnvelopeBody(body)) return fail('bad_request')
   const fields = BUDDIES_FIELD_PARSERS[op](body, Date.now())
   if (!fields) return fail('bad_request')
+  if (
+    op === 'inbox/delete' &&
+    'successor' in fields &&
+    typeof fields.successor === 'string'
+  )
+    return deleteWithSuccessor(env, fields.inboxId, fields.successor, account)
   const outcome = await OWNER_OPS[op](env, {
     ...fields,
     accountId: account.accountId,
@@ -874,6 +998,39 @@ const handleBlobGet = async (c: AppContext): Promise<Response> => {
   }
 }
 
+/**
+ * `POST inbox/successor`: `{ inboxId }` as plain JSON → `{ ok, successor }`,
+ * the inbox that replaced it after a key change, or null (witness-work ADR
+ * 0039 §5). Any account's bearer token reads it: a buddy checks a
+ * `pair.reconnect` with it. It tells anyone who knows the old inbox id that
+ * it was replaced, and by which inbox. No legacy form (`unauthorized`
+ * without a token). Counts as a read.
+ */
+const handleSuccessor = async (c: AppContext): Promise<Response> => {
+  try {
+    if (!(await isBuddiesEnabled(c.env))) return errorResponse('disabled')
+    if (!hasAuthorization(c)) return errorResponse('unauthorized')
+    const admission = await admitCaller(c, BUDDIES_SUCCESSOR_OP)
+    if (!admission.ok) return admission.response
+    if (!c.env.ACCOUNTS_DB) return errorResponse('disabled')
+    const text = await readEnvelopeText(c.req.raw)
+    const body = text == null ? null : parseJsonOrNull(text)
+    if (!isPlainObject(body) || isEnvelopeBody(body))
+      return errorResponse('bad_request')
+    const fields = BUDDIES_FIELD_PARSERS[BUDDIES_SUCCESSOR_OP](body, Date.now())
+    if (!fields) return errorResponse('bad_request')
+    const successor = await findInboxSuccessor(
+      accountsDb(c.env.ACCOUNTS_DB),
+      fields.inboxId
+    )
+    return c.json({ ok: true, successor })
+  } catch (error) {
+    console.error('buddies: request failed', { op: BUDDIES_SUCCESSOR_OP })
+    captureFailure(error, BUDDIES_SUCCESSOR_OP)
+    return buddiesInternalError()
+  }
+}
+
 /** Mounted at `/buddies/v1` by the Worker entry point. */
 export const createBuddiesRoutes = (
   deps: BuddiesRouteDependencies = { push: defaultApnsDependencies }
@@ -887,5 +1044,6 @@ export const createBuddiesRoutes = (
   routes.get(`/${BUDDIES_LIVE_OP}`, buddiesLiveDocs, handleLive)
   routes.post(`/${BUDDIES_BLOB_PUT_OP}`, buddiesBlobPutDocs, handleBlobPut)
   routes.post(`/${BUDDIES_BLOB_GET_OP}`, buddiesBlobGetDocs, handleBlobGet)
+  routes.post(`/${BUDDIES_SUCCESSOR_OP}`, buddiesSuccessorDocs, handleSuccessor)
   return routes
 }

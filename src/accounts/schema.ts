@@ -266,8 +266,37 @@ export const accountInboxes = sqliteTable(
       .notNull()
       .references(() => accounts.id, { onDelete: 'cascade' }),
     createdAt: createdAt(),
+    /**
+     * The account's key epoch (ADR 0039) whose key signed the link's proof,
+     * when it was made or last confirmed by a registration whose proof the
+     * current key signed. Only a link at the account's current epoch can be
+     * an inbox's successor.
+     */
+    keyEpoch: integer('key_epoch').notNull().default(0),
   },
   (t) => [index('account_inboxes_account_idx').on(t.accountId)]
+)
+
+/**
+ * The inbox that replaced a deleted one after a key change (ADR 0039 §5),
+ * recorded by `inbox/delete` with `successor`, so a buddy can check a
+ * reconnect invite the old key's pairing carried. Kept 90 days.
+ */
+export const inboxSuccessors = sqliteTable(
+  'inbox_successors',
+  {
+    /** The deleted inbox. */
+    inboxId: text('inbox_id').primaryKey(),
+    successorId: text('successor_id').notNull(),
+    accountId: text('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    recordedAt: integer('recorded_at', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [
+    index('inbox_successors_account_idx').on(t.accountId),
+    index('inbox_successors_recorded_idx').on(t.recordedAt),
+  ]
 )
 
 /**

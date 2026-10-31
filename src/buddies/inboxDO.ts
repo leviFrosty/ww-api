@@ -1167,6 +1167,15 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
+   * Whether this inbox is registered and not deleted or wiped: an inbox's
+   * successor must be (witness-work ADR 0039 §5). Reads only; creates
+   * nothing.
+   */
+  async isRegistered(inboxId: string): Promise<boolean> {
+    return this.#meta()?.inboxId === inboxId
+  }
+
+  /**
    * The accounts database linked this inbox to `accountId`, after this inbox
    * accepted the owner-signed registration: from now on that account's
    * bearer requests act as the owner. It's the database's winner, so when

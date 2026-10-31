@@ -90,6 +90,13 @@ export const BUDDIES_NOTIFICATION_SERVICE_CLIENT = 'notification-service'
  */
 export const BUDDIES_BLOB_PUT_OP = 'blob/put'
 export const BUDDIES_BLOB_GET_OP = 'blob/get'
+/**
+ * `POST inbox/successor`: which inbox replaced another after its account's
+ * key changed (witness-work ADR 0039 §5). A bearer read by any account, with
+ * its own route: it is neither signed nor an owner op, so not in
+ * `BUDDIES_OPS`.
+ */
+export const BUDDIES_SUCCESSOR_OP = 'inbox/successor'
 /** Ops that also need the photos switch (`buddies:photos`) on. */
 export const BUDDIES_PHOTO_OPS: ReadonlySet<string> = new Set([
   BUDDIES_BLOB_PUT_OP,
@@ -119,6 +126,7 @@ export type BuddiesOp = BuddiesSignedOp | BuddiesUnsignedOp
 export type BuddiesLiveOp = typeof BUDDIES_LIVE_OP
 export type BuddiesBlobPutOp = typeof BUDDIES_BLOB_PUT_OP
 export type BuddiesBlobGetOp = typeof BUDDIES_BLOB_GET_OP
+export type BuddiesSuccessorOp = typeof BUDDIES_SUCCESSOR_OP
 /**
  * Every op a signature can name: the signed POST ops, the live socket, and
  * `blob/put`.
@@ -127,12 +135,18 @@ export type BuddiesSigningOp =
   | BuddiesSignedOp
   | BuddiesLiveOp
   | BuddiesBlobPutOp
-/** Every op with a route, each counted against a per-caller edge tier. */
+/**
+ * Every op with a route, each counted against a per-caller edge tier. Most
+ * are signed (owner, writer, self-signed); `invite/fetch`, `invite/claim`,
+ * `blob/get`, and `inbox/successor` aren't, so their payloads have no `ts` or
+ * `nonce` (`UNSIGNED_PAYLOAD_OPS`).
+ */
 export type BuddiesRouteOp =
   | BuddiesOp
   | BuddiesLiveOp
   | BuddiesBlobPutOp
   | BuddiesBlobGetOp
+  | BuddiesSuccessorOp
 
 export const BUDDIES_OPS: readonly BuddiesOp[] = [
   'inbox/register',
@@ -196,8 +210,10 @@ export const BUDDIES_ERROR_STATUS = {
   /**
    * A handoff channel another account opened, a `backup/delete` signed by
    * another account than the bearer token's, a bearer Buddies owner request
-   * for an inbox linked to another account, or a bearer `inbox/register`
-   * whose `account` proof names another account than the token's.
+   * for an inbox linked to another account, a bearer `inbox/register`
+   * whose `account` proof names another account than the token's, or an
+   * `inbox/delete` naming a `successor` without a bearer token of the
+   * account the inbox is linked to.
    */
   forbidden: 403,
   /**
@@ -576,6 +592,18 @@ export interface EventPutPayload extends SlotPayload {
   push: boolean
 }
 
+export interface InboxDeletePayload extends InboxFields {
+  /**
+   * The inbox that replaces this one after a key change: bearer requests
+   * only (ADR 0039 §5).
+   */
+  successor?: string
+}
+
+export interface InboxSuccessorPayload {
+  inboxId: string
+}
+
 export interface InviteFetchPayload {
   inviteId: string
 }
@@ -609,7 +637,7 @@ export interface InviteClaimPayload {
 export interface BuddiesPayloads {
   'inbox/register': RegisterPayload
   'inbox/sync': SyncPayload
-  'inbox/delete': InboxFields
+  'inbox/delete': InboxDeletePayload
   'device/register': DeviceRegisterPayload
   'device/unregister': DeviceUnregisterPayload
   'slot/add': SlotAddPayload
@@ -626,6 +654,7 @@ export interface BuddiesPayloads {
   'blob/put': BlobPutPayload
   'blob/get': BlobGetPayload
   'blob/delete': BlobDeletePayload
+  'inbox/successor': InboxSuccessorPayload
 }
 
 type Fields = Record<string, unknown>
@@ -749,7 +778,12 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
       ? { ...base, since: p.since }
       : null
   },
-  'inbox/delete': inboxFields,
+  'inbox/delete': (p) => {
+    const base = inboxFields(p)
+    if (!base) return null
+    if (p.successor === undefined) return base
+    return isId(p.successor) ? { ...base, successor: p.successor } : null
+  },
   'device/register': (p) => {
     const base = inboxFields(p)
     const parsedTemplates = templates(p.templates)
@@ -834,12 +868,14 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
     if (!blobIds.every(bytes32)) return null
     return { ...base, blobIds: [...new Set(blobIds)] }
   },
+  'inbox/successor': (p) => (isId(p.inboxId) ? { inboxId: p.inboxId } : null),
 }
 
 /** Ops whose payload is never signed, so it has no `ts` or `nonce`. */
 const UNSIGNED_PAYLOAD_OPS: ReadonlySet<BuddiesRouteOp> = new Set([
   ...BUDDIES_UNSIGNED_OPS,
   BUDDIES_BLOB_GET_OP,
+  BUDDIES_SUCCESSOR_OP,
 ])
 
 /**
