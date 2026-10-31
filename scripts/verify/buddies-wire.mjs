@@ -74,6 +74,7 @@ export const SIGNED_OPS = [
   'card/put',
   'event/put',
   'slot/leave',
+  'slot/seal',
 ]
 export const UNSIGNED_OPS = ['invite/fetch', 'invite/claim']
 export const ALL_OPS = [...SIGNED_OPS, ...UNSIGNED_OPS]

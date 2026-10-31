@@ -522,6 +522,8 @@ const SIGNED_OPS: SignedRunners = {
   },
   'slot/leave': async (env, call) =>
     empty(await inbox(env, call.inboxId).leaveSlot(call)),
+  'slot/seal': async (env, call) =>
+    empty(await inbox(env, call.inboxId).sealSlot(call)),
 }
 
 type UnsignedRunners = {
