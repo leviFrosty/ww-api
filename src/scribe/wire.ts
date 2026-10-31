@@ -121,9 +121,16 @@ export interface ToolDefinition {
   returnsUntrustedText?: boolean
 }
 
+/** The client platform in `app.platform`; `web` is the browser app. */
+export const SCRIBE_APP_PLATFORMS = ['ios', 'android', 'web'] as const
+export type ScribeAppPlatform = (typeof SCRIBE_APP_PLATFORMS)[number]
+
+export const isScribeAppPlatform = (value: unknown): value is ScribeAppPlatform =>
+  SCRIBE_APP_PLATFORMS.includes(value as ScribeAppPlatform)
+
 export interface ScribeAppInfo {
   version: string
-  platform: 'ios' | 'android'
+  platform: ScribeAppPlatform
   locale: string
 }
 
