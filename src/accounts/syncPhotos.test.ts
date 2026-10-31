@@ -579,6 +579,97 @@ describe('storage limit', () => {
     expectExactUsage(s)
   })
 
+  describe('a put on a slow link', () => {
+    const MIB = 1024 * 1024
+    const beginBig = async (s: TestSession, size: number) => {
+      const index = h.syncIndexes.object(s.accountId)
+      const photo = await name()
+      const begun = await index.beginPhotoPut({
+        accountId: s.accountId,
+        name: photo,
+        size,
+        sha256: await name(),
+        meta: 'bWV0YQ',
+      })
+      if (!begun.ok || !('reservation' in begun.value)) throw new Error('begin')
+      return { index, photo, reservation: begun.value.reservation }
+    }
+
+    it('keeps the reservation of a large put while its body still arrives', async () => {
+      const s = await session()
+      const { index, photo, reservation } = await beginBig(s, 20 * MIB)
+      // At 100 KB/s the body takes more than three minutes.
+      advance(3 * MINUTE + 30 * SECOND)
+      // Still in flight: the name is held, and its retry is told when to come.
+      const retry = await put(s, photo)
+      expect(retry.body).toMatchObject({ code: 'rate_limited' })
+      expect(Number(retry.headers.get('retry-after'))).toBeGreaterThan(60)
+      expect(
+        await index.commitPhotoPut({ accountId: s.accountId, name: photo, reservation })
+      ).toMatchObject({ ok: true })
+    })
+
+    it('sizes the reservation to the body at 50 KiB/s plus a minute, from 2 to 10 minutes', async () => {
+      const s = await session()
+      for (const [size, minutes] of [
+        [1, 2],
+        [5 * MIB, 2.7],
+        [25 * MIB, 9.5],
+      ] as const) {
+        const { index, photo, reservation } = await beginBig(s, size)
+        advance((minutes - 0.1) * MINUTE)
+        expect((await put(s, photo)).body, `${size} held`).toMatchObject({ code: 'rate_limited' })
+        advance(0.2 * MINUTE)
+        expect(
+          await index.commitPhotoPut({ accountId: s.accountId, name: photo, reservation }),
+          `${size} lapsed`
+        ).toMatchObject({ ok: false, error: 'conflict' })
+      }
+    })
+
+    it('frees a large put’s space when its window lapses, and not before', async () => {
+      h.env.SYNC_PHOTO_LIMIT_BYTES = String(30 * MIB)
+      const s = await session()
+      const { photo } = await beginBig(s, 25 * MIB)
+      advance(3 * MINUTE)
+      expect((await put(s, await name(), randomBytes(10 * MIB))).body).toMatchObject({
+        code: 'storage_full',
+      })
+      advance(7 * MINUTE)
+      const again = await session(s.key)
+      expect((await put(again, await name(), randomBytes(10 * MIB))).status).toBe(200)
+      expect((await put(again, photo, randomBytes(100))).status).toBe(200)
+    })
+
+    it('stores a put whose R2 write ended minutes after it began', async () => {
+      const s = await session()
+      const original = h.photoBlobs.put.bind(h.photoBlobs)
+      vi.spyOn(h.photoBlobs, 'put').mockImplementationOnce(async (...args) => {
+        advance(150 * SECOND)
+        return original(...args)
+      })
+      const photo = await name()
+      const stored = await put(s, photo, randomBytes(6 * MIB))
+      expect(stored.status).toBe(200)
+      expect(keysOf(s, photo)).toHaveLength(1)
+      expectExactUsage(s)
+    })
+
+    it('refuses a put whose upload outlives its window and stores nothing', async () => {
+      const s = await session()
+      const original = h.photoBlobs.put.bind(h.photoBlobs)
+      vi.spyOn(h.photoBlobs, 'put').mockImplementationOnce(async (...args) => {
+        advance(4 * MINUTE)
+        return original(...args)
+      })
+      const photo = await name()
+      const late = await put(s, photo, randomBytes(6 * MIB))
+      expect(late.status).toBe(409)
+      expect(late.body).toMatchObject({ code: 'conflict' })
+      expect(keysOf(s, photo)).toEqual([])
+    })
+  })
+
   it('frees the space of a put whose body or R2 write failed', async () => {
     h.env.SYNC_PHOTO_LIMIT_BYTES = '1000'
     const s = await session()

@@ -133,8 +133,17 @@ export const SYNC_PHOTO_LIMITS = {
   accountPutBytesPerDay: 4 * 1_024 * MIB,
   /** Gets an account a rolling day: a few devices each downloading every photo. */
   accountGetsPerDay: 50_000,
-  /** Space a put reserved is freed this long after it began, if its commit never came. */
+  /**
+   * Space a put reserved is freed this long after it began, if its commit never
+   * came: at least this, and longer for a large body (`photoPutReservationMs`).
+   */
   putReservationMs: 2 * MINUTE_MS,
+  /** A put's reservation is never longer than this. */
+  putReservationMaxMs: 10 * MINUTE_MS,
+  /** Time a put's reservation allows for its request to start, besides its body. */
+  putSetupMs: MINUTE_MS,
+  /** The slowest upload a reservation waits for, a second: about 400 kbit/s. */
+  putMinBytesPerSecond: 50 * 1_024,
   /** A deleted photo's R2 object is purged this long after the delete. */
   deletedRetentionMs: 30 * DAY_MS,
   /** An account with no slot this long has its photos deleted by the next alarm. */
@@ -146,6 +155,22 @@ export const SYNC_PHOTO_LIMITS = {
   /** A sealed meta's characters: the padded 256-byte JSON sealed is ~395. */
   metaChars: 512,
 } as const
+
+/**
+ * How long a put of `size` bytes holds its reservation: a minute to start plus
+ * the body at `putMinBytesPerSecond`, between `putReservationMs` and
+ * `putReservationMaxMs`. A 25 MiB blob on a slow phone connection takes
+ * minutes, and the app waits for just this long (less a margin).
+ */
+export const photoPutReservationMs = (size: number): number =>
+  Math.min(
+    SYNC_PHOTO_LIMITS.putReservationMaxMs,
+    Math.max(
+      SYNC_PHOTO_LIMITS.putReservationMs,
+      SYNC_PHOTO_LIMITS.putSetupMs +
+        Math.ceil((size / SYNC_PHOTO_LIMITS.putMinBytesPerSecond) * 1_000)
+    )
+  )
 
 /** `b64u(HMAC-SHA256(nameKey, filename))`: what the server knows a photo by. */
 export const SYNC_PHOTO_NAME_PATTERN = /^[A-Za-z0-9_-]{43}$/
