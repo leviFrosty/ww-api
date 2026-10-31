@@ -266,8 +266,15 @@ describe('POST /account/rekey from a phone', () => {
       expect((await send('GET', '/sessions', undefined, bearer(ended.accessToken))).status).toBe(401)
       const refused = await refresh(ended)
       expect(refused.status).toBe(401)
-      expect(refused.body).toMatchObject({ code: 'unauthorized', reason: 'revoked' })
+      expect(refused.body).toMatchObject({
+        code: 'unauthorized',
+        reason: 'key_changed',
+        changedAt: Date.now(),
+      })
     }
+    expect(
+      sql('SELECT ended_reason FROM account_sessions WHERE id IN (?, ?)', other.sessionId, third.sessionId)
+    ).toEqual([{ ended_reason: 'key_changed' }, { ended_reason: 'key_changed' }])
     const sessions = (await send('GET', '/sessions', undefined, bearer(caller.accessToken))).body.sessions
     expect(sessions.map((row: { sessionId: string }) => row.sessionId)).toEqual([s.sessionId])
 
@@ -442,6 +449,52 @@ describe('refusals', () => {
     const response = await rekeyWith(s, await rekeyBody(s, await SigningKey.generate()))
     expect(response.status).toBe(401)
     expect((await send('POST', '/account/rekey', await rekeyBody(s, await SigningKey.generate()))).status).toBe(401)
+  })
+
+  it('leaves sessions that ended before the change as they ended', async () => {
+    const s = await phone()
+    const signedOut = await phone(s.key)
+    const revoked = await phone(s.key)
+    await send('DELETE', '/sessions/current', undefined, bearer(signedOut.accessToken))
+    expect(
+      (await send('POST', '/sessions/revoke', { sessionId: revoked.sessionId }, bearer(s.accessToken))).status
+    ).toBe(200)
+    const before = sql(
+      'SELECT id, revoked_at, ended_reason FROM account_sessions WHERE id IN (?, ?) ORDER BY id',
+      signedOut.sessionId,
+      revoked.sessionId
+    )
+    vi.advanceTimersByTime(1_000)
+    expect((await rekey(s)).response.status).toBe(200)
+
+    // A lost device signed out first never reads as ended by the change.
+    expect(
+      sql(
+        'SELECT id, revoked_at, ended_reason FROM account_sessions WHERE id IN (?, ?) ORDER BY id',
+        signedOut.sessionId,
+        revoked.sessionId
+      )
+    ).toEqual(before)
+    for (const ended of [signedOut, revoked]) {
+      const refused = await refresh(ended)
+      expect(refused.status).toBe(401)
+      expect(refused.body).toMatchObject({ code: 'unauthorized', reason: 'revoked' })
+      expect(refused.body.changedAt).toBeUndefined()
+    }
+  })
+
+  it('leaves a session that expired before the change expired', async () => {
+    const s = await phone()
+    const lapsed = await phone(s.key)
+    sql('UPDATE account_sessions SET expires_at = ? WHERE id = ?', Date.now() - 1, lapsed.sessionId)
+    expect((await rekey(s)).response.status).toBe(200)
+    expect(sql('SELECT revoked_at, ended_reason FROM account_sessions WHERE id = ?', lapsed.sessionId)).toEqual([
+      { revoked_at: null, ended_reason: null },
+    ])
+    const refused = await refresh(lapsed)
+    expect(refused.status).toBe(401)
+    expect(refused.body).toMatchObject({ code: 'unauthorized', reason: 'expired' })
+    expect(refused.body.changedAt).toBeUndefined()
   })
 
   it('answers why when the caller’s session ends during the change, not a conflict', async () => {
