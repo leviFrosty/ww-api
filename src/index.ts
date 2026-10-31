@@ -7,12 +7,14 @@ import { pruneEndedSessions } from "./accounts/sessionStore";
 import { pruneActivity } from "./accounts/activity";
 import { pruneSupporterRecords } from "./accounts/supporter";
 import { pruneUsedTokens } from "./accounts/passkeyStore";
+import { pruneInboxSuccessors } from "./accounts/inboxSuccessors";
 
 /**
  * Deletes account sessions that ended over a week ago, activity entries
  * over 400 days old, RevenueCat webhook event ids over 30 days old,
- * RevenueCat customers no account links, and used passkey challenge and
- * ticket ids whose tokens expired; failures only report.
+ * RevenueCat customers no account links, used passkey challenge and
+ * ticket ids whose tokens expired, and Buddies inbox successors over 90 days
+ * old; failures only report.
  */
 async function pruneAccountSessions(environment: Environment): Promise<void> {
   if (!environment.ACCOUNTS_DB) return;
@@ -40,6 +42,12 @@ async function pruneAccountSessions(environment: Environment): Promise<void> {
   } catch (error) {
     console.error("accounts: pruning used token ids failed");
     captureFailure(error, "used token prune");
+  }
+  try {
+    await pruneInboxSuccessors(db);
+  } catch (error) {
+    console.error("accounts: pruning inbox successors failed");
+    captureFailure(error, "inbox successor prune");
   }
 }
 
