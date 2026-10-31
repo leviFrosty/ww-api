@@ -1165,7 +1165,7 @@ ${readTier}`,
       "bad_request",
     ]),
     401: errorResponse(
-      "Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does. `reason` says why: `revoked` (signed out, by another device or itself), `replaced` (a cap ended it), `expired`, `reused` (a replaced refresh token came back), or `unknown`.",
+      "Malformed, not issued by this worker (its MAC doesn’t verify), unknown, replaced, ended, or expired: open a new session. A replaced token presented after its minute, or any older one, also ends the session; one this worker didn’t issue never does. `reason` says why: `revoked` (signed out, by another device or itself), `replaced` (a cap ended it), `expired`, `reused` (a replaced refresh token came back), `key_changed` (the account key changed on another session while this one was live; one signed out before the change stays `revoked`), or `unknown`.",
       ["unauthorized"],
       apiErrorSchema
         .extend({
