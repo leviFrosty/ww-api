@@ -67,6 +67,7 @@ import {
   findInboxSuccessor,
   findSuccessorAccount,
   forgetInboxSuccessor,
+  isOldKeyLink,
   recordInboxSuccessor,
   unlinkReplacedInbox,
 } from '../accounts/inboxSuccessors'
@@ -127,6 +128,8 @@ import {
  * sessions while the legacy switch is on, 426 `upgrade_required` once it's
  * off, except the iOS Notification Service Extension's owner-signed
  * `inbox/sync` for an inbox with a confirmed account link (`admitCaller`).
+ * An owner-signed request on an inbox first linked before its account's key
+ * changed is 401 `unauthorized`, `reason: "key_changed"` (`ownedByOldKey`).
  *
  * Privacy: every id travels in the body (or, for the live socket, in headers),
  * and nothing here logs or reports the body, headers, payload, token, or any
@@ -150,8 +153,12 @@ interface OpOutcome {
   push?: PushJob | null
 }
 
-/** A failure may say how long to wait (`Retry-After`). */
-type Outcome = { ok: true; value: OpOutcome } | BuddiesFailure
+/**
+ * A failure may say how long to wait (`Retry-After`), and an `unauthorized`
+ * one why (`reason`).
+ */
+type Refusal = BuddiesFailure & { reason?: 'key_changed' }
+type Outcome = { ok: true; value: OpOutcome } | Refusal
 
 const inbox = (env: Environment, inboxId: string) =>
   env.BUDDY_INBOX.get(env.BUDDY_INBOX.idFromName(inboxId))
@@ -257,6 +264,46 @@ const admitCaller = async (
   return { ok: true, caller }
 }
 
+/**
+ * An owner-signed (legacy) owner op, `inbox/live`, or `blob/put` on an inbox
+ * first linked to its account at a key epoch below the account's current
+ * one: 401 `unauthorized`, `reason: "key_changed"` (witness-work ADR 0039),
+ * for good. An inbox's owner key comes from the account key it was linked
+ * under, so after a key change whoever holds the old key could otherwise keep
+ * reading the User's old inbox (or acting as its owner) until the User's
+ * device deletes it, which a lost device never does. Registering the inbox
+ * again with the new key's proof moves its link up for successors only: the
+ * owner key is still the old one's. The old inbox is left to bearer owner
+ * ops, with which the User's device deletes it with a successor. With the
+ * legacy switch on or off, the Notification Service Extension's
+ * `linkedOnly` sync included; a legacy `inbox/register` is refused too
+ * (`checkInboxAccount`).
+ *
+ * Checked after the request's shape and `ts`, before the inbox wakes, so
+ * nothing in the inbox changes (no nonce is spent). The Worker can't check
+ * the owner signature (the inbox holds the owner key), so anyone who knows
+ * the inbox id learns that it predates a key change; buddies learn that
+ * anyway from the reconnect. Inboxes without a link (registered before
+ * accounts) and workers without the accounts database are unchanged. Bearer
+ * owner ops are left to the session rules.
+ *
+ * One indexed accounts database read per request, never cached: a cached
+ * answer could re-admit the old key after a change. If the read fails the
+ * request fails (500), rather than serving the old key.
+ */
+const ownedByOldKey = async (
+  env: Environment,
+  inboxId: string
+): Promise<boolean> =>
+  env.ACCOUNTS_DB != null &&
+  (await isOldKeyLink(accountsDb(env.ACCOUNTS_DB), inboxId))
+
+const KEY_CHANGED = {
+  ok: false,
+  error: 'unauthorized',
+  reason: 'key_changed',
+} as const satisfies Outcome
+
 /** The Notification Service Extension's `inbox/sync` (see `admitCaller`). */
 const isNotificationServiceSync = (c: AppContext, op: BuddiesRouteOp) =>
   op === 'inbox/sync' &&
@@ -286,7 +333,7 @@ type InboxAccount =
       /** The key epoch of the key that verified the proof; null without one. */
       keyEpoch: number | null
     }
-  | BuddiesFailure
+  | Refusal
 
 /**
  * Checks `inbox/register` against the accounts database (witness-work ADR
@@ -295,13 +342,20 @@ type InboxAccount =
  * account's inbox is refused, with or without a proof, and so is an inbox
  * with a successor recorded (`conflict`). `keyEpoch` is the
  * account's epoch as read with the key that verified the proof (ADR 0039).
+ *
+ * A legacy registration of an inbox first linked before its account's key
+ * changed is `key_changed`, proof or not (`ownedByOldKey`): it would only
+ * keep the old key's inbox from ageing out. A bearer one goes ahead, so the
+ * User's device can still move the link up.
  */
 const checkInboxAccount = async (
   db: ReturnType<typeof accountsDb>,
-  call: Signed<BuddiesPayloads['inbox/register']>
+  call: Signed<BuddiesPayloads['inbox/register']>,
+  bearer: boolean
 ): Promise<InboxAccount> => {
   // A replaced inbox (ADR 0039 §5) is never registered again.
   if (await findSuccessorAccount(db, call.inboxId)) return fail('conflict')
+  if (!bearer && (await isOldKeyLink(db, call.inboxId))) return KEY_CHANGED
   const linked = await findInboxAccount(db, call.inboxId)
   if (linked?.status === 'suspended') return fail('suspended')
   if (!call.account)
@@ -373,7 +427,7 @@ const registerInbox = async (
   }
   if (db) {
     try {
-      check = await checkInboxAccount(db, call)
+      check = await checkInboxAccount(db, call, account != null)
     } catch (error) {
       if (account) throw error
       console.warn('buddies: accounts database unavailable; registering unlinked')
@@ -588,6 +642,12 @@ const runSigned = async <K extends BuddiesSignedOp>(
   const call = signedCall(op, envelope, now)
   if (!call.ok) return call
   if (isStale(call.value.ts, now)) return { ok: false, error: 'stale' }
+  if (
+    !caller.account &&
+    isOwnerOp(op) &&
+    (await ownedByOldKey(env, call.value.inboxId))
+  )
+    return KEY_CHANGED
   if (caller.linkedOnly) {
     // `admitCaller` lets only `inbox/sync` through this way.
     if (op !== 'inbox/sync') return fail('upgrade_required')
@@ -725,8 +785,16 @@ const runUnsigned = async <K extends BuddiesUnsignedOp>(
 
 const errorResponse = (
   error: BuddiesErrorCode,
-  retryAfterSeconds?: number
-): Response => buddiesErrorResponse(error, { retryAfterSeconds })
+  retryAfterSeconds?: number,
+  reason?: string
+): Response =>
+  buddiesErrorResponse(error, {
+    retryAfterSeconds,
+    extras: reason ? { reason } : undefined,
+  })
+
+const keyChanged = (): Response =>
+  errorResponse(KEY_CHANGED.error, undefined, KEY_CHANGED.reason)
 
 /** A per-caller edge limit refused the request. */
 const edgeLimited = (): Response =>
@@ -763,7 +831,7 @@ const handleBuddiesOp = async (
         : await runSigned(op, c.env, envelope, caller)
     }
     if (!result.ok)
-      return errorResponse(result.error, result.retryAfterSeconds)
+      return errorResponse(result.error, result.retryAfterSeconds, result.reason)
 
     const { body, push } = result.value
     if (push) c.executionCtx.waitUntil(deliverPushJob(c.env, push, deps.push))
@@ -869,6 +937,7 @@ const handleLive = async (c: AppContext): Promise<Response> => {
       const call = readLiveCall(c.req.raw.headers, now)
       if (!call.ok) return errorResponse(call.error)
       if (isStale(call.value.ts, now)) return errorResponse('stale')
+      if (await ownedByOldKey(c.env, call.value.inboxId)) return keyChanged()
       inboxId = call.value.inboxId
     }
     return await inbox(c.env, inboxId).fetch(
@@ -936,6 +1005,8 @@ const handleBlobPut = async (c: AppContext): Promise<Response> => {
     const { account } = admission.caller
     const call = blobPutCall(c.req.raw.headers, Date.now(), account)
     if (!call.ok) return errorResponse(call.error)
+    if (!account && (await ownedByOldKey(c.env, call.value.inboxId)))
+      return keyChanged()
     if (call.value.bytes > BUDDIES_LIMITS.blobBytes)
       return errorResponse('too_large')
     const body = await readBlobBody(c.req.raw, call.value.bytes)

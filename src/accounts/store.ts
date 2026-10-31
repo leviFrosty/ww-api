@@ -186,7 +186,8 @@ export const findInboxAccount = async (
  *
  * `keyEpoch` is the epoch of the key that signed the link's proof, as read
  * with that key, never re-read here: a key change landing in between leaves
- * the link at the old epoch, so it can't be a successor (ADR 0039 §5).
+ * the link at the old epoch, so it can't be a successor (ADR 0039 §5). It's
+ * also the link's `firstKeyEpoch`, which never moves.
  */
 export const linkInbox = async (
   db: AccountsDb,
@@ -206,7 +207,7 @@ export const linkInbox = async (
     ),
     db
       .insert(accountInboxes)
-      .values({ inboxId, accountId, keyEpoch })
+      .values({ inboxId, accountId, keyEpoch, firstKeyEpoch: keyEpoch })
       .onConflictDoNothing({ target: accountInboxes.inboxId }),
   ])
   const owner = await findInboxAccount(db, inboxId)
@@ -217,6 +218,8 @@ export const linkInbox = async (
 /**
  * Moves an existing link up to `keyEpoch`, the epoch of the key that signed a
  * new proof for it (ADR 0039 §5); never down, and never another account's.
+ * Only successor eligibility follows it: `firstKeyEpoch` stays, so an inbox
+ * the old key made still refuses owner-signed requests.
  */
 export const confirmInboxLink = async (
   db: AccountsDb,

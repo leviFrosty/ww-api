@@ -273,6 +273,13 @@ export const accountInboxes = sqliteTable(
      * an inbox's successor.
      */
     keyEpoch: integer('key_epoch').notNull().default(0),
+    /**
+     * The account's key epoch when the inbox was first linked; never moves.
+     * The inbox's owner key is that epoch's (it comes from the account key),
+     * so once the account's key has changed past it, the relay refuses the
+     * inbox's owner-signed requests for good (`key_changed`).
+     */
+    firstKeyEpoch: integer('first_key_epoch').notNull().default(0),
   },
   (t) => [index('account_inboxes_account_idx').on(t.accountId)]
 )

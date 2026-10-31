@@ -142,10 +142,14 @@ const PHOTOS_SWITCH =
 const LEGACY_SWITCH =
   'It works while the legacy switch (KV `auth:legacy`) is on; once it’s off, a legacy request is 426 `upgrade_required`. A request with an `Authorization` header is always a bearer request and never falls back.'
 
+/** Owner-signed requests after a key change (witness-work ADR 0039). */
+const OLD_KEY_OWNER =
+  'Legacy: the inbox was first linked to an account whose key has changed since (`reason: "key_changed"`). Its owner key comes from the old account key, so owner-signed requests stop at the change for good, the Notification Service Extension’s sync included, even after the new key registers the inbox again. The old inbox is usable only through bearer owner ops, and the User’s device deletes it with a successor. Refused before the inbox wakes, whatever the signature.'
+
 const SIGNED_BY = {
   owner: paragraphs(
     '**Bearer:** `Authorization: Bearer <access token>` and the fields as plain JSON, without `ts` or `nonce`. The inbox must be linked to the token’s account: another account’s inbox is `forbidden`, and one with no confirmed link (registered before accounts, or its linking registration failed part-way) is `not_linked` (link it with a bearer `inbox/register`, then retry).',
-    `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH}`
+    `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH} After the account’s key changes, an inbox first linked under the old key refuses it with \`unauthorized\`, \`reason: "key_changed"\`, for good: use bearer requests, and delete the inbox with a successor.`
   ),
   writer: paragraphs(
     '**Signed by** the writer key registered for (`inboxId`, `slotId`) with `slot/add`: the signature is the slot’s capability, in both forms.',
@@ -283,6 +287,7 @@ const ownerRefusals = (
     'Legacy: signature missing, malformed, or not by the owner key.',
   stale: `Legacy only. ${DEFAULT_REASONS.stale}`,
   ...AUTH_REFUSALS,
+  unauthorized: `${DEFAULT_REASONS.unauthorized} ${OLD_KEY_OWNER}`,
   forbidden: true as const,
   ...(suspendable ? { suspended: true as const } : {}),
   not_found: true as const,
@@ -419,6 +424,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
           'Signature not by `ownerPub`, or the `account` signature is not by that account.',
         stale: true,
         ...AUTH_REFUSALS,
+        unauthorized: `${DEFAULT_REASONS.unauthorized} Legacy: the inbox was first linked to an account whose key has changed since (\`reason: "key_changed"\`), with or without \`account\`; it only takes bearer requests now.`,
         forbidden:
           'Bearer: `account` names another account than the token’s.',
         suspended:
