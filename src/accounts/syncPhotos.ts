@@ -141,13 +141,20 @@ const putPhoto = async (
     return c.json({ ok: true, ...begun.value.existed, existed: true, usage: begun.value.usage })
   const { reservation } = begun.value
 
-  const body = await readBlobBody(c.req.raw, size, SYNC_PHOTO_LIMITS.blobBytes)
-  const digest = body.ok ? await sha256Bytes(body.value) : null
-  if (!body.ok || !timingSafeEqual(bytesToBase64Url(digest!), sha256)) {
-    await index.abortPhotoPut({ name, reservation }).catch(() => undefined)
-    return buddiesErrorResponse(body.ok ? 'bad_request' : body.error)
-  }
+  // From here the put holds its name and its bytes. Unless its commit answers
+  // (which frees them itself, stored or refused), whatever ends the put frees
+  // them before the answer: a body that fails to arrive (the link dropped, the
+  // app was killed), a bad digest, a failed R2 write, or any error. Leaving
+  // them for the window to lapse would turn the retry away with 429 for
+  // minutes and keep the dead put's bytes counted against the account's room.
+  let wrote = false
+  let answered = false
   try {
+    const body = await readBlobBody(c.req.raw, size, SYNC_PHOTO_LIMITS.blobBytes)
+    const digest = body.ok ? await sha256Bytes(body.value) : null
+    if (!body.ok || !timingSafeEqual(bytesToBase64Url(digest!), sha256))
+      return buddiesErrorResponse(body.ok ? 'bad_request' : body.error)
+    wrote = true
     await c.env.ACCOUNT_PHOTOS!.put(
       syncPhotoObjectKey(accountId, name, reservation),
       body.value,
@@ -156,26 +163,40 @@ const putPhoto = async (
         httpMetadata: { contentType: 'application/octet-stream' },
       }
     )
-  } catch (error) {
-    await index
-      .abortPhotoPut({ name, reservation, wrote: true })
-      .catch(() => undefined)
-    throw error
-  }
-  const committed = await index.commitPhotoPut({
-    accountId,
-    name,
-    reservation,
-    exceptSlot: slot,
-  })
-  if (!committed.ok)
-    return buddiesErrorResponse(committed.error, {
-      extras: committed.usage ? { usage: committed.usage } : undefined,
+    const committed = await index.commitPhotoPut({
+      accountId,
+      name,
+      reservation,
+      exceptSlot: slot,
     })
-  const { photo, usage } = committed.value
-  return c.json({ ok: true, ...photo, existed: false, usage }, 200, {
-    ETag: `"${photo.sha256}"`,
-  })
+    answered = true
+    if (!committed.ok)
+      return buddiesErrorResponse(committed.error, {
+        extras: committed.usage ? { usage: committed.usage } : undefined,
+      })
+    const { photo, usage } = committed.value
+    return c.json({ ok: true, ...photo, existed: false, usage }, 200, {
+      ETag: `"${photo.sha256}"`,
+    })
+  } finally {
+    // A failed write may still have landed, so the next alarm sweeps for its
+    // object. If the commit itself threw, the abort only deletes this put's
+    // own row, which may already be gone.
+    if (!answered) {
+      const released = index
+        .abortPhotoPut({ name, reservation, wrote })
+        .catch(() => undefined)
+      // A client that went away cancels what the request still has pending
+      // unless the runtime is told to finish it: a put cut off mid-body is
+      // exactly that, and the release is what it must not lose.
+      try {
+        c.executionCtx.waitUntil(released)
+      } catch {
+        // No ExecutionContext (unit tests): the release still runs, awaited.
+      }
+      await released
+    }
+  }
 }
 
 /** `photos/list`: live photos by name, a page at a time, with the usage. */
