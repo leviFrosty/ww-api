@@ -14,7 +14,10 @@ import {
 import { handleAppStoreRatingsRequest } from './route'
 
 const lookup = (count: number, average: number) =>
-  Response.json({ resultCount: 1, results: [{ userRatingCount: count, averageUserRating: average }] })
+  Response.json({
+    resultCount: 1,
+    results: [{ userRatingCount: count, averageUserRating: average }],
+  })
 
 /** US 100 × 5.0, BR 50 × 4.0, every other storefront unrated. */
 const appleFetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -33,22 +36,54 @@ afterEach(() => {
 
 describe('fetchStorefrontRating', () => {
   it('distinguishes unrated storefronts from failed lookups', async () => {
-    expect(await fetchStorefrontRating('us', appleFetch)).toEqual({ count: 100, average: 5 })
+    expect(await fetchStorefrontRating('us', appleFetch)).toEqual({
+      count: 100,
+      average: 5,
+    })
     expect(await fetchStorefrontRating('fr', appleFetch)).toBeNull()
-    const failing = (async () => new Response('', { status: 503 })) as unknown as typeof fetch
+    const unrated = (async () => lookup(0, 0)) as unknown as typeof fetch
+    expect(await fetchStorefrontRating('fr', unrated)).toBeNull()
+    const failing = (async () =>
+      new Response('', { status: 503 })) as unknown as typeof fetch
     expect(await fetchStorefrontRating('us', failing)).toBeUndefined()
     const throwing = (async () => {
       throw new Error('offline')
     }) as unknown as typeof fetch
     expect(await fetchStorefrontRating('us', throwing)).toBeUndefined()
   })
+
+  it.each([
+    {},
+    { results: [] },
+    { resultCount: 1, results: [] },
+    {
+      resultCount: 1,
+      results: [{ userRatingCount: -1, averageUserRating: 5 }],
+    },
+    {
+      resultCount: 1,
+      results: [{ userRatingCount: 1.5, averageUserRating: 5 }],
+    },
+    { resultCount: 1, results: [{ userRatingCount: 1, averageUserRating: 6 }] },
+  ])(
+    'treats malformed Apple bodies as retryable failures: %j',
+    async (body) => {
+      const malformed = (async () =>
+        Response.json(body)) as unknown as typeof fetch
+      expect(await fetchStorefrontRating('us', malformed)).toBeUndefined()
+    },
+  )
 })
 
 describe('summarize', () => {
   it('weights the average by rating count', () => {
     expect(
-      summarize({ us: { count: 100, average: 5 }, br: { count: 50, average: 4 } }, 0),
+      summarize(
+        { us: { count: 100, average: 5 }, br: { count: 50, average: 4 } },
+        0,
+      ),
     ).toEqual({
+      complete: true,
       averageRating: 4.67,
       ratingCount: 150,
       countryCount: 2,
@@ -58,13 +93,32 @@ describe('summarize', () => {
 })
 
 describe('runRatingsSweepStep', () => {
+  it('does not queue concurrent lookups behind the Worker connection limit', async () => {
+    const kv = makeMemoryKv()
+    let active = 0
+    let maxActive = 0
+    const measuredFetch = (async (input: RequestInfo | URL) => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await Promise.resolve()
+      active -= 1
+      return appleFetch(input)
+    }) as typeof fetch
+    await runRatingsSweepStep({ kv, now: 0, fetchFn: measuredFetch })
+    expect(maxActive).toBe(1)
+  })
+
   it('publishes a summary only after every storefront is swept, then rests a day', async () => {
     const kv = makeMemoryKv()
     for (let run = 1; run < runs; run++) {
-      expect(await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch })).toBe('progress')
+      expect(
+        await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch }),
+      ).toBe('progress')
       expect(kv.store.has(SUMMARY_KEY)).toBe(false)
     }
-    expect(await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch })).toBe('completed')
+    expect(await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch })).toBe(
+      'completed',
+    )
     expect(appleFetch).toHaveBeenCalledTimes(APP_STORE_STOREFRONTS.length)
     expect(JSON.parse(kv.store.get(SUMMARY_KEY)!)).toMatchObject({
       averageRating: 4.67,
@@ -73,11 +127,19 @@ describe('runRatingsSweepStep', () => {
     })
 
     expect(
-      await runRatingsSweepStep({ kv, now: SWEEP_INTERVAL_MS - 1, fetchFn: appleFetch }),
+      await runRatingsSweepStep({
+        kv,
+        now: SWEEP_INTERVAL_MS - 1,
+        fetchFn: appleFetch,
+      }),
     ).toBe('idle')
     expect(appleFetch).toHaveBeenCalledTimes(APP_STORE_STOREFRONTS.length)
     expect(
-      await runRatingsSweepStep({ kv, now: SWEEP_INTERVAL_MS, fetchFn: appleFetch }),
+      await runRatingsSweepStep({
+        kv,
+        now: SWEEP_INTERVAL_MS,
+        fetchFn: appleFetch,
+      }),
     ).toBe('progress')
   })
 
@@ -85,14 +147,69 @@ describe('runRatingsSweepStep', () => {
     const kv = makeMemoryKv()
     kv.store.set(
       STATE_KEY,
-      JSON.stringify({ cursor: 0, completedAt: null, storefronts: { af: { count: 7, average: 3 } } }),
+      JSON.stringify({
+        pending: [...APP_STORE_STOREFRONTS],
+        completedAt: null,
+        storefronts: { af: { count: 7, average: 3 } },
+      }),
     )
-    const failing = (async () => new Response('', { status: 500 })) as unknown as typeof fetch
+    const failing = (async () =>
+      new Response('', { status: 500 })) as unknown as typeof fetch
     await runRatingsSweepStep({ kv, now: 0, fetchFn: failing })
     expect(JSON.parse(kv.store.get(STATE_KEY)!)).toMatchObject({
-      cursor: BATCH_SIZE,
       storefronts: { af: { count: 7, average: 3 } },
     })
+    expect(JSON.parse(kv.store.get(STATE_KEY)!).pending).toHaveLength(
+      APP_STORE_STOREFRONTS.length,
+    )
+    expect(kv.store.has(SUMMARY_KEY)).toBe(false)
+  })
+
+  it('does not publish a partial sweep and retries failed storefronts before completing', async () => {
+    const kv = makeMemoryKv()
+    let failUs = true
+    const partial = vi.fn(async (input: RequestInfo | URL) => {
+      if (
+        failUs &&
+        new URL(String(input)).searchParams.get('country') === 'us'
+      ) {
+        return new Response('', { status: 503 })
+      }
+      return appleFetch(input)
+    }) as unknown as typeof fetch
+    for (let run = 0; run < runs; run++) {
+      expect(await runRatingsSweepStep({ kv, now: 0, fetchFn: partial })).toBe(
+        'progress',
+      )
+    }
+    expect(kv.store.has(SUMMARY_KEY)).toBe(false)
+    expect(JSON.parse(kv.store.get(STATE_KEY)!).pending).toEqual(['us'])
+    failUs = false
+    expect(await runRatingsSweepStep({ kv, now: 1, fetchFn: partial })).toBe(
+      'completed',
+    )
+    expect(JSON.parse(kv.store.get(SUMMARY_KEY)!)).toMatchObject({
+      complete: true,
+      ratingCount: 150,
+    })
+  })
+
+  it('keeps the previous complete summary while a later sweep has failures', async () => {
+    const kv = makeMemoryKv()
+    for (let run = 0; run < runs; run++) {
+      await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch })
+    }
+    const previous = kv.store.get(SUMMARY_KEY)
+    const failing = (async () =>
+      new Response('', { status: 500 })) as unknown as typeof fetch
+    for (let run = 0; run < runs; run++) {
+      await runRatingsSweepStep({
+        kv,
+        now: SWEEP_INTERVAL_MS,
+        fetchFn: failing,
+      })
+    }
+    expect(kv.store.get(SUMMARY_KEY)).toBe(previous)
   })
 })
 
@@ -101,25 +218,31 @@ describe('GET /app-store/ratings', () => {
     const kv = makeMemoryKv()
     const cached = new Map<string, Response>()
     const cache = {
-      match: vi.fn(async (request: Request) => cached.get(request.url)?.clone()),
+      match: vi.fn(async (request: Request) =>
+        cached.get(request.url)?.clone(),
+      ),
       put: vi.fn(async (request: Request, response: Response) => {
         cached.set(request.url, response)
       }),
     }
     vi.stubGlobal('caches', { default: cache })
     const pending: Promise<unknown>[] = []
-    const request = (url = 'https://ww-proxy.leviwilkerson.com/app-store/ratings') =>
+    const request = (
+      url = 'https://ww-proxy.leviwilkerson.com/app-store/ratings',
+    ) =>
       handleAppStoreRatingsRequest({
         req: { url },
         env: { NOTES_KV: kv } as unknown as Environment,
-        executionCtx: { waitUntil: (promise: Promise<unknown>) => pending.push(promise) },
+        executionCtx: {
+          waitUntil: (promise: Promise<unknown>) => pending.push(promise),
+        },
         json: (body: unknown, status: number, headers: HeadersInit) =>
           Response.json(body, { status, headers }),
       } as unknown as AppContext).then(async (response) => {
         await Promise.all(pending)
         return response
       })
-    return { kv, cache, request }
+    return { kv, cache, cached, request }
   }
 
   it('is unavailable and uncached before the first sweep completes', async () => {
@@ -128,6 +251,22 @@ describe('GET /app-store/ratings', () => {
     expect(response.status).toBe(503)
     expect(response.headers.get('Cache-Control')).toBe('no-store')
     expect(cache.put).not.toHaveBeenCalled()
+  })
+
+  it('does not serve the legacy partial summary', async () => {
+    const { kv, cached, request } = fixture()
+    const legacy = JSON.stringify({
+      averageRating: 4.96,
+      ratingCount: 72,
+      countryCount: 4,
+      updatedAt: '2026-11-01T03:17:21.060Z',
+    })
+    kv.store.set('app-store-ratings:summary', legacy)
+    cached.set(
+      'https://ww-proxy.leviwilkerson.com/app-store/ratings',
+      new Response(legacy),
+    )
+    expect((await request()).status).toBe(503)
   })
 
   it('serves repeat requests, including query variants, from the edge cache', async () => {
@@ -141,7 +280,9 @@ describe('GET /app-store/ratings', () => {
     expect(first.headers.get('Cache-Control')).toContain('s-maxage=')
     expect(await first.json()).toEqual(summary)
 
-    const second = await request('https://ww-proxy.leviwilkerson.com/app-store/ratings?v=2')
+    const second = await request(
+      'https://ww-proxy.leviwilkerson.com/app-store/ratings?v=2',
+    )
     expect(await second.json()).toEqual(summary)
     expect(get).toHaveBeenCalledTimes(1)
     expect(cache.put).toHaveBeenCalledTimes(1)

@@ -18,7 +18,7 @@ const RETRY_AFTER_SECONDS = 60 * 60
  */
 export async function handleAppStoreRatingsRequest(ctx: AppContext) {
   // Query strings would fragment the cache without changing the body.
-  const cacheKey = new Request(new URL('/app-store/ratings', ctx.req.url))
+  const cacheKey = new Request(new URL('/app-store/ratings?v=2', ctx.req.url))
   const cache = caches.default
   const hit = await cache.match(cacheKey)
   if (hit) return hit

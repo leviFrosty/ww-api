@@ -1,8 +1,7 @@
 import { APP_STORE_STOREFRONTS } from './storefronts'
 
 /**
- * App Store social proof for the paywall ("4.89 average from 728 ratings,
- * publishers in 38+ countries").
+ * Complete App Store ratings snapshots for the paywall.
  *
  * App Store Connect's API exposes written reviews only; star-only ratings (the
  * bulk of them) are published per storefront by Apple's public iTunes lookup
@@ -15,8 +14,8 @@ import { APP_STORE_STOREFRONTS } from './storefronts'
 
 export const APP_STORE_APP_ID = '6469723047'
 
-export const STATE_KEY = 'app-store-ratings:state'
-export const SUMMARY_KEY = 'app-store-ratings:summary'
+export const STATE_KEY = 'app-store-ratings:state:v2'
+export const SUMMARY_KEY = 'app-store-ratings:summary:v2'
 
 export const BATCH_SIZE = 40
 export const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -30,14 +29,14 @@ export interface StorefrontRating {
 }
 
 interface SweepState {
-  /** Index into APP_STORE_STOREFRONTS where the next run resumes. */
-  cursor: number
+  pending: string[]
   /** When the last full sweep finished; null before the first one. */
   completedAt: number | null
   storefronts: Record<string, StorefrontRating>
 }
 
 export interface AppStoreRatingsSummary {
+  complete: true
   /** Rating-count-weighted mean across storefronts, rounded to 2 decimals. */
   averageRating: number
   ratingCount: number
@@ -46,7 +45,11 @@ export interface AppStoreRatingsSummary {
   updatedAt: string
 }
 
-const EMPTY_STATE: SweepState = { cursor: 0, completedAt: null, storefronts: {} }
+const emptyState = (): SweepState => ({
+  pending: [...APP_STORE_STOREFRONTS],
+  completedAt: null,
+  storefronts: {},
+})
 
 /**
  * One storefront's lookup. `null` means Apple reported no ratings there;
@@ -63,14 +66,41 @@ export async function fetchStorefrontRating(
     })
     if (!response.ok) return undefined
     const body = (await response.json()) as {
-      results?: Array<{ userRatingCount?: unknown; averageUserRating?: unknown }>
+      resultCount?: unknown
+      results?: Array<{
+        userRatingCount?: unknown
+        averageUserRating?: unknown
+      }>
+    }
+    if (
+      body.resultCount === 0 &&
+      Array.isArray(body.results) &&
+      body.results.length === 0
+    ) {
+      return null
+    }
+    if (
+      body.resultCount !== 1 ||
+      !Array.isArray(body.results) ||
+      body.results.length !== 1
+    ) {
+      return undefined
     }
     const app = body.results?.[0]
     const count = app?.userRatingCount
     const average = app?.averageUserRating
-    if (typeof count !== 'number' || typeof average !== 'number' || count <= 0) {
-      return null
+    if (
+      typeof count !== 'number' ||
+      !Number.isSafeInteger(count) ||
+      count < 0 ||
+      typeof average !== 'number' ||
+      !Number.isFinite(average) ||
+      average < 0 ||
+      average > 5
+    ) {
+      return undefined
     }
+    if (count === 0) return null
     return { count, average }
   } catch {
     return undefined
@@ -88,7 +118,10 @@ export function summarize(
     weighted += count * average
   }
   return {
-    averageRating: ratingCount ? Math.round((weighted / ratingCount) * 100) / 100 : 0,
+    complete: true,
+    averageRating: ratingCount
+      ? Math.round((weighted / ratingCount) * 100) / 100
+      : 0,
     ratingCount,
     countryCount: Object.keys(storefronts).length,
     updatedAt: new Date(now).toISOString(),
@@ -97,14 +130,14 @@ export function summarize(
 
 async function readState(kv: RatingsKv): Promise<SweepState> {
   const raw = await kv.get(STATE_KEY)
-  if (!raw) return { ...EMPTY_STATE }
+  if (!raw) return emptyState()
   try {
     const state = JSON.parse(raw) as SweepState
-    return typeof state.cursor === 'number' && state.storefronts
+    return Array.isArray(state.pending) && state.storefronts
       ? state
-      : { ...EMPTY_STATE }
+      : emptyState()
   } catch {
-    return { ...EMPTY_STATE }
+    return emptyState()
   }
 }
 
@@ -120,28 +153,27 @@ export async function runRatingsSweepStep({
 }): Promise<'idle' | 'progress' | 'completed'> {
   const state = await readState(kv)
   if (
-    state.cursor === 0 &&
+    state.pending.length === 0 &&
     state.completedAt !== null &&
     now - state.completedAt < SWEEP_INTERVAL_MS
   ) {
     return 'idle'
   }
 
-  const batch = APP_STORE_STOREFRONTS.slice(state.cursor, state.cursor + BATCH_SIZE)
-  const results = await Promise.all(
-    batch.map((country) => fetchStorefrontRating(country, fetchFn)),
-  )
-  batch.forEach((country, index) => {
-    const result = results[index]
-    if (result === undefined) return
+  if (state.pending.length === 0) state.pending = [...APP_STORE_STOREFRONTS]
+  const batch = state.pending.splice(0, BATCH_SIZE)
+  for (const country of batch) {
+    const result = await fetchStorefrontRating(country, fetchFn)
+    if (result === undefined) {
+      state.pending.push(country)
+      continue
+    }
     if (result === null) delete state.storefronts[country]
     else state.storefronts[country] = result
-  })
+  }
 
-  state.cursor += batch.length
-  const completed = state.cursor >= APP_STORE_STOREFRONTS.length
+  const completed = state.pending.length === 0
   if (completed) {
-    state.cursor = 0
     state.completedAt = now
     await kv.put(SUMMARY_KEY, JSON.stringify(summarize(state.storefronts, now)))
   }
