@@ -82,13 +82,14 @@ describe('per-IP rate limits', () => {
 
 describe('app store ratings', () => {
   const summary = {
+    complete: true,
     averageRating: 4.87,
     ratingCount: 1234,
     countryCount: 42,
     updatedAt: '2026-10-01T00:00:00.000Z',
   }
 
-  it('serves 503 no-store before a sweep, then the stored summary', async () => {
+  it('serves 503 for missing or legacy totals, then the complete summary', async () => {
     const first = await http('GET', '/app-store/ratings')
     if (first.status === 503) {
       expect(first.body).toEqual({
@@ -102,6 +103,10 @@ describe('app store ratings', () => {
       if (!LOCAL_LAUNCHER) return
       // Seed what the hourly cron would publish, then read it back.
       localKv('put', 'app-store-ratings:summary', JSON.stringify(summary))
+      const legacy = await http('GET', '/app-store/ratings')
+      expect(legacy.status).toBe(503)
+      expect(legacy.headers.get('cache-control')).toBe('no-store')
+      localKv('put', 'app-store-ratings:summary:v2', JSON.stringify(summary))
       const seeded = await http('GET', '/app-store/ratings')
       expect(seeded.status).toBe(200)
       expect(seeded.body).toEqual(summary)
@@ -110,6 +115,7 @@ describe('app store ratings', () => {
       // Already seeded by an earlier run against the same persisted state.
       expect(first.status).toBe(200)
       expect(first.body).toMatchObject({
+        complete: true,
         averageRating: expect.any(Number),
         ratingCount: expect.any(Number),
         countryCount: expect.any(Number),
