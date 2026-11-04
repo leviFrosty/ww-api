@@ -1349,11 +1349,20 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
 minAppVersion? }`. The value comes from KV `app:min-version`
 (`{"minVersion":"x.y.z"}`), then the `APP_MIN_VERSION` var, else it's
 absent. Invalid values are logged and ignored, and the KV read is
-edge-cached for 60 seconds. It has its own per-IP bucket (`app`). App
+edge-cached for 60 seconds; the response itself is `no-store`. It has its own per-IP bucket (`app`). App
 versions from sessions on read it at launch and on returning to the
 foreground, and show Update Required below it. It also carries Cloud
 Sync's `sync: { enabled, entitlement }`, where `entitlement` is `everyone`
-only when `?capabilities=` (comma-separated) has `sync-everyone`.
+only when `?capabilities=` (comma-separated) has `sync-everyone`. And it
+always carries the caller's coarse location for the app's sales-region check
+(witness-work ADR 0041 §3, `docs/web-purchases.md`), from Cloudflare's
+`request.cf` (`requestRegion`): `country`, the upper-case ISO 3166-1 alpha-2
+code, null when unknown (`XX`), Tor (`T1`), or malformed; and `regionCode`,
+the ISO 3166-2 subdivision without its country prefix (`MB` for Manitoba),
+null when unknown or malformed and whenever `country` is. Null means
+unknown: the web app treats `CA` with no `regionCode` as possibly Manitoba or
+Saskatchewan, and doesn't sell there. A missing `cf`
+gives both null, never an error. Never store or log them.
 
 KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
 var, then on; edge-cached 60 s). **A failed KV read counts as off**

@@ -495,6 +495,10 @@ describe('GET /app/v1/config', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('cache-control')).toBe('no-store')
     expect(res.body.ok).toBe(true)
+    // Coarse location from request.cf: always present, null when unknown.
+    expect(res.body.country === null || /^[A-Z]{2}$/.test(res.body.country)).toBe(true)
+    expect(res.body.regionCode === null || /^[A-Z0-9]{1,3}$/.test(res.body.regionCode)).toBe(true)
+    if (res.body.country === null) expect(res.body.regionCode).toBeNull()
   })
 
   it.skipIf(!LOCAL_LAUNCHER)('serves KV app:min-version', async () => {
