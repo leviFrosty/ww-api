@@ -8,8 +8,10 @@ import { isTurnstileToken } from './contracts'
  * request carries the caller's IP (`remoteip`) and an `idempotency_key`, so
  * a retry after a dropped connection can't be counted as a second use.
  *
- * The answer must name the action, and a hostname among the env's web hosts
- * (those of `WEB_APP_ORIGINS`, the web app's origins CORS allows). Cloudflare's test secrets
+ * The answer must name the action, and a hostname in `TURNSTILE_HOSTNAMES`:
+ * the host of the web app's Turnstile frame (witness-work
+ * `docs/web-turnstile.md`), where the widget runs, never the app's own host.
+ * Unset, web sign-up and recovery are off (`turnstileConfigured`). Cloudflare's test secrets
  * (`1x…`, `2x…`, `3x…`) answer for a dummy host and action, so a
  * development worker skips those two checks for them (production never
  * does, so a test secret set there passes nothing). A development worker without
@@ -36,8 +38,8 @@ export type TurnstileEnv = Pick<
   Environment,
   | 'TURNSTILE_SECRET_KEY'
   | 'TURNSTILE_SITE_KEY'
+  | 'TURNSTILE_HOSTNAMES'
   | 'APP_ATTEST_ENVIRONMENT'
-  | 'WEB_APP_ORIGINS'
 >
 
 const isDevelopment = (env: TurnstileEnv) =>
@@ -51,21 +53,42 @@ export const turnstileSiteKey = (env: TurnstileEnv): string | null =>
   env.TURNSTILE_SITE_KEY?.trim() ||
   (isDevelopment(env) ? TURNSTILE_TEST_SITE_KEY : null)
 
-/** Whether Turnstile is set up: a site key for the web and a secret here. */
-export const turnstileConfigured = (env: TurnstileEnv): boolean =>
-  turnstileSecret(env) != null && turnstileSiteKey(env) != null
+/** Whether this worker skips the host and action checks: a test secret, in development. */
+const skipsChecks = (env: TurnstileEnv, secret: string | null): boolean =>
+  isDevelopment(env) && secret != null && TEST_SECRET_PATTERN.test(secret)
 
-/** The env's web hosts: those of `WEB_APP_ORIGINS`. */
-export const webHosts = (env: TurnstileEnv): Set<string> => {
+/**
+ * The hostnames a token may be solved on: those of `TURNSTILE_HOSTNAMES`,
+ * comma-separated, trimmed and lowercased. An entry with `/` or `:` (an origin,
+ * a port, a path) is a config mistake: it's dropped, with an error in the log.
+ */
+export const turnstileHosts = (env: TurnstileEnv): Set<string> => {
   const hosts = new Set<string>()
-  for (const origin of (env.WEB_APP_ORIGINS ?? '').split(',')) {
-    try {
-      if (origin.trim()) hosts.add(new URL(origin.trim()).hostname)
-    } catch {
-      // Not an origin; CORS ignores it too.
+  for (const entry of (env.TURNSTILE_HOSTNAMES ?? '').split(',')) {
+    const host = entry.trim().toLowerCase()
+    if (!host) continue
+    if (/[/:]/.test(host)) {
+      console.error(
+        'accounts: TURNSTILE_HOSTNAMES takes bare hostnames (verify.witnesswork.app), not origins or paths; ignoring an entry',
+        { entry: host }
+      )
+      continue
     }
+    hosts.add(host)
   }
   return hosts
+}
+
+/**
+ * Whether Turnstile is set up: a site key for the web, a secret here, and the
+ * hostnames a token may come from. Without any, every token would fail
+ * `hostname-mismatch`, so web sign-up and recovery are off instead; only a
+ * development worker on a test secret, which skips the host check, needs none.
+ */
+export const turnstileConfigured = (env: TurnstileEnv): boolean => {
+  const secret = turnstileSecret(env)
+  if (secret == null || turnstileSiteKey(env) == null) return false
+  return skipsChecks(env, secret) || turnstileHosts(env).size > 0
 }
 
 export type TurnstileOutcome =
@@ -130,9 +153,9 @@ export const verifyTurnstile = async (
   }
   // Cloudflare's test secrets answer `example.com` and no action; only a
   // development worker takes them as they are.
-  if (isDevelopment(env) && TEST_SECRET_PATTERN.test(secret)) return { ok: true }
+  if (skipsChecks(env, secret)) return { ok: true }
   if (answer.action !== input.action) return { ok: false, reason: 'action-mismatch' }
-  if (typeof answer.hostname !== 'string' || !webHosts(env).has(answer.hostname))
+  if (typeof answer.hostname !== 'string' || !turnstileHosts(env).has(answer.hostname.toLowerCase()))
     return { ok: false, reason: 'hostname-mismatch' }
   return { ok: true }
 }

@@ -1598,11 +1598,19 @@ Turnstile: the widget's site key is the `TURNSTILE_SITE_KEY` var and its
 secret the `TURNSTILE_SECRET_KEY` secret. A development worker without them
 uses Cloudflare's test keys (site key `1x00000000000000000000AA`, secret
 `1x0000000000000000000000000000000AA`, which pass any token for any host);
-production without them has web sign-up and recovery off (`disabled`). To set
-up a widget (dashboard → Turnstile, or the API with a token that has Account ›
-Turnstile › Edit): managed mode, hostnames `app.witnesswork.app` and
-`beta.app.witnesswork.app` for production, `app-dev.witnesswork.app` and
-`localhost` for dev; put the site key in `[vars]` or `[env.dev.vars]`, then:
+production without them has web sign-up and recovery off (`disabled`). The
+widget runs only in the web app's Turnstile frame (witness-work
+`docs/web-turnstile.md`), never on the app's own host, so under a real secret
+Siteverify's hostname must be in the `TURNSTILE_HOSTNAMES` var
+(`verify.witnesswork.app`; dev `verify-dev.witnesswork.app`, bare hostnames,
+lowercased; an entry with `/` or `:` is ignored with an error in the log).
+Unset, web sign-up and recovery are off (`disabled`, and `GET /app/v1/config`
+says `webSignup.enabled: false`) rather than failing every token; only a
+development worker on a test secret needs none. To set up a widget (dashboard
+→ Turnstile, or the API with a token that has Account › Turnstile › Edit):
+managed mode, hostname `verify.witnesswork.app` for production,
+`verify-dev.witnesswork.app` for dev, and nothing else; put the site key in
+`[vars]` or `[env.dev.vars]` next to `TURNSTILE_HOSTNAMES`, then:
 
 ```bash
 wrangler secret put TURNSTILE_SECRET_KEY --env dev   # paste the widget's secret

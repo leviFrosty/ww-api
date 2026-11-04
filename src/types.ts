@@ -444,6 +444,14 @@ export interface Environment {
   TURNSTILE_SITE_KEY?: string;
 
   /**
+   * The hostnames Siteverify may answer for a token (comma-separated): the web
+   * app's Turnstile frame (`verify.witnesswork.app`), where the widget runs.
+   * Unset, web sign-up and recovery are off, unless a development worker
+   * uses a test secret. Bare hostnames only; an origin or path is ignored.
+   */
+  TURNSTILE_HOSTNAMES?: string;
+
+  /**
    * Turnstile's secret for Siteverify. Secret. Development workers fall back
    * to Cloudflare's always-passing test secret; production without it has
    * web sign-up and recovery off.
