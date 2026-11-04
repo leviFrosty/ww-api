@@ -888,7 +888,10 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   again for 60 seconds from its rotation (a lost response, or two refreshes
   at once; retries don't extend it and write nothing), so a device's double
   refresh can't strand it with a dead token. Presenting it later, or any older token of a
-  live session that carries a valid MAC, ends the session. An unknown,
+  live session that carries a valid MAC, ends the session, and logs
+  `accounts: refresh token reused` with `predecessor` (the token just
+  replaced, as a device that lost a refresh's answer presents, or an older
+  one), `sinceRotationSec`, and `platform`: no ids or tokens. An unknown,
   ended, or expired session is 401 `unauthorized`; a refresh that lost its
   rotation race to a session that has since moved on again is 401 without
   ending it. Sessions last 90 days from opening and refreshing never

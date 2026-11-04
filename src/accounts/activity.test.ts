@@ -163,8 +163,15 @@ describe('sessions in the activity log', () => {
     expect((await refresh(s.refreshToken)).status).toBe(200)
     expect(await kinds(s)).not.toContain('session.refresh_reused')
 
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
     vi.setSystemTime(START + 2 * MINUTE)
     expect((await refresh(s.refreshToken)).status).toBe(401)
+    // The token just replaced, presented late: a lost answer, by the look of it.
+    expect(info).toHaveBeenCalledWith('accounts: refresh token reused', {
+      predecessor: true,
+      sinceRotationSec: 120,
+      platform: 'dev',
+    })
     const witness = await session(s.key)
     const [, reused] = await activity(witness)
     expect(reused).toMatchObject({
@@ -174,6 +181,28 @@ describe('sessions in the activity log', () => {
     // Once ended, more reuse adds nothing.
     expect((await refresh(s.refreshToken)).status).toBe(401)
     expect((await kinds(witness)).filter((k) => k === 'session.refresh_reused')).toHaveLength(1)
+    expect(info).toHaveBeenCalledTimes(1)
+  })
+
+  it('logs an older replaced token as no predecessor, with no ids or tokens', async () => {
+    const s = await session(undefined, 'Phone')
+    const refresh = (refreshToken: string) => post('/sessions/refresh', { refreshToken })
+    const second = (await refresh(s.refreshToken)).body.refreshToken as string
+    vi.setSystemTime(START + 5 * MINUTE)
+    expect((await refresh(second)).status).toBe(200)
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    vi.setSystemTime(START + 6 * MINUTE)
+
+    expect((await refresh(s.refreshToken)).status).toBe(401)
+
+    expect(info).toHaveBeenCalledTimes(1)
+    expect(info.mock.calls[0]).toEqual([
+      'accounts: refresh token reused',
+      { predecessor: false, sinceRotationSec: 60, platform: 'dev' },
+    ])
+    const logged = JSON.stringify(info.mock.calls)
+    expect(logged).not.toContain(s.sessionId)
+    expect(logged).not.toContain(s.refreshToken)
   })
 
   it('logs nothing for a forged refresh token, and the session lives on', async () => {
