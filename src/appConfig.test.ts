@@ -40,6 +40,8 @@ describe('GET /app/v1/config', () => {
       minAppVersion: '1.42.0',
       sync: { enabled: false, entitlement: 'everyone' },
       webSignup: { enabled: false, turnstileSiteKey: null },
+      country: null,
+      regionCode: null,
     })
   })
 
@@ -52,6 +54,8 @@ describe('GET /app/v1/config', () => {
       ok: true,
       sync: { enabled: false, entitlement: 'everyone' },
       webSignup: { enabled: false, turnstileSiteKey: null },
+      country: null,
+      regionCode: null,
     })
   })
 
@@ -176,6 +180,48 @@ describe('GET /app/v1/config', () => {
     expect(
       await webSignup({ ...configured, PASSKEY_CHALLENGE_SECRET: undefined })
     ).toEqual({ enabled: false, turnstileSiteKey: '0x4AAAAAAAexample' })
+  })
+
+  it("says the caller's country and region from request.cf", async () => {
+    const location = async (cf?: unknown) => {
+      const request = new Request('https://ww-proxy.leviwilkerson.com/app/v1/config')
+      if (cf !== undefined) Object.defineProperty(request, 'cf', { value: cf })
+      const response = await app.fetch(request, await env())
+      expect(response.status).toBe(200)
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      const body = (await response.json()) as Record<string, unknown>
+      return { country: body.country, regionCode: body.regionCode }
+    }
+    expect(await location({ country: 'CA', regionCode: 'MB', city: 'Winnipeg' })).toEqual({
+      country: 'CA',
+      regionCode: 'MB',
+    })
+    expect(await location({ country: 'us', regionCode: 'tx' })).toEqual({
+      country: 'US',
+      regionCode: 'TX',
+    })
+    expect(await location({ country: 'FR', regionCode: '75' })).toEqual({
+      country: 'FR',
+      regionCode: '75',
+    })
+    // Unknown, Tor, malformed or missing: nothing to go on.
+    const none = { country: null, regionCode: null }
+    expect(await location({ country: 'XX', regionCode: 'MB' })).toEqual(none)
+    expect(await location({ country: 'T1', regionCode: 'MB' })).toEqual(none)
+    expect(await location({ country: 'CAN', regionCode: 'MB' })).toEqual(none)
+    expect(await location({ country: 'C1', regionCode: 'MB' })).toEqual(none)
+    expect(await location({ country: 42, regionCode: 'MB' })).toEqual(none)
+    expect(await location({ regionCode: 'MB' })).toEqual(none)
+    expect(await location({})).toEqual(none)
+    expect(await location(null)).toEqual(none)
+    expect(await location()).toEqual(none)
+    // A malformed region keeps the country.
+    for (const regionCode of ['', 'ABCD', 'CA-MB', 'M B', 7, null])
+      expect(await location({ country: 'CA', regionCode })).toEqual({
+        country: 'CA',
+        regionCode: null,
+      })
+    expect(await location({ country: 'CA' })).toEqual({ country: 'CA', regionCode: null })
   })
 
   it('counts against its own per-IP bucket', async () => {
