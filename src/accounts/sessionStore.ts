@@ -360,7 +360,7 @@ const refreshStep = async (
 
   // Issued by this worker, but replaced over a minute ago, or older still:
   // someone kept a copy. Logged as suspicious (`session.refresh_reused`).
-  if (!raced)
+  if (!raced) {
     await endSession(
       db,
       {
@@ -370,6 +370,17 @@ const refreshStep = async (
       },
       now
     )
+    // Tells a device that lost a refresh's answer (it presents the token just
+    // replaced, however late) from a copy of an older one. No ids or tokens.
+    console.info('accounts: refresh token reused', {
+      predecessor: replaced,
+      sinceRotationSec:
+        row.rotatedAt == null
+          ? null
+          : Math.round((now - row.rotatedAt.getTime()) / 1000),
+      platform: row.platform,
+    })
+  }
   return { done: null }
 }
 
