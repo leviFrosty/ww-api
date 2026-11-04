@@ -283,6 +283,33 @@ const killTree = async (pid) => {
   return pids
 }
 
+/**
+ * Workers this checkout's launcher started that the state file no longer
+ * records. Two overlapping `up`s can each start one, and the later state file
+ * hides the earlier worker, which then runs (watching files, using CPU) until
+ * reboot. A launcher worker leads its own process group and reads this
+ * checkout's vars file, so nothing else matches.
+ */
+const strayWorkers = (keep) => {
+  const out = execFileSync('ps', ['-A', '-o', 'pid=,pgid=,command='], { encoding: 'utf8' })
+  const strays = []
+  for (const line of out.split('\n')) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/)
+    if (!match) continue
+    const [pid, pgid] = [Number(match[1]), Number(match[2])]
+    const command = match[3]
+    if (pid === pgid && pid !== keep && command.includes(WRANGLER_BIN) && command.includes(VARS_PATH))
+      strays.push(pid)
+  }
+  return strays
+}
+
+const stopStrayWorkers = async (keep) => {
+  for (const pid of strayWorkers(keep)) {
+    if ((await killTree(pid)).length) console.error(`verify: stopped stray worker pid ${pid} that no state file recorded`)
+  }
+}
+
 const tailLog = (lines = 40) => {
   if (!existsSync(LOG_PATH)) return ''
   return readFileSync(LOG_PATH, 'utf8').split('\n').slice(-lines).join('\n')
@@ -323,6 +350,7 @@ async function up(args) {
   )
   if (migrate.status !== 0) fail(`applying the accounts migrations failed:\n${migrate.stderr || migrate.stdout}`)
 
+  await stopStrayWorkers()
   const port = await pickPort(HTTP_PORTS)
   const inspectorPort = await pickPort(INSPECTOR_PORTS)
   const { tokens, configured, revenueCatApiUrl } = writeVarsFile(flags, existing?.tokens)
@@ -558,6 +586,7 @@ async function down(args) {
         : `verify: recorded pid ${state.pid} is no longer our wrangler; state cleared`
     )
   }
+  await stopStrayWorkers()
   rmSync(VARS_PATH, { force: true })
   if (flags.wipe) {
     const persistDir = state?.persistDir ?? DEFAULT_PERSIST
