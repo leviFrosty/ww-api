@@ -233,6 +233,8 @@ describe('GET /sessions and POST /sessions/revoke', () => {
           expiresAt: START + 90 * 24 * 60 * MINUTE,
         },
       ],
+      now: START + 3 * MINUTE,
+      stepUpUntil: null,
     })
   })
 

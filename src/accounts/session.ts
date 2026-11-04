@@ -33,6 +33,7 @@ import {
   isSessionLive,
   createSession,
   listLiveSessions,
+  sessionStepUpAt,
   prepareSession,
   refreshSession,
   repeatSession,
@@ -42,6 +43,7 @@ import {
 } from './sessionStore'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import { credentialHash, openTicket, passkeyTokensReady } from './passkeyTokens'
+import { STEP_UP_EXEMPT } from './stepUp'
 import {
   accountPasskeys,
   batchUsingToken,
@@ -373,7 +375,10 @@ const handleClose = guarded('session/close', async (c) => {
 /**
  * `GET /sessions`: Bearer. The account's live sessions, newest first. A
  * caller whose own session has ended is 401, so it never shows a list
- * without itself.
+ * without itself. Also the server's `now` and when the caller's step-up
+ * stops counting (`stepUpUntil`, null when none counts, and always for the
+ * platforms that never need one, `STEP_UP_EXEMPT`), so a browser times the
+ * window on the server's clock rather than its own.
  */
 const handleList = guarded('session/list', async (c) => {
   const setup = await ready(c)
@@ -382,14 +387,24 @@ const handleList = guarded('session/list', async (c) => {
   if (limited) return limited
   const auth = await authenticateAccount(c, { requireLiveSession: true })
   if (!auth.ok) return auth.response
-  const { accountId, sessionId } = auth.account
-  const sessions = await listLiveSessions(accountsDb(setup.db), accountId)
+  const { accountId, sessionId, platform } = auth.account
+  const db = accountsDb(setup.db)
+  const now = Date.now()
+  const [sessions, stepUpAt] = await Promise.all([
+    listLiveSessions(db, accountId, now),
+    STEP_UP_EXEMPT.includes(platform)
+      ? null
+      : sessionStepUpAt(db, accountId, sessionId),
+  ])
   return c.json({
     ok: true,
     sessions: sessions.map((session) => ({
       ...session,
       current: session.sessionId === sessionId,
     })),
+    now,
+    stepUpUntil:
+      stepUpAt == null ? null : stepUpAt + ACCOUNT_LIMITS.stepUpMs,
   })
 })
 

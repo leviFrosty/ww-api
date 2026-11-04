@@ -806,6 +806,24 @@ describe('step-up on the web', () => {
     expect((await client.assertWith({ challengeToken: challenge.body.challengeToken, response }, web.accessToken)).status).toBe(200)
   })
 
+  it('lists when the session’s step-up stops counting, on the server’s clock', async () => {
+    const { session, passkey } = await accountWithPasskey()
+    const opened = Date.now()
+    const web = await webSession(session.key, passkey)
+    const listed = async (s: { accessToken: string }) =>
+      (await send('GET', '/sessions', undefined, authorization(s.accessToken))).body
+    // Opening counts as a step-up.
+    expect(await listed(web)).toMatchObject({ now: opened, stepUpUntil: opened + 5 * MINUTE })
+    advance(10 * MINUTE)
+    expect(await listed(web)).toMatchObject({ now: opened + 10 * MINUTE, stepUpUntil: opened + 5 * MINUTE })
+    expect((await client.stepUp(web, passkey)).assert.status).toBe(200)
+    expect(await listed(web)).toMatchObject({ stepUpUntil: opened + 15 * MINUTE })
+    // Phones never step up (they're exempt), even with a step-up recorded.
+    expect(await listed(session)).toMatchObject({ now: Date.now(), stepUpUntil: null })
+    sql("UPDATE account_sessions SET step_up_at = ? WHERE platform != 'web'", Date.now())
+    expect(await listed(session)).toMatchObject({ stepUpUntil: null })
+  })
+
   it('requires a step-up within 5 minutes for web sessions adding or removing a passkey, or deleting backups', async () => {
     const { session, passkey } = await accountWithPasskey()
     const web = await webSession(session.key, passkey)
