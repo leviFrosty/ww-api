@@ -1259,12 +1259,21 @@ export const sessionListDocs = describeRoute({
   summary: "List your devices",
   description: `The token’s account’s live sessions (not ended, not expired), newest first: one per signed-in device. Settings → Account → Devices shows them, opening each sealed label on the device.
 
+It also answers the server’s \`now\` and \`stepUpUntil\`, so a browser can tell whether a sensitive action still needs a step-up (\`step_up_required\`) by the server’s clock, not its own. \`stepUpUntil\` is null when no step-up counts on the session, as on phones, which never need one.
+
 Works for a suspended account. ${readTier}`,
   security: [{ bearerAuth: [] }],
   responses: {
     200: jsonResponse(
       "The live sessions.",
-      z.object({ ok: z.literal(true), sessions: z.array(liveSessionSchema) }),
+      z.object({
+        ok: z.literal(true),
+        sessions: z.array(liveSessionSchema),
+        now: epochMs("The server’s clock when it answered"),
+        stepUpUntil: epochMs(
+          "When the token’s session stops counting as stepped up: 5 minutes after its last passkey step-up, where opening a web session counts as one. Earlier than `now` once it has passed",
+        ).nullable(),
+      }),
     ),
     ...liveSessionErrors,
   },

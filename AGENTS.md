@@ -1496,7 +1496,11 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
   replaced, `session.replaced`), and stepped up when they open. Step-up
   (`refuseWithoutStepUp`; `STEP_UP_EXEMPT` lists the platforms that skip it:
   `ios`, `android`, `dev`) is required of web sessions within 5 minutes on
-  passkey add/remove, `backup/delete`, and `account/rekey`. Every session
+  passkey add/remove, `backup/delete`, and `account/rekey`. `GET /sessions`
+  answers the server's `now` and the caller's `stepUpUntil` (`step_up_at` +
+  5 minutes; null with none, and always for the exempt platforms), so a
+  browser times the window on the server's
+  clock, never its own. Every session
   records `method`, `app_version`, `key_epoch`, and `step_up_at`; refreshes
   refused with 401 carry `reason` (`revoked`, `replaced`, `expired`,
   `reused`, `key_changed`, `unknown`; `ended_reason` on the row).
