@@ -158,10 +158,16 @@ describe('GET /app/v1/config', () => {
     })
     const production = { ...ready, APP_ATTEST_ENVIRONMENT: 'production' }
     expect(await webSignup(production)).toEqual({ enabled: false, turnstileSiteKey: null })
+    // A site key and secret without the frame's hostname would fail every
+    // token, so sign-up stays off.
+    expect(
+      await webSignup({ ...production, TURNSTILE_SITE_KEY: '0x4AAAAAAAexample', TURNSTILE_SECRET_KEY: 'secret' })
+    ).toEqual({ enabled: false, turnstileSiteKey: '0x4AAAAAAAexample' })
     const configured = {
       ...production,
       TURNSTILE_SITE_KEY: '0x4AAAAAAAexample',
       TURNSTILE_SECRET_KEY: 'secret',
+      TURNSTILE_HOSTNAMES: 'verify.witnesswork.app',
     }
     expect(await webSignup(configured)).toEqual({
       enabled: true,
