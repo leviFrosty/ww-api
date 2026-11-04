@@ -189,24 +189,38 @@ describe('POST /web/signup/options', () => {
 
   it('checks the action and host under a real secret', async () => {
     h.env.TURNSTILE_SECRET_KEY = REAL
+    h.env.TURNSTILE_HOSTNAMES = 'verify-dev.witnesswork.app'
     const tries = {
-      'pass:web-signup:app-dev.witnesswork.app': 200,
-      'pass:web-signup:localhost': 200,
-      'pass:web-recovery:app-dev.witnesswork.app': 'action-mismatch',
+      'pass:web-signup:verify-dev.witnesswork.app': 200,
+      // Hostnames are case-insensitive.
+      'pass:web-signup:Verify-Dev.WitnessWork.app': 200,
+      'pass:web-recovery:verify-dev.witnesswork.app': 'action-mismatch',
+      // The widget runs only in the Turnstile frame: one solved on the web
+      // app's own host, or anywhere else, doesn't pass.
+      'pass:web-signup:app-dev.witnesswork.app': 'hostname-mismatch',
+      'pass:web-signup:localhost': 'hostname-mismatch',
+      'pass:web-signup:verify.witnesswork.app': 'hostname-mismatch',
       'pass:web-signup:evil.example': 'hostname-mismatch',
-      'nope:web-signup:localhost': 'invalid-input-response',
+      'nope:web-signup:verify-dev.witnesswork.app': 'invalid-input-response',
     }
     for (const [token, expected] of Object.entries(tries)) {
       const reply = await client.signupOptions({ turnstileToken: token })
       if (expected === 200) expect(reply.status, token).toBe(200)
       else expect(reply.body, token).toMatchObject({ error: 'turnstile_failed', reason: expected })
     }
-    // The hosts are the web app's (WEB_APP_ORIGINS); without any, none passes.
-    h.env.WEB_APP_ORIGINS = ''
-    expect((await client.signupOptions({ turnstileToken: 'pass:web-signup:localhost' })).body).toMatchObject({
-      error: 'turnstile_failed',
-      reason: 'hostname-mismatch',
-    })
+  })
+
+  it('is off under a real secret without TURNSTILE_HOSTNAMES, rather than failing every token', async () => {
+    h.env.TURNSTILE_SECRET_KEY = REAL
+    delete h.env.TURNSTILE_HOSTNAMES
+    expect(
+      await client.signupOptions({ turnstileToken: 'pass:web-signup:verify-dev.witnesswork.app' })
+    ).toMatchObject({ status: 503, body: { error: 'disabled' } })
+    const phone = await openTestSession(app, h.env)
+    expect(
+      (await client.recovery(phone.key, 'pass:web-recovery:verify-dev.witnesswork.app')).body
+    ).toMatchObject({ error: 'disabled' })
+    expect(siteverify).toEqual([])
   })
 
   it('skips the host and action checks for the test secrets', async () => {
@@ -239,6 +253,7 @@ describe('POST /web/signup/options', () => {
   it('skips the action and host checks for a test secret only on a development worker', async () => {
     h.env.APP_ATTEST_ENVIRONMENT = 'production'
     h.env.TURNSTILE_SITE_KEY = '0x4AAAAAAAsite-key'
+    h.env.TURNSTILE_HOSTNAMES = 'verify.witnesswork.app'
     // On production the pass key's answer (example.com, no action) doesn't match.
     expect((await client.signupOptions({ turnstileToken: 'tok' })).body).toMatchObject({
       error: 'turnstile_failed',
@@ -650,11 +665,15 @@ describe('POST /web/recovery', () => {
   it('checks Turnstile for the web-recovery action', async () => {
     const phone = await openTestSession(app, h.env)
     h.env.TURNSTILE_SECRET_KEY = REAL
+    h.env.TURNSTILE_HOSTNAMES = 'verify-dev.witnesswork.app'
     expect(
-      (await client.recovery(phone.key, 'pass:web-signup:app-dev.witnesswork.app')).body
+      (await client.recovery(phone.key, 'pass:web-signup:verify-dev.witnesswork.app')).body
     ).toMatchObject({ error: 'turnstile_failed', reason: 'action-mismatch' })
     expect(
-      (await client.recovery(phone.key, 'pass:web-recovery:app-dev.witnesswork.app')).status
+      (await client.recovery(phone.key, 'pass:web-recovery:app-dev.witnesswork.app')).body
+    ).toMatchObject({ error: 'turnstile_failed', reason: 'hostname-mismatch' })
+    expect(
+      (await client.recovery(phone.key, 'pass:web-recovery:verify-dev.witnesswork.app')).status
     ).toBe(200)
     expect((await client.recovery(phone.key, 42)).body).toMatchObject({ error: 'bad_request' })
   })
