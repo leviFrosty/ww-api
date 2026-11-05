@@ -140,6 +140,8 @@ export const SESSION_END_REASONS = [
   // Ended by an account key change on another session (witness-work ADR
   // 0039); only sessions still live at the change.
   'key_changed',
+  // Replaced by the session that renewed it (`session.renewed`).
+  'renewed',
 ] as const
 export type SessionEndReason = (typeof SESSION_END_REASONS)[number]
 
@@ -206,6 +208,9 @@ export const accountSessions = sqliteTable(
 export const ACTIVITY_KINDS = [
   'account.created',
   'session.opened',
+  // A phone's live session replaced by a new one it opened with the same
+  // proof (the session is the new one, the actor the one it ended).
+  'session.renewed',
   'session.signed_out',
   'session.revoked',
   'session.replaced',
@@ -238,14 +243,17 @@ export const accountActivity = sqliteTable(
     sessionPlatform: text('session_platform', { enum: SESSION_PLATFORMS }),
     /** That session's sealed device label, copied so it outlives the row. */
     sessionDevice: text('session_device'),
-    /** The session that ended `sessionId` (`session.revoked`, `.replaced`). */
+    /**
+     * The session that ended `sessionId` (`session.revoked`, `.replaced`), or
+     * the one `sessionId` renewed (`session.renewed`).
+     */
     actorSessionId: text('actor_session_id'),
     actorPlatform: text('actor_platform', { enum: SESSION_PLATFORMS }),
     actorDevice: text('actor_device'),
     /** The backup slot (`backup.*`); null for "every slot". */
     slotId: text('slot_id'),
     createdAt: createdAt(),
-    /** `session.opened`: how the session opened. */
+    /** `session.opened` and `.renewed`: how the session opened. */
     method: text('method', { enum: SESSION_METHODS }),
     /** `passkey.*`: the credential. */
     credentialId: text('credential_id'),

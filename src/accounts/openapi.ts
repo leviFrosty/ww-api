@@ -865,6 +865,9 @@ const sessionOpenPayload = z.object({
   accountId: buddiesId(
     "The account the device expects: the session opens only if `accountPub` is its current key (404 `unknown_account` otherwise), and never creates an account",
   ).optional(),
+  renews: buddiesId(
+    "A renewal: the live phone session this one replaces, whose access token the request carries as `Authorization: Bearer` (see Renewing). Never with `ticket`",
+  ).optional(),
 });
 
 /** `attestation_failed` and the attestation `bad_request`s carry these. */
@@ -931,6 +934,8 @@ Creates the account when the key has none (it replaces \`account/register\`), un
 
 **Web sessions:** a browser sends \`ticket\` (from \`POST /passkeys/assert\`, \`approval/receive\`, or \`web/recovery\`) in place of \`attestation\`. The ticket’s account must be \`accountPub\`’s and exist (a ticket never creates one; \`ticket_invalid\` otherwise). The session’s platform is \`web\`; it lasts 180 days from its last refresh, with no absolute limit, and counts as stepped up when it opens. At most 3 web sessions an account, apart from the phones’ 10: a fourth ends the least recently active (\`session.replaced\`). The same signed request again (same \`nonce\` and ticket) within the ticket’s 2 minutes, after a lost response, gets the same session, a new access token, and the same refresh token (or, if that one was refreshed in the last minute, the token it was replaced by), so the first answer’s refresh token never counts as reused. An \`approval\` ticket opens a session only while the phone session that approved is live. Answers 201 with \`Location: /accounts/v1/sessions/current\`, the session the new access token addresses.
 
+**Renewing:** a phone renews its live session before its 90 days are up with the same request (account key envelope and a fresh attestation) plus \`renews\`, that session’s id, and its access token as \`Authorization: Bearer\`. The new session (a full 90 days) replaces it: the old one ends with refresh reason \`renewed\`, and the account’s activity gets one \`session.renewed\` (\`session\` the new one, \`actor\` the old one) and no \`session.opened\`. It keeps the old session’s account and platform, and its label, app version, and capabilities unless the request sends new ones; phones never step up, so there’s no step-up to keep. It never ends another session at the cap, since the old one ends first. 401 \`unauthorized\` when the token isn’t that session’s, the session isn’t live (signed out, revoked, replaced, renewed, expired), isn’t a phone’s, isn’t \`accountPub\`’s account, or isn’t the attestation’s platform: the app then keeps its session and opens a new one when it ends. A refused attestation ends nothing. Renewals count toward the 20 opens a day. When the old session’s refresh token comes back (the device lost this answer, or was stopped before saving it), the new session is signed out (\`session.signed_out\`) if it has never been refreshed, so no session is left live without a holder; one that was refreshed stays.
+
 \`device\` is the device’s label, sealed (Buddies \`seal\` format) under \`HKDF-SHA256(accountKey, "", "ww-account/v1/device", 32)\` with AAD \`"ww-account/v1/device\\n" + accountPub\`; the server stores it and can’t read it.
 
 Limits: the Buddies register tier (60 a minute per caller IP) and 20 opens per account key a rolling day.`,
@@ -976,7 +981,11 @@ ${fieldTable(playIntegritySessionAttestation)}`,
       ["bad_request"],
       sessionAttestationErrorSchema,
     ),
-    401: signatureErrors[401],
+    401: errorResponse(
+      "Bad signature, or `ts` too far from the server clock (`stale` carries `serverTime` and a `Date` header). `unauthorized`: a renewal (`renews`) whose bearer token or session can’t be renewed (see Renewing).",
+      ["bad_signature", "stale", "unauthorized"],
+      staleErrorSchema,
+    ),
     403: errorResponse(
       `The attestation was refused (there’s no fallback: no attestation, no session), or a browser’s ticket is malformed, expired, used, or for another account (\`ticket_invalid\`). ${KEY_RETIRED}`,
       ["attestation_failed", "ticket_invalid", "key_retired"],
@@ -1282,7 +1291,7 @@ Works for a suspended account. ${readTier}`,
 export const sessionRevokeDocs = describeRoute({
   tags: ["Accounts"],
   summary: "Sign out a device",
-  description: `Ends one of the token’s account’s sessions and logs \`session.revoked\` in its activity, naming the calling session. Its refresh token stops working at once and its access token within 15 minutes. The token’s own session is ended like \`DELETE /sessions/current\` (\`session.signed_out\`). An already ended session is \`ok\`.
+  description: `Ends one of the token’s account’s sessions and logs \`session.revoked\` in its activity, naming the calling session. Its refresh token stops working at once and its access token within 15 minutes. The token’s own session is ended like \`DELETE /sessions/current\` (\`session.signed_out\`). An already ended session is \`ok\`. A session a phone renewed leads to the session that renewed it (\`session.renewed\`, through any later renewals): that live one is signed out, so a device list read before a renewal still signs the device out (or the caller itself, when it was the caller’s own).
 
 This doesn’t take the account key away: a device that still has it opens a new session when it next needs one, which shows up as a new \`session.opened\`.
 
@@ -1326,11 +1335,11 @@ const activityEntrySchema = z
     }),
     actor: activitySessionSchema.optional().meta({
       description:
-        "`session.revoked` and `session.replaced`: the session that ended `session`. An `approval` `session.opened`: the phone’s session that approved it.",
+        "`session.revoked` and `session.replaced`: the session that ended `session`. `session.renewed`: the session `session` replaced. An `approval` `session.opened`: the phone’s session that approved it.",
     }),
     method: z.enum(SESSION_METHODS).optional().meta({
       description:
-        "`session.opened`: how it opened (`attestation`, `dev`, `passkey`, `approval`, `recovery`, `signup`). Absent on entries from before passkeys.",
+        "`session.opened` and `session.renewed`: how it opened (`attestation`, `dev`, `passkey`, `approval`, `recovery`, `signup`). Absent on entries from before passkeys.",
     }),
     credentialId: z.string().optional().meta({
       description:
@@ -1351,6 +1360,7 @@ export const activityListDocs = describeRoute({
 | --- | --- | --- | --- |
 | \`account.created\` | The account was created | — | — |
 | \`session.opened\` | A device signed in (\`method\` says how) | The new session | \`approval\`: the phone’s session that approved it |
+| \`session.renewed\` | A phone renewed its session before it ran out (\`method\` says how it attested); not a new sign-in | The new session | The one it replaced |
 | \`session.signed_out\` | A device ended its own session | It | — |
 | \`session.revoked\` | Another device signed it out | The one signed out | The one that did it |
 | \`session.replaced\` | An eleventh phone session ended the oldest, or a fourth web session the least recently active | The ended one | The new one |

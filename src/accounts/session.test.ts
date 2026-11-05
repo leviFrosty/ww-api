@@ -1006,6 +1006,80 @@ describe('session attestation (App Attest)', () => {
     })
   })
 
+  describe('renewing', () => {
+    /** A fresh `account-session` assertion for `key` (`count` signs). */
+    const assertion = async (key: SigningKey, operationId: string, count: number) => {
+      const fields = appAttestFields(await sessionAttestationHash(key.publicKey), operationId)
+      const { challenge } = (await requestChallenge(fields)).body
+      return { ...fields, challenge, assertion: `count:${count}` }
+    }
+    const renewWith = async (
+      key: SigningKey,
+      session: { sessionId: string; accessToken: string },
+      attestation: unknown
+    ) =>
+      post(
+        '/sessions',
+        await accountEnvelope('session/open', key, {
+          attestation,
+          renews: session.sessionId,
+        }),
+        bearer(session.accessToken)
+      )
+    const activityKinds = () =>
+      (
+        h.accountsDb!.db
+          .prepare('SELECT kind FROM account_activity ORDER BY id')
+          .all() as { kind: string }[]
+      ).map((row) => row.kind)
+
+    it('renews an iPhone’s session with a fresh assertion', async () => {
+      await withAppAttest()
+      const key = await SigningKey.generate()
+      const old = (await openWith(key, await assertion(key, 'session-operation-1', 1))).body
+      const renewed = await renewWith(key, old, await assertion(key, 'session-operation-2', 2))
+      expect(renewed.status).toBe(201)
+      expect(renewed.body.platform).toBe('ios')
+      expect(sessionRows().map((row) => [row.platform, row.method, row.ended_reason])).toEqual([
+        ['ios', 'attestation', 'renewed'],
+        ['ios', 'attestation', null],
+      ])
+      expect(activityKinds()).toEqual(['account.created', 'session.opened', 'session.renewed'])
+    })
+
+    it('ends nothing when the assertion is refused', async () => {
+      await withAppAttest()
+      const key = await SigningKey.generate()
+      const old = (await openWith(key, await assertion(key, 'session-operation-1', 1))).body
+      const bad = await assertion(key, 'session-operation-2', 2)
+      const refused = await renewWith(key, old, { ...bad, assertion: 'not-an-assertion' })
+      expect(refused.status).toBe(403)
+      expect(refused.body).toMatchObject({ code: 'attestation_failed', reason: 'assertion_invalid' })
+      // A spent challenge, or none at all, doesn't renew either.
+      expect((await renewWith(key, old, bad)).status).toBe(403)
+      const missing = await renewWith(key, old, null)
+      expect(missing.status).toBe(400)
+      expect(missing.body.reason).toBe('invalid_request')
+      expect(sessionRows()).toHaveLength(1)
+      expect(sessionRows()[0].revoked_at).toBeNull()
+      expect((await refresh(old.refreshToken)).status).toBe(200)
+    })
+
+    it('refuses to renew a session of another platform', async () => {
+      await withAppAttest()
+      // A development session can't become an iPhone's by renewing.
+      const session = await open()
+      const refused = await renewWith(
+        session.key,
+        session,
+        await assertion(session.key, 'session-operation-1', 1)
+      )
+      expect(refused.status).toBe(401)
+      expect(sessionRows()).toHaveLength(1)
+      expect(sessionRows()[0].revoked_at).toBeNull()
+    })
+  })
+
   it('issues account-session challenges through /attestation/v1/challenge', async () => {
     await withAppAttest()
     const fields = appAttestFields(

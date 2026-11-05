@@ -48,7 +48,7 @@ export interface ActivityInput {
   actorSessionId?: string | null
   /** The backup slot; null for every slot. */
   slotId?: string | null
-  /** `session.opened`: how the session opened. */
+  /** `session.opened` and `.renewed`: how the session opened. */
   method?: SessionMethod | null
   /** `passkey.*`: the credential. */
   credentialId?: string | null

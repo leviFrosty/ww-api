@@ -275,6 +275,12 @@ export interface SessionOpenFields {
    * opens only into it, never creating one.
    */
   accountId: string | null
+  /**
+   * A renewal: the id of the live phone session this one replaces, whose
+   * bearer token the request carries ("Renewing a session" in the protocol).
+   * Never with a ticket.
+   */
+  renews: string | null
 }
 
 export interface PasskeyAddFields {
@@ -450,9 +456,12 @@ export const ACCOUNT_FIELD_PARSERS = {
     const device = optionalSealed(p.device, ACCOUNT_LIMITS.sessionDeviceChars)
     const accountId = p.accountId ?? null
     if (accountId !== null && !isAccountId(accountId)) return null
+    // Session ids have the same shape as account ids. Browsers never renew.
+    const renews = p.renews ?? null
+    if (renews !== null && (!isAccountId(renews) || ticket !== null)) return null
     if (appVersion === undefined || capabilities === undefined || device === undefined)
       return null
-    return { attestation, device, ticket, appVersion, capabilities, accountId }
+    return { attestation, device, ticket, appVersion, capabilities, accountId, renews }
   },
   // The envelope proves the account key: a leaked token alone can't ask.
   'sync/request': (): Fields => ({}),
