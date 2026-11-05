@@ -1009,7 +1009,7 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
 
 | Route | What |
 | --- | --- |
-| `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201 |
+| `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201. With `renews` and Bearer, renew one |
 | `POST /accounts/v1/sessions/refresh` | `{ refreshToken, appVersion?, capabilities? }` → new token pair |
 | `DELETE /accounts/v1/sessions/current` | Bearer; end the token's session |
 | `GET /accounts/v1/account` | Bearer; the token's account |
@@ -1036,6 +1036,41 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   oldest. Limits: the register edge tier, and 20 a rolling day per account
   key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
   counted before the attestation.
+- **Renew**: the open's request plus `renews` (the live session's id) in
+  the signed payload and that session's access token as `Authorization:
+  Bearer`, so a stolen Bearer alone can't extend a session: it takes the
+  account key and a fresh attestation, as an open does. The app renews in
+  its session's last 30 days (its own window; the server doesn't enforce
+  one), so its phone doesn't show up as a new sign-in every 90 days. Checked before the attestation is spent (`renewableSession`
+  in `session.ts`): the token is that session's and live
+  (`requireLiveSession`), a phone's (never `web`, which slides instead), and
+  `accountPub`'s account's; after it, the attested platform must be the
+  session's. Any of those is 401 `unauthorized` and the app keeps its
+  session until it ends, then opens as usual. One batch
+  (`prepareSession`'s `renews`): the new session's insert (only while the
+  old one is still live, so of two renewals one wins), `session.renewed`
+  (session the new one, actor the old one, `method` as for an open; no
+  `session.opened`), the old one ended `renewed` (a refresh of it is 401
+  `reason: renewed`), and only then the cap, so a renewal never replaces
+  another device's session. The new session gets a full 90 days and keeps
+  the old one's account and platform, and its label, app version, and
+  capabilities unless the request sends new ones. Phones never step up
+  (`STEP_UP_EXEMPT`), so no step-up carries over. Counts toward the 20 opens
+  a day.
+  - **A successor nobody holds**: when the renewal's answer is lost, or the
+    app is stopped before saving it, the device keeps presenting the old
+    session's refresh token. A refresh with that session's current (or just
+    replaced) token, refused `renewed`, also ends the session that renewed it
+    (found through `session.renewed`, `renewedBy`) with `session.signed_out`,
+    only while that one was never refreshed (`rotated_at IS NULL`), so it
+    doesn't sit live for 90 days counting toward the cap. A successor its
+    device refreshed is left alone. The app also closes a renewal it couldn't
+    save.
+  - **Signing out an old id**: `POST /sessions/revoke` for a session that
+    ended `renewed` follows `session.renewed` (up to 8 renewals) to the live
+    successor and signs that out, or the caller itself when the successor is
+    its own session, since a device list read before the renewal names the
+    old id.
 - **Refresh**: plain JSON `{ refreshToken, appVersion?, capabilities? }`;
   each one sent replaces the session's. A refresh token is
   `<sessionId>.<secret>.<mac>` (b64u, 16, 32, and 32 bytes; opaque to the
@@ -1317,7 +1352,9 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
   reloads its list) and cursors from before it page on while the previous
   slot is set.
 
-- **Kinds**: `account.created`, `session.opened`, `session.signed_out`,
+- **Kinds**: `account.created`, `session.opened`, `session.renewed` (a
+  phone renewed its session: session the new one, actor the old one; not a
+  sign-in), `session.signed_out`,
   `session.revoked`, `session.replaced` (the 10-session cap),
   `session.refresh_reused` (a replaced refresh token after its grace minute;
   the app flags it), `handoff.sent`, `backup.deleted` (no `slotId` = all),
@@ -1503,7 +1540,8 @@ in the PR). Code in `src/accounts/passkeys.ts` (handlers),
   clock, never its own. Every session
   records `method`, `app_version`, `key_epoch`, and `step_up_at`; refreshes
   refused with 401 carry `reason` (`revoked`, `replaced`, `expired`,
-  `reused`, `key_changed`, `unknown`; `ended_reason` on the row).
+  `reused`, `key_changed`, `renewed` (a phone renewed it), `unknown`;
+  `ended_reason` on the row).
   `key_changed` is only a session still live when another session changed
   the account key, and comes with `changedAt`; one signed out or revoked
   before it keeps `revoked` (and one already expired, `expired`), so a browser

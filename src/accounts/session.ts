@@ -9,7 +9,7 @@ import {
   type AccountFields,
   type AccountKeyPayload,
 } from './contracts'
-import { authenticateAccount, readPlainJson } from './auth'
+import { authenticateAccount, readPlainJson, type AccountAuth } from './auth'
 import { isSessionDevBypass, verifySessionAttestation } from './attestation'
 import {
   guarded,
@@ -129,6 +129,11 @@ const issueTokens = async (
  * With `accountId` in the payload, it opens only when the key is that
  * account's current key, else 404 `unknown_account`, and never creates an
  * account (ADR 0039: a device resolving a key change asks which key won).
+ *
+ * With `renews` and the bearer token of the phone session it names, the new
+ * session replaces that one (`renewableSession`, `prepareSession`): it ends
+ * `renewed`, and the account's log says `session.renewed` rather than
+ * `session.opened`, so a phone's routine reopen isn't a new sign-in.
  */
 const handleOpen = guarded('session/open', async (c) => {
   const setup = await ready(c)
@@ -165,12 +170,23 @@ const handleOpen = guarded('session/open', async (c) => {
   if (fields.ticket != null)
     return openWithTicket(c, setup, verified.payload, fields)
 
+  // A renewal's session and bearer token are checked before the attestation
+  // is spent on it.
+  let renewal: AccountAuth | null = null
+  if (fields.renews != null) {
+    const checked = await renewableSession(c, db, accountPub, fields.renews)
+    if ('refusal' in checked) return checked.refusal
+    renewal = checked.session
+  }
+
   let platform: SessionPlatform = 'dev'
   if (!isSessionDevBypass(c)) {
     const attested = await verifySessionAttestation(c, attestation, accountPub)
     if (!attested.ok) return attested.response
     platform = attested.platform
   }
+  // An iPhone's session renews only with an iPhone's attestation.
+  if (renewal && renewal.platform !== platform) return refusedRenewal()
 
   const registered = await registerAccount(db, accountPub, newAccountId)
   if ('retired' in registered) return keyRetiredResponse(registered.retired)
@@ -184,14 +200,43 @@ const handleOpen = guarded('session/open', async (c) => {
     method: platform === 'dev' ? 'dev' : 'attestation',
     appVersion: fields.appVersion,
     capabilities: fields.capabilities,
+    renews: renewal?.sessionId ?? null,
   })
   if (!issued)
     return (
       (await refuseRetiredKey(db, accountPub)) ??
-      buddiesErrorResponse('conflict')
+      // The renewed session ended (or another renewal won) in between.
+      (renewal ? refusedRenewal() : buddiesErrorResponse('conflict'))
     )
   return opened(c, setup.keys, account, issued)
 })
+
+/** 401 `unauthorized`: this session can't be renewed; open a new one. */
+const refusedRenewal = (): Response => buddiesErrorResponse('unauthorized')
+
+/**
+ * The session a renewal names (`renews`), when it can be renewed by this
+ * request: the bearer token is that session's own, the session is live (not
+ * signed out, revoked, replaced, renewed, or expired), it's a phone's (a
+ * browser's session slides instead), and it's the account of the key that
+ * signed the request. Else 401 `unauthorized`, as for any bad token.
+ */
+const renewableSession = async (
+  c: AppContext,
+  db: AccountsDb,
+  accountPub: string,
+  renews: string
+): Promise<{ session: AccountAuth } | { refusal: Response }> => {
+  const auth = await authenticateAccount(c, { requireLiveSession: true })
+  if (!auth.ok) return { refusal: auth.response }
+  const session = auth.account
+  if (session.sessionId !== renews || session.platform === 'web')
+    return { refusal: refusedRenewal() }
+  const account = await findAccountByPub(db, accountPub)
+  if (!account || account.id !== session.accountId)
+    return { refusal: refusedRenewal() }
+  return { session }
+}
 
 /** 201 with the new session's tokens, as every way of opening answers. */
 export const opened = async (
