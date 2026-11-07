@@ -6,7 +6,9 @@ A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, i
 
 WW API is open source, like the [WitnessWork app](https://github.com/leviFrosty/witness-work)
 it serves. Anyone can read the code, the protocol docs in [`docs/`](docs/),
-and the generated API reference at [`/docs`](https://ww-proxy.leviwilkerson.com/docs).
+and the generated API reference at [`/docs`](https://api.witnesswork.app/docs).
+The API is at `https://api.witnesswork.app` (dev `https://api-dev.witnesswork.app`);
+the original `https://ww-proxy.leviwilkerson.com` serves the same Worker for good.
 Since the whole contract is public, there's nothing to gain by obscuring it:
 short or cryptic field names, headers, or paths would only make the API harder
 to read, debug, and build on.
@@ -147,7 +149,7 @@ GitHub Actions will automatically deploy to Cloudflare Workers. Monitor deployme
 
 ## API Endpoints
 
-Full API reference: [`/docs`](https://ww-proxy.leviwilkerson.com/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://ww-proxy.leviwilkerson.com/openapi.json). Locally: `http://localhost:8787/docs`.
+Full API reference: [`/docs`](https://api.witnesswork.app/docs) (Scalar), generated from the routes; the raw OpenAPI 3.1 document is at [`/openapi.json`](https://api.witnesswork.app/openapi.json). Locally: `http://localhost:8787/docs`.
 
 ### Signed requests (Buddies and accounts)
 
@@ -190,10 +192,24 @@ WitnessWork once per session and then calls with short-lived bearer tokens:
 - **`GET /accounts/v1/account`** reads the token's account.
 - Handoff (`/accounts/v1/handoff/*`) and backup (`/accounts/v1/backup/*`)
   take the bearer token too, as `POST /{op}` with ids in bodies.
-- **Cloud Sync** (`GET /accounts/v1/sync`, `POST /accounts/v1/sync/put|list|get|delete`,
+- **Cloud Sync** (`GET /accounts/v1/sync`, `POST /accounts/v1/sync/put|list|get|delete|request`,
+  `POST /accounts/v1/sync/photos/put|list|get|delete`, `GET /accounts/v1/sync/photos/usage`,
   and the `GET /accounts/v1/sync/live` WebSocket): each device's end-to-end
-  encrypted snapshot in a slot, changes streamed to the account's other
-  devices. Behind KV `sync:enabled` and `sync:entitlement`; see `AGENTS.md`.
+  encrypted snapshot in a slot, the account's encrypted photos (2 GB),
+  changes streamed to the account's other devices, and the web's request
+  that the account's phones turn it on. Free
+  for everyone (witness-work ADR 0040); behind KV `sync:enabled` and
+  `sync:entitlement`; see `AGENTS.md`.
+- **Browsers** (the web app) call from an exact allow-list of origins
+  (`WEB_APP_ORIGINS`) with CORS, and open the live sockets (`sync/live`,
+  Buddies' `inbox/live`) with a 30-second ticket from
+  `POST /accounts/v1/live/ticket` (`{ socket, id }`, live session only),
+  offered as `Sec-WebSocket-Protocol: ww.v1, ticket.<ticket>` instead of
+  headers (never the access token: Cloudflare's logs record that header; the
+  ticket's claims are encrypted, and it opens one socket at a time); the 101 answers
+  `ww.v1`, and the socket closes with `4004 "expired"` when the access token
+  the ticket was minted with expires. See `AGENTS.md`, "Web app
+  origins (CORS)" and "Browser live sockets".
 
 Older app versions authenticate the pre-session way (signed envelopes,
 `account/register`, `account/info`) while the legacy switch (KV
@@ -252,6 +268,24 @@ curl "https://your-worker.workers.dev/geocode?q=1600+Amphitheatre+Parkway"
 
 **Note:** The `apiKey` parameter is automatically injected by the proxy. Any `apiKey` sent by the client will be removed.
 
+### `/places/v1/search`
+
+Points of interest and addresses near a coordinate, from HERE Discover, for
+the web app's place field. Unlike the two proxies above it reads only `q`,
+`at`, `limit` (1–20, default 5), and `lang`, and answers a trimmed shape
+(`{ ok, items: [{ id, name?, category?, address, latitude, longitude,
+distanceMeters? }] }`). Public, in the `places` per-IP bucket.
+
+```bash
+curl "https://your-worker.workers.dev/places/v1/search?q=coffee&at=39.1031,-84.5120&limit=3"
+```
+
+### `/maps/v1/mapkit-tokens`
+
+`POST` with `Authorization: Bearer <accessToken>`: a 30-minute MapKit JS token
+for the web app's map frame. 503 `maps_unconfigured` until the MapKit JS key
+is set. Both routes are documented in [`docs/maps.md`](docs/maps.md).
+
 ### `/.well-known/apple-app-site-association`
 
 Serves the AASA JSON used by iOS to validate universal links. Lists the prod
@@ -262,14 +296,17 @@ Matches `/contacts#<payload>`, `/buddies/invite#1…`, and
 `/accounts/handoff#1…`, plus the short paths older app versions put in links
 (`/c#<payload>`, any URL under `/c/*`, `/b#1…`, `/h#1…`). Those links are
 already in people's messages, so the short paths stay listed and served for
-good; dropping one would open its links in Safari instead of the app.
+good; dropping one would open its links in Safari instead of the app. On the
+website apex (`witnesswork.app`), which never had short links, it lists only
+the full-word paths ([`docs/link-pages.md`](docs/link-pages.md)).
 
 ### `/contacts` (and the short `/c`)
 
 Universal-link landing page for shared WitnessWork contacts
 (`/contacts#<payload>`). iOS hands the link off to the WitnessWork app when
 installed; otherwise this endpoint serves a fallback HTML page with an App
-Store CTA. `/c` serves the same page for links older app versions shared.
+Store CTA and "Continue on the web" (the web app's `/contacts` with the same
+fragment). `/c` serves the same page for links older app versions shared.
 
 The page, accessibility labels, and Open Graph/Twitter preview strings support
 the same 18 locales as `witness-work/src/lib/locales.ts`. Pass `?lang=pt-pt`
@@ -281,8 +318,8 @@ same language; Portuguese defaults to `pt-br`, and Chinese uses Simplified
 unless Traditional script or a Taiwan/Hong Kong/Macau region is requested.
 Responses include `Content-Language` and `Vary: Accept-Language`. Preview
 crawlers without a language preference receive English unless `lang` is set.
-The `og:url` is the bare page path (`/contacts` or `/c`), without language or
-contact data.
+The `og:url` is the bare page path (`/contacts` or `/c`) on the host it was
+served on, without language or contact data.
 The same localization rules apply to legacy `/c/:payload` links.
 
 The payload is an opaque gzip + base64url–encoded contact export produced by
@@ -577,9 +614,10 @@ Every JSON route answers errors with one envelope (`src/errors.ts`):
   (`application/octet-stream`) on success; its errors use the envelope.
 
 Per-IP limits (`RATE_LIMITER`, 60/min) count each route family in its own
-bucket: `places` (`/geocode`, `/autocomplete`), `notes-import`, `scribe`
-(`/scribe/v1/step`, `/scribe/v1/transcribe`), `attestation`,
-`route-planning`, `admin`, and `app` (`/app/v1/*`)
+bucket: `places` (`/geocode`, `/autocomplete`, `/places/v1/*`),
+`notes-import`, `scribe` (`/scribe/v1/step`, `/scribe/v1/transcribe`),
+`attestation`, `route-planning`, `maps` (`/maps/v1/*`), `admin`, and `app`
+(`/app/v1/*`)
 (`src/rateLimit.ts`). The old `/notes-import/*` attestation paths still
 count in `notes-import`. Refusals are 429 `rate_limited` with
 `Retry-After: 60`. Buddies and accounts have their own per-caller tiers.

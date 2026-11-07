@@ -9,7 +9,10 @@ import { pathToFileURL } from 'node:url'
  * `scribe:legacy-notes-import` is on.
  */
 
-const PROD_URL = 'https://ww-proxy.leviwilkerson.com'
+// The old hosts (ww-proxy.leviwilkerson.com, the dev workers.dev URL) serve
+// the same Workers for good; set WW_API_PROD_URL / WW_API_DEV_URL to use one.
+const PROD_URL = 'https://api.witnesswork.app'
+const DEV_URL = 'https://api-dev.witnesswork.app'
 const VALID_ID = /^[A-Za-z0-9_-]{8,64}$/
 const FLAGS = new Set(['--dev', '--notes-import'])
 
@@ -31,11 +34,8 @@ export function resolveResetCommand(args, env) {
   }
 
   const rawBaseUrl = development
-    ? env.WW_API_DEV_URL
+    ? env.WW_API_DEV_URL || DEV_URL
     : env.WW_API_PROD_URL || PROD_URL
-  if (!rawBaseUrl) {
-    throw new Error('WW_API_DEV_URL is not set in .env')
-  }
 
   return {
     path: notesImport ? '/admin/notes-import/reset' : '/admin/scribe/reset',

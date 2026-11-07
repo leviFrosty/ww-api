@@ -1,6 +1,7 @@
 import { base64ToBytes, bytesToBase64Url } from '../crypto'
 import { APNS_DEVICE_TOKEN_PATTERN, type ApnsEnvironment } from '../apns'
 import { FCM_TOKEN_PATTERN } from '../fcm'
+import { LIVE_EXPIRED_CLOSE } from '../liveSubprotocol'
 
 /**
  * Buddies relay wire contract (protocol v1). The source of truth is
@@ -29,6 +30,7 @@ export const BUDDIES_WRITER_OPS = [
   'card/put',
   'event/put',
   'slot/leave',
+  'slot/seal',
 ] as const
 
 export const BUDDIES_UNSIGNED_OPS = ['invite/fetch', 'invite/claim'] as const
@@ -60,6 +62,13 @@ export const BUDDIES_LIVE_HEADERS = BUDDIES_ENVELOPE_HEADERS
  * deletes any copy a client sends before forwarding.
  */
 export const BUDDIES_LIVE_ACCOUNT_HEADER = 'x-buddies-session-account'
+/**
+ * A browser `inbox/live` socket's token expiry (epoch ms), set by the Worker
+ * on the request it hands the inbox DO, which closes the socket then. Never
+ * read from a client: the Worker deletes any copy before forwarding, so a
+ * native socket never has one.
+ */
+export const BUDDIES_LIVE_EXPIRES_HEADER = 'x-buddies-session-expires-at'
 
 /**
  * Names the part of the app that sent a request. The iOS Notification
@@ -82,6 +91,13 @@ export const BUDDIES_NOTIFICATION_SERVICE_CLIENT = 'notification-service'
  */
 export const BUDDIES_BLOB_PUT_OP = 'blob/put'
 export const BUDDIES_BLOB_GET_OP = 'blob/get'
+/**
+ * `POST inbox/successor`: which inbox replaced another after its account's
+ * key changed (witness-work ADR 0039 §5). A bearer read by any account, with
+ * its own route: it is neither signed nor an owner op, so not in
+ * `BUDDIES_OPS`.
+ */
+export const BUDDIES_SUCCESSOR_OP = 'inbox/successor'
 /** Ops that also need the photos switch (`buddies:photos`) on. */
 export const BUDDIES_PHOTO_OPS: ReadonlySet<string> = new Set([
   BUDDIES_BLOB_PUT_OP,
@@ -96,6 +112,8 @@ export const BUDDIES_LIVE_CLOSE = {
   replaced: { code: 4002, reason: 'replaced' },
   /** The inbox's account was suspended. */
   suspended: { code: 4003, reason: 'suspended' },
+  /** A browser socket's token expired (`LIVE_EXPIRED_CLOSE`). */
+  expired: LIVE_EXPIRED_CLOSE,
 } as const
 
 export type BuddiesOwnerOp = (typeof BUDDIES_OWNER_OPS)[number]
@@ -109,6 +127,7 @@ export type BuddiesOp = BuddiesSignedOp | BuddiesUnsignedOp
 export type BuddiesLiveOp = typeof BUDDIES_LIVE_OP
 export type BuddiesBlobPutOp = typeof BUDDIES_BLOB_PUT_OP
 export type BuddiesBlobGetOp = typeof BUDDIES_BLOB_GET_OP
+export type BuddiesSuccessorOp = typeof BUDDIES_SUCCESSOR_OP
 /**
  * Every op a signature can name: the signed POST ops, the live socket, and
  * `blob/put`.
@@ -117,12 +136,18 @@ export type BuddiesSigningOp =
   | BuddiesSignedOp
   | BuddiesLiveOp
   | BuddiesBlobPutOp
-/** Every op with a route, each counted against a per-caller edge tier. */
+/**
+ * Every op with a route, each counted against a per-caller edge tier. Most
+ * are signed (owner, writer, self-signed); `invite/fetch`, `invite/claim`,
+ * `blob/get`, and `inbox/successor` aren't, so their payloads have no `ts` or
+ * `nonce` (`UNSIGNED_PAYLOAD_OPS`).
+ */
 export type BuddiesRouteOp =
   | BuddiesOp
   | BuddiesLiveOp
   | BuddiesBlobPutOp
   | BuddiesBlobGetOp
+  | BuddiesSuccessorOp
 
 export const BUDDIES_OPS: readonly BuddiesOp[] = [
   'inbox/register',
@@ -131,11 +156,15 @@ export const BUDDIES_OPS: readonly BuddiesOp[] = [
   ...BUDDIES_UNSIGNED_OPS,
 ]
 
-/** Ops that keep working with the kill switch off, so people can always leave. */
+/**
+ * Ops that keep working with the kill switch off, so people can always leave,
+ * and a writer can always seal its slot after a key change.
+ */
 export const BUDDIES_ALWAYS_ALLOWED_OPS: ReadonlySet<BuddiesOp> = new Set([
   'inbox/delete',
   'slot/remove',
   'slot/leave',
+  'slot/seal',
 ])
 
 /**
@@ -181,13 +210,20 @@ export const BUDDIES_ERROR_STATUS = {
    * or a bearer request's own account is (`BUDDIES_SUSPENDED_REFUSED_OPS`).
    */
   suspended: 403,
+  /**
+   * A writer op from a slot its writer sealed (`slot/seal`), but leaving or
+   * sealing again. Final: nothing unseals a slot.
+   */
+  sealed: 403,
   /** `inbox/register` named an account the accounts database doesn't have. */
   unknown_account: 404,
   /**
    * A handoff channel another account opened, a `backup/delete` signed by
    * another account than the bearer token's, a bearer Buddies owner request
-   * for an inbox linked to another account, or a bearer `inbox/register`
-   * whose `account` proof names another account than the token's.
+   * for an inbox linked to another account, a bearer `inbox/register`
+   * whose `account` proof names another account than the token's, or an
+   * `inbox/delete` naming a `successor` without a bearer token of the
+   * account the inbox is linked to.
    */
   forbidden: 403,
   /**
@@ -218,6 +254,31 @@ export const BUDDIES_ERROR_STATUS = {
    * `supporter` and the account isn't a Supporter (witness-work ADR 0030).
    */
   supporter_required: 403,
+  /**
+   * A Cloud Sync `photos/put` past the account's photo storage limit. No
+   * `Retry-After`: only the User freeing space fixes it.
+   */
+  storage_full: 429,
+  /** A Cloud Sync `photos/put` on an account with no slot. */
+  no_slot: 409,
+  /**
+   * A passkey ceremony didn't verify (witness-work
+   * `docs/passkeys-protocol.md`); `reason` says which check failed.
+   */
+  passkey_failed: 403,
+  /** A web session's ticket that's malformed, expired, used, or for another account. */
+  ticket_invalid: 403,
+  /** Turnstile's Siteverify refused the token; `reason` is its first error code. */
+  turnstile_failed: 403,
+  /** A web session hasn't passed a step-up in the last 5 minutes. */
+  step_up_required: 403,
+  /**
+   * A session open, `account/register`, or web sign-up with an account key a
+   * key change retired (ADR 0039); `changedAt` says when.
+   */
+  key_retired: 403,
+  /** A web session less than 24 hours old asked to change the account key. */
+  session_too_new: 403,
 } as const
 
 export type BuddiesErrorCode = keyof typeof BUDDIES_ERROR_STATUS
@@ -550,6 +611,18 @@ export interface EventPutPayload extends SlotPayload {
   push: boolean
 }
 
+export interface InboxDeletePayload extends InboxFields {
+  /**
+   * The inbox that replaces this one after a key change: bearer requests
+   * only (ADR 0039 §5).
+   */
+  successor?: string
+}
+
+export interface InboxSuccessorPayload {
+  inboxId: string
+}
+
 export interface InviteFetchPayload {
   inviteId: string
 }
@@ -583,7 +656,7 @@ export interface InviteClaimPayload {
 export interface BuddiesPayloads {
   'inbox/register': RegisterPayload
   'inbox/sync': SyncPayload
-  'inbox/delete': InboxFields
+  'inbox/delete': InboxDeletePayload
   'device/register': DeviceRegisterPayload
   'device/unregister': DeviceUnregisterPayload
   'slot/add': SlotAddPayload
@@ -594,12 +667,14 @@ export interface BuddiesPayloads {
   'card/put': CardPutPayload
   'event/put': EventPutPayload
   'slot/leave': SlotPayload
+  'slot/seal': SlotPayload
   'invite/fetch': InviteFetchPayload
   'invite/claim': InviteClaimPayload
   'inbox/live': InboxFields
   'blob/put': BlobPutPayload
   'blob/get': BlobGetPayload
   'blob/delete': BlobDeletePayload
+  'inbox/successor': InboxSuccessorPayload
 }
 
 type Fields = Record<string, unknown>
@@ -723,7 +798,12 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
       ? { ...base, since: p.since }
       : null
   },
-  'inbox/delete': inboxFields,
+  'inbox/delete': (p) => {
+    const base = inboxFields(p)
+    if (!base) return null
+    if (p.successor === undefined) return base
+    return isId(p.successor) ? { ...base, successor: p.successor } : null
+  },
   'device/register': (p) => {
     const base = inboxFields(p)
     const parsedTemplates = templates(p.templates)
@@ -769,6 +849,7 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
     return { ...base, eventId: p.eventId, kind: p.kind, push: p.push }
   },
   'slot/leave': slotFields,
+  'slot/seal': slotFields,
   'invite/fetch': (p) => (isId(p.inviteId) ? { inviteId: p.inviteId } : null),
   'invite/claim': (p) => {
     if (!isId(p.inviteId) || typeof p.claimSecret !== 'string') return null
@@ -808,12 +889,14 @@ export const BUDDIES_FIELD_PARSERS: FieldParsers = {
     if (!blobIds.every(bytes32)) return null
     return { ...base, blobIds: [...new Set(blobIds)] }
   },
+  'inbox/successor': (p) => (isId(p.inboxId) ? { inboxId: p.inboxId } : null),
 }
 
 /** Ops whose payload is never signed, so it has no `ts` or `nonce`. */
 const UNSIGNED_PAYLOAD_OPS: ReadonlySet<BuddiesRouteOp> = new Set([
   ...BUDDIES_UNSIGNED_OPS,
   BUDDIES_BLOB_GET_OP,
+  BUDDIES_SUCCESSOR_OP,
 ])
 
 /**
@@ -859,9 +942,11 @@ export const isAccountCall = <T>(
   call: Signed<T> | AccountCall<T>
 ): call is AccountCall<T> => !('signature' in call)
 
+/** `sealed` only on a slot its writer sealed (`slot/seal`); absent otherwise. */
 export type SyncSlot = {
   slotId: string
   createdAt: number
+  sealed?: true
 }
 
 export type SyncCard = {

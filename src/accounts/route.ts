@@ -5,6 +5,7 @@ import { buddiesCallerKey } from '../buddies/limits'
 import {
   accountsDb,
   findAccountInfo,
+  keyRetiredResponse,
   newAccountId,
   registerAccount,
   type AccountInfo,
@@ -24,8 +25,39 @@ import { sessionHandlers } from './session'
 import { handleActivity } from './activityRoute'
 import { supporterHandlers } from './supporterRoute'
 import { syncHandlers } from './sync'
+import { syncPhotoHandlers } from './syncPhotos'
+import { passkeyHandlers } from './passkeys'
+import { webHandlers } from './webSignup'
+import { approvalHandlers } from './approval'
+import { rekeyHandlers } from './rekey'
+import {
+  passkeyAddDocs,
+  passkeyAssertDocs,
+  passkeyChallengeDocs,
+  passkeyListDocs,
+  passkeyRegisterOptionsDocs,
+  passkeyRemoveDocs,
+  passkeyWrapDocs,
+} from './passkeyOpenapi'
+import {
+  webRecoveryDocs,
+  webSignupDocs,
+  webSignupOptionsDocs,
+} from './webSignupOpenapi'
+import {
+  approvalCancelDocs,
+  approvalClaimDocs,
+  approvalDoneDocs,
+  approvalOpenDocs,
+  approvalReceiveDocs,
+  approvalSendDocs,
+  approvalStatusDocs,
+} from './approvalOpenapi'
+import { handleLiveTicket } from './liveTickets'
 import {
   accountDocs,
+  accountKeyHistoryDocs,
+  accountRekeyDocs,
   activityListDocs,
   accountInfoDocs,
   accountRegisterDocs,
@@ -40,6 +72,7 @@ import {
   handoffReceiveDocs,
   handoffSendDocs,
   handoffStatusDocs,
+  liveTicketDocs,
   sessionCloseDocs,
   sessionOpenDocs,
   sessionListDocs,
@@ -51,7 +84,13 @@ import {
   syncGetDocs,
   syncListDocs,
   syncLiveDocs,
+  syncPhotoDeleteDocs,
+  syncPhotoGetDocs,
+  syncPhotoListDocs,
+  syncPhotoPutDocs,
+  syncPhotoUsageDocs,
   syncPutDocs,
+  syncSwitchRequestDocs,
   syncStatusDocs,
 } from './openapi'
 
@@ -59,7 +98,8 @@ import {
  * `POST /accounts/v1/account/register`: the account for a signing key, created
  * on first use. Self-signed, like `inbox/register`, and idempotent: the same
  * key always gets the same `accountId`, so a replay learns nothing new. It
- * counts against the register edge tier and the caller's daily quota.
+ * counts against the register edge tier and the caller's daily quota. A key
+ * a key change retired is 403 `key_retired` (ADR 0039).
  *
  * Opening a session (`POST /accounts/v1/sessions`) replaces it; it stays for
  * app versions before sessions, so it's refused with 426 `upgrade_required`
@@ -90,11 +130,13 @@ const handleRegister = guarded('account/register', async (c) => {
   )
   if (refused) return refused
 
-  const account = await registerAccount(
+  const registered = await registerAccount(
     accountsDb(c.env.ACCOUNTS_DB),
     payload.accountPub,
     newAccountId
   )
+  if ('retired' in registered) return keyRetiredResponse(registered.retired)
+  const { account } = registered
   return c.json({ ok: true, accountId: account.id, status: account.status })
 })
 
@@ -174,6 +216,9 @@ export const createAccountsRoutes = () => {
   // App versions before sessions (and `GET /account`).
   routes.post('/account/register', accountRegisterDocs, handleRegister)
   routes.post('/account/info', accountInfoDocs, handleInfo)
+  // Changing the account key (ADR 0039), and the history it leaves.
+  routes.post('/account/rekey', accountRekeyDocs, rekeyHandlers.rekey)
+  routes.get('/account/key-history', accountKeyHistoryDocs, rekeyHandlers.keyHistory)
   routes.post('/handoff/open', handoffOpenDocs, handoffHandlers.open)
   routes.post('/handoff/claim', handoffClaimDocs, handoffHandlers.claim)
   routes.post('/handoff/status', handoffStatusDocs, handoffHandlers.status)
@@ -192,6 +237,41 @@ export const createAccountsRoutes = () => {
   routes.post('/sync/list', syncListDocs, syncHandlers.list)
   routes.post('/sync/get', syncGetDocs, syncHandlers.get)
   routes.post('/sync/delete', syncDeleteDocs, syncHandlers.delete)
+  routes.post('/sync/request', syncSwitchRequestDocs, syncHandlers.switchRequest)
   routes.get('/sync/live', syncLiveDocs, syncHandlers.live)
+  routes.post('/sync/photos/put', syncPhotoPutDocs, syncPhotoHandlers.put)
+  routes.post('/sync/photos/list', syncPhotoListDocs, syncPhotoHandlers.list)
+  routes.post('/sync/photos/get', syncPhotoGetDocs, syncPhotoHandlers.get)
+  routes.post('/sync/photos/delete', syncPhotoDeleteDocs, syncPhotoHandlers.delete)
+  routes.get('/sync/photos/usage', syncPhotoUsageDocs, syncPhotoHandlers.usage)
+  // Passkeys (ADR 0038): the collection is a resource; the ceremonies and
+  // removal are POSTs so credential ids stay out of URLs.
+  routes.post('/passkeys/challenge', passkeyChallengeDocs, passkeyHandlers.challenge)
+  routes.post('/passkeys/assert', passkeyAssertDocs, passkeyHandlers.assert)
+  routes.post(
+    '/passkeys/register/options',
+    passkeyRegisterOptionsDocs,
+    passkeyHandlers.registerOptions
+  )
+  routes.post('/passkeys', passkeyAddDocs, passkeyHandlers.add)
+  routes.post('/passkeys/wrap', passkeyWrapDocs, passkeyHandlers.wrap)
+  routes.get('/passkeys', passkeyListDocs, passkeyHandlers.list)
+  routes.post('/passkeys/remove', passkeyRemoveDocs, passkeyHandlers.remove)
+  // Accounts on the web: sign-up behind Turnstile and caps, and a recovery
+  // key's ticket.
+  routes.post('/web/signup/options', webSignupOptionsDocs, webHandlers.signupOptions)
+  routes.post('/web/signup', webSignupDocs, webHandlers.signup)
+  routes.post('/web/recovery', webRecoveryDocs, webHandlers.recovery)
+  // Approving a browser from a phone: the handoff with the roles turned
+  // around, `POST /approval/{op}` like it.
+  routes.post('/approval/open', approvalOpenDocs, approvalHandlers.open)
+  routes.post('/approval/claim', approvalClaimDocs, approvalHandlers.claim)
+  routes.post('/approval/status', approvalStatusDocs, approvalHandlers.status)
+  routes.post('/approval/send', approvalSendDocs, approvalHandlers.send)
+  routes.post('/approval/receive', approvalReceiveDocs, approvalHandlers.receive)
+  routes.post('/approval/done', approvalDoneDocs, approvalHandlers.done)
+  routes.post('/approval/cancel', approvalCancelDocs, approvalHandlers.cancel)
+  // A browser's ticket onto a live socket (`sync/live`, Buddies' `inbox/live`).
+  routes.post('/live/ticket', liveTicketDocs, handleLiveTicket)
   return routes
 }

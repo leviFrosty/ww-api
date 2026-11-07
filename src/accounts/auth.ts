@@ -9,7 +9,7 @@ import {
 import type { AccountStatus, SessionPlatform } from './schema'
 import { accountsDb, findAccount } from './store'
 import { accessTokenKeys, verifyAccessToken } from './tokens'
-import { isSessionLive } from './sessionStore'
+import { liveSessionKeyEpoch } from './sessionStore'
 import { refuseLegacyAuth } from './legacySwitch'
 
 /**
@@ -24,7 +24,9 @@ import { refuseLegacyAuth } from './legacySwitch'
  *
  * Each sets `c.var.account` on success (read it with `accountOf(c)`), and a
  * refusal is a ready `Response` plus its code, for routes with their own
- * error format: 401 `unauthorized` (with `WWW-Authenticate`), 403
+ * error format: 401 `unauthorized` (with `WWW-Authenticate`; `reason:
+ * "key_changed"` for a live-session route's token from before a key
+ * change), 403
  * `suspended`, 503 `disabled` (no token secret, or `requireActive` or
  * `requireLiveSession` without the accounts database), or 500 `internal`.
  *
@@ -52,7 +54,12 @@ export type AccountAuthRefusal = {
 }
 
 export type AccountAuthResult =
-  | { ok: true; account: AccountAuth }
+  | {
+      ok: true
+      account: AccountAuth
+      /** When the access token expires, epoch ms. */
+      expiresAt: number
+    }
   | AccountAuthRefusal
 
 export interface RequireAccountOptions {
@@ -70,11 +77,19 @@ export interface RequireAccountOptions {
    * Costs one D1 read, never cached, so a revocation applies at once. For the
    * security surfaces a signed-out device must not act on in its token's
    * last 15 minutes: the device list, revoking, the activity log, the
-   * account, moving the account (handoff), and deleting backups. Elsewhere a
+   * account, moving the account (handoff), passkeys, changing the account
+   * key, and writing or deleting Cloud Sync data and backups. Elsewhere a
    * token outlives its session by up to 15 minutes, by design (ADR 0027).
+   *
+   * The same read compares the token's key epoch (`kep`) with the
+   * session's: a token from before the session's key change is 401
+   * `unauthorized` with `reason: "key_changed"`, and the app refreshes
+   * (ADR 0039).
    */
   requireLiveSession?: boolean
 }
+
+export type AuthenticateAccountOptions = RequireAccountOptions
 
 const STATUS_CACHE_MS = 30_000
 const STATUS_CACHE_ENTRIES = 1_000
@@ -154,13 +169,13 @@ export const bearerToken = (header: string | undefined): string | null =>
   /^Bearer +([A-Za-z0-9._~+/-]+=*) *$/i.exec(header ?? '')?.[1] ?? null
 
 /**
- * Verifies the request's bearer token and, with `requireLiveSession`, its
- * session, and with `requireActive`, the account's status; on success sets
- * `c.var.account`.
+ * Verifies the request's bearer token and, with
+ * `requireLiveSession`, its session, and with `requireActive`, the account's
+ * status; on success sets `c.var.account`.
  */
 export const authenticateAccount = async (
   c: AppContext,
-  options: RequireAccountOptions = {}
+  options: AuthenticateAccountOptions = {}
 ): Promise<AccountAuthResult> => {
   const keys = await accessTokenKeys(c.env)
   if (!keys) return refuse('disabled')
@@ -174,9 +189,9 @@ export const authenticateAccount = async (
   }
   if (options.requireLiveSession) {
     if (!c.env.ACCOUNTS_DB) return refuse('disabled')
-    let live: boolean
+    let keyEpoch: number | null
     try {
-      live = await isSessionLive(
+      keyEpoch = await liveSessionKeyEpoch(
         accountsDb(c.env.ACCOUNTS_DB),
         account.accountId,
         account.sessionId
@@ -186,14 +201,22 @@ export const authenticateAccount = async (
       captureFailure(error, 'account session')
       return refuse('internal')
     }
-    if (!live) return refuse('unauthorized')
+    if (keyEpoch == null) return refuse('unauthorized')
+    if (claims.keyEpoch < keyEpoch)
+      return {
+        ok: false,
+        error: 'unauthorized',
+        response: buddiesErrorResponse('unauthorized', {
+          extras: { reason: 'key_changed' },
+        }),
+      }
   }
   if (options.requireActive) {
     const refused = await refuseInactiveAccount(c.env, account)
     if (refused) return refused
   }
   c.set('account', account)
-  return { ok: true, account }
+  return { ok: true, account, expiresAt: claims.expiresAt }
 }
 
 /**

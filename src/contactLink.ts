@@ -8,6 +8,12 @@ import {
   resolveContactLinkLocale,
   type ContactLinkLocale,
 } from './contactLinkLocales'
+import {
+  apexAssetOrigin,
+  isApexLinkHost,
+  pageOrigin,
+  webAppOrigin,
+} from './linkHosts'
 
 /**
  * Contact-share universal link handlers.
@@ -15,7 +21,10 @@ import {
  * Flow: the WitnessWork app encodes a contact (gzip + base64url) into the URL
  * fragment and shares a URL like:
  *
- *   https://ww-proxy.leviwilkerson.com/contacts#<payload>
+ *   https://witnesswork.app/contacts#<payload>
+ *
+ * (older builds share `https://ww-proxy.leviwilkerson.com/c#<payload>`; both
+ * hosts serve the page, docs/link-pages.md).
  *
  * Clients never send a fragment to a server, so link previews and the
  * fallback page only ever request the bare `/contacts` — the contact stays out
@@ -24,7 +33,8 @@ import {
  * - iOS with the app installed: the OS intercepts the tap via the AASA file
  *   this worker serves and hands the URL to the app, which decodes and imports.
  * - iOS without the app / other platforms: the fallback HTML renders with a
- *   "Get WitnessWork" CTA linking to the App Store.
+ *   "Get WitnessWork" CTA linking to the App Store, and "Continue on the web"
+ *   to the web app's `/contacts#<payload>`.
  *
  * Older app versions shared the short `/c#<payload>`, and the oldest put the
  * payload in the path (`/c/<payload>`). Those links are already out in the
@@ -42,13 +52,13 @@ const APP_STORE_URL = 'https://apps.apple.com/us/app/jw-time/id6469723047'
 const CONTACT_LINK_PATH = '/contacts'
 const SHORT_CONTACT_LINK_PATH = '/c'
 const LEGACY_CONTACT_LINK_PATH_PREFIX = `${SHORT_CONTACT_LINK_PATH}/`
-const SITE_ORIGIN = 'https://ww-proxy.leviwilkerson.com'
-const OG_IMAGE_URL = `${SITE_ORIGIN}/assets/og-image.png`
-const APPLE_TOUCH_ICON_URL = `${SITE_ORIGIN}/assets/apple-touch-icon.png`
+const OG_IMAGE_PATH = '/assets/og-image.png'
+const APPLE_TOUCH_ICON_PATH = '/assets/apple-touch-icon.png'
 const IMPORT_DEEP_LINK_PREFIX = 'witnesswork://import-contact/'
 /** The app's payload encoding: unpadded base64url. */
 const BASE64URL = /^[A-Za-z0-9_-]+$/
 const OPEN_APP_LINK_ID = 'open-app'
+const CONTINUE_WEB_LINK_ID = 'continue-web'
 
 /**
  * WitnessWork brand palette — mirrors `lightModeColors` in
@@ -67,9 +77,9 @@ const BRAND = {
 } as const
 
 /**
- * Builds the "Open app" deep link in the browser from the fragment. Only a
- * base64url payload makes it into the href; anything else leaves the link
- * hidden.
+ * Builds the "Open app" deep link and "Continue on the web" (its page in
+ * `data-base`) in the browser from the fragment. Only a base64url payload
+ * makes it into an href; anything else leaves the links hidden.
  */
 const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
   var payload = location.hash.slice(1);
@@ -77,6 +87,10 @@ const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
   var link = document.getElementById('${OPEN_APP_LINK_ID}');
   link.href = '${IMPORT_DEEP_LINK_PREFIX}' + payload;
   link.hidden = false;
+  var web = document.getElementById('${CONTINUE_WEB_LINK_ID}');
+  if (!web) return;
+  web.href = web.getAttribute('data-base') + '#' + payload;
+  web.hidden = false;
 })();`
 
 /**
@@ -86,36 +100,34 @@ const OPEN_APP_FROM_FRAGMENT_SCRIPT = `(function () {
  * at least one character; `1?*` = link format 1). The short paths (`/c`,
  * `/c/*`, `/b`, `/h`) are in links already shared, so they stay listed for
  * good: dropping one would open those links in Safari instead of the app.
+ * The website apex (`apex`) never had short links, and the site Worker owns
+ * every other path there, so it lists only the full-word ones.
  */
-function buildAasaPayload(teamId: string): object {
+function buildAasaPayload(teamId: string, apex: boolean): object {
   const appIDs = [
     `${teamId}.${PROD_BUNDLE_ID}`,
     `${teamId}.${BETA_BUNDLE_ID}`,
     `${teamId}.${DEV_BUNDLE_ID}`,
   ]
-  return {
-    applinks: {
-      details: [
-        {
-          appIDs,
-          components: [
-            { '/': CONTACT_LINK_PATH, '#': '?*' },
-            // Buddy invite `/buddies/invite#1<secret>`: the secret stays in
-            // the fragment.
-            { '/': '/buddies/invite', '#': '1?*' },
-            // Set Up Another Device `/accounts/handoff#1<channel, key,
-            // secret>`, likewise.
-            { '/': '/accounts/handoff', '#': '1?*' },
-            // The short paths of links already shared.
-            { '/': SHORT_CONTACT_LINK_PATH, '#': '?*' },
-            { '/': `${LEGACY_CONTACT_LINK_PATH_PREFIX}*` },
-            { '/': '/b', '#': '1?*' },
-            { '/': '/h', '#': '1?*' },
-          ],
-        },
-      ],
-    },
+  const components: Record<string, string>[] = [
+    { '/': CONTACT_LINK_PATH, '#': '?*' },
+    // Buddy invite `/buddies/invite#1<secret>`: the secret stays in the
+    // fragment.
+    { '/': '/buddies/invite', '#': '1?*' },
+    // Set Up Another Device `/accounts/handoff#1<channel, key, secret>`,
+    // likewise.
+    { '/': '/accounts/handoff', '#': '1?*' },
+  ]
+  if (!apex) {
+    // The short paths of links already shared.
+    components.push(
+      { '/': SHORT_CONTACT_LINK_PATH, '#': '?*' },
+      { '/': `${LEGACY_CONTACT_LINK_PATH_PREFIX}*` },
+      { '/': '/b', '#': '1?*' },
+      { '/': '/h', '#': '1?*' }
+    )
   }
+  return { applinks: { details: [{ appIDs, components }] } }
 }
 
 export function handleAasaRequest(context: AppContext) {
@@ -129,7 +141,7 @@ export function handleAasaRequest(context: AppContext) {
   }
   // Apple requires Content-Type: application/json and no redirects. Hono's
   // c.json() sets the right header.
-  return context.json(buildAasaPayload(teamId))
+  return context.json(buildAasaPayload(teamId, isApexLinkHost(context.req.url)))
 }
 
 /**
@@ -144,8 +156,13 @@ export function handleContactLinkRequest(context: AppContext) {
     context.req.path === SHORT_CONTACT_LINK_PATH
       ? SHORT_CONTACT_LINK_PATH
       : CONTACT_LINK_PATH
+  const web = webAppOrigin(context.env.WEB_APP_ORIGIN)
+  const continueOnWeb = web
+    ? `
+    <a class="secondary" id="${CONTINUE_WEB_LINK_ID}" data-base="${escapeHtml(`${web}${CONTACT_LINK_PATH}`)}" hidden>${escapeHtml(contactLinkTranslations[locale].continueOnWeb)}</a>`
+    : ''
   return context.html(
-    renderFallbackPage(locale, path, `<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${escapeHtml(contactLinkTranslations[locale].openApp)}</a>
+    renderFallbackPage(locale, path, pageOrigin(context.req.url), apexAssetOrigin(context.req.url), `<a class="secondary" id="${OPEN_APP_LINK_ID}" hidden>${escapeHtml(contactLinkTranslations[locale].openApp)}</a>${continueOnWeb}
     <script>${OPEN_APP_FROM_FRAGMENT_SCRIPT}</script>`)
   )
 }
@@ -159,12 +176,26 @@ export function handleLegacyContactLinkRequest(context: AppContext) {
   nameTransactionAfterRoute(context)
   const locale = contactLinkLocale(context)
   const payload = context.req.param('payload') ?? ''
-  const openAppLink = BASE64URL.test(payload)
+  const valid = BASE64URL.test(payload)
+  const openAppLink = valid
     ? `<a class="secondary" href="${IMPORT_DEEP_LINK_PREFIX}${payload}">${escapeHtml(contactLinkTranslations[locale].openApp)}</a>`
     : ''
+  // The web app reads the payload from its fragment, like `/contacts#…`.
+  const web = webAppOrigin(context.env.WEB_APP_ORIGIN)
+  const continueOnWeb =
+    valid && web
+      ? `
+    <a class="secondary" id="${CONTINUE_WEB_LINK_ID}" href="${escapeHtml(`${web}${CONTACT_LINK_PATH}`)}#${payload}">${escapeHtml(contactLinkTranslations[locale].continueOnWeb)}</a>`
+      : ''
   // Never the request path: it holds the payload.
   return context.html(
-    renderFallbackPage(locale, SHORT_CONTACT_LINK_PATH, openAppLink)
+    renderFallbackPage(
+      locale,
+      SHORT_CONTACT_LINK_PATH,
+      pageOrigin(context.req.url),
+      apexAssetOrigin(context.req.url),
+      openAppLink + continueOnWeb
+    )
   )
 }
 
@@ -191,15 +222,21 @@ function escapeHtml(value: string): string {
  * Fallback HTML for taps that reach the worker (app not installed, non-iOS,
  * or Safari address-bar hit). Kept self-contained — no external fonts — so
  * iMessage's rich-link sniffer can render a fast preview. `og:url` is always
- * a bare page URL (`/contacts` or `/c`, never a payload), and `no-referrer`
+ * a bare page URL on the host it was served on (`/contacts` or `/c`, never a
+ * payload), and `no-referrer`
  * keeps legacy page URLs out of the Referer header of follow-up requests.
  */
 function renderFallbackPage(
   locale: ContactLinkLocale,
   path: typeof CONTACT_LINK_PATH | typeof SHORT_CONTACT_LINK_PATH,
+  origin: string,
+  assets: string | undefined,
   openAppLink: string
 ): string {
   const messages = contactLinkTranslations[locale]
+  // On the apex the site owns `/assets/…`; the API host serves these.
+  const ogImageUrl = `${assets ?? origin}${OG_IMAGE_PATH}`
+  const appleTouchIconUrl = `${assets ?? origin}${APPLE_TOUCH_ICON_PATH}`
   const title = escapeHtml(messages.title)
   const description = escapeHtml(messages.description)
   const imageAlt = escapeHtml(messages.imageAlt)
@@ -224,8 +261,8 @@ function renderFallbackPage(
   <meta property="og:locale" content="${language}_${territory}">
   <meta property="og:title" content="${title}">
   <meta property="og:description" content="${description}">
-  <meta property="og:url" content="${SITE_ORIGIN}${path}">
-  <meta property="og:image" content="${OG_IMAGE_URL}">
+  <meta property="og:url" content="${origin}${path}">
+  <meta property="og:image" content="${ogImageUrl}">
   <meta property="og:image:width" content="1024">
   <meta property="og:image:height" content="1024">
   <meta property="og:image:alt" content="${imageAlt}">
@@ -233,11 +270,11 @@ function renderFallbackPage(
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${title}">
   <meta name="twitter:description" content="${description}">
-  <meta name="twitter:image" content="${OG_IMAGE_URL}">
+  <meta name="twitter:image" content="${ogImageUrl}">
   <meta name="twitter:image:alt" content="${imageAlt}">
 
-  <link rel="apple-touch-icon" href="${APPLE_TOUCH_ICON_URL}">
-  <link rel="icon" type="image/png" href="${APPLE_TOUCH_ICON_URL}">
+  <link rel="apple-touch-icon" href="${appleTouchIconUrl}">
+  <link rel="icon" type="image/png" href="${appleTouchIconUrl}">
 
   <style>
     * { box-sizing: border-box; }
@@ -295,9 +332,13 @@ function renderFallbackPage(
       font-size: 1rem;
     }
     a.btn:hover { filter: brightness(1.05); }
+    /* Text links, but a full 48px row each (44pt iOS, 48dp Android). */
     a.secondary {
-      display: block;
-      margin-top: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      margin-top: 0.5rem;
       color: ${BRAND.accent3};
       text-decoration: none;
       font-size: 0.85rem;
@@ -308,7 +349,7 @@ function renderFallbackPage(
 </head>
 <body>
   <div class="card">
-    <img class="icon" src="${APPLE_TOUCH_ICON_URL}" alt="${imageAlt}" width="88" height="88">
+    <img class="icon" src="${appleTouchIconUrl}" alt="${imageAlt}" width="88" height="88">
     <h1>${title}</h1>
     <p>${escapeHtml(messages.instructions)}</p>
     <a class="btn" href="${APP_STORE_URL}">${escapeHtml(messages.getApp)}</a>

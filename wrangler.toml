@@ -20,9 +20,41 @@ upload_source_maps = true
 directory = "./public"
 binding = "ASSETS"
 
+# The old host stays for good, never redirected: shipped builds call it, and
+# links people already sent point at it (witness-work ADR 0042).
 [[routes]]
 pattern = "ww-proxy.leviwilkerson.com"
 custom_domain = true
+
+[[routes]]
+pattern = "api.witnesswork.app"
+custom_domain = true
+
+# The website apex's link pages and association files (docs/link-pages.md).
+# The site Worker is the apex's Custom Domain and serves everything else. Only
+# full-word paths: the short /c, /c/*, /b and /h stay on the old host. A
+# pattern without `*` matches only that URL with no query string, so the
+# pages end in `*` (`?lang=`, `?fbclid=`); src/linkHosts.ts hands the site
+# anything else they catch. Repeated for dev.witnesswork.app under [env.dev].
+[[routes]]
+pattern = "witnesswork.app/.well-known/apple-app-site-association"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/.well-known/assetlinks.json"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/accounts/handoff*"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/contacts*"
+zone_name = "witnesswork.app"
+
+[[routes]]
+pattern = "witnesswork.app/buddies/invite*"
+zone_name = "witnesswork.app"
 
 # Exposes the deployed Worker version (id/tag/timestamp) to the runtime so
 # /health can report the actual build. NOT inherited by named envs — repeated
@@ -39,10 +71,35 @@ binding = "CF_VERSION_METADATA"
 name = "ww-proxy-dev"
 workers_dev = true   # public https://ww-proxy-dev.<subdomain>.workers.dev (device-reachable)
 preview_urls = true
-# Routes ARE inherited by named envs (unlike vars/kv/ratelimits), so without this
-# dev would inherit prod's [[routes]] custom domain and try to steal
-# ww-proxy.leviwilkerson.com on deploy. Empty list = workers.dev URL only.
-routes = []
+
+# Routes ARE inherited by named envs (unlike vars/kv/ratelimits), so dev lists
+# its own complete set; otherwise it would take prod's hosts on deploy. Its
+# apex routes only get traffic once dev.witnesswork.app exists (the site's dev
+# Worker Custom Domain). Patterns as for prod above. Order matters: `wrangler
+# dev` serves locally as the first route's host, so api-dev stays first.
+[[env.dev.routes]]
+pattern = "api-dev.witnesswork.app"
+custom_domain = true
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/.well-known/apple-app-site-association"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/.well-known/assetlinks.json"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/accounts/handoff*"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/contacts*"
+zone_name = "witnesswork.app"
+
+[[env.dev.routes]]
+pattern = "dev.witnesswork.app/buddies/invite*"
+zone_name = "witnesswork.app"
 
 [env.dev.version_metadata]
 binding = "CF_VERSION_METADATA"
@@ -51,6 +108,8 @@ binding = "CF_VERSION_METADATA"
 crons = ["17 * * * *"]
 
 [env.dev.vars]
+# "Continue on the web" on the contact and Buddies invite pages.
+WEB_APP_ORIGIN = "https://app-dev.witnesswork.app"
 # Named environments do not inherit the production model override.
 NOTES_IMPORT_MODEL = "openai/gpt-6-luna"
 NOTES_IMPORT_REASONING_EFFORT = "low"
@@ -62,6 +121,8 @@ APP_ATTEST_ENVIRONMENT = "development"
 IOS_BUNDLE_ID = "com.leviwilkerson.jwtimedev"
 # Deprecated and ignored: Supporter status follows witness-work ADR 0014.
 REVENUECAT_ENTITLEMENT_ID = "Supporter"
+# Count RevenueCat Billing (web) sandbox subscriptions as Supporter; dev only, never in [vars].
+REVENUECAT_COUNT_WEB_SANDBOX = "true"
 # Runtime-limit env fallbacks. Named environments do not inherit [vars], so all
 # five are explicitly repeated here. KV `notes-import:limits` overrides each
 # field independently for this environment.
@@ -75,19 +136,48 @@ BUDDIES_ENABLED = "true"
 # Buddies photo blobs fallback when KV `buddies:photos` is absent. On in dev.
 BUDDIES_PHOTOS = "on"
 # Legacy-auth fallback when KV `auth:legacy` is absent (witness-work ADR 0027):
-# "off" refuses pre-session auth with 426 upgrade_required. Named environments
-# don't inherit [vars], so it's repeated here.
-AUTH_LEGACY = "on"
+# "off" refuses pre-session auth with 426 upgrade_required. Off on dev since the
+# web launch (ADR 0038 §11); KV `auth:legacy` = "on" turns it back on here.
+AUTH_LEGACY = "off"
+# Passkeys (witness-work ADR 0038, docs/passkeys-protocol.md): the RP IDs this
+# worker accepts (the first is the default, and the one Android origins pair
+# with), and each RP ID's origins. Checked as pairs, never as two lists.
+# Android: the Play app-signing key and the upload key of
+# com.leviwilkerson.jwtime, and the debug key of com.leviwilkerson.jwtimedev.
+PASSKEY_RP_IDS = "app-dev.witnesswork.app,localhost"
+PASSKEY_ORIGINS = '''{"app-dev.witnesswork.app":["https://app-dev.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes","android:apk-key-hash:-sYXRdwJA3hvue3mKpYrOZ9zSPC7b4mbgzJmdZEDO5w"],"localhost":["http://localhost:8081","http://localhost:8082","http://localhost:19006","http://localhost:4173","http://localhost:5173"]}'''
+# Web sign-up (docs/passkeys-protocol.md, "Web sign-up"): the kill switch's
+# fallback when KV `accounts:web-signup` is absent, and the caps. Turnstile:
+# Cloudflare's always-passing test site key until a dev widget exists; the
+# matching test secret is used when the TURNSTILE_SECRET_KEY secret is unset.
+# TURNSTILE_HOSTNAMES: where a token may be solved, the web app's Turnstile
+# frame (witness-work docs/web-turnstile.md); checked under a real secret only.
+WEB_SIGNUP = "on"
+WEB_SIGNUP_PER_IP_DAY = "3"
+WEB_SIGNUP_PER_ASN_HOUR = "30"
+WEB_RECOVERY_PER_IP_DAY = "10"
+TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_HOSTNAMES = "verify-dev.witnesswork.app"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor.
 # APP_MIN_VERSION = "1.42.0"
 # Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
-# `sync:entitlement` are absent. On in dev; Supporters only.
+# `sync:entitlement` are absent. On in dev; free for everyone (ADR 0040).
 SYNC_ENABLED = "true"
-SYNC_ENTITLEMENT = "supporter"
+SYNC_ENTITLEMENT = "everyone"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. On in dev.
 SPACES_ENABLED = "true"
+# The web app's origins (witness-work ADR 0038 §10): CORS and browser live
+# sockets admit exactly these (comma-separated, no wildcards). Dev serves
+# app-dev plus the local web dev servers (Expo/Metro 8081-8082, Expo web
+# 19006, Vite preview 4173, Vite dev 5173). Named environments don't inherit
+# [vars], so it's set in both.
+WEB_APP_ORIGINS = "https://app-dev.witnesswork.app,http://localhost:8081,http://localhost:8082,http://localhost:19006,http://localhost:4173,http://localhost:5173"
+# Cloud Sync photos' switch fallback when KV `sync:photos` is absent (on).
+# SYNC_PHOTO_LIMIT_BYTES (unset: 2,000,000,000) overrides the per-account photo
+# storage; the verify launcher passes it for a tiny limit locally.
+SYNC_PHOTOS = "on"
 # Android Notes Import (witness-work ADR 0017). Stays off until the package,
 # the Cloud project number, and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret
 # are all set. Dev builds (com.leviwilkerson.jwtimedev) aren't on Play, so test
@@ -106,6 +196,10 @@ SCRIBE_MAX_OUTPUT_TOKENS = "4096"
 SCRIBE_FREE_MONTHLY = "150000"
 SCRIBE_SUPPORTER_SESSION = "540000"
 SCRIBE_SUPPORTER_WEEKLY = "1550000"
+# The MapKit JS frame's origin that POST /maps/v1/mapkit-tokens names in its
+# tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
+# A local frame (http://localhost:<port>) belongs in .dev.vars, never here.
+MAPKIT_JS_ORIGINS = "https://maps-dev.witnesswork.app"
 # Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
 # runs stay out of the production dashboards; uncomment to check delivery
 # (events carry `environment: development`).
@@ -168,6 +262,16 @@ class_name = "SharedSpace"
 name = "SCRIBE_METER"
 class_name = "ScribeMeter"
 
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_RATE_COUNTER"
+class_name = "AccountRateCounter"
+
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[env.dev.durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 # Buddies note photos (encrypted blobs), separate from prod's bucket. Not
 # inherited, like every binding. `pnpm run deploy:dev` creates it and sets its
 # lifecycle rule (scripts/r2-lifecycle.mjs).
@@ -188,6 +292,12 @@ bucket_name = "ww-account-backups-dev"
 [[env.dev.r2_buckets]]
 binding = "ACCOUNT_SYNC"
 bucket_name = "ww-account-sync-dev"
+
+# Cloud Sync photos (witness-work ADR 0040), separate from prod's bucket.
+# `pnpm run deploy:dev` creates it with no age rule (scripts/r2-lifecycle.mjs).
+[[env.dev.r2_buckets]]
+binding = "ACCOUNT_PHOTOS"
+bucket_name = "ww-account-photos-dev"
 
 # Anonymous accounts (witness-work ADR 0024): accounts, their status, and which
 # Buddies inboxes they own. Not inherited, like every binding. Migrations come
@@ -235,8 +345,27 @@ new_sqlite_classes = ["AccountSync"]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
 
+# From v10 on, dev's tags differ from production's [[migrations]] below, on
+# purpose. Wrangler matches the Worker's applied tag by name and applies only
+# the steps after it, so each list follows its own Worker's history. Dev
+# applied AccountRateCounter (v10) and AccountApproval (v11) from the web
+# launch branch before Shared Spaces reached dev, so SharedSpace is v12 here
+# and v10 in production. Both lists end at v12, so from v13 on the tags agree
+# again: add a new class at the end of both lists, and never renumber an
+# applied tag (src/durableObjectMigrations.test.ts pins them). A branch whose
+# dev list lacks dev's applied tag (v12 when this was written; ww-api main
+# until the web launch lands) can't deploy here: wrangler replays every step,
+# and the deploy fails.
 [[env.dev.migrations]]
 tag = "v10"
+new_sqlite_classes = ["AccountRateCounter"]
+
+[[env.dev.migrations]]
+tag = "v11"
+new_sqlite_classes = ["AccountApproval"]
+
+[[env.dev.migrations]]
+tag = "v12"
 new_sqlite_classes = ["SharedSpace"]
 
 [[env.dev.ratelimits]]
@@ -319,6 +448,10 @@ head_sampling_rate = 1
   head_sampling_rate = 1
 
 [vars]
+# "Continue on the web" on the contact and Buddies invite pages: unset in
+# production until the web app is live at https://app.witnesswork.app (the
+# launch runbook sets it then); the link is hidden while it's unset. Dev sets
+# it under [env.dev.vars].
 # Explicit production invariant: development attestations and bypasses fail closed.
 APP_ATTEST_ENVIRONMENT = "production"
 # iOS bundle id — part of the App Attest app id (`<APPLE_TEAM_ID>.<IOS_BUNDLE_ID>`).
@@ -351,20 +484,52 @@ BUDDIES_ENABLED = "false"
 # (no BUDDIES_PHOTOS fallback here). Not inherited by [env.dev].
 # Legacy-auth fallback when KV `auth:legacy` is absent (witness-work ADR 0027):
 # "off" refuses the pre-session ways of authenticating (account envelopes) with
-# 426 upgrade_required. Repeated under [env.dev.vars].
+# 426 upgrade_required. A failed KV read counts as off (ADR 0038 §11). The web
+# launch runbook writes KV `auth:legacy` = "off" (AGENTS.md). Repeated under
+# [env.dev.vars], where it's "off".
 AUTH_LEGACY = "on"
+# Passkeys (witness-work ADR 0038, docs/passkeys-protocol.md): the RP ID and
+# its origins: the web app, its beta, and the Android app's Play app-signing
+# and upload keys (com.leviwilkerson.jwtime). The RP ID never changes once the
+# first passkey exists. Repeated (with dev's) under [env.dev.vars].
+PASSKEY_RP_IDS = "app.witnesswork.app"
+PASSKEY_ORIGINS = '''{"app.witnesswork.app":["https://app.witnesswork.app","https://beta.app.witnesswork.app","android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw","android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes"]}'''
+# Web sign-up (docs/passkeys-protocol.md, "Web sign-up"): the kill switch's
+# fallback when KV `accounts:web-signup` is absent, and the caps. WEB_SIGNUP
+# is already "on", so sign-up and web recovery open as soon as this worker
+# has the rest of their setup, whichever lands last: the production Turnstile
+# widget's site key and its frame's host below, its secret (`wrangler secret put
+# TURNSTILE_SECRET_KEY`), and the passkey secrets PASSKEY_CHALLENGE_SECRET and
+# ACCOUNT_TICKET_SECRET. To set them up ahead of the launch, put KV
+# `accounts:web-signup` = off first; that holds sign-up, not recovery.
+# Repeated under [env.dev.vars].
+WEB_SIGNUP = "on"
+WEB_SIGNUP_PER_IP_DAY = "3"
+WEB_SIGNUP_PER_ASN_HOUR = "30"
+WEB_RECOVERY_PER_IP_DAY = "10"
+# TURNSTILE_SITE_KEY = "0x…"
+# TURNSTILE_HOSTNAMES = "verify.witnesswork.app"
 # App-wide minimum version fallback when KV `app:min-version` is absent
 # (GET /app/v1/config). Unset = no floor. Repeated under [env.dev.vars].
 # APP_MIN_VERSION = "1.42.0"
 # Cloud Sync (witness-work ADR 0030) fallbacks when KV `sync:enabled` /
 # `sync:entitlement` are absent. Off in prod until KV `sync:enabled` turns it
-# on, before the app release that defaults to it. Repeated under [env.dev.vars].
+# on, before the app release that defaults to it. Free for everyone (witness-work
+# ADR 0040); KV `sync:entitlement supporter` is the lever back. Repeated under
+# [env.dev.vars].
 SYNC_ENABLED = "false"
-SYNC_ENTITLEMENT = "supporter"
+SYNC_ENTITLEMENT = "everyone"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. Off in prod until KV `spaces:enabled` turns it
 # on, before the app release that shares cars. Repeated under [env.dev.vars].
 SPACES_ENABLED = "false"
+# The web app's origins (witness-work ADR 0038 §10): CORS and browser live
+# sockets admit exactly these (comma-separated, no wildcards; never localhost
+# here). Not inherited by [env.dev], which has its own list.
+WEB_APP_ORIGINS = "https://app.witnesswork.app,https://beta.app.witnesswork.app"
+# Cloud Sync photos' switch fallback when KV `sync:photos` is absent (on).
+# Repeated under [env.dev.vars].
+SYNC_PHOTOS = "on"
 # Android Notes Import via Play Integrity (witness-work ADR 0017; details in
 # AGENTS.md). Android stays off until the package, the Cloud project number,
 # and the PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON secret are all set; the status
@@ -394,6 +559,10 @@ SCRIBE_SUPPORTER_WEEKLY = "1550000"
 # app ships, so not a secret. Remove to turn server analytics off.
 # POSTHOG_HOST defaults to https://us.i.posthog.com. Not inherited by [env.dev].
 POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
+# The MapKit JS frame's origin that POST /maps/v1/mapkit-tokens names in its
+# tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
+# Production never accepts an http:// origin.
+MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state
@@ -460,14 +629,18 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 #
 # Cloud Sync switches (cacheTtl 60; witness-work ADR 0030). `sync:enabled`:
 # "true" (or "on") on, anything else off; absent falls back to SYNC_ENABLED.
-# `sync:entitlement`: "everyone" makes it free, "supporter" a Supporter
-# benefit; absent falls back to SYNC_ENTITLEMENT, else supporter. Off refuses
-# sync/put, list, get, and live with 503 disabled; delete and GET /sync work.
+# `sync:entitlement`: "supporter" makes it a Supporter benefit again,
+# "everyone" (or anything else) free; absent falls back to SYNC_ENTITLEMENT,
+# else everyone (ADR 0040). Off refuses sync/put, list, get, live, and setting
+# sync/request with 503 disabled; delete, clearing the request, and GET /sync
+# work.
 #   wrangler kv key put --binding NOTES_KV sync:enabled true          # on
 #   wrangler kv key put --binding NOTES_KV sync:enabled false         # off
 #   wrangler kv key put --binding NOTES_KV sync:entitlement everyone  # free
 #   wrangler kv key put --binding NOTES_KV sync:entitlement supporter # Supporters
 #   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
+#   wrangler kv key put --binding NOTES_KV sync:photos off            # photo puts off
+#   wrangler kv key delete --binding NOTES_KV sync:photos             # use SYNC_PHOTOS
 # (add `--env dev` for the dev worker).
 #
 # Shared Spaces switches (cacheTtl 60; witness-work ADR 0037, Shared Cars).
@@ -479,6 +652,14 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 #   wrangler kv key put --binding NOTES_KV spaces:enabled false      # off
 #   wrangler kv key put --binding NOTES_KV spaces:maxMembers 12      # raise the cap
 #   wrangler kv key delete --binding NOTES_KV spaces:enabled         # use the var
+# (add `--env dev` for the dev worker).
+#
+# Web sign-up kill switch (cacheTtl 60): "off" refuses web/signup/options and
+# web/signup with 503 disabled (web/recovery isn't affected); "on" opens them;
+# absent falls back to WEB_SIGNUP. A failed read counts as on, since Turnstile
+# and the caps still apply.
+#   wrangler kv key put --binding NOTES_KV accounts:web-signup off   # pause
+#   wrangler kv key delete --binding NOTES_KV accounts:web-signup    # use the var
 # (add `--env dev` for the dev worker).
 #
 # Route planning kill switch (cacheTtl 60): off iff the value is "false"; an
@@ -617,6 +798,17 @@ bucket_name = "ww-account-backups"
 binding = "ACCOUNT_SYNC"
 bucket_name = "ww-account-sync"
 
+# Cloud Sync photos (witness-work ADR 0040 §6): one end-to-end encrypted blob
+# per put at v1/<accountId>/<name>/<putId>, written once; the AccountSync DO
+# holds the rows and purges deleted photos 30 days later. No age rule: it
+# would delete live photos, which are never rewritten. Every deploy runs
+# scripts/r2-lifecycle.mjs first, which creates the bucket and keeps only the
+# multipart-abort rule. Without the binding, photo routes answer
+# `photos_disabled`. Repeated (with its own bucket) under [env.dev] above.
+[[r2_buckets]]
+binding = "ACCOUNT_PHOTOS"
+bucket_name = "ww-account-photos"
+
 # Notes Import streaming — per-import run DO + per-user cap/index DO, each
 # SQLite-backed (event log / active-import set). See
 # docs/notes-import-streaming-durable-objects.md. Repeated under [env.dev] above.
@@ -689,6 +881,19 @@ class_name = "SharedSpace"
 name = "SCRIBE_METER"
 class_name = "ScribeMeter"
 
+# Accounts: rolling-window counters, one per hashed name (failed passkey
+# sign-ins per hashed caller IP; counts only, deleted once out of their
+# window). Repeated under [env.dev] above.
+[[durable_objects.bindings]]
+name = "ACCOUNT_RATE_COUNTER"
+class_name = "AccountRateCounter"
+
+# Approving a browser from a phone (docs/passkeys-protocol.md): one channel
+# per QR code, 75 seconds unclaimed, 5 minutes claimed.
+[[durable_objects.bindings]]
+name = "ACCOUNT_APPROVAL"
+class_name = "AccountApproval"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotesImportRun", "NotesImportIndex"]
@@ -727,9 +932,23 @@ new_sqlite_classes = ["AccountSync"]
 tag = "v9"
 new_sqlite_classes = ["ScribeMeter"]
 
+# Production's history (ww-proxy was at v9 before these). SharedSpace (v10)
+# landed on main first and the web launch's AccountRateCounter (v11) and
+# AccountApproval (v12) follow it. If main ships first, production goes v9 to
+# v10, then v10 to v12 when the web launch ships; if the web launch ships
+# first, v9 to v12 in one deploy. [env.dev.migrations] replaces this list for
+# dev, which applied them in another order (above).
 [[migrations]]
 tag = "v10"
 new_sqlite_classes = ["SharedSpace"]
+
+[[migrations]]
+tag = "v11"
+new_sqlite_classes = ["AccountRateCounter"]
+
+[[migrations]]
+tag = "v12"
+new_sqlite_classes = ["AccountApproval"]
 
 [observability]
 enabled = true
@@ -759,3 +978,20 @@ logs.persist = true
 # Rotation: the old value goes to ACCOUNT_TOKEN_SECRET_PREVIOUS first (verify only;
 # refresh tokens issued under it refresh only while it's set, see AGENTS.md).
 # wrangler secret put ACCOUNT_TOKEN_SECRET_PREVIOUS [--env dev]
+# Browser live socket tickets (POST /accounts/v1/live/ticket); without it, browser
+# live sockets are disabled. Its own value per worker, never ACCOUNT_TOKEN_SECRET's:
+# openssl rand -base64 32 | wrangler secret put LIVE_TICKET_SECRET [--env dev]
+# MapKit JS tokens (witness-work ADR 0037 §8; APPLE_TEAM_ID is the issuer); without
+# both, POST /maps/v1/mapkit-tokens answers 503 maps_unconfigured:
+# wrangler secret put MAPKIT_JS_KEY_ID [--env dev]        # 10-char MapKit JS key id
+# wrangler secret put MAPKIT_JS_PRIVATE_KEY [--env dev]   # .p8 PEM contents: < AuthKey_XXXX.p8
+# Passkeys (ADR 0038): the challenge and ticket MAC keys, each its own value per
+# worker, at least 32 characters, never ACCOUNT_TOKEN_SECRET's. Without them the
+# passkey routes and ticket sessions answer `disabled`:
+# openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET [--env dev]
+# openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET [--env dev]
+# Web sign-up and recovery (ADR 0038 §5): the Turnstile widget's secret key,
+# from the dashboard (Turnstile → the widget → Settings). Production needs it
+# (and TURNSTILE_SITE_KEY) before web sign-up opens; dev uses Cloudflare's
+# always-passing test secret until its own widget's is set:
+# wrangler secret put TURNSTILE_SECRET_KEY [--env dev]

@@ -10,10 +10,16 @@ details, primarily the **environments**.
 
 There are two deployed API Workers, defined in `wrangler.toml`:
 
-| Env  | Worker name    | URL                                          | Deploy command        |
-| ---- | -------------- | -------------------------------------------- | --------------------- |
-| prod | `ww-proxy`     | `https://ww-proxy.leviwilkerson.com`         | `pnpm run deploy`     |
-| dev  | `ww-proxy-dev` | `https://ww-proxy-dev.<subdomain>.workers.dev` | `pnpm run deploy:dev` |
+| Env  | Worker name    | URLs                                                                                     | Deploy command        |
+| ---- | -------------- | ---------------------------------------------------------------------------------------- | --------------------- |
+| prod | `ww-proxy`     | `https://api.witnesswork.app`, `https://ww-proxy.leviwilkerson.com`                      | `pnpm run deploy`     |
+| dev  | `ww-proxy-dev` | `https://api-dev.witnesswork.app`, `https://ww-proxy-dev.levi-wilkerson.workers.dev`     | `pnpm run deploy:dev` |
+
+New clients use the `witnesswork.app` hosts (witness-work ADR 0042). The old
+hosts serve the same Workers for good and are never redirected: shipped builds
+call them, and WebSockets don't follow redirects. Each Worker also answers a
+few exact paths on the website apex (`witnesswork.app`, dev
+`dev.witnesswork.app`): the link pages and association files, below.
 
 Three app-update Workers (Hot Updater) are defined separately in
 `wrangler-updates.json`, one per app channel, each with its own D1 database and
@@ -43,6 +49,44 @@ The dev worker exists for **real-device App Attest end-to-end testing**: it pins
 to the dev iOS bundle id `com.leviwilkerson.jwtimedev` (from witness-work
 `app.config.ts`, `IS_DEV` branch) and is the only place
 `NOTES_IMPORT_DEV_BYPASS_TOKEN` should ever be set — **never on prod.**
+
+### Web app origins (CORS)
+
+The web app (witness-work ADR 0038 §10) calls this API cross-origin from a
+browser, so CORS (`src/cors.ts`, registered first in `src/app.ts`) admits an
+exact allow-list per environment, the `WEB_APP_ORIGINS` var (comma-separated;
+`Origin` must equal an entry byte for byte, no wildcards or suffixes):
+
+| Env  | `WEB_APP_ORIGINS` |
+| ---- | ----------------- |
+| prod | `https://app.witnesswork.app`, `https://beta.app.witnesswork.app` |
+| dev  | `https://app-dev.witnesswork.app`, `http://localhost:8081`, `:8082`, `:19006`, `:4173`, `:5173` |
+
+The verify launcher runs `--env dev`, so local web dev servers on those ports
+work against it; the test harness sets `http://localhost:8081` and app-dev.
+Unset, no browser gets in. Native apps send no `Origin` and see no change.
+
+- **Every answer** to an allowed origin, errors included (`apiError`, 401
+  with `WWW-Authenticate`, 404, 426, 429, 503, `onError`'s 500), carries
+  `Access-Control-Allow-Origin: <that origin>`, `Vary: Origin`, and
+  `Access-Control-Expose-Headers: ETag, Retry-After, Date, WWW-Authenticate,
+  x-ww-updated-at`. Never `Access-Control-Allow-Credentials` (no cookies).
+  101 upgrades are left alone; a response with immutable headers is copied.
+  Any other `Origin`, or none: no CORS headers.
+- **Preflights** (`OPTIONS` with `Access-Control-Request-Method`) are
+  answered by the middleware before any limiter, auth, KV read, or Durable
+  Object, so they never count against a limit: 204 with
+  `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`, the
+  requested headers echoed in `Access-Control-Allow-Headers`, and
+  `Access-Control-Max-Age: 7200`, when the origin is allowed and every
+  requested header is `authorization`, `content-type`, `if-match`,
+  `if-none-match`, `sentry-trace`, `baggage`, `x-ww-*`, or `x-buddies-*`,
+  but never `x-ww-admin-token`, and `x-ww-dev-bypass` only on a worker with
+  `NOTES_IMPORT_DEV_BYPASS_TOKEN` set (dev); else 403 with no CORS headers.
+- **Live sockets** from a browser authenticate with a live ticket in
+  `Sec-WebSocket-Protocol` instead of headers and must come from an allowed
+  `Origin`; see
+  "Browser live sockets" under [Accounts](#browser-live-sockets).
 
 ### App Attest bundle ids
 
@@ -150,8 +194,14 @@ their feature: `/contacts#<payload>`, `/buddies/invite#1…`,
 `/c/<payload>`), `/b#1…`, and `/h#1…`. Those links live on in people's
 messages and screenshots, so **the short paths stay routed and in the AASA for
 good**; a redirect wouldn't do, because iOS decides from the AASA whether a
-tapped URL opens the app. Each page's `og:url` is the path it was served on
-(never a payload).
+tapped URL opens the app. Each page's `og:url` is the path it was served on,
+on the host it was served on (never a payload).
+
+New links use the website apex (`https://witnesswork.app/contacts#…`), where
+only the full-word paths are routed here and the AASA lists only those. The
+contact and Buddies invite pages offer "Continue on the web" (`WEB_APP_ORIGIN`).
+Hosts, routes, fragment formats and the web app's contract:
+[`docs/link-pages.md`](docs/link-pages.md).
 
 The app must parse the readable paths (and Android's intent filters must list
 them) for at least one release before it starts generating them, or people on
@@ -163,10 +213,16 @@ older builds get the web page instead of the app.
 pnpm run deploy:dev
 ```
 
+Deploy dev only from `web-launch` or a branch cut from it until the web
+launch lands on `main`. Dev's Durable Object migrations are at `v12`, a tag
+`main`'s dev list doesn't have, so a deploy from `main` fails (see the
+comments above `[[env.dev.migrations]]` in `wrangler.toml`).
+
 Secrets are per environment: add `--env dev` to `wrangler secret put` to keep
 them off prod (the full list is at the bottom of `wrangler.toml`).
-`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN` and
-`ACCOUNT_TOKEN_SECRET` differ between the two workers.
+`NOTES_IMPORT_DEV_BYPASS_TOKEN` is dev only, and `ADMIN_API_TOKEN`,
+`ACCOUNT_TOKEN_SECRET`, and `LIVE_TICKET_SECRET` differ between the two
+workers.
 
 ## Local iteration (no deploy)
 
@@ -195,6 +251,11 @@ implement it as written and list any deviation in the PR. Code: `src/scribe/`
 input, `step.ts` the model call, `meter.ts` + `meterDO.ts` metering,
 `status.ts` kill switch and provider health, `legacy.ts` the Notes Import
 cutover).
+
+`app.platform` in the step body is `ios`, `android` or `web` (the browser app);
+anything else is a 400 `bad_request` (rule `app`). Nothing branches on it:
+analytics and limits use the session's platform. The list is
+`SCRIBE_APP_PLATFORMS` in `src/scribe/wire.ts`.
 
 A Cancel or a dropped connection stops the model call through
 `c.req.raw.signal`, which aborts only under the `enable_request_signal`
@@ -609,6 +670,102 @@ Links. Clients are iOS and Android
   through: one more reason to turn `auth:legacy` off before relying on
   suspension. `owner_account` needs no migration (created in
   place at registration, `confirmed` added in place).
+- **Inbox successor** (witness-work ADR 0039 §5; the protocol's "Inbox
+  successor"): after a key change the app deletes its old inbox with
+  `inbox/delete` `{ inboxId, successor }`, and buddies check a
+  `pair.reconnect` with `POST /buddies/v1/inbox/successor` `{ inboxId }` →
+  `{ ok, successor }` (any account's bearer token, read tier, kill switch
+  applies, no legacy form). Code in `src/accounts/inboxSuccessors.ts` and
+  `deleteWithSuccessor`/`handleSuccessor` in `route.ts`; D1 table
+  `inbox_successors` and `account_inboxes.key_epoch` (migration
+  `0008_inbox-successor.sql`, which backfills each link with the epoch its
+  account had when it was linked, from `retired_account_keys`: 0 for every
+  account that never changed its key; a link made within a second after a
+  change counts as the old key's). A link records the epoch of the key
+  that verified its proof (read with that key, so a key change landing in
+  between leaves it at the old epoch), and a later proof by a newer key
+  moves an existing link up (`confirmInboxLink`). Recording is one
+  insert-select (`recordInboxSuccessor`) gated on the deleted inbox being
+  the token's account's (linked, or already replaced by it), the successor
+  being another inbox linked to it at its current epoch with no successor
+  of its own, and the caller's session being live at that epoch, after the
+  successor's DO said it's registered (`isRegistered`, read-only); then the
+  inbox DO deletes, and the deleted inbox's link is dropped
+  (`unlinkReplacedInbox`). An inbox with any successor recorded is never
+  registered again (409 `conflict` in `checkInboxAccount`, bearer or legacy,
+  proof or not; a legacy registration while D1 is down still falls back to
+  registering unlinked, as before). A legacy request naming `successor` is 403
+  `forbidden`, another account's inbox 403, a suspended account 403
+  `suspended` (deleting without a successor still works), an ended session
+  401, a bad successor 409 `conflict` with nothing deleted. The first record wins
+  while it still qualifies (another successor is 409; the same one
+  refreshes it), and one that no longer does (from before a key change) is
+  replaced, in the upsert's own `WHERE`. A repeat answers `ok` once the DO
+  says `not_found` (`buddies.deleted` is logged only for the real
+  deletion), and a DO refusal or a throw drops the record again (a retry
+  records it once more). The read checks every time that the successor is
+  still linked to the same account at its current epoch and that the
+  account isn't suspended, and answers `null` otherwise (so a K1 holder's
+  record from before the change is never vouched for after it), or after
+  90 days; the hourly cron prunes rows 90 days old. It tells anyone with a
+  token who knows the old inbox id that it was replaced, and by which inbox.
+  The guarantee holds only after the key change: buddies who accept a K1
+  holder's reconnect before it aren't recovered, and the old inbox must be
+  linked to the account before the change (the app links it first and
+  skips the invites if it can't), since another account holding the old
+  key could link an unlinked old inbox and name its own successor.
+- **Old-key owner ops** (witness-work ADR 0039): an inbox's owner key comes
+  from the account key, so after a key change whoever holds the old key
+  could keep reading the old inbox with owner-signed requests until the
+  User's device deletes it (never, if that device is gone). So an
+  owner-signed (legacy) owner op, `inbox/live` upgrade, or `blob/put` on an
+  inbox whose `account_inboxes.first_key_epoch` (the epoch it was first
+  linked at; never moves, migration `0009_inbox-first-key-epoch.sql`,
+  backfilled from `key_epoch`) is below its account's `key_epoch` is 401
+  `unauthorized` with `reason: "key_changed"`, for good, legacy switch on
+  or off, the Notification Service Extension's `linkedOnly` sync included
+  (`ownedByOldKey` in `route.ts`, `isOldKeyLink` in `inboxSuccessors.ts`).
+  A registration with the new key's proof moves `key_epoch` up for
+  successors only: the owner key is still the old one's. The old inbox is
+  usable only through bearer owner ops, and the app deletes it with a
+  successor. A legacy `inbox/register` of it is 401 `key_changed` too,
+  proof or not, so the old key can't keep it from ageing out
+  (`checkInboxAccount`, after the signature and quota; a legacy
+  registration while D1 is down still falls back to registering unlinked).
+  It's one D1 read by primary key per such request (a join on `accounts`),
+  after the shape and `ts` checks and before the inbox DO wakes, so no
+  nonce is spent; never cached, and a D1 failure is a 500, never a pass.
+  The Worker can't check the owner signature, so anyone who knows the inbox
+  id learns it predates a key change (buddies learn it from the reconnect
+  anyway). Unlinked inboxes, workers without `ACCOUNTS_DB`, and bearer
+  requests are unchanged.
+- **Slot seal** (witness-work ADR 0039 §5; the protocol's "Sealing a
+  slot"): the User's writer keys into buddies' inboxes also come from the
+  account key, and a writer op is authorized by the writer signature alone
+  (a bearer token's account is never compared with the slot; a legacy one
+  names none). So after a key change the old key's holder could keep
+  writing as the User until the User's device leaves each slot, which it
+  delays until the buddy claims the reconnect (or 24 h). `slot/seal` is a
+  writer op (`{ inboxId, slotId }` → `{ ok }`; bearer with any session, or
+  legacy while `auth:legacy` is on; kill switch and suspension don't stop
+  it, like `slot/leave`) that sets `slot.sealed = 1` in the inbox DO (column
+  added in place by `#ready`). From then on `#commit` refuses every writer
+  op from that slot with 403 `sealed` unless the caller passes
+  `whileSealed` (only `slot/leave` and `sealSlot`), so a new writer op is
+  refused by default. The check runs inside the write's own transaction,
+  after the signature's await, so a racing write lands before the seal or
+  is refused. Idempotent, final (nothing unseals; `slot/remove` and `slot/leave`
+  still delete it, and a slot added again starts open), `not_found` /
+  `gone` for an unknown inbox / slot. The owner's `inbox/sync` lists the
+  slot with `sealed: true` (absent when open) and live sockets get one
+  `changed`. Nothing else is stored: no account or session. The first seal
+  of an open slot skips the writer's signer budget (`#authenticate`), so a
+  holder of the key can't spend it to keep the slot open; re-seals count. `slot/leave` of
+  a sealed slot (`#departSealedSlot`) drops the slot and its card but keeps
+  its events and their `slot_usage` row until retention prunes them (then
+  `#prune` drops the orphaned usage row), so the old key's holder can't
+  delete the reconnect invite by leaving first; the owner's `slot/remove`
+  of the id still deletes them.
 - **Bindings** (repeated under `[env.dev]`): `BUDDY_INBOX` (`BuddyInbox`, one
   SQLite DO per `inboxId`), `BUDDY_INVITE` (`BuddyInvite`, one per `inviteId`),
   migration `v3`, `BUDDY_REGISTRATION_QUOTA` (`BuddyRegistrationQuota`, one per
@@ -626,8 +783,9 @@ Links. Clients are iOS and Android
     client IP (IPv6 by /64); never the target inbox. The budgets were sized
     per IP, so one account gets the same. `BUDDIES_RATE_LIMITER` 120/min for
     `invite/fetch` + `invite/claim`, `BUDDIES_REGISTER_LIMITER` 60/min for
-    `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync` +
-    `inbox/live`, `BUDDIES_BLOB_PUT_LIMITER` 60/min for `blob/put`,
+    `inbox/register`, `BUDDIES_READ_LIMITER` 600/min for `inbox/sync`,
+    `inbox/live`, and `inbox/successor`, `BUDDIES_BLOB_PUT_LIMITER` 60/min
+    for `blob/put`,
     `BUDDIES_BLOB_GET_LIMITER` 600/min for `blob/get`,
     `BUDDIES_WRITE_LIMITER` 600/min for every other op (namespaces 1002-1007
     prod, 2002-2007 dev; `limits.test.ts` keeps `wrangler.toml` equal to the
@@ -726,11 +884,13 @@ Links. Clients are iOS and Android
   sends `{"type":"changed","seq":…}` after each write that changes
   `inbox/sync`. Sentry events drop `x-buddies-*` headers. Under `wrangler
   dev`, the TCP connection lingers about 10 s after a server-sent close frame;
-  the frame itself arrives at once.
+  the frame itself arrives at once. Browsers offer a live ticket naming the
+  inbox as a subprotocol entry instead
+  ([Browser live sockets](#browser-live-sockets)).
 - **Privacy**: every id travels in the body (for the live socket, in headers;
   never the URL). Never log or report bodies, headers, blobs,
   ids, account ids, or tokens (access tokens included; Sentry drops
-  `Authorization` and `x-buddies-*`). APNs and FCM requests use the `fetch` captured before
+  `Authorization`, `Sec-WebSocket-Protocol`, and `x-buddies-*`). APNs and FCM requests use the `fetch` captured before
   Sentry wraps the global, so device tokens in APNs URLs stay out of Sentry
   spans (FCM tokens travel only in request bodies). The dev worker's 100%
   Workers traces do record subrequest URLs, APNs included.
@@ -785,9 +945,9 @@ authenticating survive only behind the legacy switch (`auth:legacy`), for app
 versions from before sessions.
 
 - `GET /accounts/v1/account`: Bearer, read-only. Returns the token's
-  account (`accountId`, `accountPub`, `status`, `createdAt`, `inboxIds`, and
-  `statusChanges` without their reasons) for Settings → Account and the
-  developer tools. Counts against the Buddies read edge tier.
+  account (`accountId`, `accountPub`, `status`, `createdAt`, `keyEpoch`,
+  `inboxIds`, and `statusChanges` without their reasons) for Settings →
+  Account and the developer tools. Counts against the Buddies read edge tier.
 - `POST /accounts/v1/account/register` (legacy): self-signed under the
   `ww-account/v1` context; idempotent per key. Counts against the Buddies
   register edge tier and the per-caller daily quota. Replaced by opening a
@@ -849,8 +1009,8 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
 
 | Route | What |
 | --- | --- |
-| `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201 |
-| `POST /accounts/v1/sessions/refresh` | `{ refreshToken }` → new token pair |
+| `POST /accounts/v1/sessions` | Open a session: self-signed, attested; 201. With `renews` and Bearer, renew one |
+| `POST /accounts/v1/sessions/refresh` | `{ refreshToken, appVersion?, capabilities? }` → new token pair |
 | `DELETE /accounts/v1/sessions/current` | Bearer; end the token's session |
 | `GET /accounts/v1/account` | Bearer; the token's account |
 | `GET /accounts/v1/sessions`, `POST …/sessions/revoke` | Bearer; devices ([Activity and devices](#activity-and-devices)) |
@@ -869,11 +1029,50 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   accessToken, accessExpiresAt, refreshToken, sessionExpiresAt }`. A refused
   attestation is 403 `attestation_failed` with the attestation routes'
   `reason` and `action`. Optional sealed `device` label (≤ 512 chars, else
-  `too_large`), stored opaque. An eleventh live session ends the account's
+  `too_large`), stored opaque. Optional `appVersion` and `capabilities`
+  (at most 16 names of ≤ 32 chars, `a-z0-9-`; unknown names dropped,
+  malformed is `bad_request`), stored on the session; `sync-everyone` is
+  the only one so far ([Cloud Sync](#cloud-sync)). An eleventh live session ends the account's
   oldest. Limits: the register edge tier, and 20 a rolling day per account
   key (`BUDDY_REGISTRATION_QUOTA` under a hashed `session-open` name),
   counted before the attestation.
-- **Refresh**: plain JSON `{ refreshToken }`. A refresh token is
+- **Renew**: the open's request plus `renews` (the live session's id) in
+  the signed payload and that session's access token as `Authorization:
+  Bearer`, so a stolen Bearer alone can't extend a session: it takes the
+  account key and a fresh attestation, as an open does. The app renews in
+  its session's last 30 days (its own window; the server doesn't enforce
+  one), so its phone doesn't show up as a new sign-in every 90 days. Checked before the attestation is spent (`renewableSession`
+  in `session.ts`): the token is that session's and live
+  (`requireLiveSession`), a phone's (never `web`, which slides instead), and
+  `accountPub`'s account's; after it, the attested platform must be the
+  session's. Any of those is 401 `unauthorized` and the app keeps its
+  session until it ends, then opens as usual. One batch
+  (`prepareSession`'s `renews`): the new session's insert (only while the
+  old one is still live, so of two renewals one wins), `session.renewed`
+  (session the new one, actor the old one, `method` as for an open; no
+  `session.opened`), the old one ended `renewed` (a refresh of it is 401
+  `reason: renewed`), and only then the cap, so a renewal never replaces
+  another device's session. The new session gets a full 90 days and keeps
+  the old one's account and platform, and its label, app version, and
+  capabilities unless the request sends new ones. Phones never step up
+  (`STEP_UP_EXEMPT`), so no step-up carries over. Counts toward the 20 opens
+  a day.
+  - **A successor nobody holds**: when the renewal's answer is lost, or the
+    app is stopped before saving it, the device keeps presenting the old
+    session's refresh token. A refresh with that session's current (or just
+    replaced) token, refused `renewed`, also ends the session that renewed it
+    (found through `session.renewed`, `renewedBy`) with `session.signed_out`,
+    only while that one was never refreshed (`rotated_at IS NULL`), so it
+    doesn't sit live for 90 days counting toward the cap. A successor its
+    device refreshed is left alone. The app also closes a renewal it couldn't
+    save.
+  - **Signing out an old id**: `POST /sessions/revoke` for a session that
+    ended `renewed` follows `session.renewed` (up to 8 renewals) to the live
+    successor and signs that out, or the caller itself when the successor is
+    its own session, since a device list read before the renewal names the
+    old id.
+- **Refresh**: plain JSON `{ refreshToken, appVersion?, capabilities? }`;
+  each one sent replaces the session's. A refresh token is
   `<sessionId>.<secret>.<mac>` (b64u, 16, 32, and 32 bytes; opaque to the
   app), so the session is found by id. The MAC is HMAC-SHA256 over
   `<sessionId>.<secret>` under its own key from `ACCOUNT_TOKEN_SECRET` (or
@@ -894,18 +1093,22 @@ Attest once, then bearer tokens (witness-work ADR 0027; "Sessions" in its
   one), `sinceRotationSec`, and `platform`: no ids or tokens. An unknown,
   ended, or expired session is 401 `unauthorized`; a refresh that lost its
   rotation race to a session that has since moved on again is 401 without
-  ending it. Sessions last 90 days from opening and refreshing never
-  extends them. Read edge tier.
+  ending it. Phone sessions last 90 days from opening and refreshing never
+  extends them; a web session (platform `web`, opened with a ticket: see
+  [Passkeys and web sessions](#passkeys-and-web-sessions)) lasts 180 days
+  from its last refresh, with no absolute limit. A refusal carries `reason`
+  (`REFRESH_REFUSALS`). Read edge tier.
 - **Close**: `DELETE /sessions/current`, Bearer, no body; ends the token's
   own session, idempotent. Read tier. Session ids never go in URLs.
 - **Storage**: D1 `account_sessions` (migration
   `migrations/accounts/0001_account-sessions.sql`): id, account, platform
-  (`ios`, `android`, `dev`), sealed device label, SHA-256 of the current
+  (`ios`, `android`, `dev`, `web`), sealed device label, SHA-256 of the current
   and previous refresh token, and times. No install id, App Attest key,
   `accountPub`, or IP. The hourly cron deletes sessions a week after they
   were revoked or expired.
 - **Access tokens**: HS256 JWTs, 15 minutes (never past the session's end),
-  claims `sub` (account), `sid` (session), `platform`, `iss`
+  claims `sub` (account), `sid` (session), `platform`, `kep` (the
+  session's key epoch; absent counts as `0`), `iss`
   `ww-api/<APP_ATTEST_ENVIRONMENT>`, `aud` `ww-account`, `iat`, `exp`.
   Nothing is stored; a token is valid until it expires, so closing a
   session stops its refresh token at once and its access token within 15
@@ -954,12 +1157,18 @@ Building a route on accounts (`src/accounts/auth.ts`):
   ended (signed out, revoked, replaced, expired, or deleted) with the same
   401 `unauthorized` and `WWW-Authenticate` an expired token gets, so the
   app's refresh → 401 → open path signs it back in. One D1 read
-  (`isSessionLive`), **never cached**: revocation bites at once. Use it on
-  security surfaces a signed-out device must not act on in its token's last
-  15 minutes: today `GET /sessions`, `POST /sessions/revoke`,
-  `GET /activity`, `GET /account` (and `account/info`'s bearer form),
-  `handoff/open` and `handoff/send`, and `backup/delete`. Leave it off hot
-  paths (Buddies, Notes Import, route planning, backup put/list/get,
+  (`liveSessionKeyEpoch`), **never cached**: revocation bites at once. The
+  same read compares the token's `kep` with the session's `key_epoch`: a
+  token from before the session's key change is 401 `unauthorized` with
+  `reason: "key_changed"` (the app refreshes). Use it on security surfaces a
+  signed-out device must not act on in its token's last 15 minutes: today
+  `GET /sessions`, `POST /sessions/revoke`, `GET /activity`, `GET /account`
+  (and `account/info`'s bearer form), `handoff/open` and `handoff/send`, the
+  passkey routes, `account/rekey`, `account/key-history`, and every write
+  of re-sealable data:
+  `sync/put`, `sync/delete`, `sync/photos/put`, `sync/photos/delete`,
+  `backup/put`, `backup/delete` (ADR 0039). Leave it off hot paths (Buddies,
+  Notes Import, route planning, backup list/get, Cloud Sync reads,
   Supporter, handoff status/cancel), where ADR 0027's 15 minutes stand, and
   off `DELETE /sessions/current`, which must always succeed.
 - `authenticateAccount(c, options?)`: the same check as a call, for routes
@@ -986,13 +1195,121 @@ Building a route on accounts (`src/accounts/auth.ts`):
   sends any method.
 
 **Privacy**: never log or report access or refresh tokens, account ids,
-session ids, or device labels. Sentry drops `Authorization`. Drizzle's
+session ids, or device labels. Sentry drops `Authorization` and
+`Sec-WebSocket-Protocol` (a browser socket's ticket). Drizzle's
 query errors quote the query's parameters (ids, token hashes), so report a
 caught error with `captureFailure(error, operation)` (`src/sentry.ts`),
 never `Sentry.captureException`: a database error, or one it caused, goes
 out as a `DatabaseError` naming the operation only. As a backstop,
 `beforeSend` cuts `Failed query:`, `params:`, and `D1_…:` text from every
 string and drops the exceptions chained under it.
+
+### Browser live sockets
+
+Browsers can't set headers on a WebSocket (witness-work ADR 0038 §10), so a
+web client authenticates `GET /accounts/v1/sync/live` and
+`GET /buddies/v1/inbox/live` with a live ticket in `Sec-WebSocket-Protocol`
+(code in `src/liveSubprotocol.ts` and `src/accounts/liveTickets.ts`). A
+request with that header takes this path; one without it takes the native
+header path, unchanged.
+
+**Why a ticket, not the access token:** `wrangler tail`, and so Workers Logs,
+records `Sec-WebSocket-Protocol` in full, while it redacts `Authorization`.
+A 15-minute access token there would be a credential in Cloudflare's logs.
+A ticket that lands there names no id (its claims are encrypted), opens one
+socket kind for one id for 30 seconds, one socket at a time, and calls no
+other route.
+
+| Step | Wire |
+| --- | --- |
+| Mint | `POST /accounts/v1/live/ticket` (Bearer, live session) `{ "socket": "sync" \| "buddies", "id": "<slotId \| inboxId>" }` → `{ "ok": true, "ticket", "expiresAt" }` |
+| Cloud Sync | `Sec-WebSocket-Protocol: ww.v1, ticket.<sync ticket>` |
+| Buddies | `Sec-WebSocket-Protocol: ww.v1, ticket.<buddies ticket>` |
+
+- **The ticket**: `b64u(iv ‖ AES-256-GCM(UTF-8 JSON claims)).b64u(HMAC-SHA256)`,
+  466 characters: the claims are padded with spaces to 288 bytes, so the
+  length shows neither the socket nor the id's. A random 12-byte IV; the MAC covers the
+  first part. Two keys from the Worker secret `LIVE_TICKET_SECRET`, each the
+  SHA-256 of its own label and the secret (`ww-live/v1/ticket-cipher`,
+  `ww-live/v1/ticket`), as `ACCOUNT_TOKEN_SECRET`'s derived keys are.
+  Claims, epoch seconds: `typ` `ww-live`, `iss`
+  (`ww-api/<APP_ATTEST_ENVIRONMENT>`), `sub` (account), `sid` (session),
+  `platform`, `socket`, `id`, `tokenExp` (the access token's `exp`), and
+  `exp` (30 s after minting, or `tokenExp` if sooner). `expiresAt` in the
+  answer is `exp` in epoch ms. Nothing is stored.
+- **Minting**: `requireLiveSession`, so a signed-out or revoked session
+  mints none (401 `unauthorized`); a token with under a second left is 401
+  too, so the app refreshes it first. Counts against the read edge tier and
+  checks only the id's shape (a sync slot id; a 22-character inbox id), 400
+  `bad_request` otherwise; 503 `disabled` without the secret.
+- **One open socket per ticket, not single-use**: within its 30 seconds a
+  ticket reopens its socket after a drop. But the Worker hands the DO the
+  ticket's hash (b64u SHA-256 of its MAC, `x-ww-live-ticket`; it opens
+  nothing), the DO keeps it in the socket's attachment (already written on
+  connect, so no extra storage write), and refuses a second socket on the
+  same hash while one is open with 409 `conflict`, before it accepts
+  anything. A logged copy so can't open sockets that push the User's own
+  past the cap (`4000`/`4002 "replaced"`). Burning tickets would put a
+  Durable Object or KV write in every connect; sockets carry change notices
+  only, never data.
+- **Session liveness is checked at the mint, not at the upgrade.** Neither
+  socket path checks that the session is still live (the native one never
+  did); a ticket minted just before sign-out still opens within its 30
+  seconds, and the socket closes when the token expires.
+- **The secret**: its own value per worker, never `ACCOUNT_TOKEN_SECRET`'s:
+  `openssl rand -base64 32 | wrangler secret put LIVE_TICKET_SECRET` (add
+  `--env dev` for dev). Shorter than 32 characters (warned once per
+  isolate), or equal to `ACCOUNT_TOKEN_SECRET` or
+  `ACCOUNT_TOKEN_SECRET_PREVIOUS` (warned too), it's ignored and tickets are
+  off (503 `disabled`). There's no previous slot: rotating it fails the
+  tickets minted in the last 30 seconds once, and the app mints another.
+  The verify launcher, `.dev.vars.example`, and the test harness set their
+  own.
+- **Check order on the socket**, all in the Worker before any Durable
+  Object: `Origin` in `WEB_APP_ORIGINS`, else 403 `forbidden`, first, so a
+  foreign page learns nothing of an offer's shape; then the offer's shape,
+  else 400 `bad_request`: a comma-separated list of RFC 9110 tokens,
+  trimmed, at most 2,048 characters, `ww.v1` and `ticket.<ticket>` each
+  once, nothing else, `ww.v1` present, and no `Authorization` header
+  alongside; then the kill switch (503) and, for Cloud Sync, the edge tier
+  (429); then the ticket, else 401 `unauthorized` with the
+  `WWW-Authenticate` a bad token gets; then the header path's checks in its
+  order (Cloud Sync: entitlement, upgrade; Buddies: edge tier, upgrade, the
+  inbox's ownership, `not_linked`, suspension); then the DO's 409
+  `conflict` for an open ticket. No id goes in the URL, and none reads in
+  the offer: the ticket names them, sealed.
+- **Verifying the ticket**: length, two parts, the MAC, before anything is
+  decrypted or parsed; then the seal, `typ`, `iss`, `socket` (the route's: a
+  Buddies ticket never opens Cloud Sync), `exp` and `tokenExp` not passed,
+  `exp` no later than `tokenExp`, `exp` at most 30 s and `tokenExp` at most
+  one access token lifetime (plus its 60 s `iat` skew) from now, each plus
+  5 s of skew, and the claims' shapes. A missing, forged, expired, or
+  other-socket ticket is 401; 503 `disabled` without `LIVE_TICKET_SECRET`.
+- **The browser can't see any of these statuses**: a failed handshake is
+  only a close (1006) to page script. So the web app mints a fresh ticket
+  on every connect, never reuses one, and reconnects with backoff; when
+  the mint itself answers 401, it refreshes its access token first.
+- **Forwarding**: the DO gets the internal headers it already trusts
+  (`x-ww-sync-account` and `x-ww-slot-id`; `x-buddies-session-account` and
+  `x-buddies-payload`, built from the ticket's inbox id) plus `tokenExp`
+  (epoch ms) in `x-ww-sync-expires-at` / `x-buddies-session-expires-at`,
+  and the ticket's hash in `x-ww-live-ticket`. The Worker drops
+  `Sec-WebSocket-Protocol` and `Authorization`, so the ticket never reaches
+  the DO, overwrites a client's `x-ww-slot-id` or `x-buddies-payload` with
+  the ticket's id, and drops a client's copy of the expiry and ticket
+  headers on the native path.
+- **101**: carries `Sec-WebSocket-Protocol: ww.v1` (a browser fails the
+  handshake otherwise); native upgrades get no subprotocol header.
+- **Expiry**: the DO keeps `expiresAt` (the access token's, from the
+  ticket) in the socket's attachment and closes it with `4004 "expired"`
+  once it passes (the app refreshes, mints a ticket, and reconnects).
+  Pings are auto-responses that don't wake a hibernated DO, so
+  the DO alarm does it: `BuddyInbox` counts each socket's expiry among its
+  `#nextDeadline` deadlines; `AccountSync` keeps its next retention run in
+  `alarm_schedule.retention_at` and sets the alarm for the sooner of that and
+  the soonest expiry, running retention only when it's due (an object from
+  before the table treats its pending alarm as retention's). Native sockets
+  keep outliving their token, as before.
 
 ### Activity and devices
 
@@ -1035,7 +1352,9 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
   reloads its list) and cursors from before it page on while the previous
   slot is set.
 
-- **Kinds**: `account.created`, `session.opened`, `session.signed_out`,
+- **Kinds**: `account.created`, `session.opened`, `session.renewed` (a
+  phone renewed its session: session the new one, actor the old one; not a
+  sign-in), `session.signed_out`,
   `session.revoked`, `session.replaced` (the 10-session cap),
   `session.refresh_reused` (a replaced refresh token after its grace minute;
   the app flags it), `handoff.sent`, `backup.deleted` (no `slotId` = all),
@@ -1043,10 +1362,12 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
   `account.suspended`/`.reinstated` (never the reason),
   `buddies.inbox_linked` (a new link, in `linkInbox`'s batch),
   `buddies.deleted` (the Worker, after the inbox DO accepted `inbox/delete`;
-  never in the DO). Writer ops log nothing, so nothing ties a writing
-  account to another account's inbox. Expiry, refreshes,
-  reads, and uploads aren't logged. Clients skip unknown kinds, so adding
-  one is safe.
+  never in the DO), `passkey.added`/`.removed`, `device.approved`,
+  `account.key_changed` (the session that changed it; the sessions it ended
+  are `session.revoked` with it as actor). Writer ops log nothing, so
+  nothing ties a writing account to another account's inbox. Expiry,
+  refreshes, reads, and uploads aren't logged. Clients skip unknown kinds,
+  so adding one is safe.
 - **Recording a new action**: add the kind to `ACTIVITY_KINDS`
   (`schema.ts`; no migration, it's a text column), then put
   `activityInsert(db, { accountId, kind, sessionId })` in the action's own
@@ -1068,19 +1389,42 @@ session (or none) is 404 `not_found`, and the caller's own is signed out.
 minAppVersion? }`. The value comes from KV `app:min-version`
 (`{"minVersion":"x.y.z"}`), then the `APP_MIN_VERSION` var, else it's
 absent. Invalid values are logged and ignored, and the KV read is
-edge-cached for 60 seconds. It has its own per-IP bucket (`app`). App
+edge-cached for 60 seconds; the response itself is `no-store`. It has its own per-IP bucket (`app`). App
 versions from sessions on read it at launch and on returning to the
-foreground, and show Update Required below it.
+foreground, and show Update Required below it. It also carries Cloud
+Sync's `sync: { enabled, entitlement }`, where `entitlement` is `everyone`
+only when `?capabilities=` (comma-separated) has `sync-everyone`. And it
+always carries the caller's coarse location for the app's sales-region check
+(witness-work ADR 0041 §3, `docs/web-purchases.md`), from Cloudflare's
+`request.cf` (`requestRegion`): `country`, the upper-case ISO 3166-1 alpha-2
+code, null when unknown (`XX`), Tor (`T1`), or malformed; and `regionCode`,
+the ISO 3166-2 subdivision without its country prefix (`MB` for Manitoba),
+null when unknown or malformed and whenever `country` is. Null means
+unknown: the web app treats `CA` with no `regionCode` as possibly Manitoba or
+Saskatchewan, and doesn't sell there. A missing `cf`
+gives both null, never an error. Never store or log them.
 
 KV `auth:legacy` (`"off"` or `"on"`; absent falls back to the `AUTH_LEGACY`
-var, then on; edge-cached 60 s). While it's on, converted routes also take
-the way they authenticated before sessions. Off, those requests get 426
+var, then on; edge-cached 60 s). **A failed KV read counts as off**
+(witness-work ADR 0038 §11): the old ways of signing requests never come back
+because KV is down. The dev worker's `AUTH_LEGACY` is `off`; production's is
+still `on` until the web launch writes KV `auth:legacy` = `off` (below). The
+e2e suites and the fuzzer turn it on in the local launcher's KV for their run,
+since production still serves legacy requests. While it's on, converted
+routes also take the way they authenticated before sessions. Off, those requests get 426
 `upgrade_required`, `account/register` included, except the iOS
 Notification Service Extension's owner-signed Buddies `inbox/sync`
 (`x-buddies-client: notification-service`) for an inbox with a confirmed
 account link (see Buddies → Authentication).
 
 #### Turning off backward compatibility
+
+This is the web launch's runbook (witness-work ADR 0038 §11): requests signed
+the pre-session way are refused once the web launches, and app versions
+before 1.45.0 (the first that opens sessions) lose Buddies and Notes Import
+until they update. Production's `AUTH_LEGACY` var stays `on`; step 3 is what
+turns it off, and deleting the key turns it back on. Dev is already off by its
+var.
 
 Do these in order. Each step takes up to 60 seconds to reach every colo.
 
@@ -1100,10 +1444,293 @@ wrangler kv key put --binding NOTES_KV notes-import:min-version '{"minVersion":"
 wrangler kv key put --binding NOTES_KV auth:legacy off
 ```
 
-Add `--env dev` to each for the dev worker. To undo, take them back in
-reverse: `wrangler kv key delete --binding NOTES_KV auth:legacy` (back to
-`AUTH_LEGACY`, on), then put the previous floors back, or delete
-`app:min-version` and `notes-import:min-version` to remove them.
+Add `--env dev` to each for the dev worker (step 3 isn't needed there; its
+var is off). To undo, take them back in reverse: `wrangler kv key delete
+--binding NOTES_KV auth:legacy` (back to `AUTH_LEGACY`: on in production, off
+on dev; `put auth:legacy on` re-allows dev), then put the previous floors
+back, or delete `app:min-version` and `notes-import:min-version` to remove
+them.
+
+### Passkeys and web sessions
+
+Passkeys are credentials of an existing account, never an identity of their
+own (witness-work ADR 0038; the wire contract is its
+`docs/passkeys-protocol.md`, implement it as written and list any deviation
+in the PR). Code in `src/accounts/passkeys.ts` (handlers),
+`passkeyStore.ts` (passkeys, wraps, user handle, used token ids),
+`webauthn.ts` (ceremony checks around `@simplewebauthn/server`),
+`passkeyTokens.ts` (challenges and tickets), `passkeyConfig.ts` (RP pairs),
+`stepUp.ts`, and `rateCounterDO.ts`; docs in `passkeyOpenapi.ts`. Tables
+`passkeys`, `passkey_wraps`, `used_token_ids` (migration
+`migrations/accounts/0004_passkeys.sql`).
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/passkeys/challenge` | `sign-in` (no auth) or `step-up` (Bearer) challenge |
+| `POST /accounts/v1/passkeys/assert` | Sign-in → account, wraps, `passkey` ticket; step-up → `stepUpAt` |
+| `POST /accounts/v1/passkeys/register/options` | Bearer; creation options, mints the user handle |
+| `POST /accounts/v1/passkeys` | Bearer + signed `passkey/add`, step-up |
+| `POST /accounts/v1/passkeys/wrap` | Bearer + signed `passkey/wrap` |
+| `GET /accounts/v1/passkeys` | Bearer; the account's passkeys |
+| `POST /accounts/v1/passkeys/remove` | Bearer + signed `passkey/remove`, step-up |
+| `POST /accounts/v1/sessions` with `ticket` | A browser's web session, in place of attestation |
+| `POST /accounts/v1/web/signup/options` | No auth; Turnstile, caps → the new account's creation options |
+| `POST /accounts/v1/web/signup` | Signed `web/signup` by the new key: account, passkey, wrap, web session |
+| `POST /accounts/v1/web/recovery` | Signed `web/recovery`; Turnstile → a `recovery` ticket |
+| `POST /accounts/v1/approval/{open,status,receive,done,cancel}` | The browser: none (`open`) or `browserToken` |
+| `POST /accounts/v1/approval/{claim,status,send,cancel}` | The phone: Bearer of the claiming phone session |
+
+- **Relying party**: vars `PASSKEY_RP_IDS` (comma list; the first is the
+  default and the one Android origins pair with) and `PASSKEY_ORIGINS` (JSON
+  object from RP ID to its origins, web and `android:apk-key-hash:`). A
+  challenge or creation options without `rpId` get the RP ID the request's
+  `Origin` pairs with, else the first.
+  Production: `app.witnesswork.app`. Dev: `app-dev.witnesswork.app` and
+  `localhost` (the local ports). Origin and RP ID are checked as a pair, and
+  the authenticator data's `rpIdHash` against the challenge's RP ID. A new
+  Android signing key is a var change; the RP ID never changes once the first
+  passkey exists.
+- **Checks and reasons**: `webauthn.ts` checks, in order, the client data's
+  type (a create answering a get is `signature`, a get answering a create
+  `registration`) and challenge (`challenge`), the origin pair (`origin`),
+  `rpIdHash` (`rp_id`), UP (`user_presence`), UV (`user_verification`), the
+  counter (`counter`: synced passkeys' 0 always passes, and the stored
+  counter is `MAX(stored, reported)`, never lowered), then the library
+  verifies the signature (`signature`) or attestation (`registration`). The route checks the
+  credential (`unknown_credential`) and user handle (`user_handle`) first.
+  Failed assertions count against 30 per caller IP an hour
+  (`AccountRateCounter`, named by an HMAC of the IP under a key from
+  `ACCOUNT_TICKET_SECRET`, src/accounts/rateCounter.ts; never a plain hash,
+  which anyone could compute for every IPv4 address). `Retry-After` never
+  passes the end of the window. Rotating `ACCOUNT_TICKET_SECRET` starts the
+  counts over.
+- **Challenges and tickets** are stateless HMACs (`passkeyTokens.ts`) under
+  their own secrets, with `typ`, issuer, id, and expiry. Using one inserts
+  its id into `used_token_ids` in the same D1 batch as what it authorizes
+  (`batchUsing`); the hourly cron prunes expired ids. A ticket's session
+  open records the session and a hash of the signed request, so the same
+  request again within 2 minutes (a lost response) gets the same session and
+  the same refresh token: a web session's first one is derived from its id
+  (`repeatSession`, no write), or, once refreshed within the minute, the
+  token it was replaced by. The first answer's token never counts as
+  `reused`. An `approval` ticket opens a session only while the approving
+  phone's session (`actorSessionId`) is live.
+- **Signed envelopes work once**: `passkey/add`, `passkey/wrap`,
+  `passkey/remove`, and bearer `backup/delete` record their envelope's
+  nonce (per account key, until `ts` + 5 minutes; `envelopeNonce` in
+  `used_token_ids`) in the action's own D1 batch (`backup/delete`: just
+  before R2), so a captured envelope is 409 `replay`. `signedForToken`
+  (`signed.ts`) checks it first. `session/open` doesn't: a phone's
+  attestation is single-use already, and a ticket's repeat is the
+  lost-response path. Legacy (pre-session) envelopes are unchanged.
+- **Caps are atomic**: the 10th passkey is counted in its own insert
+  (`passkeyInsert`), so parallel adds can't pass it.
+- **Wrap ids** are unique per credential (`passkey_wraps`' key is
+  `(credential_id, wrap_id)`), so another account's id never conflicts with
+  or reveals anything about one's own.
+- **Web sessions**: platform `web`, sliding 180 days from the last refresh,
+  at most 3 per account apart from the phones' 10 (least recently active
+  replaced, `session.replaced`), and stepped up when they open. Step-up
+  (`refuseWithoutStepUp`; `STEP_UP_EXEMPT` lists the platforms that skip it:
+  `ios`, `android`, `dev`) is required of web sessions within 5 minutes on
+  passkey add/remove, `backup/delete`, and `account/rekey`. `GET /sessions`
+  answers the server's `now` and the caller's `stepUpUntil` (`step_up_at` +
+  5 minutes; null with none, and always for the exempt platforms), so a
+  browser times the window on the server's
+  clock, never its own. Every session
+  records `method`, `app_version`, `key_epoch`, and `step_up_at`; refreshes
+  refused with 401 carry `reason` (`revoked`, `replaced`, `expired`,
+  `reused`, `key_changed`, `renewed` (a phone renewed it), `unknown`;
+  `ended_reason` on the row).
+  `key_changed` is only a session still live when another session changed
+  the account key, and comes with `changedAt`; one signed out or revoked
+  before it keeps `revoked` (and one already expired, `expired`), so a browser
+  can tell a lost device signed out first (wipe) from one the change ended.
+  On a call, `reason: "key_changed"` means something else: the access token
+  is from before the session's own key change; refresh and retry.
+- **Accounts** gain `passkey_user_handle` (minted with a conditional write),
+  `key_epoch` (ADR 0039 raises it; wraps for another epoch are refused),
+  `created_via` (`app` or `web`), and `key_changed_at`.
+- **Privacy**: never log or report challenge tokens, tickets, registration or
+  assertion bodies, user handles, credential ids, wraps, or anything near a
+  PRF output (the server never sees one). Sentry drops request bodies
+  (`dropRequestBody`). Logs name the op only (`guarded`).
+- **Web sign-up** (`webSignup.ts`, `turnstile.ts`): there's no device
+  integrity on the web, so sign-up has Turnstile (managed widget, actions
+  `web-signup` and `web-recovery`; Siteverify gets `remoteip` and an
+  `idempotency_key`, and the answer's action and hostname, one of
+  `WEB_APP_ORIGINS`' hosts, must match, except under Cloudflare's test
+  secrets on a development worker only), caps, and a kill switch. A
+  `turnstileToken` over 2,048 characters is `bad_request`. Caps live in an
+  `AccountRateCounter` per network (`capsShardName`: `web-caps:` and an HMAC
+  of the ASN, so one request's IP and ASN limits are taken atomically in one
+  object): `WEB_SIGNUP_PER_IP_DAY` (3, IPv6 by /64) and
+  `WEB_SIGNUP_PER_ASN_HOUR` (30, from `request.cf.asn`; skipped without
+  one), checked at `options` (an outage lets it through) and taken at
+  `web/signup` before the D1 batch, given back if the batch fails; an outage
+  there fails closed (503 `unavailable`, `Retry-After: 30`). Recovery:
+  `WEB_RECOVERY_PER_IP_DAY` (10) per IP a day, checked before Siteverify and
+  counted only after it passes, so junk can't lock a shared IP out (an outage
+  lets it through: the envelope proves the key). Names are HMACs of the IP or
+  ASN under a key derived from `ACCOUNT_TICKET_SECRET` and the UTC day
+  (`counterName`, src/accounts/rateCounter.ts), each also counting
+  yesterday's name so the windows still roll; no IP or ASN is stored. They
+  depend on the secret alone, so counts hold across isolates, DO evictions,
+  and restarts. Both envelopes work once (409 `replay`).
+- **Approving a browser from a phone** (`approval.ts`, `approvalDO.ts`): the
+  handoff with the roles turned around, one `AccountApproval` SQLite DO per
+  channel (its own class, migration `v11`: roles, auth, lifetimes, location,
+  and the ticket all differ from `AccountHandoff`). The browser opens it with
+  the verifiers of the phone's `claimToken` and its own `browserToken` and a
+  sealed hello; a phone session claims it (web sessions are `forbidden`); the
+  claiming session sends the sealed key (logs `device.approved`); the
+  browser's first `receive` while `sent` mints an `approval` ticket (the same
+  one until it expires); the web session it opens needs the approving
+  session still live. 75 seconds unclaimed, 5 minutes from the claim; five
+  wrong tokens (claim and browser together) burn a channel in progress, and a
+  finished one counts none and keeps its status. `done` and `cancel` keep
+  only the status, the token verifiers, and a hash of the claiming session
+  (so its phone can still read the status) until the alarm deletes it: the
+  blobs, location, account id, and session id go. The DO keeps the browser's
+  coarse location from `request.cf` (city, region, country, latitude,
+  longitude; never the IP) and `claim` answers it with `far` (another
+  country, or more than 200 km by haversine). `open` is 60 per caller IP an
+  hour (`AccountRateCounter`, an HMAC name). Channel hashes (`sha256B64u`,
+  `tokenDigest`) are shared with the handoff DO in `src/crypto.ts`.
+- **Rate counters**: `refuseOverRateCounter` (src/accounts/rateCounter.ts)
+  checks or takes limits in a named `AccountRateCounter` for the assert
+  failure budget, the web caps, and approval opens: 429 `rate_limited` with
+  `Retry-After`, an outage allowing (or, for web sign-up's take, 503
+  `unavailable`). Docs are split by tag: `passkeyOpenapi.ts` (Passkeys),
+  `webSignupOpenapi.ts` (Web sign-up), `approvalOpenapi.ts` (Approving a
+  browser).
+- **Web sign-up kill switch**: KV `accounts:web-signup` (`off`/`on`), then
+  the `WEB_SIGNUP` var, then on; a failed read counts as on (`readKvSwitch`,
+  shared with the legacy switch, whose failed read counts as off). Off refuses
+  `web/signup/options` and `web/signup` with 503 `disabled`; recovery isn't
+  affected. `GET /app/v1/config` answers `webSignup: { enabled,
+  turnstileSiteKey }` (the site key whenever Turnstile is set up, since
+  recovery uses it too).
+
+  ```bash
+  wrangler kv key put --binding NOTES_KV accounts:web-signup off   # pause (add --env dev)
+  wrangler kv key delete --binding NOTES_KV accounts:web-signup    # back to the var
+  ```
+
+Secrets, each a different value per worker, at least 32 characters, never
+`ACCOUNT_TOKEN_SECRET`'s; without either, the passkey routes and ticket
+sessions answer `disabled`. Keep a copy in 1Password's Agents vault. Rotating
+one invalidates challenges (≤ 10 minutes) or tickets (≤ 2 minutes) in flight,
+and rotating `ACCOUNT_TICKET_SECRET` also starts the rate counters (assert
+failures, web caps) over, nothing else, so there's no previous slot:
+
+```bash
+openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET --env dev
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET --env dev
+# Production (the owner, at the launch):
+openssl rand -base64 32 | wrangler secret put PASSKEY_CHALLENGE_SECRET
+openssl rand -base64 32 | wrangler secret put ACCOUNT_TICKET_SECRET
+```
+
+Turnstile: the widget's site key is the `TURNSTILE_SITE_KEY` var and its
+secret the `TURNSTILE_SECRET_KEY` secret. A development worker without them
+uses Cloudflare's test keys (site key `1x00000000000000000000AA`, secret
+`1x0000000000000000000000000000000AA`, which pass any token for any host);
+production without them has web sign-up and recovery off (`disabled`). The
+widget runs only in the web app's Turnstile frame (witness-work
+`docs/web-turnstile.md`), never on the app's own host, so under a real secret
+Siteverify's hostname must be in the `TURNSTILE_HOSTNAMES` var
+(`verify.witnesswork.app`; dev `verify-dev.witnesswork.app`, bare hostnames,
+lowercased; an entry with `/` or `:` is ignored with an error in the log).
+Unset, web sign-up and recovery are off (`disabled`, and `GET /app/v1/config`
+says `webSignup.enabled: false`) rather than failing every token; only a
+development worker on a test secret needs none. To set up a widget (dashboard
+→ Turnstile, or the API with a token that has Account › Turnstile › Edit):
+managed mode, hostname `verify.witnesswork.app` for production,
+`verify-dev.witnesswork.app` for dev, and nothing else; put the site key in
+`[vars]` or `[env.dev.vars]` next to `TURNSTILE_HOSTNAMES`, then:
+
+```bash
+wrangler secret put TURNSTILE_SECRET_KEY --env dev   # paste the widget's secret
+wrangler secret put TURNSTILE_SECRET_KEY             # production (the owner)
+```
+
+The verify launcher sets synthetic ones; `src/e2e/passkeys.e2e.test.ts`
+drives the routes with a software authenticator (`src/test/webauthn.ts`), and
+`src/e2e/webSignup.e2e.test.ts` signs up and recovers against the real
+Siteverify with the test keys. `TURNSTILE_SECRET_KEY=2x0000000000000000000000000000000AA
+node scripts/verify/dev.mjs up` makes every token fail (`3x…` answers "already
+spent").
+
+### Changing the account key
+
+The same account under a new key (witness-work ADR 0039; the wire contract
+is its `docs/account-key-change.md`, implement it as written and list any
+deviation in the PR). Code in `src/accounts/rekey.ts`; retired keys in
+`store.ts` (`refuseRetiredKey`, `isRetiredKey`, `registerAccount`). Tables
+`retired_account_keys` and `account_key_history`, and
+`accounts.key_changed_at` (migration
+`migrations/accounts/0006_account-key-change.sql`).
+
+| Route | What |
+| --- | --- |
+| `POST /accounts/v1/account/rekey` | Bearer, live session; signed by the old key (op `account/rekey`) and the new (`newSignature`) → `{ ok, keyEpoch, accessToken, accessExpiresAt }` |
+| `GET /accounts/v1/account/key-history` | Bearer, live session → `{ ok, keyEpoch, history }` (the sealed blob, or `null`) |
+
+- **Who may**: phone sessions (`STEP_UP_EXEMPT`) at any age; a web session
+  at least 24 hours old (403 `session_too_new`) with a step-up in the last 5
+  minutes (`step_up_required`). Suspended accounts may.
+- **One batch**, every statement after the swap gated on it having landed
+  (`committed`: the account now has the new key, the new epoch, and this
+  request's `key_changed_at`): the envelope's nonce (each works once, 409
+  `replay`; no idempotent retry, the device refreshes and reads
+  `GET /account`), the swap (a compare-and-swap on `account_pub` and
+  `key_epoch`, also requiring the caller's session live, the new key never
+  retired, and the limits), the retired key, the caller's session (new
+  epoch, re-sealed `device`), `session.revoked` for and the end of every
+  other live session (`ended_reason` `key_changed`; already ended ones keep
+  theirs), every wrap deleted and `passkeyWrap` (only the session's
+  step-up credential, a phone's too, else 404 `not_found`) stored at the
+  new epoch, the history upserted, the account's RevenueCat customers
+  locked and unlinked elsewhere (`keyChangeSupporterStatements`, ADR 0039
+  §9; see Supporter), and `account.key_changed`. A lost swap is read
+  again: a moved key or epoch is 409 `conflict` with the account's
+  `keyEpoch` (another device won); a caller session that ended meanwhile is
+  401 `unauthorized` with its `reason` (`revoked`, `replaced`, `expired`),
+  so the app never drops its new key for a change nobody made. Then every
+  Cloud Sync socket of the account closes with `4005 "key_changed"`
+  (`closeForKeyChange`); the caller reconnects with the answer's token.
+- **Retired keys** never open a session or make an account: `POST /sessions`
+  (attested and every ticket), legacy `account/register`, `web/signup`, and
+  `web/recovery` answer 403 `key_retired` with `changedAt`. The checks run
+  before the attestation or ticket, and again inside the writes: a session
+  row is inserted only while its key and epoch are still the account's
+  (`prepareSession`), and an account only while its key isn't retired, so a
+  key change racing a session open can't leave either behind.
+- **Opening into a known account**: `POST /sessions` takes an optional
+  `accountId` in its payload; then it opens only when `accountPub` is that
+  account's current key (404 `unknown_account` otherwise) and never creates
+  an account. A device resolving an interrupted key change uses it.
+- **Re-sealing** (`sync/put` with `x-ww-reseal: 1`): it needs a strong
+  quoted-ETag `If-Match` (`bad_request` without one or with a weak `W/"…"`
+  one), so it never replaces bytes written after the device read the slot. Within 7 days of the account's last key
+  change (`forbidden` otherwise), an existing slot (`precondition_failed`
+  otherwise) takes the new bytes but keeps its session, platform, and
+  `updatedAt` (in the DO and in R2's `customMetadata`), so retention and the
+  Cloud Sync request see no new write.
+- **Limits**: 3 changes per account a rolling day and 10 a rolling 30 days,
+  counted from `account.key_changed` entries (checked first for
+  `Retry-After`, and again in the swap's own statement), plus the register
+  edge tier.
+- **Buddies**: inbox links record the key epoch whose key signed them, and
+  `inbox/delete` with `successor` records the new inbox for buddies' reconnect
+  checks, only for a link at the current epoch (Buddies → Inbox successor).
+  An inbox first linked at an older epoch refuses owner-signed requests
+  (401 `key_changed`) for good; it's usable only through bearer owner ops,
+  and the app deletes it with a successor (Buddies → Old-key owner ops).
+- **Privacy**: never log or report keys, the history blob, wraps, credential
+  ids, account ids, or session ids. The history is sealed by the devices; the
+  server stores it opaque.
 
 ### Supporter status (RevenueCat)
 
@@ -1125,6 +1752,20 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   Repeating a link reads RevenueCat again (the app does after purchases and
   restores). At most 5 customers an account, 5 accounts a customer
   (`SUPPORTER_LINK_LIMITS`); past either, the least recently linked goes.
+  A key change (ADR 0039 §9) dates each customer the account links by its
+  earliest link to it (`first_linked_at`, under any of the customer's
+  ids). It unlinks the customer from other accounts that first linked it
+  later; earlier links stay. It locks the customer to the account for 90
+  days (`revenuecat_customer_locks`, by the linked id and by RevenueCat's
+  `original_app_user_id`) only when no other account links it from as
+  early or earlier, so a later linker's change never locks out the owner.
+  Customers match by `COALESCE(original_app_user_id, app_user_id)`,
+  stored from each read. `first_linked_at` never moves; `linked_at` does on
+  every repeat. While locked, a link from an account that doesn't still
+  link the customer is 409 `conflict` with `reason: "customer_locked"`:
+  checked on the id sent before RevenueCat is read, then on every id the
+  read names (the id, the original, the aliases, as the webhook matches
+  them) in the link's own statement. The cron prunes ended locks.
   Read edge tier per IP, plus the register tier (60 a minute) per account,
   since every link reads RevenueCat and the worker's RevenueCat key has one
   rate limit for everyone; works for a suspended account; RevenueCat
@@ -1154,8 +1795,11 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   trouble is 503, so RevenueCat retries (5 times over ~80 minutes).
 - **Storage**: D1 `revenuecat_customers`, `account_revenuecat_customers`,
   `revenuecat_webhook_events` (migration
-  `migrations/accounts/0003_revenuecat-customers.sql`). The hourly cron prunes
-  event ids past 30 days and customers no account links.
+  `migrations/accounts/0003_revenuecat-customers.sql`), and
+  `revenuecat_customer_locks` with `first_linked_at` and
+  `original_app_user_id` (`0007_rekey-supporter-lock.sql`). The hourly cron
+  prunes event ids past 30 days, customers no account links, and ended
+  locks.
 - **Not logged** in the activity log: Supporter start and end are billing
   state (ADR 0029 §7).
 - **Verify loop**: `REVENUECAT_API_URL` (development workers only; production
@@ -1163,6 +1807,11 @@ ADR 0029). Code in `src/accounts/supporter.ts` (store and `isAccountSupporter`),
   the worker was started with
   `REVENUECAT_API_URL=http://127.0.0.1:18790 node scripts/verify/dev.mjs up`;
   the launcher sets a synthetic webhook secret.
+- **Web sandbox**: `REVENUECAT_COUNT_WEB_SANDBOX = "true"` lives only in
+  `[env.dev.vars]` (and `.dev.vars.example`), never in top-level `[vars]`, and
+  is ignored unless `APP_ATTEST_ENVIRONMENT` is `development`. With it, a
+  RevenueCat Billing sandbox subscription counts toward Supporter status
+  (witness-work ADR 0014); without it, it doesn't.
 - **Privacy**: never log or report app user ids, account ids, tokens, the
   webhook's Authorization header, or webhook bodies. The webhook logs only the
   event type and how many linked customers it read. Sentry drops
@@ -1248,6 +1897,16 @@ bodies and headers, never URLs.
   and one `put` a slot a minute (429 `rate_limited` with `Retry-After`), both
   read from an R2 prefix listing, so two racing puts can each pass. `put`
   counts against the Buddies photo-upload edge tier, the rest the read tier.
+  Each slot has an `etag` (R2's own, opaque): `list` returns it per slot,
+  `get` sends it as `ETag`, and `put` returns it (body and `ETag`). An
+  optional strong quoted `If-Match: "<etag>"` on `put` writes only while the
+  slot still holds those bytes, so a re-seal after an account key change
+  never rolls back a newer backup or re-creates a deleted one: other bytes or
+  no slot is 412 `precondition_failed` (nothing written, no slot made); a
+  weak `W/"…"`, unquoted, `*`, or list value is 400 `bad_request`. It is
+  checked against the listing and again by R2 (`onlyIf.etagMatches`), so a
+  put landing in between loses too. The per-slot minute limit applies first
+  (429), as in `sync/put`. No header: unchanged (older apps).
   `delete` without `slotId` deletes every slot. Suspended accounts can still
   back up. Without the bucket or `ACCOUNTS_DB`, every op is 503 `disabled`.
 - **`GET /accounts/handoff`** (and the short `/h`) is the page a camera
@@ -1285,12 +1944,19 @@ iCloud and Google Drive; each device uses exactly one. Code in
 
 | Route | What |
 | --- | --- |
-| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed? }` |
-| `POST /accounts/v1/sync/put` | Bearer; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`? → `{ ok, etag, size, updatedAt, seq }` |
-| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt }] }` |
+| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt, photos }` |
+| `POST /accounts/v1/sync/put` | Bearer, live session; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`?, `x-ww-reseal`? → `{ ok, etag, size, updatedAt, seq }` |
+| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
-| `POST /accounts/v1/sync/delete` | Bearer, `{ slotId }` or `{}` (every slot; needs a live session) → `{ ok, seq }` |
-| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id`: `hello`, then `changed` |
+| `POST /accounts/v1/sync/delete` | Bearer, live session; `{ slotId }` or `{}` (every slot) → `{ ok, seq }` |
+| `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
+| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
+| `POST /accounts/v1/live/ticket` | Bearer `{ socket, id }` → `{ ticket, expiresAt }`: a browser's 30-second [live socket ticket](#browser-live-sockets) |
+| `POST /accounts/v1/sync/photos/put` | Bearer; raw blob, `x-ww-photo-name`, `x-ww-sha256`, `x-ww-photo-meta`, `Content-Length`, `x-ww-slot-id`? → `{ ok, name, size, sha256, createdAt, existed, usage }` |
+| `POST /accounts/v1/sync/photos/list` | Bearer, `{ cursor? }` → `{ ok, photos: [{ name, size, sha256, createdAt, meta }], cursor, usage }` |
+| `POST /accounts/v1/sync/photos/get` | Bearer, `{ name }` → the blob, `ETag`, `x-ww-created-at` |
+| `POST /accounts/v1/sync/photos/delete` | Bearer, live session; `{ names }` (1–100) or `{ all: true }`; `x-ww-slot-id`? → `{ ok, usage }` |
+| `GET /accounts/v1/sync/photos/usage` | Bearer → `{ ok, usage: { bytes, count, limit } }` |
 
 - **Storage**: one `AccountSync` SQLite DO per account (binding
   `ACCOUNT_SYNC_INDEX`, `idFromName(accountId)`, migration `v8`) holds each
@@ -1311,20 +1977,31 @@ iCloud and Google Drive; each device uses exactly one. Code in
   and tells every socket.
 - **Switches** (KV in `NOTES_KV`, edge-cached 60 s): `sync:enabled`
   (`true`/`on`, absent → `SYNC_ENABLED`: dev `"true"`, prod `"false"`) and
-  `sync:entitlement` (`everyone` | `supporter`, absent → `SYNC_ENTITLEMENT`,
-  else `supporter`). Off: put, list, get, and live are 503 `disabled`. Not
-  entitled: 403 `supporter_required`, from `accountSupporterStatus` (the
-  account's own status), cached 60 s per isolate per account; RevenueCat
-  unreachable is 503 `unavailable`, never "not a Supporter". Delete and the
-  status always work. `GET /app/v1/config` carries both as `sync: { enabled,
+  `sync:entitlement` (`supporter` makes it a Supporter benefit again, anything
+  else `everyone`; absent → `SYNC_ENTITLEMENT`, `"everyone"` in both
+  environments, else `everyone`). Sync is free (witness-work ADR 0040);
+  `supporter` is only the lever back. `everyone` reaches only apps and
+  browsers that send the `sync-everyone` capability (`capabilities` on
+  session open, refresh and web sign-up, stored on the session; a session
+  with some is cached 60 s per isolate, one without isn't, and a refresh
+  that sends a list clears its isolate's copy; `?capabilities=` on
+  `GET /app/v1/config`). Apps that
+  never send it, at any version, keep the Supporter rule, because they turn
+  Cloud Sync on by themselves for any device that never chose (witness-work
+  ADR 0040 §2). Off: put, list, get, live, and setting
+  the request are 503 `disabled`. Not entitled: 403 `supporter_required`,
+  from `accountSupporterStatus` (the account's own status), cached 60 s per
+  isolate per account; RevenueCat unreachable is 503 `unavailable`, never
+  "not a Supporter". Delete, clearing the request, and the status always
+  work. `GET /app/v1/config` carries both as `sync: { enabled,
   entitlement }` for devices without a session. Turning it off refuses new
   sockets and doesn't close open ones.
 - **Limits** (`SYNC_LIMITS`, each with its sizing): 20 MiB a blob (413
   `too_large` from `Content-Length` before the body is read), 20 slots an
   account (429 `limit`, new slots only), one put a slot every 2 seconds and
   one at a time, 1,000 puts and 2 GiB an account a rolling day (429
-  `rate_limited` with `Retry-After`), 20 live sockets an account (the oldest
-  closes with `4000 "replaced"`). Put counts in the Buddies write edge tier,
+  `rate_limited` with `Retry-After`), 20 live sockets an account, browser
+  sockets included (the oldest closes with `4000 "replaced"`). Put counts in the Buddies write edge tier,
   the rest in the read tier. Hits log `buddies: limit hit {op: 'sync/put',
   limit}`.
 - **Retention** (the DO's daily alarm, while it has slots): a slot not
@@ -1333,6 +2010,88 @@ iCloud and Google Drive; each device uses exactly one. Code in
   for 400 days. R2's lifecycle rule (400 days on `v1/`, set by
   `scripts/r2-lifecycle.mjs` on every deploy) is the backstop. A failed
   session read keeps the slot until the next run.
+- **Slot sessions**: each slot keeps the platform of the session that last
+  wrote it (`slot.platform`, added to older indexes by `ADDED_COLUMNS`), and
+  `sync/list` adds `platform` and `live` (that session is live, from D1's
+  `sessionStates`). A slot put before the column reads its session's row,
+  and says `platform: null, live: false` once that row is pruned. A failed
+  D1 read says `live: true`, as retention does.
+- **The Cloud Sync request** (witness-work ADR 0040 §5, its
+  `docs/cloud-sync-photos.md`): a browser signed in to an account whose
+  phones aren't on Cloud Sync sets `{ requested: true }` with a self-signed
+  envelope (op `sync/request`) by the token's own account, as
+  `backup/delete` does (`forbidden` for another account's key), so a leaked
+  token alone can't move the User's phones. Each envelope is good once: its
+  nonce is kept in the DO's `request_nonce` for twice the `ts` window, and a
+  reuse is 409 `replay`, so a captured envelope can't undo a withdrawal.
+  Phones read `requestedAt` in
+  `GET /sync` and switch; they never clear it. Asking again keeps
+  `requestedAt` and restarts the 30 days. It clears itself (checked on read)
+  once every live `ios`, `android` or `dev` session has written a slot since
+  `requestedAt` (an account without one clears at once), or 30 days after
+  the last ask; `{ requested: false }` (bearer only) withdraws it. A failed
+  session read keeps it standing. Stored in the `AccountSync` DO's
+  `sync_request` table, not D1, and not in the activity log. Counts in the
+  read tier.
+- **Photos** (witness-work ADR 0040 §6, its `docs/cloud-sync-photos.md`;
+  code in `src/accounts/syncPhotos.ts` and `syncDO.ts`): each photo is an
+  end-to-end encrypted blob under an immutable keyed name. The `AccountSync`
+  DO holds a row per name (size, digest, sealed meta, current `put_id`,
+  times, `deleted_at`), the live usage (`photo_state`, kept exact in every
+  transaction), reservations, the purge queue (`photo_purge`), and
+  one-minute rate buckets (`photo_rate`). R2 `ACCOUNT_PHOTOS`
+  (`ww-account-photos` prod, `ww-account-photos-dev` dev) holds each put at
+  `v1/<accountId>/<name>/<putId>`, `putId` random per put.
+  - **Put**: `beginPhotoPut` answers `existed` for a live name (nothing
+    written; it counts as a put with no bytes), else checks one put a name
+    at a time (429 `rate_limited`), a slot exists (409 `no_slot`), 20,000
+    live photos (429 `limit`), the storage limit against live usage plus
+    other uploads' reservations (429 `storage_full` with `usage`, no
+    `Retry-After`; a put a delete cancelled doesn't count), and 4 GiB stored
+    a rolling day, then counts the put and reserves the size. Refused puts
+    don't count. A rate's `Retry-After` waits for the minute buckets that
+    hold enough of it to age out, not just the oldest.
+    The Worker then reads the body (the server always reads it to the end
+    before answering, except a declared size over 25 MiB: 413 `too_large`),
+    checks its digest, writes R2, and `commitPhotoPut` checks the limit and
+    the slot again, makes the name live, advances `seq`, and sends `changed`
+    to every socket but `x-ww-slot-id`'s. A bad body, a body that
+    fails to arrive (the link dropped, the app was killed) or a failed write
+    frees the reservation and the name at once, so the retry is accepted and
+    the bytes stop counting; one whose commit never comes lapses after a minute
+    plus the body at 50 KiB/s (`photoPutReservationMs`): 2 minutes for a
+    small photo, about 9½ for 25 MiB, so a large upload survives a slow link.
+  - **Delete** marks the rows deleted (usage drops at once), queues their
+    put's object for the purge 30 days later, cancels any put of those names
+    in flight (its commit answers 409 `conflict` and deletes its own
+    object), advances `seq`, and tells the sockets. A re-put of a deleted
+    name writes a new object, so the purge can't take it. `sync/delete {}`
+    deletes every photo too.
+  - **Alarm** (folded into the daily retention alarm, kept while the account
+    has slots, photos, queued purges, puts in flight, or a sweep pending):
+    an account with no slot for a day (`no_slot_since`, set when the last
+    slot goes, cleared by a slot put, checked again right before deleting)
+    has its photos deleted; queued objects 30 days old are purged; after a
+    put lapsed or an R2 write failed, objects no row, purge entry or
+    reservation names are swept (`photo_state.sweep` is a generation, so a
+    sweep never clears a request made while it ran).
+  - **Switches**: put, list and get need Cloud Sync on and an entitled
+    account. KV `sync:photos` (`off`/`false` off; absent → `SYNC_PHOTOS`, on
+    in both environments, else on) refuses only puts, 503
+    `photos_disabled`. Without the photo bucket, put and get (which need R2)
+    are `photos_disabled`, never `disabled`, and the status says `photos:
+    false`; list, delete and usage read the index and keep working, and the
+    rest of Cloud Sync carries on. Delete and usage always work.
+  - **Limits** (`SYNC_PHOTO_LIMITS`): 25 MiB a blob, 2,000,000,000 bytes an
+    account (`SYNC_PHOTO_LIMIT_BYTES` overrides it; locally `node
+    scripts/verify/dev.mjs up --photo-limit-bytes 2000`), 20,000 live photos,
+    20,000 puts and 4 GiB stored and 50,000 gets an account a rolling day. Put
+    counts in the Buddies photo-upload edge tier (`blob/put`, 60/min), the
+    rest in the read tier. Hits log `buddies: limit hit {op:
+    'sync/photos/put', limit}`.
+  - **R2 lifecycle**: none by age (photos are written once);
+    `scripts/r2-lifecycle.mjs ww-account-photos` keeps only the
+    multipart-abort rule, and `--check` fails if an expiry rule appears.
 - **Suspended** accounts keep syncing (nothing reaches another person).
 - **Privacy**: ciphertext only; the server can't read a device name or any
   data. Never log or report slot ids, account ids, session ids, sizes,
@@ -1341,9 +2100,9 @@ iCloud and Google Drive; each device uses exactly one. Code in
 ```bash
 # Turn Cloud Sync on (prod starts off; before the app release that defaults to it)
 wrangler kv key put --binding NOTES_KV sync:enabled true
-# Off (kill switch): refuses put/list/get/live with 503 disabled
+# Off (kill switch): refuses put/list/get/live and setting the request with 503 disabled
 wrangler kv key put --binding NOTES_KV sync:enabled false
-# Make it free for everyone, or a Supporter benefit again
+# Free for everyone (the default, ADR 0040), or a Supporter benefit again
 wrangler kv key put --binding NOTES_KV sync:entitlement everyone
 wrangler kv key put --binding NOTES_KV sync:entitlement supporter
 # Fall back to the SYNC_ENABLED / SYNC_ENTITLEMENT vars
@@ -1351,6 +2110,10 @@ wrangler kv key delete --binding NOTES_KV sync:enabled
 wrangler kv key delete --binding NOTES_KV sync:entitlement
 # Add --env dev to each for the dev worker.
 node scripts/r2-lifecycle.mjs ww-account-sync --check   # read-only bucket check
+# Photo puts off (reads and deletes keep working), and back to the var
+wrangler kv key put --binding NOTES_KV sync:photos off
+wrangler kv key delete --binding NOTES_KV sync:photos
+node scripts/r2-lifecycle.mjs ww-account-photos --check # no age rule, multipart abort only
 ```
 
 ## Shared Spaces
@@ -1572,7 +2335,7 @@ it commented out.
 | `api_notes_import_finished` | Once per started run | `outcome` (`success`, `model_error`, `cancelled`, `interrupted`), `duration_ms`, `notes_chars`; on success: `empty`, `empty_charged`, record counts (`contacts`, `visits`, `time_entries`, `categories`, `warnings`, `publisher_detected`), `imports_remaining`, `model`, `provider`, `input_tokens`, `output_tokens`, `reasoning_tokens` |
 | `api_notes_import_limit_reached` | An authenticated request is refused by an allowance or the concurrency cap | `limit` (`imports`, `refinements`, `active_cap`) |
 
-Every event carries `platform` (`ios`, `android`, `dev`: the session's
+Every event carries `platform` (`ios`, `android`, `dev`, `web`: the session's
 platform on bearer requests, else App Attest, Play Integrity, or the bypass
 header), `transport` (`stream`, `legacy`), `refinement`, `supporter`,
 `has_account` (true on every bearer request), and `environment`. The internal-TestFlight Beta app talks to prod, so its imports
@@ -1618,7 +2381,7 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   `ROUTE_PLANNING_QUOTA`, migration `v5`, one instance per caller:
   `account:<accountId>` for bearer, the app user id for legacy, which
   stores only optimization timestamps and deletes itself a day after the
-  newest). Every call that reaches HERE counts, including `no_route` answers.
+  newest; directions and MapKit JS tokens count in their own instances). Every call that reaches HERE counts, including `no_route` answers.
   The per-IP `RATE_LIMITER` also applies.
 - **Kill switch**: KV `route-planning:enabled` in `NOTES_KV`. `"false"` turns
   optimizing off (503 `unavailable`; the app says it's temporarily unavailable);
@@ -1635,10 +2398,32 @@ route". Code lives in `src/routePlanning/`; README documents the contract.
   URL) and the HERE key stay out of trace spans. Nothing logs bodies,
   coordinates, or account ids.
 
+## Maps on the web
+
+The web app's map (witness-work ADR 0037 §8) is MapKit JS in a sandboxed frame
+on `maps.witnesswork.app` (`maps-dev.witnesswork.app` for dev). Contract,
+setup, and decisions: [`docs/maps.md`](docs/maps.md). Code in `src/maps/`.
+
+- `POST /maps/v1/mapkit-tokens`: Bearer (`requireActive`), a 30-minute ES256
+  MapKit JS JWT (`kid`, `typ: JWT`; `iss`, `iat`, `exp`, `origin`, `scope:
+  mapkit_js`). 10 a minute and 500 a day per account, counted in the
+  `RoutePlanningQuota` DO under `mapkit-token:account:<id>`, plus the per-IP
+  `maps` bucket. 503 `maps_unconfigured` until `MAPKIT_JS_PRIVATE_KEY`,
+  `MAPKIT_JS_KEY_ID` (secrets), `APPLE_TEAM_ID`, and a `MAPKIT_JS_ORIGINS`
+  origin are all set. `MAPKIT_JS_ORIGINS` is a var per environment; an
+  `http://localhost` origin counts only under `wrangler dev` (a development
+  worker on a local host) and belongs in `.dev.vars`, never `wrangler.toml`.
+  Never log the token or the key.
+- `GET /places/v1/search`: HERE Discover for points of interest, public in the
+  per-IP `places` bucket like `/autocomplete`. Reads only `q`, `at`, `limit`,
+  `lang`; answers a trimmed shape, never HERE's raw body.
+- Directions for the web are the existing `POST /route-planning/directions`.
+
 ## API docs (OpenAPI + Scalar)
 
 `GET /docs` is the Scalar API reference and `GET /openapi.json` its OpenAPI
-3.1 document, on both workers (prod: https://ww-proxy.leviwilkerson.com/docs).
+3.1 document, on both workers (prod: https://api.witnesswork.app/docs, also on
+the old host).
 The repo is public, so the docs are too, admin routes included (they still
 need the token).
 

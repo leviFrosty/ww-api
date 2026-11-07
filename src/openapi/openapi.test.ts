@@ -80,3 +80,17 @@ describe('OpenAPI document', () => {
     expect(await response.text()).toContain('/openapi.json')
   })
 })
+
+describe('servers', () => {
+  it('lists api.witnesswork.app first and keeps the original host', async () => {
+    const { servers } = (await (await get('/openapi.json')).json()) as {
+      servers: { url: string }[]
+    }
+    expect(servers.map((server) => server.url)).toEqual([
+      'https://api.witnesswork.app',
+      'https://ww-proxy.leviwilkerson.com',
+      'https://api-dev.witnesswork.app',
+      'https://ww-proxy-dev.levi-wilkerson.workers.dev',
+    ])
+  })
+})

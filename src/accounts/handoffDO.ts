@@ -1,8 +1,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Environment } from '../types'
-import { bytesToBase64Url, sha256Bytes, timingSafeEqual } from '../crypto'
+import { sha256B64u, timingSafeEqual, tokenDigest } from '../crypto'
 import {
-  decodeB64u,
   fail,
   ok,
   type BuddiesFailure,
@@ -141,7 +140,7 @@ export class AccountHandoff extends DurableObject<Environment> {
     // claimed, nothing may await, or two claims could both see `open`.
     const [tokenHash, claimHash] = await Promise.all([
       tokenDigest(args.claimToken),
-      digest(`${args.claimPub}\n${args.hello}`),
+      sha256B64u(`${args.claimPub}\n${args.hello}`),
     ])
     const channel = this.#live(args.channelId, Date.now())
     if (!channel) return fail('not_found')
@@ -310,10 +309,3 @@ export class AccountHandoff extends DurableObject<Environment> {
     this.#schemaReady = false
   }
 }
-
-const digest = async (text: string): Promise<string> =>
-  bytesToBase64Url(await sha256Bytes(new TextEncoder().encode(text)))
-
-/** `b64u(SHA-256(claimToken bytes))`, what `verifier` holds. */
-const tokenDigest = async (claimToken: string): Promise<string> =>
-  bytesToBase64Url(await sha256Bytes(decodeB64u(claimToken) ?? new Uint8Array()))

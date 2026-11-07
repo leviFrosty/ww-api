@@ -19,7 +19,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Places',
     description:
-      'HERE Geocoding & Search proxy. The worker injects its own `apiKey` and forwards every other query parameter unchanged.',
+      'HERE Geocoding & Search. `/geocode` and `/autocomplete` proxy HERE: the worker injects its own `apiKey` and forwards every other query parameter unchanged. `/places/v1/search` (points of interest) reads only its own parameters and shapes the answer.',
   },
   {
     name: 'Attestation',
@@ -56,9 +56,29 @@ export const OPENAPI_TAGS = [
       'A blind, end-to-end encrypted store shared by up to 10 members, one per shared car (witness-work ADR 0037). The server holds sealed records under random ids, members as token hashes, wrapped keys, and invites, and never learns what a space is or which accounts are on it. Every op is `POST /spaces/v1/{op}` with a bearer token; ids and member tokens travel in bodies, never URLs. The wire contract is witness-work’s [docs/shared-cars-protocol.md](https://github.com/leviFrosty/witness-work/blob/main/docs/shared-cars-protocol.md).',
   },
   {
+    name: 'Passkeys',
+    description:
+      'Passkeys of an existing account (witness-work ADR 0038): sign in, step up a web session, and save the account key sealed under a passkey’s PRF output, which the server can’t open. A browser opens its web session with the ticket a sign-in answers. The wire contract is witness-work’s `docs/passkeys-protocol.md`.',
+  },
+  {
+    name: 'Web sign-up',
+    description:
+      'Accounts on the web (witness-work ADR 0038 §5): create an account with a passkey behind Turnstile and per-network caps, or get a ticket for a web session with a recovery key.',
+  },
+  {
+    name: 'Approving a browser',
+    description:
+      'A signed-in phone approves a browser by scanning its QR code (witness-work ADR 0038): the handoff with the roles turned around. The browser gets the account key sealed to it and an `approval` ticket for its web session.',
+  },
+  {
     name: 'Route planning',
     description:
       'Supporter-only stop ordering through HERE Waypoints Sequence. Coordinates only.',
+  },
+  {
+    name: 'Maps',
+    description:
+      'MapKit JS tokens for the web app’s map, which runs in a sandboxed frame on its own origin and gets only coordinates and pin styles (witness-work ADR 0037 §8).',
   },
   {
     name: 'App Store',
@@ -91,14 +111,23 @@ const DOCUMENTATION = {
 
 **Signed requests.** Buddies and accounts ops send \`{ "payload", "signature" }\`: \`payload\` is the request’s fields as base64url-encoded UTF-8 JSON, and \`signature\` is an Ed25519 signature over the op’s context line followed by those exact bytes. Each op lists its decoded \`payload\` fields. Older app builds send the same values as \`p\` and \`s\` (headers \`x-buddies-p\`/\`x-buddies-s\`, \`x-ww-p\`/\`x-ww-s\`), which are still accepted.
 
-**Rate limits.** Places, Notes Import, attestation, route planning, app config, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.`,
+**Rate limits.** Places, Notes Import, attestation, route planning, app config, and admin routes each count in their own per-IP bucket of 60 requests a minute. Buddies has its own per-caller tiers, documented on each op.
+
+**CORS.** Only the web app's own origins (an exact list per environment) may call from a browser, on every route. Allowed request headers: \`authorization\`, \`content-type\`, \`if-match\`, \`if-none-match\`, \`sentry-trace\`, \`baggage\`, \`x-ww-*\`, and \`x-buddies-*\`. Exposed response headers: \`ETag\`, \`Retry-After\`, \`Date\`, \`WWW-Authenticate\`, and \`x-ww-updated-at\`. No credentials (cookies). Preflights aren't rate limited; a disallowed origin, method, or header gets 403. Browsers authenticate live sockets with \`Sec-WebSocket-Protocol\` entries (see each socket).`,
     license: { name: 'See repository', url: REPO_URL },
   },
+  // The old hosts keep serving the same Workers for good (witness-work ADR
+  // 0042).
   servers: [
-    { url: 'https://ww-proxy.leviwilkerson.com', description: 'Production' },
+    { url: 'https://api.witnesswork.app', description: 'Production' },
+    {
+      url: 'https://ww-proxy.leviwilkerson.com',
+      description: 'Production (original host, still served)',
+    },
+    { url: 'https://api-dev.witnesswork.app', description: 'Development' },
     {
       url: 'https://ww-proxy-dev.levi-wilkerson.workers.dev',
-      description: 'Development',
+      description: 'Development (workers.dev)',
     },
   ],
   tags: OPENAPI_TAGS,

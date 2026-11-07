@@ -5,7 +5,7 @@ description: Start an isolated local ww-api (Hono on Cloudflare Workers via wran
 
 # Verify ww-api
 
-`scripts/verify/dev.mjs` runs this checkout's worker with `wrangler dev --env dev --local` on a free port in 8790-8799, its own inspector port (9240-9259), its own persistence dir, and a generated vars file of synthetic tokens. It never uses port 8787 or 9229 (the user's own `wrangler dev`), `.wrangler/state`, or `.dev.vars`. All commands run from the repo root.
+`scripts/verify/dev.mjs` runs this checkout's worker with `wrangler dev --env dev --local` on a free port in 8790-8799, its own inspector port (9240-9259), its own persistence dir, and a generated vars file of synthetic tokens. The tokens that key persisted state are kept in `<persist dir>/verify-secrets.json`, so `down` then `up --persist-to` the same dir finds its sessions and rate counts again. It never uses port 8787 or 9229 (the user's own `wrangler dev`), `.wrangler/state`, or `.dev.vars`. All commands run from the repo root.
 
 ## Launch
 
@@ -13,12 +13,14 @@ description: Start an isolated local ww-api (Hono on Cloudflare Workers via wran
 node scripts/verify/dev.mjs up                       # prints the base URL as its last line
 node scripts/verify/dev.mjs up --persist-to /tmp/ww-verify-$RUN_ID   # separate state per run
 node scripts/verify/dev.mjs up --secrets-from ~/dev/ww-api/.dev.vars # opt in to real optional keys
+node scripts/verify/dev.mjs up --photo-limit-bytes 2000              # Cloud Sync photo storage fills after 2,000 bytes
 ```
 
 - Ready when `up` prints `verify: worker ready (pid N, …)` and then the URL. It polls `GET /health` for up to 90 s and exits nonzero with the last log lines if wrangler dies.
 - `up` is idempotent. If `.verify/state.json` names a live, healthy worker, `up` reuses it. If the recorded worker is alive but unhealthy, `up` restarts it.
-- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, `BUDDIES_PHOTOS=on`, and `SPACES_ENABLED=true` (Shared Spaces). The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
-- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, and `ACCOUNT_TOKEN_SECRET` (account sessions), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
+- `--photo-limit-bytes <n>` sets the worker's `SYNC_PHOTO_LIMIT_BYTES` (Cloud Sync photo storage per account, 2,000,000,000 by default), so a few small photos reach `storage_full`. `up` with a different value restarts the worker; `up` without the flag reuses whatever runs, and a fresh start uses the default. `doctor` prints the limit in effect.
+- Env `dev` gives `APP_ATTEST_ENVIRONMENT=development`, `BUDDIES_ENABLED=true`, `BUDDIES_PHOTOS=on`, `SPACES_ENABLED=true` (Shared Spaces), `AUTH_LEGACY=off` (requests signed the pre-session way get 426; `pnpm test:e2e` and `pnpm fuzz:buddies` put KV `auth:legacy` = `on` for their run), and the passkey RP IDs `app-dev.witnesswork.app` and `localhost` (origins `http://localhost:8081`, `:8082`, `:19006`, `:4173`, `:5173`). The fresh KV has no `buddies:enabled` or `buddies:photos` key, so the relay and its photo blobs are on with no switch to flip. The `BUDDY_BLOBS` R2 bucket is simulated locally in the persistence dir.
+- `.verify/dev.vars.env` (mode 600) holds a random `NOTES_IMPORT_DEV_BYPASS_TOKEN`, `ADMIN_API_TOKEN`, `ACCOUNT_TOKEN_SECRET` (account sessions), `PASSKEY_CHALLENGE_SECRET` and `ACCOUNT_TICKET_SECRET` (passkeys), `LIVE_TICKET_SECRET` (browser live socket tickets), plus `APPLE_TEAM_ID=VERIFY0000` unless a real one is passed. The tokens are reused across restarts and recorded in `state.json` so tests can read them.
 - The WitnessWork app's verify loop consumes this as `node <ww-api>/scripts/verify/dev.mjs up` followed by `… url`.
 
 ## Doctor
@@ -56,7 +58,7 @@ node scripts/verify/dev.mjs kv get app-store-ratings:summary
 node scripts/verify/dev.mjs kv delete buddies:enabled
 ```
 
-- For the isolated local worker, send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Never send synthetic caller IPs to a deployed Worker: Cloudflare rejects them before the request reaches the API. Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/attestation/*`, `/route-planning/*`, and `/admin/*` each count separately), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync` + `inbox/live`, 60/min for `blob/put`, 600/min for `blob/get`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
+- For the isolated local worker, send a unique `cf-connecting-ip` per request (`198.18.x.y` or similar). Never send synthetic caller IPs to a deployed Worker: Cloudflare rejects them before the request reaches the API. Without one, every request shares the same per-IP key, and you hit the local rate limiters: 60/min per family (`/geocode` + `/autocomplete`, `/notes-import*`, `/attestation/*`, `/route-planning/*`, `/maps/*`, and `/admin/*` each count separately; `/places/*` counts with `/geocode`), and the Buddies per-caller tiers (IPv6 grouped by /64): 120/min for `invite/fetch` + `invite/claim`, 60/min for `inbox/register`, 600/min for `inbox/sync`, `inbox/live`, and `inbox/successor`, 60/min for `blob/put`, 600/min for `blob/get`, 600/min for other signed ops. The e2e helpers and the fuzzer already do this.
 - Signed Buddies ops need Ed25519 envelopes. Use `RelayOwner` and `RelayWriter` in `src/test/e2e.ts` (built on `src/test/buddiesClient.ts`) rather than hand-rolling curl. Photo blobs: `photoBlob()` makes sealed-looking bytes with their id and token, `RelayOwner.putBlob` and `getBlob` send them (raw bytes, envelope in headers).
 - KV edits take effect on the next request (no 60 s edge cache locally).
 
@@ -70,14 +72,14 @@ pnpm fuzz:buddies --seed 42 --case 17   # replay one failing case
 
 The seed decides each case's mutation and its parameters. Ids, keys, and nonces are fresh every run, so you can replay a seed against the same persisted state.
 
-There are 28 generators, 9 of them for bearer requests (skipped, and counted as skipped, without a dev bypass token):
+There are 29 generators, 9 of them for bearer requests (skipped, and counted as skipped, without a dev bypass token):
 
 - **Bad signatures:** tampered signature, tampered payload, wrong key or wrong role, a signature reused on another op, malformed `signature`.
 - **Replay and time:** sequential and parallel replay, stale `ts`.
 - **Bad payloads:** a wrong-typed field, a missing field, malformed envelopes (bad JSON, base64, UTF-8), unicode and huge strings.
 - **Size and caps:** blob sizes at and one byte over every limit, envelopes over 256 KiB (declared and chunked), slot, invite, template, kind, and expiry caps.
 - **Photo blobs:** `blob/put` → `blob/get` round trip with an idempotent retry, 1 MiB accepted and one byte more `too_large`, a flipped bit (`bad_request`), a stranger's signature, and the same 404 for a wrong token, an unknown blob or inbox, and a deleted blob.
-- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
+- **Other:** unknown routes and methods, invite claim burn after 5 wrong secrets, parallel `event/put` dedupe, `slot/seal` racing the slot's own `event/put`s (each lands and syncs, or is 403 `sealed` and doesn't; then every write is `sealed`, and `slot/leave` still works but keeps the events that landed), per-caller edge limits (one IPv4, or rotating addresses in one IPv6 /64, until 429 `rate_limited` with `Retry-After: 60`).
 - **Bearer requests** (sessions opened through the dev bypass): bad tokens on every route class (forged, truncated, `alg: none`, a refresh token, other schemes; always 401 `unauthorized` with the challenge, never the envelope), another account's token (403 `forbidden`), an inbox registered before accounts (409 `not_linked`), malformed plain-JSON bodies and envelopes sent with a token (400), `inbox/register` proofs (missing, another account's, forged, for another inbox), bearer `blob/put` headers, writer ops with any session's token, a bearer round trip, and per-account edge limits from rotating addresses.
 
 The oracle checks every request:
@@ -106,7 +108,7 @@ After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapsh
 
 ```bash
 node scripts/verify/dev.mjs down          # kill our recorded process group + children, remove state.json and the vars file
-node scripts/verify/dev.mjs down --wipe   # also delete the persisted DO/KV state dir
+node scripts/verify/dev.mjs down --wipe   # also delete the persisted DO/KV state dir (and its synthetic secrets)
 ```
 
 `down` kills only the pid recorded in `.verify/state.json`, its detached process group, and its descendants. It never kills by name. Logs and `.verify/artifacts/` stay. Delete old artifacts yourself when they're no longer needed, because disk space is limited. Run `down` after every failed attempt too, so no ports are stranded.
@@ -120,14 +122,18 @@ Only names are listed here; never print values.
 | `NOTES_IMPORT_DEV_BYPASS_TOKEN` | Notes Import bypass tests | generated per state dir |
 | `ADMIN_API_TOKEN` | admin reset positive tests | generated per state dir |
 | `ACCOUNT_TOKEN_SECRET` | account sessions (`/accounts/v1/sessions*`, bearer tokens) | generated per state dir |
+| `PASSKEY_CHALLENGE_SECRET`, `ACCOUNT_TICKET_SECRET` | passkeys and web sessions (`/accounts/v1/passkeys*`, ticket opens) | generated per state dir |
+| `TURNSTILE_SECRET_KEY` | web sign-up and recovery's Siteverify (`/accounts/v1/web/*`); `2x0000000000000000000000000000000AA` fails every token, `3x…` says "already spent" | unset, so the dev worker uses Cloudflare's always-passing test secret |
+| `LIVE_TICKET_SECRET` | browser live socket tickets (`POST /accounts/v1/live/ticket`) | generated per state dir |
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
-| `HERE_API_KEY` | `/geocode` + `/autocomplete` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
+| `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
+| `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |
 | `OPENROUTER_API_KEY` | real provider health and the paid kickoff | unset; the status probe fails open |
 | `REVENUECAT_API_KEY` | Supporter lookups during a paid kickoff | unset |
 | `WW_API_E2E_ALLOW_PAID=1` | opt-in to an import plus correction (two real model calls; OpenRouter spend) | off |
 | `WW_API_URL`, `WW_API_DEV_BYPASS_TOKEN`, `WW_API_ADMIN_TOKEN` | point e2e at another worker | from `.verify/state.json` |
 
-- Optional keys come from the process env or `up --secrets-from <env file>`. Only the five allowlisted names are read: HERE, OpenRouter, RevenueCat, the Apple team id, and `FCM_SERVICE_ACCOUNT_JSON`.
+- Optional keys come from the process env or `up --secrets-from <env file>`. Only the allowlisted names (`OPTIONAL_SECRETS` in `scripts/verify/dev.mjs`) are read: HERE, OpenRouter, RevenueCat, the Apple team id, `FCM_SERVICE_ACCOUNT_JSON`, PostHog, the fake RevenueCat URL, and the three `MAPKIT_JS_*` names.
 - Unlike APNs (HTTP/2 only, so not from `wrangler dev`), FCM works locally: with `FCM_SERVICE_ACCOUNT_JSON` set, the local relay really sends Buddies alerts to Android emulators with Google Play services. Write the key on one line (`printf 'FCM_SERVICE_ACCOUNT_JSON=%s\n' "$(op document get <id> --vault Agents | jq -c .)" > fcm.env`, mode 600, outside the repo) and pass `--secrets-from fcm.env`; JSON values are written single-quoted to the vars file so dotenv keeps them intact.
 - `SENTRY_DSN` and the APNs keys are never passed, so local fuzzing can't reach Sentry or Apple.
 - CI needs no secrets: `wrangler dev --local` runs without Cloudflare credentials.

@@ -5,6 +5,8 @@ import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { AccountHandoff } from '../accounts/handoffDO'
 import { AccountSync } from '../accounts/syncDO'
 import { SharedSpace } from '../spaces/spaceDO'
+import { AccountRateCounter } from '../accounts/rateCounterDO'
+import { AccountApproval } from '../accounts/approvalDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
 import { createBuddiesRoutes } from '../buddies/route'
 import { resetApnsState } from '../apns'
@@ -97,6 +99,8 @@ export interface LiveResponse {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   body: any
   socket: FakeWebSocket | null
+  /** The `Sec-WebSocket-Protocol` the answer chose, if any. */
+  protocol: string | null
 }
 
 export interface HarnessOptions {
@@ -120,6 +124,8 @@ export interface HarnessOptions {
   syncBucket?: boolean
   /** The `SPACES_ENABLED` var; `"true"` (dev's) by default. */
   spacesEnabled?: string
+  /** Bind the Cloud Sync photo bucket (`ACCOUNT_PHOTOS`). Default true. */
+  photoBucket?: boolean
   /**
    * Account sessions as on the dev worker (default true): a token secret,
    * `APP_ATTEST_ENVIRONMENT` development, and the dev bypass token.
@@ -129,7 +135,39 @@ export interface HarnessOptions {
 
 /** The harness's `ACCOUNT_TOKEN_SECRET` and dev bypass token. */
 export const TEST_TOKEN_SECRET = 'test-account-token-secret-0123456789abcdef'
+/** The harness's `LIVE_TICKET_SECRET`. */
+export const TEST_LIVE_TICKET_SECRET = 'test-live-ticket-secret-0123456789abcdef'
 export const TEST_DEV_BYPASS = 'test-dev-bypass-token'
+/** A web app origin in the harness's `WEB_APP_ORIGINS` (the dev list's). */
+export const TEST_WEB_ORIGIN = 'http://localhost:8081'
+/** The harness's passkey challenge and ticket secrets. */
+export const TEST_CHALLENGE_SECRET = 'test-passkey-challenge-secret-0123456789ab'
+export const TEST_TICKET_SECRET = 'test-account-ticket-secret-0123456789abcdef'
+
+/** The dev worker's relying parties (wrangler.toml `[env.dev.vars]`). */
+export const TEST_RP_ID = 'app-dev.witnesswork.app'
+export const TEST_ORIGIN = 'https://app-dev.witnesswork.app'
+export const TEST_ANDROID_ORIGIN =
+  'android:apk-key-hash:-sYXRdwJA3hvue3mKpYrOZ9zSPC7b4mbgzJmdZEDO5w'
+export const TEST_LOCAL_ORIGIN = 'http://localhost:8081'
+export const TEST_PASSKEY_VARS = {
+  PASSKEY_RP_IDS: `${TEST_RP_ID},localhost`,
+  PASSKEY_ORIGINS: JSON.stringify({
+    [TEST_RP_ID]: [
+      TEST_ORIGIN,
+      'android:apk-key-hash:TBOYNDcshVpuphnPrwPUa5EUFC3ry8vL8cHHQFU-HKw',
+      'android:apk-key-hash:xR7_3Ju_a8Are0wxkpALrEJnvW4F9M_FIXflNiOkdes',
+      TEST_ANDROID_ORIGIN,
+    ],
+    localhost: [
+      'http://localhost:8081',
+      'http://localhost:8082',
+      'http://localhost:19006',
+      'http://localhost:4173',
+      'http://localhost:5173',
+    ],
+  }),
+}
 
 export interface Harness {
   env: Environment
@@ -142,10 +180,14 @@ export interface Harness {
   backups: MemoryR2
   /** The `ACCOUNT_SYNC` bucket (present even when unbound, for assertions). */
   syncBlobs: MemoryR2
+  /** The `ACCOUNT_PHOTOS` bucket (present even when unbound, for assertions). */
+  photoBlobs: MemoryR2
   handoffs: FakeNamespace<AccountHandoff>
   syncIndexes: FakeNamespace<AccountSync>
   /** Shared Spaces' `SHARED_SPACE` objects, one per space id. */
   spaces: FakeNamespace<SharedSpace>
+  rateCounters: FakeNamespace<AccountRateCounter>
+  approvals: FakeNamespace<AccountApproval>
   inboxes: FakeNamespace<BuddyInbox>
   invites: FakeNamespace<BuddyInvite>
   quotas: FakeNamespace<BuddyRegistrationQuota>
@@ -223,6 +265,7 @@ export const createHarness = async (
   const r2 = makeMemoryR2()
   const backups = makeMemoryR2()
   const syncBlobs = makeMemoryR2()
+  const photoBlobs = makeMemoryR2()
   const accountsDb = options.accountsDb === false ? null : makeMemoryD1()
 
   const apnsKeys = (await crypto.subtle.generateKey(
@@ -261,14 +304,20 @@ export const createHarness = async (
     ...(accountsDb ? { ACCOUNTS_DB: accountsDb } : {}),
     ...(options.backupBucket === false ? {} : { ACCOUNT_BACKUPS: backups }),
     ...(options.syncBucket === false ? {} : { ACCOUNT_SYNC: syncBlobs }),
+    ...(options.photoBucket === false ? {} : { ACCOUNT_PHOTOS: photoBlobs }),
     SYNC_ENABLED: 'true',
     SPACES_ENABLED: options.spacesEnabled ?? 'true',
+    WEB_APP_ORIGINS: `https://app-dev.witnesswork.app,${TEST_WEB_ORIGIN}`,
     ...(options.sessions === false
       ? {}
       : {
           ACCOUNT_TOKEN_SECRET: TEST_TOKEN_SECRET,
+          LIVE_TICKET_SECRET: TEST_LIVE_TICKET_SECRET,
           APP_ATTEST_ENVIRONMENT: 'development',
           NOTES_IMPORT_DEV_BYPASS_TOKEN: TEST_DEV_BYPASS,
+          PASSKEY_CHALLENGE_SECRET: TEST_CHALLENGE_SECRET,
+          ACCOUNT_TICKET_SECRET: TEST_TICKET_SECRET,
+          ...TEST_PASSKEY_VARS,
         }),
     ...limiters,
     ...(options.apnsConfigured === false
@@ -307,6 +356,15 @@ export const createHarness = async (
     (state) => new SharedSpace(state as never, env as never)
   )
   env.SHARED_SPACE = spaces.namespace as Environment['SHARED_SPACE']
+  const rateCounters = createNamespace(
+    (state) => new AccountRateCounter(state as never, env as never)
+  )
+  env.ACCOUNT_RATE_COUNTER =
+    rateCounters.namespace as Environment['ACCOUNT_RATE_COUNTER']
+  const approvals = createNamespace(
+    (state) => new AccountApproval(state as never, env as never)
+  )
+  env.ACCOUNT_APPROVAL = approvals.namespace as Environment['ACCOUNT_APPROVAL']
 
   const pending: Promise<unknown>[] = []
   const executionCtx = {
@@ -324,9 +382,12 @@ export const createHarness = async (
     accountsDb,
     backups,
     syncBlobs,
+    photoBlobs,
     handoffs,
     syncIndexes,
     spaces,
+    rateCounters,
+    approvals,
     inboxes,
     invites,
     quotas,
@@ -404,8 +465,14 @@ export const createHarness = async (
       env,
       executionCtx
     )) as Response & { webSocket?: FakeWebSocket | null }
+    const protocol = response.headers.get('sec-websocket-protocol')
     if (response.status === 101)
-      return { status: 101, body: null, socket: response.webSocket ?? null }
+      return {
+        status: 101,
+        body: null,
+        socket: response.webSocket ?? null,
+        protocol,
+      }
     const text = await response.text()
     let body: unknown = text
     try {
@@ -413,7 +480,7 @@ export const createHarness = async (
     } catch {
       // Not JSON (e.g. Hono's plain 404).
     }
-    return { status: response.status, body, socket: null }
+    return { status: response.status, body, socket: null, protocol }
   }
 
   harness.getBlob = async (payload) => {

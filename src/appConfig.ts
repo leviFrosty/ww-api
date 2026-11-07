@@ -1,6 +1,8 @@
 import type { AppContext, Environment } from './types'
 import { parseMinAppVersion } from './notesImport/config'
-import { syncSwitches } from './accounts/syncSwitch'
+import { entitlementForApp, syncSwitches } from './accounts/syncSwitch'
+import { webSignupAvailable } from './accounts/webSignup'
+import { turnstileSiteKey } from './accounts/turnstile'
 
 /**
  * `GET /app/v1/config` (witness-work ADR 0027, `docs/accounts-protocol.md`,
@@ -47,24 +49,75 @@ export const resolveAppMinVersion = async (
   return null
 }
 
+const COUNTRY_PATTERN = /^[A-Z]{2}$/
+const REGION_PATTERN = /^[A-Z0-9]{1,3}$/
+/** Cloudflare's `cf.country` for an unknown location, and for Tor. */
+const NO_COUNTRY = new Set(['XX', 'T1'])
+
+const normalizedCode = (value: unknown, pattern: RegExp): string | null => {
+  if (typeof value !== 'string') return null
+  const upper = value.trim().toUpperCase()
+  return pattern.test(upper) ? upper : null
+}
+
+/**
+ * The caller's coarse location from `request.cf`, for the app's sales-region
+ * check (witness-work ADR 0041 §3): `country` (ISO 3166-1 alpha-2) and
+ * `regionCode` (the ISO 3166-2 subdivision without its country prefix, `MB`
+ * for Manitoba). Null when unknown, Tor, or malformed; `regionCode` is null
+ * whenever `country` is. Never stored or logged.
+ */
+export const requestRegion = (
+  request: Request
+): { country: string | null; regionCode: string | null } => {
+  const raw = (request as { cf?: unknown }).cf
+  const cf = raw != null && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const country = normalizedCode(cf.country, COUNTRY_PATTERN)
+  if (country == null || NO_COUNTRY.has(country)) return { country: null, regionCode: null }
+  return { country, regionCode: normalizedCode(cf.regionCode, REGION_PATTERN) }
+}
+
 /**
  * Also carries Cloud Sync's switches (witness-work ADR 0030), so a device
  * without a session knows whether opening one would get it Cloud Sync:
  * `sync: { enabled, entitlement }`. `enabled` is false on a worker without
- * the sync bucket or the accounts database.
+ * the sync bucket or the accounts database. `entitlement` is `everyone` only
+ * for a request whose `?capabilities=` (comma-separated) has `sync-everyone`.
+ *
+ * And web sign-up's (witness-work `docs/passkeys-protocol.md`, "Web
+ * sign-up"): `webSignup: { enabled, turnstileSiteKey }`. `enabled` is the
+ * kill switch, false on a worker without what sign-up needs. The site key is
+ * there whenever Turnstile is set up, even with sign-up off, since recovery
+ * on the web uses it too; null otherwise.
+ *
+ * And the caller's `country` and `regionCode` (`requestRegion`), always
+ * present, null when unknown.
  */
 export const handleAppConfigRequest = async (c: AppContext) => {
-  const [minAppVersion, switches] = await Promise.all([
+  const [minAppVersion, switches, webSignupEnabled] = await Promise.all([
     resolveAppMinVersion(c.env),
     syncSwitches(c.env),
+    webSignupAvailable(c.env),
   ])
   const sync = {
     enabled:
       switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null,
-    entitlement: switches.entitlement,
+    // Apps that never send the capability see `supporter`, so they never
+    // turn Cloud Sync on by themselves (witness-work ADR 0040 §2).
+    entitlement: entitlementForApp(
+      switches.entitlement,
+      c.req.queries('capabilities')?.flatMap((value) => value.split(','))
+    ),
   }
+  const webSignup = {
+    enabled: webSignupEnabled,
+    turnstileSiteKey: turnstileSiteKey(c.env),
+  }
+  const { country, regionCode } = requestRegion(c.req.raw)
   return c.json(
-    minAppVersion ? { ok: true, minAppVersion, sync } : { ok: true, sync },
+    minAppVersion
+      ? { ok: true, minAppVersion, sync, webSignup, country, regionCode }
+      : { ok: true, sync, webSignup, country, regionCode },
     200,
     { 'Cache-Control': 'no-store' }
   )

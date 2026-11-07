@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest'
-import { randomBytes, randomId, sha256B64u } from '../test/buddiesClient'
+import { b64u, randomBytes, randomId, sha256B64u } from '../test/buddiesClient'
+import { accountSignedMessage } from '../accounts/contracts'
 import {
   DEV_BYPASS_TOKEN,
   LOCAL_LAUNCHER,
@@ -14,11 +15,11 @@ import {
 } from '../test/e2e'
 
 /**
- * Cloud Sync (witness-work ADR 0030) over real HTTP: the switches in
- * `/app/v1/config` and `GET /accounts/v1/sync`, a Supporter-only refusal,
- * then (with `sync:entitlement everyone` in the launcher's local KV) put,
+ * Cloud Sync (witness-work ADR 0030, ADR 0040) over real HTTP: the switches
+ * in `/app/v1/config` and `GET /accounts/v1/sync`, a Supporter-only refusal
+ * (with `sync:entitlement supporter` in the launcher's local KV), then put,
  * list, get, the live socket's `hello` and `changed`, `If-Match`, the kill
- * switch, and delete.
+ * switch, and delete, and the Cloud Sync request.
  */
 
 afterAll(() => {
@@ -43,11 +44,26 @@ const put = async (
     },
   })
 
+/** `{ requested: true }` with the account's self-signed envelope. */
+const askEnvelope = async (session: E2ESession) => {
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({ accountPub: session.key.publicKey, ts: Date.now(), nonce: randomId() })
+  )
+  return {
+    requested: true,
+    payload: b64u(bytes),
+    signature: b64u(await session.key.sign(accountSignedMessage('sync/request', bytes))),
+  }
+}
+
 const syncOp = (session: E2ESession, op: string, body: unknown = {}) =>
   http('POST', `/accounts/v1/sync/${op}`, {
     body,
     headers: bearerHeaders(session),
   })
+
+/** Cloud Sync for everyone reaches apps that send the capability (ADR 0040 §2). */
+const CURRENT_APP = { appVersion: '1.47.0', capabilities: ['sync-everyone'] }
 
 describe('Cloud Sync switches', () => {
   it('says them in the public app config', async () => {
@@ -61,10 +77,50 @@ describe('Cloud Sync switches', () => {
 })
 
 describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
+  it.skipIf(!LOCAL_LAUNCHER)(
+    'keeps everyone’s Cloud Sync from an app without the capability',
+    async () => {
+      localKv('put', 'sync:entitlement', 'everyone')
+      try {
+        // Even at 1.47.0, an app that doesn't send `sync-everyone` would turn
+        // Cloud Sync on by itself for a device that never chose (ADR 0040 §2).
+        const old = await openSession(undefined, { appVersion: '1.47.0' })
+        const status = await http('GET', '/accounts/v1/sync', {
+          headers: bearerHeaders(old),
+        })
+        expect(status.body).toMatchObject({
+          entitled: false,
+          entitlement: 'supporter',
+          supporter: false,
+        })
+        const refused = await put(old, slot(), randomBytes(64))
+        expect(refused.status).toBe(403)
+        expect(refused.body.code).toBe('supporter_required')
+        const config = await http('GET', '/app/v1/config?appVersion=1.47.0')
+        expect(config.body.sync?.entitlement).toBe('supporter')
+
+        // The same account's session with the capability is in.
+        const current = await openSession(old.key, CURRENT_APP)
+        const entitled = await http('GET', '/accounts/v1/sync', {
+          headers: bearerHeaders(current),
+        })
+        expect(entitled.body).toMatchObject({ entitled: true, entitlement: 'everyone' })
+        expect((await put(current, slot(), randomBytes(64))).status).toBe(200)
+        const currentConfig = await http(
+          'GET',
+          '/app/v1/config?capabilities=sync-everyone'
+        )
+        expect(currentConfig.body.sync?.entitlement).toBe('everyone')
+      } finally {
+        localKv('delete', 'sync:entitlement')
+      }
+    }
+  )
+
   it('refuses an account that isn’t a Supporter while it’s a Supporter benefit', async () => {
     if (LOCAL_LAUNCHER) localKv('put', 'sync:entitlement', 'supporter')
     try {
-      const session = await openSession()
+      const session = await openSession(undefined, CURRENT_APP)
       const status = await http('GET', '/accounts/v1/sync', {
         headers: bearerHeaders(session),
       })
@@ -86,7 +142,7 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
     async () => {
       localKv('put', 'sync:entitlement', 'everyone')
       try {
-        const session = await openSession()
+        const session = await openSession(undefined, CURRENT_APP)
         const phone = slot()
         const tablet = slot()
 
@@ -119,7 +175,9 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
         expect(listed.body).toMatchObject({
           ok: true,
           seq: 1,
-          slots: [{ slotId: phone, etag: stored.body.etag, size: 200_000 }],
+          slots: [
+            { slotId: phone, etag: stored.body.etag, size: 200_000, platform: 'dev', live: true },
+          ],
         })
 
         const got = await httpBytes('/accounts/v1/sync/get', {
@@ -174,4 +232,99 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
       }
     }
   )
+
+  it.skipIf(!LOCAL_LAUNCHER)('sets, repeats, reads, and withdraws the Cloud Sync request', async () => {
+    const session = await openSession(undefined, CURRENT_APP)
+    const status = async () =>
+      (await http('GET', '/accounts/v1/sync', { headers: bearerHeaders(session) })).body
+    expect(await status()).toMatchObject({ ok: true, requestedAt: null })
+    // A token alone can't ask.
+    expect((await syncOp(session, 'request', { requested: true })).body.code).toBe('bad_request')
+    const set = await syncOp(session, 'request', await askEnvelope(session))
+    expect(set.status).toBe(200)
+    expect(set.body).toEqual({ ok: true, requestedAt: expect.any(Number) })
+    const repeat = await syncOp(session, 'request', await askEnvelope(session))
+    expect(repeat.body).toEqual({ ok: true, requestedAt: set.body.requestedAt })
+    expect(await status()).toMatchObject({ requestedAt: set.body.requestedAt })
+
+    // Setting needs Cloud Sync on; clearing never does.
+    localKv('put', 'sync:enabled', 'false')
+    try {
+      const off = await syncOp(session, 'request', await askEnvelope(session))
+      expect(off.status).toBe(503)
+      expect(off.body.code).toBe('disabled')
+      expect((await syncOp(session, 'request', { requested: false })).body).toEqual({
+        ok: true,
+        requestedAt: null,
+      })
+    } finally {
+      localKv('delete', 'sync:enabled')
+    }
+    expect(await status()).toMatchObject({ requestedAt: null })
+    expect((await syncOp(session, 'request', { requested: 'yes' })).body.code).toBe('bad_request')
+  })
+
+  it.skipIf(!LOCAL_LAUNCHER)(
+    'puts, lists, gets, and deletes a photo, telling the other device',
+    async () => {
+      const session = await openSession(undefined, CURRENT_APP)
+      const phone = slot()
+      const tablet = slot()
+      expect((await put(session, phone, randomBytes(64))).status).toBe(200)
+      const tabletLive = await openLive(
+        { ...bearerHeaders(session), upgrade: 'websocket', 'x-ww-slot-id': tablet },
+        '/accounts/v1/sync/live'
+      )
+      expect(tabletLive.status).toBe(101)
+      if (tabletLive.status !== 101) return
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'hello', seq: 1 })
+
+      const name = await sha256B64u(randomBytes(16))
+      const meta = b64u(randomBytes(120))
+      // Small, so it also fits a worker started with a tiny --photo-limit-bytes.
+      const bytes = randomBytes(1_000)
+      const sha256 = await sha256B64u(bytes)
+      const photoPut = (body: Uint8Array) =>
+        httpBytes('/accounts/v1/sync/photos/put', {
+          bytes: body,
+          headers: {
+            ...bearerHeaders(session),
+            'x-ww-photo-name': name,
+            'x-ww-sha256': sha256,
+            'x-ww-photo-meta': meta,
+            'x-ww-slot-id': phone,
+          },
+        })
+      const stored = await photoPut(bytes)
+      expect(stored.status).toBe(200)
+      expect(stored.body).toMatchObject({ ok: true, name, size: 1_000, sha256, existed: false })
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'changed', seq: 2 })
+      expect((await photoPut(randomBytes(10))).body).toMatchObject({ existed: true, size: 1_000 })
+
+      const listed = await syncOp(session, 'photos/list', {})
+      expect(listed.body).toMatchObject({
+        ok: true,
+        photos: [{ name, size: 1_000, sha256, meta }],
+        cursor: null,
+      })
+      const got = await httpBytes('/accounts/v1/sync/photos/get', {
+        json: { name },
+        headers: bearerHeaders(session),
+      })
+      expect(got.status).toBe(200)
+      expect(got.bytes).toEqual(bytes)
+      expect(got.headers.get('etag')).toBe(`"${sha256}"`)
+
+      expect((await syncOp(session, 'photos/delete', { names: [name] })).body).toMatchObject({
+        ok: true,
+        usage: { bytes: 0, count: 0 },
+      })
+      expect(JSON.parse(await tabletLive.connection.next())).toEqual({ type: 'changed', seq: 3 })
+      expect((await syncOp(session, 'photos/get', { name })).status).toBe(404)
+      const usage = await http('GET', '/accounts/v1/sync/photos/usage', { headers: bearerHeaders(session) })
+      expect(usage.body).toMatchObject({ ok: true, usage: { bytes: 0, count: 0 } })
+      tabletLive.connection.end()
+    }
+  )
 })
+

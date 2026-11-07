@@ -373,14 +373,21 @@ describe('backup with a bearer token', () => {
     const bytes = randomBytes(10_000)
     expect(await putBearer(s, { slotId, bytes })).toEqual({
       status: 200,
-      body: { ok: true, uploadedAt: START },
+      body: { ok: true, uploadedAt: START, etag: expect.any(String) },
     })
     expect(h.backups.objects.get(`v1/${s.accountId}/${slotId}`)?.bytes).toEqual(bytes)
 
     const listed = await post('/backup/list', undefined, bearer(s.accessToken))
     expect(listed.body).toEqual({
       ok: true,
-      slots: [{ slotId, size: 10_000, uploadedAt: START }],
+      slots: [
+        {
+          slotId,
+          size: 10_000,
+          uploadedAt: START,
+          etag: h.backups.objects.get(`v1/${s.accountId}/${slotId}`)?.etag,
+        },
+      ],
     })
 
     const got = await (app as { request: typeof fetch }).request(

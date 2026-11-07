@@ -86,7 +86,7 @@ describe('pnpm admin:reset-usage', () => {
     expect(resolveResetCommand([ACCOUNT], { ADMIN_API_TOKEN: 'prod-token' })).toEqual({
       path: '/admin/scribe/reset',
       body: { accountId: ACCOUNT },
-      baseUrl: 'https://ww-proxy.leviwilkerson.com',
+      baseUrl: 'https://api.witnesswork.app',
       token: 'prod-token',
       environment: 'production',
     })
@@ -104,6 +104,19 @@ describe('pnpm admin:reset-usage', () => {
       token: 'dev-token',
       environment: 'development',
     })
+  })
+
+  it('defaults --dev to api-dev.witnesswork.app, and either default to an override', async () => {
+    const { resolveResetCommand } = await load()
+    expect(
+      resolveResetCommand(['--dev', ACCOUNT], { ADMIN_API_TOKEN_DEV: 'dev-token' }).baseUrl
+    ).toBe('https://api-dev.witnesswork.app')
+    expect(
+      resolveResetCommand([ACCOUNT], {
+        ADMIN_API_TOKEN: 'prod-token',
+        WW_API_PROD_URL: 'https://ww-proxy.leviwilkerson.com',
+      }).baseUrl
+    ).toBe('https://ww-proxy.leviwilkerson.com')
   })
 
   it('reaches the old Notes Import reset with --notes-import', async () => {

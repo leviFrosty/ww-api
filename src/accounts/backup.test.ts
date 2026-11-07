@@ -160,11 +160,12 @@ describe('backup', () => {
     const { key, accountId } = await register()
     const slotId = randomId()
     const bytes = randomBytes(10_000)
-    expect(await put(key, { slotId, bytes })).toEqual({
-      status: 200,
-      body: { ok: true, uploadedAt: START },
-    })
+    const stored = await put(key, { slotId, bytes })
     const object = h.backups.objects.get(`v1/${accountId}/${slotId}`)
+    expect(stored).toEqual({
+      status: 200,
+      body: { ok: true, uploadedAt: START, etag: object?.etag },
+    })
     expect(object?.bytes).toEqual(bytes)
     expect(object?.customMetadata).toEqual({ uploadedAt: String(START) })
 
@@ -172,7 +173,9 @@ describe('backup', () => {
       status: 200,
       body: {
         ok: true,
-        slots: [{ slotId, size: 10_000, uploadedAt: START }],
+        slots: [
+          { slotId, size: 10_000, uploadedAt: START, etag: object?.etag },
+        ],
       },
     })
 
@@ -181,6 +184,7 @@ describe('backup', () => {
     expect(got.headers.get('content-type')).toBe('application/octet-stream')
     expect(got.headers.get('content-length')).toBe('10000')
     expect(got.headers.get('cache-control')).toBe('no-store')
+    expect(got.headers.get('etag')).toBe(`"${object?.etag}"`)
     expect(new Uint8Array(await got.arrayBuffer())).toEqual(bytes)
 
     expect(await remove(key, slotId)).toEqual({
@@ -259,15 +263,161 @@ describe('backup', () => {
 
     vi.setSystemTime(START + MINUTE)
     const bytes = randomBytes(123)
-    expect(await put(key, { slotId, bytes })).toEqual({
+    expect(await put(key, { slotId, bytes })).toMatchObject({
       status: 200,
       body: { ok: true, uploadedAt: START + MINUTE },
     })
     const slots = (await list(key)).body.slots as { slotId: string }[]
-    expect(slots.find((slot) => slot.slotId === slotId)).toEqual({
+    expect(slots.find((slot) => slot.slotId === slotId)).toMatchObject({
       slotId,
       size: 123,
       uploadedAt: START + MINUTE,
+    })
+  })
+
+  describe('If-Match', () => {
+    const slotEtag = async (key: SigningKey, slotId: string) =>
+      (
+        (await list(key)).body.slots as { slotId: string; etag: string }[]
+      ).find((slot) => slot.slotId === slotId)!.etag
+
+    const stored = (accountId: string, slotId: string) =>
+      h.backups.objects.get(`v1/${accountId}/${slotId}`)
+
+    it('replaces the slot when the etag matches, and returns the new one', async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      const etag = await slotEtag(key, slotId)
+      vi.setSystemTime(START + MINUTE)
+      const bytes = randomBytes(77)
+      const resealed = await put(key, {
+        slotId,
+        bytes,
+        headers: { 'if-match': `"${etag}"` },
+      })
+      expect(resealed.status).toBe(200)
+      expect(resealed.body.etag).toBe(stored(accountId, slotId)?.etag)
+      expect(resealed.body.etag).not.toBe(etag)
+      expect(stored(accountId, slotId)?.bytes).toEqual(bytes)
+    })
+
+    it('refuses a stale etag with 412 precondition_failed and keeps the newer backup', async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      const stale = await slotEtag(key, slotId)
+      vi.setSystemTime(START + MINUTE)
+      const newer = randomBytes(55)
+      await put(key, { slotId, bytes: newer })
+      vi.setSystemTime(START + 2 * MINUTE)
+      expect(
+        await put(key, { slotId, headers: { 'if-match': `"${stale}"` } })
+      ).toMatchObject({ status: 412, body: { code: 'precondition_failed' } })
+      expect(stored(accountId, slotId)?.bytes).toEqual(newer)
+    })
+
+    it("refuses a slot that doesn't exist, and doesn't create it", async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      expect(
+        await put(key, {
+          slotId,
+          headers: { 'if-match': `"${'a'.repeat(32)}"` },
+        })
+      ).toMatchObject({ status: 412, body: { code: 'precondition_failed' } })
+      expect(stored(accountId, slotId)).toBeUndefined()
+      expect(h.backups.calls.some((call) => call.startsWith('put '))).toBe(false)
+    })
+
+    it('does not re-create a slot deleted since it was read', async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      const etag = await slotEtag(key, slotId)
+      await remove(key, slotId)
+      vi.setSystemTime(START + MINUTE)
+      expect(
+        await put(key, { slotId, headers: { 'if-match': `"${etag}"` } })
+      ).toMatchObject({ status: 412, body: { code: 'precondition_failed' } })
+      expect(stored(accountId, slotId)).toBeUndefined()
+    })
+
+    it('refuses a write that lands between the check and the put (R2 onlyIf)', async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      const etag = await slotEtag(key, slotId)
+      vi.setSystemTime(START + MINUTE)
+      const racer = randomBytes(33)
+      // Another device's put commits after this request listed the slot.
+      const realList = h.backups.list.bind(h.backups)
+      vi.spyOn(h.backups, 'list').mockImplementationOnce(async (options) => {
+        const listed = await realList(options)
+        h.backups.objects.set(`v1/${accountId}/${slotId}`, {
+          ...stored(accountId, slotId)!,
+          bytes: racer,
+          etag: 'f'.repeat(32),
+        })
+        return listed
+      })
+      expect(
+        await put(key, { slotId, headers: { 'if-match': `"${etag}"` } })
+      ).toMatchObject({ status: 412, body: { code: 'precondition_failed' } })
+      expect(stored(accountId, slotId)?.bytes).toEqual(racer)
+    })
+
+    it.each([
+      ['a weak etag', (etag: string) => `W/"${etag}"`],
+      ['an unquoted etag', (etag: string) => etag],
+      ['*', () => '*'],
+      ['an empty etag', () => '""'],
+      ['a list of etags', (etag: string) => `"${etag}", "${etag}"`],
+    ])('refuses %s as bad_request', async (_name, header) => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      const original = randomBytes(40)
+      await put(key, { slotId, bytes: original })
+      const etag = await slotEtag(key, slotId)
+      vi.setSystemTime(START + MINUTE)
+      expect(
+        await put(key, { slotId, headers: { 'if-match': header(etag) } })
+      ).toMatchObject({ status: 400, body: { code: 'bad_request' } })
+      expect(stored(accountId, slotId)?.bytes).toEqual(original)
+    })
+
+    it('behaves as before without the header', async () => {
+      const { key, accountId } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      vi.setSystemTime(START + MINUTE)
+      const bytes = randomBytes(21)
+      expect((await put(key, { slotId, bytes })).status).toBe(200)
+      expect(stored(accountId, slotId)?.bytes).toEqual(bytes)
+      // A first put of a new slot needs no header either.
+      expect((await put(key)).status).toBe(200)
+    })
+
+    it('keeps the one-put-a-minute limit', async () => {
+      const { key } = await register()
+      const slotId = randomId()
+      await put(key, { slotId })
+      const etag = await slotEtag(key, slotId)
+      vi.setSystemTime(START + 10_000)
+      expect(
+        await put(key, { slotId, headers: { 'if-match': `"${etag}"` } })
+      ).toMatchObject({ status: 429, body: { code: 'rate_limited' } })
+    })
+
+    it("doesn't let one account's etag match another's slot", async () => {
+      const a = await register()
+      const b = await register()
+      const slotId = randomId()
+      await put(a.key, { slotId })
+      const etag = await slotEtag(a.key, slotId)
+      expect(
+        await put(b.key, { slotId, headers: { 'if-match': `"${etag}"` } })
+      ).toMatchObject({ status: 412 })
     })
   })
 

@@ -8,15 +8,34 @@ import {
 import { RevenueCatError } from '../revenuecat'
 import { captureFailure } from '../sentry'
 import { isPlainObject } from '../buddies/contracts'
-import { isWebSocketUpgrade, readBlobBody } from '../buddies/envelope'
+import {
+  isWebSocketUpgrade,
+  parseEnvelope,
+  readBlobBody,
+  readEnvelopeText,
+} from '../buddies/envelope'
 import {
   buddiesErrorResponse,
   buddiesInternalError,
 } from '../buddies/errorResponse'
-import { authenticateAccount, readPlainJson, type AccountAuth } from './auth'
-import { guarded, refuseAtEdge } from './signed'
+import {
+  acceptLiveSubprotocol,
+  forwardedLiveRequest,
+  readBrowserLive,
+  LIVE_TICKET_HEADER,
+} from '../liveSubprotocol'
+import {
+  authenticateAccount,
+  readPlainJson,
+  type AccountAuth,
+  type AuthenticateAccountOptions,
+  parseJsonOrNull,
+} from './auth'
+import { accountForKey, guarded, refuseAtEdge, verifyEnvelope } from './signed'
+import { admitLiveTicket } from './liveTickets'
+import { cachedSessionCapabilities, sessionStates } from './sessionStore'
 import { accountSupporterStatus } from './supporter'
-import { accountsDb } from './store'
+import { accountsDb, findKeyChangedAt } from './store'
 import {
   SYNC_ETAG_PATTERN,
   SYNC_HEADERS,
@@ -25,7 +44,12 @@ import {
   parseIfMatch,
   syncObjectKey,
 } from './syncContracts'
-import { syncSwitches } from './syncSwitch'
+import {
+  entitlementForApp,
+  isSyncPhotosOn,
+  syncSwitches,
+  type SyncEntitlement,
+} from './syncSwitch'
 
 /**
  * Cloud Sync (witness-work ADR 0030, `docs/accounts-protocol.md`, "Sync"):
@@ -34,12 +58,16 @@ import { syncSwitches } from './syncSwitch'
  * Object per account holds the slots' metadata and live sockets; R2
  * (`ACCOUNT_SYNC`) holds the ciphertext.
  *
- * Every route is bearer. `GET /sync` (the account's status) and
- * `sync/delete` always work; `sync/put`, `sync/list`, `sync/get`, and the
- * live socket need the kill switch on (503 `disabled`) and an entitled
- * account (403 `supporter_required`; RevenueCat unreachable is 503
- * `unavailable`, never a "not a Supporter"). A suspended account keeps
- * syncing: sync never reaches another person.
+ * Every route is bearer. `GET /sync` (the account's status), `sync/delete`,
+ * and clearing the Cloud Sync request always work; `sync/put`, `sync/list`,
+ * `sync/get`, the live socket, and setting the request need the kill switch
+ * on (503 `disabled`) and an entitled account (403 `supporter_required`;
+ * RevenueCat unreachable is 503 `unavailable`, never a "not a Supporter").
+ * Everyone is entitled unless KV `sync:entitlement` says `supporter`
+ * (witness-work ADR 0040), but only on a session that sent the
+ * `sync-everyone` capability; other sessions keep the Supporter rule
+ * (ADR 0040 §2). A suspended account keeps syncing: sync never
+ * reaches another person.
  *
  * `sync/put` counts against the Buddies write edge tier, the rest against
  * the read tier.
@@ -75,8 +103,38 @@ const cachedSupporter = async (
   return supporter
 }
 
+/**
+ * The capabilities the session last sent, or null (an app that sends none,
+ * or the session can't be read: the Supporter rule still admits Supporters).
+ */
+const callerCapabilities = async (
+  env: Environment,
+  sessionId: string
+): Promise<string[] | null> => {
+  try {
+    return await cachedSessionCapabilities(accountsDb(env.ACCOUNTS_DB!), sessionId)
+  } catch (error) {
+    captureFailure(error, 'sync session capabilities read')
+    return null
+  }
+}
+
+/**
+ * The entitlement this caller's app sees: `everyone` only when its session
+ * sent `sync-everyone` (`entitlementForApp`, witness-work ADR 0040 §2).
+ */
+const callerEntitlement = async (
+  env: Environment,
+  account: Pick<AccountAuth, 'sessionId'>,
+  entitlement: SyncEntitlement
+): Promise<SyncEntitlement> =>
+  // Read only when it decides anything.
+  entitlement === 'everyone'
+    ? entitlementForApp(entitlement, await callerCapabilities(env, account.sessionId))
+    : entitlement
+
 /** The account's sync index. */
-const syncIndex = (env: Environment, accountId: string) =>
+export const syncIndex = (env: Environment, accountId: string) =>
   env.ACCOUNT_SYNC_INDEX.get(env.ACCOUNT_SYNC_INDEX.idFromName(accountId))
 
 /** Off without the bucket or the accounts database. */
@@ -84,30 +142,36 @@ const unavailableHere = (env: Environment): Response | null =>
   env.ACCOUNT_SYNC && env.ACCOUNTS_DB ? null : buddiesErrorResponse('disabled')
 
 /** The token's account, after the edge tier; or the refusal. */
-const caller = async (
+export const caller = async (
   c: AppContext,
-  tier: 'write' | 'read',
-  options?: { requireLiveSession?: boolean }
-): Promise<{ account: AccountAuth } | { refusal: Response }> => {
+  tier: 'write' | 'read' | 'photoPut',
+  options?: Pick<AuthenticateAccountOptions, 'requireLiveSession'>
+): Promise<
+  { account: AccountAuth; expiresAt: number } | { refusal: Response }
+> => {
   const limited = await refuseAtEdge(
     c,
-    tier === 'write' ? 'event/put' : 'inbox/sync'
+    tier === 'write' ? 'event/put' : tier === 'photoPut' ? 'blob/put' : 'inbox/sync'
   )
   if (limited) return { refusal: limited }
   const auth = await authenticateAccount(c, options)
-  return auth.ok ? { account: auth.account } : { refusal: auth.response }
+  return auth.ok
+    ? { account: auth.account, expiresAt: auth.expiresAt }
+    : { refusal: auth.response }
 }
 
 /**
- * The switches and the account's entitlement for put, list, get, and live:
- * null admits.
+ * The switches and the account's entitlement for put, list, get, live, and
+ * setting the Cloud Sync request: null admits.
  */
-const refuseUnentitled = async (
+export const refuseUnentitled = async (
   env: Environment,
-  accountId: string
+  account: Pick<AccountAuth, 'accountId' | 'sessionId'>
 ): Promise<Response | null> => {
-  const { enabled, entitlement } = await syncSwitches(env)
+  const { accountId } = account
+  const { enabled, entitlement: switched } = await syncSwitches(env)
   if (!enabled) return buddiesErrorResponse('disabled')
+  const entitlement = await callerEntitlement(env, account, switched)
   if (entitlement === 'everyone') return null
   try {
     return (await cachedSupporter(env, accountId))
@@ -143,7 +207,13 @@ const handleStatus = guarded('sync', async (c) => {
   if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
-  const { enabled, entitlement } = await syncSwitches(c.env)
+  const switches = await syncSwitches(c.env)
+  const { enabled } = switches
+  const entitlement = await callerEntitlement(
+    c.env,
+    who.account,
+    switches.entitlement
+  )
   let supporter = false
   let supporterCheckFailed = false
   try {
@@ -153,6 +223,13 @@ const handleStatus = guarded('sync', async (c) => {
     supporterCheckFailed = true
   }
   const entitled = enabled && (entitlement === 'everyone' || supporter)
+  let requestedAt: number | null = null
+  try {
+    requestedAt = await syncIndex(c.env, who.account.accountId).requestedAt()
+  } catch (error) {
+    // The entitlement answer still goes out; the phone reads again later.
+    captureFailure(error, 'sync request read')
+  }
   return c.json({
     ok: true,
     enabled: enabled && unavailableHere(c.env) == null,
@@ -160,7 +237,46 @@ const handleStatus = guarded('sync', async (c) => {
     entitlement,
     supporter,
     ...(supporterCheckFailed ? { supporterCheckFailed: true } : {}),
+    requestedAt,
+    photos: c.env.ACCOUNT_PHOTOS != null && (await isSyncPhotosOn(c.env)),
   })
+})
+
+/**
+ * `sync/request`: `{ requested: true, payload, signature }` asks the
+ * account's phones to switch to Cloud Sync (the web sets it; witness-work
+ * ADR 0040 §5); `{ requested: false }` withdraws it. Setting is bearer and a
+ * self-signed envelope (op `sync/request`) by the token's own account, as
+ * `backup/delete` is, so a leaked token alone can't move the User's phones;
+ * it needs Cloud Sync on and an entitled account. Withdrawing always works.
+ * Not in the activity log: it changes no one's access.
+ */
+const handleSwitchRequest = guarded('sync/request', async (c) => {
+  if (!c.env.ACCOUNTS_DB) return buddiesErrorResponse('disabled')
+  const who = await caller(c, 'read')
+  if ('refusal' in who) return who.refusal
+  const { accountId } = who.account
+  const text = await readEnvelopeText(c.req.raw)
+  const body = parseJsonOrNull(text)
+  if (!isPlainObject(body) || typeof body.requested !== 'boolean')
+    return buddiesErrorResponse('bad_request')
+  let nonce: string | null = null
+  if (body.requested) {
+    const verified = await verifyEnvelope('sync/request', parseEnvelope(text!))
+    if ('refusal' in verified) return verified.refusal
+    const found = await accountForKey(c.env, verified.payload.accountPub)
+    if ('refusal' in found) return found.refusal
+    if (found.account.id !== accountId) return buddiesErrorResponse('forbidden')
+    nonce = verified.payload.nonce
+    const refused =
+      unavailableHere(c.env) ?? (await refuseUnentitled(c.env, who.account))
+    if (refused) return refused
+  }
+  const index = syncIndex(c.env, accountId)
+  if (nonce == null) return c.json({ ok: true, requestedAt: await index.clearRequest() })
+  const set = await index.setRequest({ accountId, nonce })
+  if (!set.ok) return buddiesErrorResponse(set.error)
+  return c.json({ ok: true, requestedAt: set.value })
 })
 
 /**
@@ -169,6 +285,15 @@ const handleStatus = guarded('sync', async (c) => {
  * is refused before anything else; the body is read and checked against its
  * size and digest before the slot is reserved, so a bad upload never holds
  * the slot.
+ *
+ * `x-ww-reseal: 1` re-seals an existing slot (another device's, too) under a
+ * new account key: it keeps the slot's session, platform, and `updatedAt`,
+ * so retention and the Cloud Sync request see no new write. It needs a
+ * strong quoted-ETag `If-Match` (`bad_request` without one, or with a weak
+ * `W/"…"` one), so it never replaces
+ * bytes a device wrote after the re-sealer read the slot. Allowed only
+ * within `resealWindowMs` of the account's last key change (`forbidden`);
+ * a slot that doesn't exist is `precondition_failed` (ADR 0039).
  */
 const handlePut = guarded('sync/put', async (c) => {
   const declared = c.req.header('content-length')
@@ -176,17 +301,27 @@ const handlePut = guarded('sync/put', async (c) => {
   if (declared != null && Number(declared) > SYNC_LIMITS.blobBytes)
     return off ?? buddiesErrorResponse('too_large')
   if (off) return off
-  const who = await caller(c, 'write')
+  // A signed-out device's last token never writes over a slot re-sealed
+  // under a new account key (ADR 0039).
+  const who = await caller(c, 'write', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
-  const { accountId, sessionId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const { accountId, sessionId, platform } = who.account
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
 
   const slotId = c.req.header(SYNC_HEADERS.slotId)
   const sha256 = c.req.header(SYNC_HEADERS.sha256)
   const size = declared == null ? NaN : Number(declared)
-  const ifMatch = parseIfMatch(c.req.header('if-match') ?? null)
+  const ifMatchHeader = c.req.header('if-match') ?? null
+  const ifMatch = parseIfMatch(ifMatchHeader)
+  const resealHeader = c.req.header(SYNC_HEADERS.reseal)
+  const reseal = resealHeader === '1'
   if (
+    (resealHeader !== undefined && !reseal) ||
+    // A re-seal replaces exactly the bytes it read, never newer ones: a
+    // strong ETag only (a weak `W/"…"` doesn't promise the same bytes).
+    (reseal &&
+      !(ifMatch != null && 'etag' in ifMatch && !/^\s*W\//.test(ifMatchHeader ?? ''))) ||
     !isSyncSlotId(slotId) ||
     typeof sha256 !== 'string' ||
     !SYNC_ETAG_PATTERN.test(sha256) ||
@@ -196,6 +331,12 @@ const handlePut = guarded('sync/put', async (c) => {
   )
     return buddiesErrorResponse('bad_request')
 
+  if (reseal) {
+    const changedAt = await findKeyChangedAt(accountsDb(c.env.ACCOUNTS_DB!), accountId)
+    if (changedAt == null || Date.now() - changedAt > SYNC_LIMITS.resealWindowMs)
+      return buddiesErrorResponse('forbidden')
+  }
+
   const body = await readBlobBody(c.req.raw, size, SYNC_LIMITS.blobBytes)
   if (!body.ok) return buddiesErrorResponse(body.error)
   const digest = await sha256Bytes(body.value)
@@ -203,13 +344,13 @@ const handlePut = guarded('sync/put', async (c) => {
     return buddiesErrorResponse('bad_request')
 
   const index = syncIndex(c.env, accountId)
-  const begun = await index.beginPut({ accountId, slotId, size, ifMatch })
+  const begun = await index.beginPut({ accountId, slotId, size, ifMatch, reseal })
   if (!begun.ok)
     return buddiesErrorResponse(begun.error, {
       retryAfterSeconds: begun.retryAfterSeconds,
     })
   const { reservation } = begun.value
-  const updatedAt = Date.now()
+  const updatedAt = begun.value.updatedAt ?? Date.now()
   try {
     await c.env.ACCOUNT_SYNC!.put(syncObjectKey(accountId, slotId), body.value, {
       sha256: bytesToHex(digest),
@@ -228,6 +369,8 @@ const handlePut = guarded('sync/put', async (c) => {
     size,
     updatedAt,
     sessionId,
+    platform,
+    reseal,
   })
   if (!committed.ok) return buddiesErrorResponse(committed.error)
   return c.json({ ok: true, ...committed.value }, 200, {
@@ -235,17 +378,43 @@ const handlePut = guarded('sync/put', async (c) => {
   })
 })
 
-/** `sync/list`: every slot's ETag, size, and server time, and the account's `seq`. */
+/**
+ * `sync/list`: every slot's ETag, size, and server time, the platform of the
+ * session that last wrote it and whether that session is live, and the
+ * account's `seq`. A failed session read says `live: true`, as retention
+ * does, so a pull never fails on it.
+ */
 const handleList = guarded('sync/list', async (c) => {
   const off = unavailableHere(c.env)
   if (off) return off
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
-  const listed = await syncIndex(c.env, accountId).list()
-  return c.json({ ok: true, ...listed })
+  const { seq, slots } = await syncIndex(c.env, accountId).list()
+  let states: Awaited<ReturnType<typeof sessionStates>> | null = null
+  try {
+    states = await sessionStates(
+      accountsDb(c.env.ACCOUNTS_DB!),
+      accountId,
+      [...new Set(slots.map((slot) => slot.sessionId))]
+    )
+  } catch (error) {
+    captureFailure(error, 'sync/list sessions')
+  }
+  return c.json({
+    ok: true,
+    seq,
+    slots: slots.map(({ sessionId, platform, ...slot }) => {
+      const state = states?.get(sessionId)
+      return {
+        ...slot,
+        platform: platform ?? state?.platform ?? null,
+        live: states ? (state?.live ?? false) : true,
+      }
+    }),
+  })
 })
 
 /** `sync/get`: one slot's bytes exactly as put. */
@@ -255,7 +424,7 @@ const handleGet = guarded('sync/get', async (c) => {
   const who = await caller(c, 'read')
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
-  const refused = await refuseUnentitled(c.env, accountId)
+  const refused = await refuseUnentitled(c.env, who.account)
   if (refused) return refused
   const field = await readSlotField(c, true)
   if ('refusal' in field) return field.refusal
@@ -281,19 +450,19 @@ const handleGet = guarded('sync/get', async (c) => {
 /**
  * `sync/delete`: one slot, or every slot without `slotId`. Idempotent, and
  * it works while Cloud Sync is off or the account isn't entitled, so a
- * device can always take its data off the server. Deleting every slot needs
- * a live session (Delete Buddies runs it before closing its own).
+ * device can always take its data off the server. Needs a live session
+ * (Delete Buddies runs it before closing its own), so a signed-out device
+ * can't delete what a key change re-sealed (ADR 0039).
  */
 const handleDelete = guarded('sync/delete', async (c) => {
   const off = unavailableHere(c.env)
   if (off) return off
   const field = await readSlotField(c, false)
   if ('refusal' in field) return field.refusal
-  const who = await caller(c, 'read', {
-    requireLiveSession: field.slotId == null,
-  })
+  const who = await caller(c, 'read', { requireLiveSession: true })
   if ('refusal' in who) return who.refusal
   const { accountId } = who.account
+  // Every slot takes every photo with it (the index marks them deleted).
   const { seq } = await syncIndex(c.env, accountId).deleteSlots({
     accountId,
     slotId: field.slotId,
@@ -302,29 +471,70 @@ const handleDelete = guarded('sync/delete', async (c) => {
 })
 
 /**
- * `GET sync/live`: upgrades to the account's live socket. The token and the
- * device's own slot id (`x-ww-slot-id`) ride in headers; the DO gets the
- * verified account in `SYNC_HEADERS.account`, and any copy a client sent is
- * dropped.
+ * `GET sync/live`: upgrades to the account's live socket. The DO gets the
+ * verified account in `SYNC_HEADERS.account` (any copy a client sent is
+ * dropped) and the device's own slot in `x-ww-slot-id`.
+ *
+ * - Native apps send the token in `Authorization` and the slot id in
+ *   `x-ww-slot-id`. Their sockets outlive the token, so a `web` token is
+ *   refused there (403 `forbidden`).
+ * - Browsers can't set headers on a WebSocket, so they offer `ww.v1` and
+ *   `ticket.<ticket>` in `Sec-WebSocket-Protocol` (src/liveSubprotocol.ts),
+ *   from an allowed `Origin`: a `sync` ticket from `POST live/ticket`
+ *   (src/accounts/liveTickets.ts), which names the slot. Origin (403) and
+ *   the offer's shape (400) come first, then the switches, the same edge
+ *   tier, and the ticket (401) in place of the token; then every other check
+ *   runs in the same order. The DO gets the token's expiry from the ticket
+ *   in `SYNC_HEADERS.expiresAt` and the ticket's hash in
+ *   `LIVE_TICKET_HEADER` (never the ticket), refuses a second socket on the
+ *   same ticket while one is open (409 `conflict`), and closes the socket
+ *   with `4004 "expired"` at the expiry; the 101 says
+ *   `Sec-WebSocket-Protocol: ww.v1`.
  */
 const handleLive = async (c: AppContext): Promise<Response> => {
   try {
+    const browser = readBrowserLive(c.env, c.req.raw.headers)
+    if (browser && !browser.ok) return buddiesErrorResponse(browser.error)
     const off = unavailableHere(c.env)
     if (off) return off
-    const who = await caller(c, 'read')
-    if ('refusal' in who) return who.refusal
-    const { accountId } = who.account
-    const refused = await refuseUnentitled(c.env, accountId)
+    let account: AccountAuth
+    let slotId: string | undefined
+    let ticket: { expiresAt: number; hash: string } | null = null
+    if (browser) {
+      const limited = await refuseAtEdge(c, 'inbox/sync')
+      if (limited) return limited
+      const admitted = await admitLiveTicket(c.env, browser.ticket, 'sync')
+      if (!admitted.ok) return admitted.response
+      const { claims } = admitted
+      account = claims.account
+      slotId = claims.id
+      ticket = { expiresAt: claims.tokenExpiresAt, hash: claims.hash }
+    } else {
+      const who = await caller(c, 'read')
+      if ('refusal' in who) return who.refusal
+      // A browser's token never opens a header socket: nothing would close
+      // it when the token expires. Browsers use tickets.
+      if (who.account.platform === 'web') return buddiesErrorResponse('forbidden')
+      account = who.account
+      slotId = c.req.header(SYNC_HEADERS.slotId)
+    }
+    const { accountId } = account
+    const refused = await refuseUnentitled(c.env, account)
     if (refused) return refused
     if (!isWebSocketUpgrade(c.req.raw))
       return buddiesErrorResponse('upgrade_required')
-    if (!isSyncSlotId(c.req.header(SYNC_HEADERS.slotId)))
-      return buddiesErrorResponse('bad_request')
-    const headers = new Headers(c.req.raw.headers)
-    headers.set(SYNC_HEADERS.account, accountId)
-    return await syncIndex(c.env, accountId).fetch(
-      new Request(c.req.raw, { headers })
+    if (!isSyncSlotId(slotId)) return buddiesErrorResponse('bad_request')
+    const response = await syncIndex(c.env, accountId).fetch(
+      forwardedLiveRequest(c.req.raw, {
+        [SYNC_HEADERS.account]: accountId,
+        [SYNC_HEADERS.slotId]: slotId,
+        ...(ticket && {
+          [SYNC_HEADERS.expiresAt]: String(ticket.expiresAt),
+          [LIVE_TICKET_HEADER]: ticket.hash,
+        }),
+      }, [SYNC_HEADERS.expiresAt])
     )
+    return ticket ? acceptLiveSubprotocol(response) : response
   } catch (error) {
     console.error('accounts: request failed', { op: 'sync/live' })
     captureFailure(error, 'sync/live')
@@ -338,5 +548,6 @@ export const syncHandlers = {
   list: handleList,
   get: handleGet,
   delete: handleDelete,
+  switchRequest: handleSwitchRequest,
   live: handleLive,
 }

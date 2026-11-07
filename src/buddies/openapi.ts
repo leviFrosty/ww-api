@@ -142,10 +142,14 @@ const PHOTOS_SWITCH =
 const LEGACY_SWITCH =
   'It works while the legacy switch (KV `auth:legacy`) is on; once it’s off, a legacy request is 426 `upgrade_required`. A request with an `Authorization` header is always a bearer request and never falls back.'
 
+/** Owner-signed requests after a key change (witness-work ADR 0039). */
+const OLD_KEY_OWNER =
+  'Legacy: the inbox was first linked to an account whose key has changed since (`reason: "key_changed"`). Its owner key comes from the old account key, so owner-signed requests stop at the change for good, the Notification Service Extension’s sync included, even after the new key registers the inbox again. The old inbox is usable only through bearer owner ops, and the User’s device deletes it with a successor. Refused before the inbox wakes, whatever the signature.'
+
 const SIGNED_BY = {
   owner: paragraphs(
     '**Bearer:** `Authorization: Bearer <access token>` and the fields as plain JSON, without `ts` or `nonce`. The inbox must be linked to the token’s account: another account’s inbox is `forbidden`, and one with no confirmed link (registered before accounts, or its linking registration failed part-way) is `not_linked` (link it with a bearer `inbox/register`, then retry).',
-    `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH}`
+    `**Legacy** (no \`Authorization\` header; app versions before sessions): the envelope, signed by the inbox owner key (the \`ownerPub\` stored for \`inboxId\`). ${LEGACY_SWITCH} After the account’s key changes, an inbox first linked under the old key refuses it with \`unauthorized\`, \`reason: "key_changed"\`, for good: use bearer requests, and delete the inbox with a successor.`
   ),
   writer: paragraphs(
     '**Signed by** the writer key registered for (`inboxId`, `slotId`) with `slot/add`: the signature is the slot’s capability, in both forms.',
@@ -283,6 +287,7 @@ const ownerRefusals = (
     'Legacy: signature missing, malformed, or not by the owner key.',
   stale: `Legacy only. ${DEFAULT_REASONS.stale}`,
   ...AUTH_REFUSALS,
+  unauthorized: `${DEFAULT_REASONS.unauthorized} ${OLD_KEY_OWNER}`,
   forbidden: true as const,
   ...(suspendable ? { suspended: true as const } : {}),
   not_found: true as const,
@@ -299,6 +304,9 @@ const ownerRefusals = (
 const SENDER_SUSPENDED =
   'Bearer: the token’s account is suspended, so it can’t reach other people (it can still leave). Checked from the account’s status, cached up to 30 s; the inbox never learns which account wrote. A legacy request names no account and isn’t refused.'
 
+const SLOT_SEALED =
+  'The slot’s writer sealed it (`slot/seal`): only `slot/leave` and `slot/seal` still work, for good.'
+
 /** The refusals every writer op shares. */
 const writerRefusals = (extraRateLimit = '') => ({
   bad_request: true as const,
@@ -312,6 +320,7 @@ const writerRefusals = (extraRateLimit = '') => ({
   replay: true as const,
   rate_limited: `${edgeLimited('write')}, ${WRITER_BUDGET} are spent${extraRateLimit}.`,
   disabled: true as const,
+  sealed: SLOT_SEALED,
 })
 
 // --- Ops ------------------------------------------------------------------
@@ -327,6 +336,10 @@ const syncSchema = z.object({
       z.object({
         slotId: z.string(),
         createdAt: z.number().int(),
+        sealed: z.literal(true).optional().meta({
+          description:
+            'Present only once the slot’s writer sealed it (`slot/seal`): it takes no more writes, but its card and events stay until it’s left or removed.',
+        }),
       })
     )
     .meta({
@@ -419,6 +432,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
           'Signature not by `ownerPub`, or the `account` signature is not by that account.',
         stale: true,
         ...AUTH_REFUSALS,
+        unauthorized: `${DEFAULT_REASONS.unauthorized} Legacy: the inbox was first linked to an account whose key has changed since (\`reason: "key_changed"\`), with or without \`account\`; it only takes bearer requests now.`,
         forbidden:
           'Bearer: `account` names another account than the token’s.',
         suspended:
@@ -426,7 +440,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         unknown_account: '`account.accountId` doesn’t exist.',
         replay: true,
         conflict:
-          'The inbox is registered (or was, before a wipe) with a different `ownerPub`, or is linked to a different account.',
+          'The inbox is registered (or was, before a wipe) with a different `ownerPub`, is linked to a different account, or was replaced by a successor after a key change (never registered again).',
         rate_limited: `${edgeLimited('register')}, or the caller’s ${count(BUDDIES_ABUSE_LIMITS.registrationsPerDay)} registrations a day are spent (\`Retry-After\` until the oldest leaves the window).`,
         disabled: `${DEFAULT_REASONS.disabled} Also a bearer request on a worker without the accounts database.`,
       }),
@@ -475,15 +489,29 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
     description: paragraphs(
       'Wipes the inbox (slots, cards, events, devices, roster, photo blobs) and every open invite it created, closing its live sockets with 4001. Only a hash of the owner key is kept, so only that key can register the `inboxId` again.',
       SIGNED_BY.owner,
+      '**`successor`** (after an account key change, witness-work ADR 0039 §5): names the inbox that replaces this one, which buddies then read with `inbox/successor` to check a reconnect invite. Bearer only, from a session of the account the inbox is linked to (not suspended: `suspended`) that is still live at the account’s key epoch. It must be another registered inbox linked to the same account at its current key epoch (linked, or registered again, with a proof by the current key) with no successor of its own, else `conflict` and nothing is deleted. Once deleted, the inbox’s account link is dropped and it can never be registered again (`inbox/register` answers `conflict`). The first successor recorded stays while it still qualifies (another one is `conflict`); one that no longer does (recorded before a key change) is replaced. The successor is recorded first and kept 90 days, and dropped again if the inbox refuses the deletion or can’t be reached; repeating the request answers `ok` once the inbox is gone. Without it, nothing changes.',
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
     ),
-    requestBody: ownerBody('inbox/delete', { inboxId }),
+    requestBody: ownerBody('inbox/delete', {
+      inboxId,
+      successor: buddiesId(
+        'The inbox that replaces this one after a key change. Bearer only'
+      ).optional(),
+    }),
     responses: {
       200: jsonResponse('Deleted.', okSchema),
-      ...refusals(
-        ownerRefusals('write', { killSwitch: false, suspendable: false })
-      ),
+      ...refusals({
+        ...ownerRefusals('write', { killSwitch: false, suspendable: false }),
+        unauthorized: `${DEFAULT_REASONS.unauthorized} With \`successor\`, also a token whose session ended (a key change ends every other session) or is behind the account’s key epoch.`,
+        forbidden: `${DEFAULT_REASONS.forbidden} Also \`successor\` in a legacy request.`,
+        suspended:
+          'With `successor`: the inbox’s account is suspended. Deleting without one still works.',
+        conflict:
+          '`successor` is this inbox, isn’t registered (deleted or wiped), isn’t linked to the same account at its current key epoch, has a successor of its own, or differs from a successor already recorded that still qualifies. Nothing is deleted.',
+        disabled:
+          'With `successor`, on a worker without the accounts database.',
+      }),
     },
   }),
 
@@ -754,7 +782,7 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
   'slot/leave': describeOp({
     summary: 'Leave a buddy’s inbox',
     description: paragraphs(
-      'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave.',
+      'The writer removes its own slot (with its card and events) from the recipient’s inbox, when ending a connection. Idempotent: an unknown inbox or slot succeeds, since there is nothing left to leave. A sealed slot (`slot/seal`) keeps its events for the owner until they expire (its card goes), so leaving can’t delete a reconnect invite.',
       SIGNED_BY.writer,
       `${tierLine('write')} Works for a suspended account.`,
       KILL_SWITCH_EXEMPT
@@ -776,6 +804,37 @@ export const buddiesOpDocs: Record<BuddiesOp, MiddlewareHandler> = {
         ...AUTH_REFUSALS,
         replay: true,
         rate_limited: `${edgeLimited('write')}.`,
+      }),
+    },
+  }),
+
+  'slot/seal': describeOp({
+    summary: 'Seal your slot in a buddy’s inbox',
+    description: paragraphs(
+      'After an account key change (witness-work ADR 0039 §5) the old account key’s holder holds the User’s writer keys too, since they derive from it. The User’s device seals each slot it writes from, before it leaves: from then on every writer op from the slot but `slot/leave` and `slot/seal` is 403 `sealed`, in either form, for good (nothing unseals a slot). A write racing the seal either lands before it or is refused. The slot’s card and events stay, and the owner sees `sealed: true` on it in `inbox/sync` and can still remove it. Idempotent. Stores nothing new: no account, only the flag on the slot.',
+      SIGNED_BY.writer,
+      `${tierLine('write')} Works for a suspended account.`,
+      KILL_SWITCH_EXEMPT
+    ),
+    requestBody: signedBody(
+      signedPayload({
+        inboxId: buddiesId('The recipient’s inbox'),
+        slotId: buddiesId('Your slot in it'),
+      }),
+      'Writer-signed (op `slot/seal`).'
+    ),
+    responses: {
+      200: jsonResponse('Sealed (or already sealed).', okSchema),
+      ...refusals({
+        bad_request: true,
+        bad_signature:
+          'Signature missing, malformed, or not by the slot’s writer key.',
+        stale: true,
+        ...AUTH_REFUSALS,
+        not_found: true,
+        gone: 'The slot doesn’t exist: you left, or the inbox owner removed you. Nothing to seal.',
+        replay: true,
+        rate_limited: `${edgeLimited('write')}, or (sealing again) ${WRITER_BUDGET} are spent; the first seal of an open slot doesn’t count against them.`,
       }),
     },
   }),
@@ -875,17 +934,18 @@ const fieldHeaders = (op: string, fields: z.ZodRawShape) => [
   },
 ]
 
-const { gone, replaced, suspended } = BUDDIES_LIVE_CLOSE
+const { gone, replaced, suspended, expired } = BUDDIES_LIVE_CLOSE
 
 export const buddiesLiveDocs = describeOp({
   summary: 'Live socket (WebSocket)',
   description: paragraphs(
     'Upgrades to a WebSocket that says *that* the owner’s inbox changed, so the app syncs within a second while in the foreground. It never carries content. The request rides in headers, since an upgrade has no body and ids never go in URLs. Opening a socket is not owner activity for the 180-day retention.',
     '**Bearer:** `Authorization: Bearer <access token>` and `x-buddies-payload` (no signature). Same account check as an owner op: `forbidden` for another account’s inbox, `not_linked` for one with no confirmed link.',
+    '**Browsers** can’t set headers on a WebSocket, so they mint a `buddies` ticket for their inbox with `POST /accounts/v1/live/ticket` and offer `Sec-WebSocket-Protocol: ww.v1, ticket.<ticket>` instead (any order; no `Authorization` or `x-buddies-payload`; never the access token, which Cloudflare’s logs would record). It’s always a bearer upgrade, the ticket standing in for the token, checked like one. Checked in this order: the `Origin` must be one of the web app’s (`WEB_APP_ORIGINS`), else `forbidden`; an offer without `ww.v1`, with a repeated or unknown entry, or that isn’t a list of tokens is `bad_request`; then the kill switch (`disabled`); a missing, forged, expired (30 s), or Cloud Sync ticket is `unauthorized`; then the bearer checks (read tier, upgrade, the inbox’s ownership, `not_linked`, suspension); and while a socket opened with the same ticket is open, another is `conflict`. The 101 answers `Sec-WebSocket-Protocol: ww.v1`. Page script can’t see these statuses (a refused handshake is only a close), so mint a fresh ticket for every connect, never reuse one, and reconnect with backoff. No id goes in the URL, and the ticket names its ids sealed.',
     `**Legacy** (no \`Authorization\` header): the owner-signed envelope (op \`inbox/live\`) in \`x-buddies-payload\` and \`x-buddies-signature\`, with the same \`stale\` and \`replay\` checks as a POST owner op. ${LEGACY_SWITCH}`,
     '**Server → app messages:**\n\n- `{"type":"hello","seq":N}` right after the upgrade, `N` being the inbox head.\n- `{"type":"changed","seq":N}` after every committed write that changes what `inbox/sync` returns: new events, cards, the roster, a delivered claim, and slot changes. Slot changes don’t advance `seq`, so sync on every `changed`.',
     '**Keepalive:** send the text `ping` about every 25 s; the relay answers `pong` without waking the inbox. Anything else the app sends is ignored.',
-    `**Close codes:** \`${gone.code} "${gone.reason}"\` the inbox was deleted or wiped (sync, which restores it); \`${replaced.code} "${replaced.reason}"\` an ${BUDDIES_LIMITS.liveSockets + 1}th socket opened and closed the oldest (at most ${BUDDIES_LIMITS.liveSockets} per inbox); \`${suspended.code} "${suspended.reason}"\` the inbox’s account was suspended. Reconnect with backoff while in the foreground.`,
+    `**Close codes:** \`${gone.code} "${gone.reason}"\` the inbox was deleted or wiped (sync, which restores it); \`${replaced.code} "${replaced.reason}"\` an ${BUDDIES_LIMITS.liveSockets + 1}th socket opened and closed the oldest (at most ${BUDDIES_LIMITS.liveSockets} per inbox); \`${suspended.code} "${suspended.reason}"\` the inbox’s account was suspended; \`${expired.code} "${expired.reason}"\` (browser sockets only) the access token its ticket was minted with expired, so refresh, mint a ticket, and reconnect. Header sockets outlive their token, so a browser session’s (\`web\`) token is refused there with \`403 forbidden\`. Reconnect with backoff while in the foreground.`,
     `${tierLine('read')} The upgrade also counts toward ${OWNER_BUDGET}.`,
     `${KILL_SWITCH_OFF} Turning it off refuses new sockets but doesn’t close open ones.`
   ),
@@ -898,13 +958,26 @@ export const buddiesLiveDocs = describeOp({
       description: 'Must be `websocket`, else `426 upgrade_required`.',
     },
     ...fieldHeaders('inbox/live', { inboxId: buddiesId('Your inbox') }),
+    {
+      name: 'Sec-WebSocket-Protocol',
+      in: 'header' as const,
+      required: false,
+      schema: { type: 'string' as const },
+      description:
+        'Browsers only: `ww.v1, ticket.<ticket>` (a `buddies` ticket from `POST /accounts/v1/live/ticket`), in place of `Authorization` and `x-buddies-payload`. Needs an allowed `Origin`.',
+    },
   ],
   responses: {
-    101: { description: 'Switching protocols: the socket is open.' },
+    101: {
+      description:
+        'Switching protocols: the socket is open. A browser upgrade gets `Sec-WebSocket-Protocol: ww.v1`.',
+    },
     ...refusals({
       ...ownerRefusals('read'),
       bad_request:
-        'Missing or malformed `x-buddies-payload`, a bad payload, or a bearer upgrade with `x-buddies-signature`.',
+        'Missing or malformed `x-buddies-payload`, a bad payload, a bearer upgrade with `x-buddies-signature`, or a malformed `Sec-WebSocket-Protocol` offer.',
+      conflict:
+        'Browsers only: a socket opened with this ticket is still open. Mint another; a copied ticket never opens a second socket.',
       upgrade_required:
         'Not a WebSocket upgrade (`Upgrade: websocket`), or a legacy upgrade after the legacy switch (KV `auth:legacy`) was turned off. No `Retry-After`.',
     }),
@@ -976,6 +1049,39 @@ export const buddiesBlobPutDocs = describeOp({
       too_large: `\`bytes\`, \`Content-Length\`, or the streamed body is over ${kib(BUDDIES_LIMITS.blobBytes)}.`,
       rate_limited: `${edgeLimited('blobPut')}, ${OWNER_BUDGET} are spent, or a per-inbox cap is hit (\`Retry-After\` until the soonest live blob expires or the oldest upload leaves the day).`,
       photos_disabled: true,
+    }),
+  },
+})
+
+export const buddiesSuccessorDocs = describeRoute({
+  tags: TAGS,
+  security: [{ bearerAuth: [] }],
+  summary: 'Read an inbox’s successor',
+  description: paragraphs(
+    'The inbox that replaced `inboxId` after its account’s key changed (witness-work ADR 0039 §5), as `inbox/delete` with `successor` recorded it, or `null`. A buddy accepts a `pair.reconnect` from the old inbox only when this names the offered inbox. Checked at every read: `null` unless the recorded successor is still linked to the same account at the account’s current key epoch and the account isn’t suspended (so one recorded before a key change, by anyone holding the old key, is never vouched for after it), and for an inbox nobody replaced or one recorded over 90 days ago. Anyone with a token who knows the old `inboxId` learns that it was replaced, and by which inbox.',
+    '**Bearer only:** `Authorization: Bearer <access token>` of any account, and `{ "inboxId" }` as plain JSON (an envelope is `bad_request`). No legacy form: without the header it’s `unauthorized`.',
+    tierLine('read'),
+    KILL_SWITCH_OFF
+  ),
+  requestBody: jsonBody(
+    z.object({ inboxId: buddiesId('The replaced (old) inbox') }),
+    'Plain JSON.'
+  ),
+  responses: {
+    200: jsonResponse(
+      'The successor, or `null`.',
+      z.object({
+        ok: z.literal(true),
+        successor: buddiesId('The inbox that replaced it')
+          .nullable()
+          .meta({ description: 'The inbox that replaced it, or `null`.' }),
+      })
+    ),
+    ...refusals({
+      bad_request: true,
+      unauthorized: `${DEFAULT_REASONS.unauthorized} Also a request without one.`,
+      rate_limited: `${edgeLimited('read')}.`,
+      disabled: `${DEFAULT_REASONS.disabled} Also a worker without the accounts database.`,
     }),
   },
 })

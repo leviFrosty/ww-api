@@ -56,7 +56,7 @@ export const appConfigDocs = describeRoute({
   tags: ['Service'],
   summary: 'App configuration',
   description:
-    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var; edge-cached for 60 seconds. Also Cloud Sync’s switches (`sync`). No authentication.',
+    'What the app reads at launch and when it returns to the foreground. Below `minAppVersion` it shows a blocking Update Required screen with a store link. From KV `app:min-version` (`{"minVersion":"1.42.0"}`), then the `APP_MIN_VERSION` var (the KV read is edge-cached for 60 seconds; the response is `no-store`). Also Cloud Sync’s switches (`sync`), web sign-up’s (`webSignup`), and the caller’s coarse location (`country`, `regionCode`) for the app’s sales-region check. Query `capabilities` (comma-separated, for example `sync-everyone`): what the app does, as on session open. No authentication.',
   responses: {
     200: jsonResponse(
       'The configuration.',
@@ -78,12 +78,42 @@ export const appConfigDocs = describeRoute({
             }),
             entitlement: z.enum(['supporter', 'everyone']).meta({
               description:
-                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `supporter`).',
+                'Who gets it: Supporters, or everyone (KV `sync:entitlement`, then the `SYNC_ENTITLEMENT` var, else `everyone`; witness-work ADR 0040). `everyone` only when `?capabilities=` has `sync-everyone`; otherwise `supporter`.',
             }),
           })
           .meta({
             description:
               'Cloud Sync’s switches (witness-work ADR 0030), so a device without a session knows whether opening one would get it Cloud Sync. `GET /accounts/v1/sync` gives the account’s own answer.',
+          }),
+        webSignup: z
+          .object({
+            enabled: z.boolean().meta({
+              description:
+                'Whether web sign-up is open (KV `accounts:web-signup`, then the `WEB_SIGNUP` var; a failed KV read counts as on). False on a worker without the accounts database, passkeys, or Turnstile. While false, the web says sign-up is paused.',
+            }),
+            turnstileSiteKey: z.string().nullable().meta({
+              description:
+                'The Turnstile site key for the web’s sign-up and recovery widgets (Cloudflare’s test key on development workers without one). Present even while sign-up is off, since recovery uses it too; null without Turnstile.',
+            }),
+          })
+          .meta({ description: 'Web sign-up’s switch and Turnstile site key.' }),
+        country: z
+          .string()
+          .regex(/^[A-Z]{2}$/)
+          .nullable()
+          .meta({
+            description:
+              'The caller’s country (ISO 3166-1 alpha-2, upper case) from Cloudflare’s `request.cf.country`, for the app’s sales-region check (witness-work ADR 0041 §3). Null when unknown (`XX`), Tor (`T1`), or malformed. Coarse location only; never stored or logged.',
+            example: 'CA',
+          }),
+        regionCode: z
+          .string()
+          .regex(/^[A-Z0-9]{1,3}$/)
+          .nullable()
+          .meta({
+            description:
+              'The caller’s subdivision from `request.cf.regionCode`: its ISO 3166-2 code without the country prefix, upper case (`MB` for Manitoba). Null when unknown or malformed, and whenever `country` is null. Null means the subdivision is unknown, not that it’s outside any rule: the web app treats `CA` with a null `regionCode` as possibly Manitoba or Saskatchewan and doesn’t sell there. Coarse location only; never stored or logged.',
+            example: 'MB',
           }),
       })
     ),

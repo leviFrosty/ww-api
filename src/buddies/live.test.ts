@@ -55,6 +55,7 @@ const error = (status: number, code: string) => ({
   status,
   body: relayError(code),
   socket: null,
+  protocol: null,
 })
 
 /** Opens a socket and returns its client end. */

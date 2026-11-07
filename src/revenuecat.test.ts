@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
+  countsWebSandboxSubscriptions,
   fetchSupporterStatus,
   isSupporter,
   LIFETIME_SUPPORTER_ENTITLEMENT,
@@ -299,5 +301,212 @@ describe('fetchSupporterStatus deadline', () => {
     }) as typeof fetch
     await read(capture)
     expect(signal).toBeInstanceOf(AbortSignal)
+  })
+})
+
+// RevenueCat Billing (web) purchases, in the shape RevenueCat answers for a
+// sandbox Stripe test card. Ids and dates are made up.
+const SOONER = '2026-12-01T00:00:00Z'
+const webMonthly = (isSandbox: boolean, expires = FUTURE) => ({
+  display_name: 'Web Monthly',
+  expires_date: expires,
+  is_sandbox: isSandbox,
+  period_type: 'normal',
+  price: { amount: 3.99, currency: 'USD' },
+  purchase_date: '2026-06-01T00:00:00Z',
+  store: 'rc_billing',
+  store_transaction_id: 'sub_test_0000000000000000',
+})
+const webSubscriber = (isSandbox: boolean) => ({
+  entitlements: {
+    'Monthly Donator': {
+      expires_date: FUTURE,
+      product_identifier: 'web_jwtime_399_1mo',
+    },
+  },
+  subscriptions: { web_jwtime_399_1mo: webMonthly(isSandbox) },
+})
+
+const status = (
+  sub: Record<string, unknown>,
+  options: { countWebSandbox?: boolean } = {}
+) =>
+  fetchSupporterStatus({
+    apiKey: 'sk_test',
+    appUserId: 'uuid-123',
+    fetchImpl: fakeFetch(200, { subscriber: sub }),
+    nowMs: NOW,
+    ...options,
+  })
+
+describe('web sandbox subscriptions', () => {
+  it('ignores an rc_billing sandbox subscription by default', async () => {
+    expect(await status(webSubscriber(true))).toEqual({
+      known: true,
+      supporter: false,
+      expiresAt: null,
+    })
+  })
+
+  it('counts an rc_billing sandbox subscription with the switch on', async () => {
+    expect(
+      await status(webSubscriber(true), { countWebSandbox: true })
+    ).toEqual({ known: true, supporter: true, expiresAt: Date.parse(FUTURE) })
+  })
+
+  it('counts an rc_billing production subscription either way', async () => {
+    for (const countWebSandbox of [false, true]) {
+      expect(
+        (await status(webSubscriber(false), { countWebSandbox })).supporter
+      ).toBe(true)
+    }
+  })
+
+  it('counts an App Store sandbox subscription either way', async () => {
+    const sandbox = {
+      ...monthly,
+      subscriptions: {
+        jwtime_399_1mo: {
+          expires_date: FUTURE,
+          is_sandbox: true,
+          store: 'app_store',
+        },
+      },
+    }
+    for (const countWebSandbox of [false, true]) {
+      expect((await status(sandbox, { countWebSandbox })).supporter).toBe(true)
+    }
+  })
+
+  it('counts an App Store subscription beside an ignored one, to its expiry', async () => {
+    expect(
+      await status({
+        entitlements: {
+          'Monthly Donator': {
+            expires_date: FUTURE,
+            product_identifier: 'web_jwtime_399_1mo',
+          },
+          'Annual Donator': {
+            expires_date: SOONER,
+            product_identifier: 'jwtime_4799_1yr',
+          },
+        },
+        subscriptions: {
+          web_jwtime_399_1mo: webMonthly(true),
+          jwtime_4799_1yr: { expires_date: SOONER, store: 'app_store' },
+        },
+      })
+    ).toEqual({ known: true, supporter: true, expiresAt: Date.parse(SOONER) })
+  })
+
+  it('finds an App Store subscription an ignored one shadows on the same entitlement', async () => {
+    // RevenueCat names one product per entitlement, the one that ends last,
+    // so a later web sandbox purchase hides the App Store one behind it.
+    expect(
+      await status({
+        entitlements: {
+          'Monthly Donator': {
+            expires_date: FUTURE,
+            product_identifier: 'web_jwtime_399_1mo',
+          },
+        },
+        subscriptions: {
+          web_jwtime_399_1mo: webMonthly(true),
+          jwtime_399_1mo: { expires_date: SOONER, store: 'app_store' },
+        },
+      })
+    ).toEqual({ known: true, supporter: true, expiresAt: Date.parse(SOONER) })
+  })
+
+  it('ignores an expired subscription an ignored one shadows', async () => {
+    expect(
+      (
+        await status({
+          entitlements: {
+            'Monthly Donator': {
+              expires_date: FUTURE,
+              product_identifier: 'web_jwtime_399_1mo',
+            },
+          },
+          subscriptions: {
+            web_jwtime_399_1mo: webMonthly(true),
+            jwtime_399_1mo: { expires_date: PAST, store: 'app_store' },
+          },
+        })
+      ).supporter
+    ).toBe(false)
+  })
+
+  it('still counts a promotional grant and Lifetime Supporter', async () => {
+    const lifetime = `rc_promo_${LIFETIME_SUPPORTER_ENTITLEMENT}_lifetime`
+    expect(
+      (
+        await status({
+          entitlements: {
+            'Monthly Donator': {
+              expires_date: FUTURE,
+              product_identifier: 'rc_promo_Monthly Donator_monthly',
+            },
+          },
+          subscriptions: {
+            'rc_promo_Monthly Donator_monthly': {
+              expires_date: FUTURE,
+              store: 'promotional',
+            },
+          },
+        })
+      ).supporter
+    ).toBe(true)
+    expect(
+      (
+        await status({
+          entitlements: {
+            [LIFETIME_SUPPORTER_ENTITLEMENT]: {
+              expires_date: PROMO_LIFETIME,
+              product_identifier: lifetime,
+            },
+          },
+          subscriptions: {
+            [lifetime]: { expires_date: PROMO_LIFETIME, store: 'promotional' },
+          },
+        })
+      ).supporter
+    ).toBe(true)
+  })
+})
+
+describe('countsWebSandboxSubscriptions', () => {
+  it('is never set for the production worker', () => {
+    const toml = readFileSync(
+      new URL('../wrangler.toml', import.meta.url),
+      'utf8'
+    )
+    const topLevel = toml.split(/^\[env\./m)[0]
+    expect(topLevel).not.toMatch(/REVENUECAT_COUNT_WEB_SANDBOX/)
+  })
+
+  it('is on only on a development worker with the var set', () => {
+    expect(
+      countsWebSandboxSubscriptions({
+        APP_ATTEST_ENVIRONMENT: 'development',
+        REVENUECAT_COUNT_WEB_SANDBOX: 'true',
+      })
+    ).toBe(true)
+    expect(
+      countsWebSandboxSubscriptions({ APP_ATTEST_ENVIRONMENT: 'development' })
+    ).toBe(false)
+    for (const value of ['false', '1', 'TRUE'])
+      expect(
+        countsWebSandboxSubscriptions({
+          APP_ATTEST_ENVIRONMENT: 'development',
+          REVENUECAT_COUNT_WEB_SANDBOX: value,
+        })
+      ).toBe(false)
+    expect(
+      countsWebSandboxSubscriptions({
+        APP_ATTEST_ENVIRONMENT: 'production',
+        REVENUECAT_COUNT_WEB_SANDBOX: 'true',
+      })
+    ).toBe(false)
   })
 })

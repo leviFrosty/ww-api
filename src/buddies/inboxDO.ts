@@ -11,6 +11,7 @@ import { deleteAllThen, readSeqPage } from '../durableObjectStorage'
 import {
   BUDDIES_LIMITS as LIMITS,
   BUDDIES_LIVE_ACCOUNT_HEADER,
+  BUDDIES_LIVE_EXPIRES_HEADER,
   BUDDIES_LIVE_CLOSE,
   BUDDIES_LIVE_OP,
   INVITE_CLAIMED_KIND,
@@ -61,6 +62,14 @@ import {
 import { BUDDIES_ABUSE_LIMITS as ABUSE, SignerBudget, logLimitHit } from './limits'
 import { buddiesErrorResponse } from './errorResponse'
 import { retryAfterSeconds } from '../errors'
+import {
+  closeExpiredSockets,
+  readLiveExpiry,
+  readLiveTicketHash,
+  isTicketOpen,
+  LIVE_TICKET_HEADER,
+  soonestSocketExpiry,
+} from '../liveSubprotocol'
 
 type Empty = Record<string, never>
 
@@ -152,13 +161,23 @@ type BlobRow = {
 /** `WebSocket.READY_STATE_OPEN`. */
 const SOCKET_OPEN = 1
 
-/** Stored on each live socket; survives hibernation. */
-type LiveAttachment = { openedAt: number }
+/**
+ * Stored on each live socket; survives hibernation. `expiresAt` (epoch ms)
+ * is a browser socket's token expiry and `ticket` its ticket's hash
+ * (`LIVE_TICKET_HEADER`); native sockets have neither.
+ */
+type LiveAttachment = { openedAt: number; expiresAt?: number; ticket?: string }
 
-const openedAt = (ws: WebSocket): number => {
-  const attachment = ws.deserializeAttachment() as LiveAttachment | null
-  return attachment?.openedAt ?? 0
-}
+const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
+  (ws.deserializeAttachment() as LiveAttachment | null) ?? null
+
+const openedAt = (ws: WebSocket): number => attachmentOf(ws)?.openedAt ?? 0
+
+const expiryOf = (ws: WebSocket): number | null =>
+  attachmentOf(ws)?.expiresAt ?? null
+
+const ticketOf = (ws: WebSocket): string | null =>
+  attachmentOf(ws)?.ticket ?? null
 
 /** Live sockets carry only these tiny signals, never content. */
 type LiveMessage = { type: 'hello' | 'changed'; seq: number }
@@ -190,10 +209,13 @@ const SCHEMA = [
      created_at     INTEGER NOT NULL,
      last_active_at INTEGER NOT NULL
    )`,
+  // `sealed`: its writer sealed it (`slot/seal`); never cleared. Inboxes
+  // from before it get the column in place (`#ready`).
   `CREATE TABLE IF NOT EXISTS slot (
      slot_id    TEXT PRIMARY KEY,
      writer_pub TEXT NOT NULL,
-     created_at INTEGER NOT NULL
+     created_at INTEGER NOT NULL,
+     sealed     INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE TABLE IF NOT EXISTS card (
      slot_id    TEXT PRIMARY KEY,
@@ -800,7 +822,10 @@ export class BuddyInbox extends DurableObject<Environment> {
     return result
   }
 
-  /** Idempotent: a missing inbox or slot means there is nothing left to leave. */
+  /**
+   * Idempotent: a missing inbox or slot means there is nothing left to leave.
+   * Leaving a sealed slot keeps its events (`#departSealedSlot`).
+   */
   async leaveSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
     const key = this.#key(call, 'writer')
     if (!key.ok) return ok({})
@@ -812,13 +837,52 @@ export class BuddyInbox extends DurableObject<Environment> {
     )
     if (!valid) return fail('bad_signature')
     let removed = false
-    const result = this.#commit(call, 'writer', key.value, () => {
-      removed = this.#deleteSlot(call.slotId)
-      return ok({})
-    })
+    const result = this.#commit(
+      call,
+      'writer',
+      key.value,
+      () => {
+        removed = this.#sealed(call.slotId)
+          ? this.#departSealedSlot(call.slotId)
+          : this.#deleteSlot(call.slotId)
+        return ok({})
+      },
+      { whileSealed: true }
+    )
     if (removed) this.#broadcastChanged()
     if (!result.ok && (result.error === 'gone' || result.error === 'not_found'))
       return ok({})
+    return result
+  }
+
+  /**
+   * `slot/seal` (witness-work ADR 0039 §5): after a key change, whoever holds
+   * the old account key holds the User's writer keys too, so the User's
+   * device seals each slot it writes from before it leaves. From then on
+   * every writer op from the slot but leaving and sealing again is `sealed`
+   * (`#commit`), for good. The owner still reads what's there and can remove
+   * the slot. Idempotent. Unlike `slot/leave`, a missing inbox or slot is an
+   * error: nothing was sealed.
+   */
+  async sealSlot(call: Signed<SlotPayload>): Promise<BuddiesResult<Empty>> {
+    const auth = await this.#authenticate('slot/seal', call, 'writer')
+    if (!auth.ok) return auth
+    let sealed = false
+    const result = this.#commit(
+      call,
+      'writer',
+      auth.value,
+      () => {
+        if (!this.#sealed(call.slotId)) {
+          this.#sql.exec('UPDATE slot SET sealed = 1 WHERE slot_id = ?', call.slotId)
+          sealed = true
+        }
+        return ok({})
+      },
+      { whileSealed: true }
+    )
+    // The owner's `inbox/sync` shows it.
+    if (sealed) this.#broadcastChanged()
     return result
   }
 
@@ -984,10 +1048,24 @@ export class BuddyInbox extends DurableObject<Environment> {
    * the account the Worker verified (`BUDDIES_LIVE_ACCOUNT_HEADER`, which it
    * sets only from a valid token), then accepts the socket with the
    * Hibernation API and greets it with the current `seq`. Opening a socket is
-   * not owner activity for the 180-day retention.
+   * not owner activity for the 180-day retention. A browser socket's token
+   * expiry (`BUDDIES_LIVE_EXPIRES_HEADER`, also set only by the Worker) is
+   * one of the alarm's deadlines; the alarm closes it with `4004 "expired"`.
+   * While a socket on the browser's ticket (`LIVE_TICKET_HEADER`, its hash,
+   * set only by the Worker) is open, another is 409 `conflict`, so a copied
+   * ticket can't push the owner's sockets off.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return liveError(fail('upgrade_required'))
+    const expiresAt = readLiveExpiry(
+      request.headers.get(BUDDIES_LIVE_EXPIRES_HEADER)
+    )
+    const ticket = readLiveTicketHash(request.headers.get(LIVE_TICKET_HEADER))
+    if (expiresAt === undefined || ticket === undefined)
+      return liveError(fail('bad_request'))
+    // Only a socket that passed every check below holds this ticket.
+    if (ticket != null && isTicketOpen(this.#liveSockets(), ticket, ticketOf))
+      return liveError(fail('conflict'))
     const call = this.#liveCall(request.headers, Date.now())
     if (!call.ok) return liveError(call)
     const auth = await this.#authenticate(BUDDIES_LIVE_OP, call.value, 'owner')
@@ -1003,7 +1081,11 @@ export class BuddyInbox extends DurableObject<Environment> {
 
     const [client, server] = Object.values(new WebSocketPair())
     this.ctx.acceptWebSocket(server)
-    const attachment: LiveAttachment = { openedAt: Date.now() }
+    const attachment: LiveAttachment = {
+      openedAt: Date.now(),
+      ...(expiresAt == null ? {} : { expiresAt }),
+      ...(ticket == null ? {} : { ticket }),
+    }
     server.serializeAttachment(attachment)
     // One socket per device is typical; past the cap the oldest make way.
     const others = this.#liveSockets()
@@ -1014,6 +1096,7 @@ export class BuddyInbox extends DurableObject<Environment> {
     for (const ws of others.slice(0, Math.max(0, excess)))
       closeQuietly(ws, code, reason)
     this.#signal(server, { type: 'hello', seq: admitted.value })
+    if (expiresAt != null) await this.#ensureAlarm(Date.now())
     return new Response(null, { status: 101, webSocket: client })
   }
 
@@ -1132,6 +1215,15 @@ export class BuddyInbox extends DurableObject<Environment> {
   }
 
   /**
+   * Whether this inbox is registered and not deleted or wiped: an inbox's
+   * successor must be (witness-work ADR 0039 §5). Reads only; creates
+   * nothing.
+   */
+  async isRegistered(inboxId: string): Promise<boolean> {
+    return this.#meta()?.inboxId === inboxId
+  }
+
+  /**
    * The accounts database linked this inbox to `accountId`, after this inbox
    * accepted the owner-signed registration: from now on that account's
    * bearer requests act as the owner. It's the database's winner, so when
@@ -1183,10 +1275,12 @@ export class BuddyInbox extends DurableObject<Environment> {
 
   /**
    * Retention: events at 30 days, blobs at their `expiresAt`, the weekly
-   * blob sweep, invite bookkeeping, and the 180-day wipe.
+   * blob sweep, invite bookkeeping, and the 180-day wipe. Also closes
+   * browser sockets whose token expired (their expiries are deadlines too).
    */
   async alarm(): Promise<void> {
     const now = Date.now()
+    closeExpiredSockets(this.#liveSockets(), expiryOf, now)
     if (!this.#ready()) return
     const idle = this.#idleOwnerPub(now)
     if (idle) {
@@ -1199,7 +1293,9 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!this.#ready()) return
     }
     this.ctx.storage.transactionSync(() => this.#prune(now))
-    await this.#flushBlobDeletes()
+    // A socket's expiry can wake the alarm before R2's retry backoff is up.
+    const backoff = this.#blobDeleteBackoff()
+    if (!backoff || backoff.retryAt <= now) await this.#flushBlobDeletes()
     await this.#sweepBlobs(now)
     await this.#retryInviteDeletes(now)
     if (
@@ -1259,6 +1355,11 @@ export class BuddyInbox extends DurableObject<Environment> {
     }
     if (ref === 'owner' && !SUSPENDED_ALLOWED_OPS.has(op) && this.#suspended())
       return fail('suspended')
+    // The first seal of an open slot skips the budget: whoever else holds
+    // the writer key can spend it, and must not keep the slot open that way.
+    // A re-seal counts, so its nonces stay bounded.
+    if (op === 'slot/seal' && call.slotId && !this.#sealed(call.slotId))
+      return key
     const [budget, limit] =
       ref === 'owner'
         ? [ABUSE.ownerRequests, 'ownerRequests']
@@ -1288,13 +1389,22 @@ export class BuddyInbox extends DurableObject<Environment> {
    * synchronous transaction, so each signed request still takes effect at
    * most once, and only within ±5 minutes. Account calls carry no nonce and
    * record none.
+   *
+   * A writer op from a sealed slot is `sealed` unless `whileSealed` (only
+   * `slot/leave` and `slot/seal`), so a writer op added later is refused by
+   * default. Checked here, in the transaction the write runs in, after the
+   * signature check's await: a write racing `slot/seal` either commits
+   * before it or sees the seal.
    */
   #commit<T>(
     call: AuthCall,
     ref: KeyRef,
     verifiedKey: string,
     work: (now: number) => BuddiesResult<T>,
-    { activity = ref === 'owner' }: { activity?: boolean } = {}
+    {
+      activity = ref === 'owner',
+      whileSealed = false,
+    }: { activity?: boolean; whileSealed?: boolean } = {}
   ): BuddiesResult<T> {
     const now = Date.now()
     return this.ctx.storage.transactionSync((): BuddiesResult<T> => {
@@ -1305,6 +1415,13 @@ export class BuddyInbox extends DurableObject<Environment> {
         ? this.#refuseAccount(call.accountId)?.error
         : this.#admit(call, now)
       if (denied) return fail(denied)
+      if (
+        ref === 'writer' &&
+        !whileSealed &&
+        call.slotId &&
+        this.#sealed(call.slotId)
+      )
+        return fail('sealed')
       if (activity) this.#touch(now)
       const result = work(now)
       if (result.ok) {
@@ -1392,6 +1509,11 @@ export class BuddyInbox extends DurableObject<Environment> {
       if (!this.#hasColumn('push_device', 'app_alerts')) {
         this.#sql.exec(
           'ALTER TABLE push_device ADD COLUMN app_alerts INTEGER NOT NULL DEFAULT 0'
+        )
+      }
+      if (!this.#hasColumn('slot', 'sealed')) {
+        this.#sql.exec(
+          'ALTER TABLE slot ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0'
         )
       }
       if (this.#hasTable('device')) this.#migrateDevices()
@@ -1520,6 +1642,16 @@ export class BuddyInbox extends DurableObject<Environment> {
           writerPub: string
         }>('SELECT writer_pub AS writerPub FROM slot WHERE slot_id = ?', slotId)
         .toArray()[0]?.writerPub ?? null
+    )
+  }
+
+  /** Whether the slot's writer sealed it (`slot/seal`). */
+  #sealed(slotId: string): boolean {
+    return (
+      this.#count(
+        'SELECT COUNT(*) AS n FROM slot WHERE slot_id = ? AND sealed = 1',
+        slotId
+      ) > 0
     )
   }
 
@@ -1834,9 +1966,15 @@ export class BuddyInbox extends DurableObject<Environment> {
     return targets
   }
 
-  /** Deletes a slot with its card and events; false when there was none. */
+  /**
+   * Deletes the slot and everything it wrote. True when that changed what
+   * `inbox/sync` returns: the slot existed, or a left sealed slot's events
+   * were still kept.
+   */
   #deleteSlot(slotId: string): boolean {
-    const existed = this.#writerPub(slotId) != null
+    const existed =
+      this.#writerPub(slotId) != null ||
+      this.#count('SELECT COUNT(*) AS n FROM event WHERE slot_id = ?', slotId) > 0
     this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM event WHERE slot_id = ?', slotId)
@@ -1844,6 +1982,22 @@ export class BuddyInbox extends DurableObject<Environment> {
     this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
     this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
     return existed
+  }
+
+  /**
+   * `slot/leave` of a sealed slot: the slot goes (no more writes, `gone`),
+   * and so do its card and write bookkeeping, but its events stay readable by
+   * the owner until they expire (`#prune`) or the owner removes the slot id.
+   * Whoever holds a sealed slot's writer key after a key change can't delete
+   * the reconnect invite in it by leaving first. Its `slot_usage` row stays
+   * with the events, so the caps still count them.
+   */
+  #departSealedSlot(slotId: string): boolean {
+    this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM card WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM slot_write WHERE slot_id = ?', slotId)
+    this.#sql.exec('DELETE FROM slot_push WHERE slot_id = ?', slotId)
+    return true
   }
 
   // --- Live-socket helpers -------------------------------------------------
@@ -1893,10 +2047,13 @@ export class BuddyInbox extends DurableObject<Environment> {
   #snapshot(since: number, now: number): SyncResponse {
     const head = this.#meta()?.seq ?? 0
     const slots = this.#sql
-      .exec<SyncSlot>(
-        'SELECT slot_id AS slotId, created_at AS createdAt FROM slot ORDER BY created_at, slot_id'
+      .exec<{ slotId: string; createdAt: number; sealed: number }>(
+        'SELECT slot_id AS slotId, created_at AS createdAt, sealed FROM slot ORDER BY created_at, slot_id'
       )
       .toArray()
+      .map(({ sealed, ...slot }): SyncSlot =>
+        sealed ? { ...slot, sealed: true } : slot
+      )
 
     // Read in whole chunks (`readSeqPage`): a page cut short must not leave
     // its cursor open.
@@ -1984,6 +2141,10 @@ export class BuddyInbox extends DurableObject<Environment> {
       )
     }
     this.#sql.exec('DELETE FROM event WHERE created_at <= ?', expiry)
+    // A left sealed slot's usage row goes with its last event.
+    this.#sql.exec(
+      'DELETE FROM slot_usage WHERE events = 0 AND slot_id NOT IN (SELECT slot_id FROM slot)'
+    )
     this.#sql.exec(
       'DELETE FROM invite WHERE expires_at <= ?',
       now - LIMITS.inviteGraceMs
@@ -2059,6 +2220,8 @@ export class BuddyInbox extends DurableObject<Environment> {
     }
     const sweep = this.#blobSweepDue()
     if (sweep != null) deadlines.push(sweep)
+    const expiry = soonestSocketExpiry(this.#liveSockets(), expiryOf)
+    if (expiry != null) deadlines.push(expiry)
     return deadlines.length ? Math.min(...deadlines) : null
   }
 

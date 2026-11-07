@@ -72,6 +72,7 @@ describe('access tokens', () => {
     expect(accessExpiresAt).toBe(NOW + 15 * 60_000)
     expect(await verifyAccessToken(keys, accessToken, NOW)).toEqual({
       ...SESSION,
+      keyEpoch: 0,
       expiresAt: accessExpiresAt,
     })
     const { header, claims } = await realParts(keys)
@@ -82,6 +83,7 @@ describe('access tokens', () => {
       sub: SESSION.accountId,
       sid: SESSION.sessionId,
       platform: 'ios',
+      kep: 0,
       iat: NOW / 1_000,
       exp: NOW / 1_000 + 900,
     })

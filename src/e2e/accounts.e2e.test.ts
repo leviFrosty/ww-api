@@ -114,6 +114,7 @@ describe('POST /accounts/v1/account/info', () => {
       accountPub: key.publicKey,
       status: 'active',
       createdAt: expect.any(Number),
+      keyEpoch: 0,
       inboxIds: [],
       statusChanges: [],
     })
@@ -223,7 +224,11 @@ describe('POST /accounts/v1/backup/*', () => {
     const bytes = randomBytes(64 * 1_024)
     const stored = await put(key, slotId, bytes)
     expect(stored.status).toBe(200)
-    expect(stored.body).toEqual({ ok: true, uploadedAt: expect.any(Number) })
+    expect(stored.body).toEqual({
+      ok: true,
+      uploadedAt: expect.any(Number),
+      etag: expect.any(String),
+    })
     // One put a slot a minute.
     const again = await put(key, slotId, bytes)
     expect(again.status).toBe(429)
@@ -232,7 +237,14 @@ describe('POST /accounts/v1/backup/*', () => {
     const listed = await send('backup/list', key)
     expect(listed.body).toEqual({
       ok: true,
-      slots: [{ slotId, size: bytes.byteLength, uploadedAt: stored.body.uploadedAt }],
+      slots: [
+        {
+          slotId,
+          size: bytes.byteLength,
+          uploadedAt: stored.body.uploadedAt,
+          etag: stored.body.etag,
+        },
+      ],
     })
 
     const got = await httpBytes('/accounts/v1/backup/get', {
@@ -240,6 +252,7 @@ describe('POST /accounts/v1/backup/*', () => {
     })
     expect(got.status).toBe(200)
     expect(got.bytes).toEqual(bytes)
+    expect(got.headers.get('etag')).toBe(`"${stored.body.etag}"`)
 
     expect((await send('backup/delete', key)).status).toBe(200)
     expect((await send('backup/list', key)).body.slots).toEqual([])
@@ -469,7 +482,8 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch (local 
       // Sessions still open (they replace account/register).
       await openSession()
     } finally {
-      localKv('delete', 'auth:legacy')
+      // Back to the suites' default: on (see src/test/e2eGlobalSetup.ts).
+      localKv('put', 'auth:legacy', 'on')
     }
     expect((await send('account/info', key)).status).toBe(200)
   })
@@ -481,6 +495,10 @@ describe('GET /app/v1/config', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('cache-control')).toBe('no-store')
     expect(res.body.ok).toBe(true)
+    // Coarse location from request.cf: always present, null when unknown.
+    expect(res.body.country === null || /^[A-Z]{2}$/.test(res.body.country)).toBe(true)
+    expect(res.body.regionCode === null || /^[A-Z0-9]{1,3}$/.test(res.body.regionCode)).toBe(true)
+    if (res.body.country === null) expect(res.body.regionCode).toBeNull()
   })
 
   it.skipIf(!LOCAL_LAUNCHER)('serves KV app:min-version', async () => {

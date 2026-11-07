@@ -8,6 +8,7 @@ import type { AppEnv, AppContext, HealthCheckResponse } from "./types";
 import { HERE_API, HTTP_STATUS } from "./config";
 import { apiError, dateHeader } from "./errors";
 import { rateLimit } from "./rateLimit";
+import { cors } from "./cors";
 import { proxyRequestToHereApi } from "./proxy";
 import {
   handleAasaRequest,
@@ -78,7 +79,9 @@ import { createSpacesRoutes } from "./spaces/route";
 import { createAccountsAdminRoutes } from "./accounts/admin";
 import { handleBuddyInvitePage } from "./buddies/invitePage";
 import { handleHandoffPage } from "./accounts/handoffPage";
+import { apexPassthrough } from "./linkHosts";
 import { createRoutePlanningRoutes } from "./routePlanning/route";
+import { createMapsRoutes, createPlacesRoutes } from "./maps/route";
 import { handleRevenueCatWebhook } from "./accounts/revenueCatWebhook";
 import { revenueCatWebhookDocs } from "./accounts/openapi";
 import { mountApiDocs } from "./openapi/route";
@@ -149,16 +152,29 @@ function handleApplicationError(error: Error, context: AppContext) {
   return apiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, "server_error");
 }
 
+// On the website apex (witnesswork.app), only the link pages and association
+// files are ww-api's; any other request a route catches goes on to the site
+// Worker (src/linkHosts.ts), so it never sees ww-api's CORS either. Every
+// other host skips it. Registered first.
+app.use("*", apexPassthrough());
+
+// CORS for the web app's origins (src/cors.ts): answers preflights before
+// every other middleware (no limiter, auth, or KV read sees one) and adds the
+// CORS headers to every answer, errors included. Registered right after the
+// apex passthrough.
+app.use("*", cors());
+
 // Scribe AI's hard cutover (src/scribe/legacy.ts): every Notes Import route
 // but `GET /notes-import/status` is 426 unless KV `scribe:legacy-notes-import`
-// is on, before its rate limit, auth, or kill switch. Registered first so it
-// runs first.
+// is on, before its rate limit, auth, or kill switch. Registered before them
+// so it runs first.
 app.use("/notes-import", notesImportCutover());
 app.use("/notes-import/*", notesImportCutover());
 
 // Each family counts in its own per-IP bucket (src/rateLimit.ts).
 app.use("/geocode", rateLimit("places"));
 app.use("/autocomplete", rateLimit("places"));
+app.use("/places/*", rateLimit("places"));
 app.use("/notes-import", rateLimit("notes-import"));
 // The usage read counts in the read edge tier instead (in its handler), so
 // opening the composer on every device never spends the imports' bucket.
@@ -173,10 +189,14 @@ app.use("/scribe/v1/step", rateLimit("scribe"));
 app.use("/scribe/v1/transcribe", rateLimit("scribe"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
+app.use("/maps/*", rateLimit("maps"));
 app.use("/app/v1/*", rateLimit("app"));
 
 app.get("/geocode", geocodeDocs, handleGeocodeRequest);
 app.get("/autocomplete", autocompleteDocs, handleAutocompleteRequest);
+// Points of interest for the web app's place field (HERE Discover), shaped
+// rather than passed through.
+app.route("/places/v1", createPlacesRoutes());
 app.get("/health", healthDocs, handleHealthCheckRequest);
 // The app's minimum version (Update Required), read at launch and foreground.
 app.get("/app/v1/config", appConfigDocs, handleAppConfigRequest);
@@ -343,6 +363,9 @@ app.get("/h", shortHandoffPageDocs, handleHandoffPage);
 // Supporter-only route ordering (HERE Waypoints Sequence); coordinates only,
 // with per-account limits in the RoutePlanningQuota DO.
 app.route("/route-planning", createRoutePlanningRoutes());
+// MapKit JS tokens for the web app's map frame (witness-work ADR 0037 §8);
+// bearer, with per-account limits.
+app.route("/maps/v1", createMapsRoutes());
 // The OpenAPI document and Scalar reference for every route above.
 mountApiDocs(app);
 app.notFound(handleNotFound);

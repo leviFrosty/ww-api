@@ -11,8 +11,9 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  * valid while its signature, issuer, audience, and expiry check out.
  *
  * Claims: the registered `iss`, `aud`, `sub` (the account id), `iat`, and
- * `exp`, plus `sid` (the session id, as in OpenID Connect) and `platform`
- * (`ios`, `android`, or `dev`).
+ * `exp`, plus `sid` (the session id, as in OpenID Connect), `platform`
+ * (`ios`, `android`, `dev`, or `web`), and `kep`, the session's key epoch
+ * (ADR 0039; a token without one counts as `0`).
  *
  * Rotation: the header's `kid` is derived from the secret that signed it, so
  * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
@@ -38,10 +39,10 @@ export const ACCESS_TOKEN_AUDIENCE = 'ww-account'
 /** `openssl rand -base64 32` is 44 characters; anything shorter is refused. */
 export const MIN_TOKEN_SECRET_CHARS = 32
 /** Clock skew allowed on `iat`, seconds. */
-const IAT_SKEW_SECONDS = 60
+export const IAT_SKEW_SECONDS = 60
 /** Far beyond any token this worker mints; longer input isn't parsed. */
 const MAX_TOKEN_CHARS = 2_048
-const ACCESS_TOKEN_SECONDS = ACCOUNT_LIMITS.accessTokenMs / 1_000
+export const ACCESS_TOKEN_SECONDS = ACCOUNT_LIMITS.accessTokenMs / 1_000
 
 export type TokenEnv = Pick<
   Environment,
@@ -55,6 +56,8 @@ export interface AccessTokenClaims {
   accountId: string
   sessionId: string
   platform: SessionPlatform
+  /** The session's key epoch when the token was issued (`kep`). */
+  keyEpoch: number
   /** Epoch milliseconds. */
   expiresAt: number
 }
@@ -106,6 +109,44 @@ export const accessTokenIssuer = (
 const encoder = new TextEncoder()
 const keyCache = new Map<string, Promise<TokenKey>>()
 
+const labelled = (label: string, secret: string) =>
+  sha256Bytes(encoder.encode(`${label}\n${secret}`))
+
+const hmacKey = (bytes: Uint8Array) =>
+  crypto.subtle.importKey(
+    'raw',
+    bytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify']
+  )
+
+const derivedKeyCache = new Map<string, Promise<CryptoKey>>()
+
+/**
+ * The HMAC-SHA256 key `label` derives from a Worker secret: the SHA-256 of
+ * `<label>\n<secret>`. Every key the accounts routes take from a secret is
+ * one of these, each kept apart from the others by its label: the refresh
+ * token and activity id keys here, the challenge and ticket keys
+ * (src/accounts/passkeyTokens.ts), and rate counter names
+ * (src/accounts/rateCounter.ts). Cached per isolate.
+ */
+export const derivedHmacKey = (
+  label: string,
+  secret: string
+): Promise<CryptoKey> => {
+  const cacheKey = `${label}\n${secret}`
+  let cached = derivedKeyCache.get(cacheKey)
+  if (!cached) {
+    // Labels can carry a day (rate counter names), so the cache is bounded.
+    if (derivedKeyCache.size >= 64) derivedKeyCache.clear()
+    cached = labelled(label, secret).then(hmacKey)
+    cached.catch(() => derivedKeyCache.delete(cacheKey))
+    derivedKeyCache.set(cacheKey, cached)
+  }
+  return cached
+}
+
 const tokenKey = (secret: string): Promise<TokenKey> => {
   let cached = keyCache.get(secret)
   if (!cached) {
@@ -113,29 +154,18 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
       const digest = await sha256Bytes(
         encoder.encode(`ww-account/v1/token-kid\n${secret}`)
       )
-      const hmac = (bytes: Uint8Array) =>
-        crypto.subtle.importKey(
-          'raw',
-          bytes,
-          { name: 'HMAC', hash: 'SHA-256' },
-          false,
-          ['sign', 'verify']
-        )
-      const labelled = (label: string) =>
-        sha256Bytes(encoder.encode(`${label}\n${secret}`))
-      const derived = (label: string) => labelled(label).then(hmac)
       const [key, macKey, rotationKey, cipherKey, nonceKey] =
         await Promise.all([
-          hmac(encoder.encode(secret)),
-          derived('ww-account/v1/refresh-mac'),
-          derived('ww-account/v1/refresh-rotation'),
-          labelled('ww-account/v1/activity-id-cipher').then((bytes) =>
+          hmacKey(encoder.encode(secret)),
+          derivedHmacKey('ww-account/v1/refresh-mac', secret),
+          derivedHmacKey('ww-account/v1/refresh-rotation', secret),
+          labelled('ww-account/v1/activity-id-cipher', secret).then((bytes) =>
             crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, [
               'encrypt',
               'decrypt',
             ])
           ),
-          derived('ww-account/v1/activity-id-nonce'),
+          derivedHmacKey('ww-account/v1/activity-id-nonce', secret),
         ])
       return {
         kid: bytesToBase64Url(digest).slice(0, 16),
@@ -151,16 +181,23 @@ const tokenKey = (secret: string): Promise<TokenKey> => {
   return cached
 }
 
-let warnedShortSecret = false
+const warnedShortSecrets = new Set<string>()
 
-const usableSecret = (value: string | undefined): string | null => {
+/**
+ * `value` trimmed, or null when it's unset or shorter than
+ * `MIN_TOKEN_SECRET_CHARS` (warned once per isolate for each `name`).
+ */
+export const usableSecret = (
+  value: string | undefined,
+  name = 'a token secret'
+): string | null => {
   const secret = value?.trim()
   if (!secret) return null
   if (secret.length >= MIN_TOKEN_SECRET_CHARS) return secret
-  if (!warnedShortSecret) {
-    warnedShortSecret = true
+  if (!warnedShortSecrets.has(name)) {
+    warnedShortSecrets.add(name)
     console.warn(
-      `accounts: a token secret is shorter than ${MIN_TOKEN_SECRET_CHARS} characters; ignoring it`
+      `accounts: ${name} is shorter than ${MIN_TOKEN_SECRET_CHARS} characters; ignoring it`
     )
   }
   return null
@@ -225,6 +262,11 @@ export const signAccessToken = async (
     accountId: string
     sessionId: string
     platform: SessionPlatform
+    /**
+     * The session's key epoch (`kep`). Defaults to `0`, which fails closed:
+     * after a key change, a write with it is refused.
+     */
+    keyEpoch?: number
     sessionExpiresAt?: number
   },
   now: number = Date.now()
@@ -243,6 +285,7 @@ export const signAccessToken = async (
     sub: session.accountId,
     sid: session.sessionId,
     platform: session.platform,
+    kep: session.keyEpoch ?? 0,
     iat,
     exp,
   })
@@ -263,12 +306,15 @@ const isPlatform = (value: unknown): value is SessionPlatform =>
 const isSeconds = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 
+const isKeyEpoch = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+
 /**
  * The claims of a token this worker signed and that hasn't expired, or null.
  * Checks, in order: three base64url segments, an `HS256` header whose `kid`
  * names a configured key, the signature, then `iss`, `aud`, `iat`, `exp`, and
- * the shapes of `sub`, `sid`, and `platform`. A `dev` token never passes on
- * production.
+ * the shapes of `sub`, `sid`, `platform`, and `kep` (absent is `0`). A `dev`
+ * token never passes on production.
  */
 export const verifyAccessToken = async (
   keys: AccessTokenKeys,
@@ -305,7 +351,7 @@ export const verifyAccessToken = async (
 
   const claims = decodeJson(payloadPart)
   if (!claims) return null
-  const { iss, aud, sub, sid, platform, iat, exp } = claims
+  const { iss, aud, sub, sid, platform, iat, exp, kep = 0 } = claims
   const nowSeconds = now / 1_000
   if (iss !== keys.issuer || aud !== ACCESS_TOKEN_AUDIENCE) return null
   if (!isSeconds(iat) || !isSeconds(exp)) return null
@@ -314,6 +360,13 @@ export const verifyAccessToken = async (
   if (!isAccountId(sub)) return null
   if (typeof sid !== 'string' || !BUDDIES_ID_PATTERN.test(sid)) return null
   if (!isPlatform(platform)) return null
+  if (!isKeyEpoch(kep)) return null
   if (platform === 'dev' && keys.issuer === 'ww-api/production') return null
-  return { accountId: sub, sessionId: sid, platform, expiresAt: exp * 1_000 }
+  return {
+    accountId: sub,
+    sessionId: sid,
+    platform,
+    keyEpoch: kep,
+    expiresAt: exp * 1_000,
+  }
 }

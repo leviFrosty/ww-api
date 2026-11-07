@@ -170,7 +170,7 @@ describe('the legacy switch', () => {
     expect(await read(null, 'on')).toBe(true)
   })
 
-  it('falls back to the var when KV fails', async () => {
+  it('counts a failed KV read as off, whatever the var says (ADR 0038 §11)', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     const failing = {
       get: async () => {
@@ -178,6 +178,7 @@ describe('the legacy switch', () => {
       },
     }
     expect(await isLegacyAuthEnabled({ NOTES_KV: failing, AUTH_LEGACY: 'off' })).toBe(false)
-    expect(await isLegacyAuthEnabled({ NOTES_KV: failing })).toBe(true)
+    expect(await isLegacyAuthEnabled({ NOTES_KV: failing, AUTH_LEGACY: 'on' })).toBe(false)
+    expect(await isLegacyAuthEnabled({ NOTES_KV: failing })).toBe(false)
   })
 })

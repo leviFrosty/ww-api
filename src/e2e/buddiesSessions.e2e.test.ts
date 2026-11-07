@@ -289,7 +289,8 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch on Budd
       if ('connection' in attempt) attempt.connection.end()
       expect((await owner.op('inbox/delete')).status).toBe(200)
     } finally {
-      localKv('delete', 'auth:legacy')
+      // Back to the suites' default: on (see src/test/e2eGlobalSetup.ts).
+      localKv('put', 'auth:legacy', 'on')
     }
     expect((await legacy.send('inbox/delete')).status).toBe(200)
   })
@@ -332,7 +333,8 @@ describe.skipIf(!LOCAL_LAUNCHER || !DEV_BYPASS_TOKEN)('the legacy switch on Budd
       expect((await extensionSync(owner, extension, 'inbox/delete')).status).toBe(426)
       expect((await owner.sync()).status).toBe(200)
     } finally {
-      localKv('delete', 'auth:legacy')
+      // Back to the suites' default: on (see src/test/e2eGlobalSetup.ts).
+      localKv('put', 'auth:legacy', 'on')
     }
     expect((await owner.op('inbox/delete')).status).toBe(200)
     expect((await unlinked.send('inbox/delete')).status).toBe(200)

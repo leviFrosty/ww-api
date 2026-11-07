@@ -23,6 +23,12 @@ export interface Environment {
    * prefix used to derive the App Attest relying-party id (`<team>.<bundle>`).
    */
   APPLE_TEAM_ID: string;
+  /**
+   * The web app's origin (`https://app.witnesswork.app`, dev
+   * `https://app-dev.witnesswork.app`), for the contact and Buddies invite
+   * pages' "Continue on the web". Unset = no such link.
+   */
+  WEB_APP_ORIGIN?: string;
   RATE_LIMITER: RateLimit;
 
   /**
@@ -99,6 +105,13 @@ export interface Environment {
    * it.
    */
   REVENUECAT_API_URL?: string;
+
+  /**
+   * Development workers only: `"true"` counts RevenueCat Billing (web)
+   * sandbox subscriptions toward Supporter status (witness-work ADR 0014).
+   * Unset, or on production, they're ignored.
+   */
+  REVENUECAT_COUNT_WEB_SANDBOX?: string;
 
   /** Explicit Worker environment; production fails closed if a dev bypass exists. */
   APP_ATTEST_ENVIRONMENT: 'development' | 'production';
@@ -316,6 +329,25 @@ export interface Environment {
   ACCOUNT_SYNC?: R2Bucket;
 
   /**
+   * Cloud Sync's photos (witness-work ADR 0040 §6): one end-to-end encrypted
+   * blob per put at `v1/<accountId>/<name>/<putId>`, written once. No age
+   * rule. Without it, `sync/photos/*` answers `photos_disabled`.
+   */
+  ACCOUNT_PHOTOS?: R2Bucket;
+
+  /**
+   * Cloud Sync photos' switch fallback when KV `sync:photos` is absent:
+   * `"off"` (or `"false"`) turns photo puts off, anything else (or unset) on.
+   */
+  SYNC_PHOTOS?: string;
+
+  /**
+   * An account's photo storage limit in bytes, when a positive integer; else
+   * 2,000,000,000. For tests and trying the full state on a local or dev worker.
+   */
+  SYNC_PHOTO_LIMIT_BYTES?: string;
+
+  /**
    * One SQLite DO per account (`idFromName(accountId)`): Cloud Sync's slot
    * metadata, change `seq`, put limits, retention alarm, and live sockets.
    */
@@ -330,10 +362,19 @@ export interface Environment {
   SYNC_ENABLED?: string;
 
   /**
-   * Who gets Cloud Sync when KV `sync:entitlement` is absent: `"everyone"`,
-   * else Supporters only.
+   * Who gets Cloud Sync when KV `sync:entitlement` is absent: `"supporter"`
+   * makes it a Supporter benefit, anything else (or unset) everyone
+   * (witness-work ADR 0040).
    */
   SYNC_ENTITLEMENT?: string;
+
+  /**
+   * The web app's origins (witness-work ADR 0038 §10), comma-separated, each
+   * matched exactly against `Origin`: CORS (src/cors.ts) and the browser's
+   * live sockets (src/liveSubprotocol.ts) admit only these. Unset: no
+   * browser access.
+   */
+  WEB_APP_ORIGINS?: string;
 
   /**
    * Signs session access tokens (HS256, witness-work ADR 0027). Secret, at
@@ -350,9 +391,105 @@ export interface Environment {
   ACCOUNT_TOKEN_SECRET_PREVIOUS?: string;
 
   /**
+   * Passkeys (witness-work ADR 0038): the RP IDs this worker accepts,
+   * comma-separated; the first is the default and the one Android origins
+   * pair with. Without it (or `PASSKEY_ORIGINS`), the passkey routes answer
+   * `disabled`.
+   */
+  PASSKEY_RP_IDS?: string;
+
+  /**
+   * Each RP ID's origins, as a JSON object (or TOML table) from RP ID to an
+   * array of origins (web origins and `android:apk-key-hash:` ones). A
+   * response's origin must pair with its RP ID here.
+   */
+  PASSKEY_ORIGINS?: string | Record<string, string[]>;
+
+  /**
+   * Signs passkey challenge tokens (`ww-challenge`). Secret, at least 32
+   * characters, distinct per worker, never the access token's. Without it,
+   * the passkey routes answer `disabled`.
+   */
+  PASSKEY_CHALLENGE_SECRET?: string;
+
+  /**
+   * Signs the tickets a browser opens a web session with (`ww-ticket`:
+   * passkey, approval, recovery). Secret, at least 32 characters, distinct
+   * per worker. Without it, ticket sessions and the passkey routes answer
+   * `disabled`.
+   */
+  ACCOUNT_TICKET_SECRET?: string;
+
+  /**
+   * Web sign-up's kill-switch fallback when KV `accounts:web-signup` is
+   * absent: `"off"` (or `"false"`) refuses both sign-up routes with 503
+   * `disabled`; anything else (and unset) leaves them on.
+   */
+  WEB_SIGNUP?: string;
+
+  /** Web sign-ups per caller IP (IPv6 by /64) a rolling day. Default 3. */
+  WEB_SIGNUP_PER_IP_DAY?: string;
+
+  /** Web sign-ups per network (ASN) a rolling hour. Default 30. */
+  WEB_SIGNUP_PER_ASN_HOUR?: string;
+
+  /** Web recoveries (`web/recovery`) per caller IP a rolling day. Default 10. */
+  WEB_RECOVERY_PER_IP_DAY?: string;
+
+  /**
+   * Turnstile's site key for web sign-up and recovery, served by
+   * `GET /app/v1/config` (`webSignup.turnstileSiteKey`). Not a secret.
+   * Development workers fall back to Cloudflare's always-passing test key.
+   */
+  TURNSTILE_SITE_KEY?: string;
+
+  /**
+   * The hostnames Siteverify may answer for a token (comma-separated): the web
+   * app's Turnstile frame (`verify.witnesswork.app`), where the widget runs.
+   * Unset, web sign-up and recovery are off, unless a development worker
+   * uses a test secret. Bare hostnames only; an origin or path is ignored.
+   */
+  TURNSTILE_HOSTNAMES?: string;
+
+  /**
+   * Turnstile's secret for Siteverify. Secret. Development workers fall back
+   * to Cloudflare's always-passing test secret; production without it has
+   * web sign-up and recovery off.
+   */
+  TURNSTILE_SECRET_KEY?: string;
+
+  /**
+   * Rolling-window counters for the accounts routes (passkey sign-in failures
+   * per IP; web sign-up and recovery caps in one `web-caps` instance), one
+   * SQLite DO per hashed name (`src/accounts/rateCounterDO.ts`).
+   */
+  ACCOUNT_RATE_COUNTER: DurableObjectNamespace<
+    import('./accounts/rateCounterDO').AccountRateCounter
+  >;
+
+  /**
+   * One SQLite Durable Object per approval channel (a browser approved from a
+   * phone, docs/passkeys-protocol.md): the browser's verifiers, sealed hello,
+   * and coarse location, the claiming phone session, the sealed key, and the
+   * `approval` ticket, for 75 seconds unclaimed or 5 minutes claimed.
+   */
+  ACCOUNT_APPROVAL: DurableObjectNamespace<
+    import('./accounts/approvalDO').AccountApproval
+  >;
+
+  /**
+   * Signs browser live socket tickets (`POST /accounts/v1/live/ticket`,
+   * src/accounts/liveTickets.ts). Secret, at least 32 characters, distinct
+   * per prod/dev worker and from `ACCOUNT_TOKEN_SECRET`. Without it, the
+   * ticket route and browser live sockets answer `disabled`; native sockets
+   * are unaffected.
+   */
+  LIVE_TICKET_SECRET?: string;
+
+  /**
    * Legacy-auth fallback when KV `auth:legacy` is absent: `"off"` refuses the
    * pre-session ways of authenticating with 426 `upgrade_required`; anything
-   * else (and unset) accepts them.
+   * else (and unset) accepts them. A failed KV read counts as off.
    */
   AUTH_LEGACY?: string;
 
@@ -448,12 +585,32 @@ export interface Environment {
   // --- Route planning ------------------------------------------------------
 
   /**
-   * One SQLite DO per account id holding only the timestamps of its route
-   * optimizations from the last 24 hours (per-account daily/minute limits).
+   * One SQLite DO per caller and limit holding only the timestamps of its
+   * charged calls from the last 24 hours (per-account daily/minute limits):
+   * route optimizations, directions, and MapKit JS tokens.
    */
   ROUTE_PLANNING_QUOTA: DurableObjectNamespace<
     import('./routePlanning/quotaDO').RoutePlanningQuota
   >;
+
+  // --- Maps (witness-work ADR 0037 §8) -------------------------------------
+
+  /**
+   * MapKit JS key, the `.p8` PKCS#8 PEM (secret). With `MAPKIT_JS_KEY_ID`,
+   * `APPLE_TEAM_ID`, and a frame origin, `POST /maps/v1/mapkit-tokens` mints
+   * tokens; without them it answers 503 `maps_unconfigured`.
+   */
+  MAPKIT_JS_PRIVATE_KEY?: string;
+
+  /** The MapKit JS key's 10-character id (secret), the JWT's `kid`. */
+  MAPKIT_JS_KEY_ID?: string;
+
+  /**
+   * Comma-separated origins of the MapKit JS frame that tokens may name
+   * (`https://maps.witnesswork.app`). `http://localhost` and `127.0.0.1`
+   * origins count only on development workers. The first is the default.
+   */
+  MAPKIT_JS_ORIGINS?: string;
 }
 
 /** Request-scoped values routes share through `c.var`. */

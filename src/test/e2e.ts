@@ -395,13 +395,18 @@ export interface E2ESession {
  * Opens an account session with the dev bypass standing in for attestation
  * (`POST /accounts/v1/sessions`). Needs `DEV_BYPASS_TOKEN`.
  */
-export const openSession = async (key?: SigningKey): Promise<E2ESession> => {
+export const openSession = async (
+  key?: SigningKey,
+  /** What the app sends: its version, and `capabilities` (`sync-everyone`). */
+  fields: { appVersion?: string; capabilities?: string[] } = {}
+): Promise<E2ESession> => {
   const signingKey = key ?? (await SigningKey.generate())
   const bytes = encoder.encode(
     JSON.stringify({
       accountPub: signingKey.publicKey,
       ts: Date.now(),
       nonce: randomId(),
+      ...fields,
     })
   )
   const response = await http('POST', '/accounts/v1/sessions', {

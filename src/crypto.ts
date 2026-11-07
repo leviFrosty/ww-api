@@ -57,6 +57,68 @@ export const bytesToBase64Url = (bytes: Uint8Array): string => {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+/** b64u SHA-256 of a string's UTF-8: what channels store for a key or a claim. */
+export const sha256B64u = async (text: string): Promise<string> =>
+  bytesToBase64Url(await sha256Bytes(encoder.encode(text)))
+
+/**
+ * b64u SHA-256 of a b64u token's bytes, what a channel's verifier holds for
+ * the token (the handoff's and approval's `claimToken`, `browserToken`). A
+ * token that isn't base64url hashes as no bytes, which no verifier matches.
+ */
+export const tokenDigest = async (token: string): Promise<string> => {
+  let bytes: Uint8Array = new Uint8Array()
+  if (/^[A-Za-z0-9_-]*$/.test(token) && token.length % 4 !== 1) {
+    try {
+      bytes = base64ToBytes(token)
+    } catch {
+      // Not base64url.
+    }
+  }
+  return bytesToBase64Url(await sha256Bytes(bytes))
+}
+
 /** Cryptographically-random URL-safe token of `byteLength` random bytes. */
 export const randomToken = (byteLength = 32): string =>
   bytesToBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)))
+
+/**
+ * Imports an ES256 signing key from a PKCS#8 PEM (an Apple `.p8`, P-256).
+ * Tolerates secrets stored with literal (or doubly escaped) `\n` sequences,
+ * on one line, or without the PEM armor.
+ */
+export const importEs256PrivateKey = (pem: string): Promise<CryptoKey> => {
+  const base64 = pem
+    .replace(/\\n/g, '\n')
+    .replace(/-----(?:BEGIN|END) [A-Z ]+-----/g, '')
+    // Base64 has no backslashes or whitespace.
+    .replace(/[\s\\]+/g, '')
+  return crypto.subtle.importKey(
+    'pkcs8',
+    base64ToBytes(base64),
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign']
+  )
+}
+
+const encodeJson = (value: unknown): string =>
+  bytesToBase64Url(encoder.encode(JSON.stringify(value)))
+
+/**
+ * A compact ES256 JWS. WebCrypto's ECDSA signature is already the raw
+ * `r || s` (IEEE P1363) that JOSE wants, so it's encoded as is.
+ */
+export const signEs256Jwt = async (
+  key: CryptoKey,
+  header: Record<string, unknown>,
+  claims: Record<string, unknown>
+): Promise<string> => {
+  const signingInput = `${encodeJson({ alg: 'ES256', ...header })}.${encodeJson(claims)}`
+  const signature = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    key,
+    encoder.encode(signingInput)
+  )
+  return `${signingInput}.${bytesToBase64Url(new Uint8Array(signature))}`
+}

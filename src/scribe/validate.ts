@@ -1,5 +1,7 @@
 import type { ScribeLimits } from './config'
+import { isScribeAppPlatform } from './wire'
 import type {
+  ScribeAppInfo,
   ScribeStepRequest,
   ToolDefinition,
   WireMessage,
@@ -382,7 +384,7 @@ export const validateStepEnvelope = (
     !isRecord(app) ||
     typeof app.version !== 'string' ||
     !APP_VERSION.test(app.version) ||
-    (app.platform !== 'ios' && app.platform !== 'android') ||
+    !isScribeAppPlatform(app.platform) ||
     typeof app.locale !== 'string' ||
     !LOCALE.test(app.locale)
   )
@@ -416,7 +418,7 @@ export const validateStepRequest = (
       step: body.step as number,
       app: {
         version: app.version,
-        platform: app.platform as 'ios' | 'android',
+        platform: app.platform as ScribeAppInfo['platform'],
         locale: app.locale,
       },
       tools: tools.value,

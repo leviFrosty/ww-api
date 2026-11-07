@@ -27,7 +27,7 @@ export const NOTES_IMPORT_EVENTS = {
  * (Play Integrity), or `dev` for the dev-bypass header. `dev` exists on the
  * dev worker only.
  */
-export type NotesImportPlatform = 'ios' | 'android' | 'dev'
+export type NotesImportPlatform = 'ios' | 'android' | 'dev' | 'web'
 
 export type NotesImportTransport = 'stream' | 'legacy'
 

@@ -35,9 +35,13 @@ import {
   accountSignedMessage,
   handoffBlobTooLarge,
   parseAccountKeyPayload,
+  passkeyAddTooLarge,
+  rekeyTooLarge,
   sessionDeviceTooLarge,
+  webSignupTooLarge,
 } from './contracts'
 import { accountsDb, findAccountByPub, type AccountRecord } from './store'
+import { envelopeNonce, findUsedToken, type UsedId } from './passkeyStore'
 import {
   bearerOrLegacy,
   type AccountAuth,
@@ -54,19 +58,25 @@ export type Verified<K extends AccountsOp> =
   | VerifiedCall<K>
   | { refusal: Response }
 
+/** Each op's own `too_large` check, run on the payload before parsing it. */
+const TOO_LARGE: Partial<Record<AccountsOp, (payload: unknown) => boolean>> = {
+  'handoff/send': handoffBlobTooLarge,
+  'session/open': sessionDeviceTooLarge,
+  'passkey/add': passkeyAddTooLarge,
+  'web/signup': webSignupTooLarge,
+  'account/rekey': rekeyTooLarge,
+}
+
 /**
  * Checks a parsed envelope for `op`: the key payload and the op's own fields
- * (`bad_request`, or `too_large` for `handoff/send`'s oversized key and
- * `session/open`'s oversized device label), the signature
- * by the named key (`bad_signature`), and the timestamp (`stale`).
+ * (`bad_request`, or `too_large` for a field over its cap: `TOO_LARGE`), the
+ * signature by the named key (`bad_signature`), and the timestamp (`stale`).
  */
 export const verifyEnvelope = async <K extends AccountsOp>(
   op: K,
   envelope: Envelope | null
 ): Promise<Verified<K>> => {
-  if (op === 'handoff/send' && envelope && handoffBlobTooLarge(envelope.payload))
-    return { refusal: buddiesErrorResponse('too_large') }
-  if (op === 'session/open' && envelope && sessionDeviceTooLarge(envelope.payload))
+  if (envelope && TOO_LARGE[op]?.(envelope.payload))
     return { refusal: buddiesErrorResponse('too_large') }
   const payload = envelope ? parseAccountKeyPayload(envelope.payload) : null
   const fields = envelope
@@ -122,6 +132,32 @@ export const accountForKey = async (
   return account
     ? { account }
     : { refusal: buddiesErrorResponse('unknown_account') }
+}
+
+/**
+ * A signed op's fields from the JSON body of a bearer request, whose key
+ * must be the token's own account (`forbidden` otherwise), and the
+ * envelope's nonce, which must not have been used (409 `replay`). The caller
+ * records `nonce` (`usedTokenInsert`) in the batch of what the envelope
+ * signs, so each envelope works once.
+ */
+export const signedForToken = async <K extends AccountsOp>(
+  c: AppContext,
+  op: K,
+  account: AccountAuth
+): Promise<
+  { fields: AccountFields<K>; nonce: UsedId } | { refusal: Response }
+> => {
+  const verified = await verifiedBody(c, op)
+  if ('refusal' in verified) return verified
+  const found = await accountForKey(c.env, verified.payload.accountPub)
+  if ('refusal' in found) return found
+  if (found.account.id !== account.accountId)
+    return { refusal: buddiesErrorResponse('forbidden') }
+  const nonce = await envelopeNonce(verified.payload)
+  if (await findUsedToken(accountsDb(c.env.ACCOUNTS_DB!), nonce.id))
+    return { refusal: buddiesErrorResponse('replay') }
+  return { fields: verified.fields, nonce }
 }
 
 /** A bearer request's fields for `op`, or its refusal. */
