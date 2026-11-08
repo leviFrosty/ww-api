@@ -38,4 +38,4 @@ Preconditions:
 - `/notes-import/status` caches completed responses per isolate for 30 s. A KV flip shows up only after that window, or after `down` and `up`.
 - With no `OPENROUTER_API_KEY`, the provider probe fails open (`available:true`). Don't treat that as proof that providers are healthy.
 - Once ratings are served, the local Cache API keeps the 200 for 6 h. To see the 503 again, run `down --wipe` and then `up`.
-- Crons don't run under `wrangler dev`. Seed `app-store-ratings:summary` instead of waiting for the sweep, and never curl `/cdn-cgi/handler/scheduled`, which calls Apple's iTunes lookup.
+- Crons don't run under `wrangler dev`. Seed `app-store-ratings:summary` instead of waiting for the sweep, and never curl `/cdn-cgi/handler/scheduled`, which reads Apple's App Store pages.

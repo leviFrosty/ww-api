@@ -2303,15 +2303,21 @@ wrangler kv key delete --binding NOTES_KV spaces:maxMembers
 `GET /app-store/ratings` returns `{complete: true, averageRating, ratingCount,
 countryCount, updatedAt}` for the app's paywall. `countryCount` counts storefronts
 with ratings, not publisher locations. App Store Connect's API only exposes written
-reviews, so totals come from Apple's public iTunes lookup, summed across all
-175 storefronts (`src/appStoreRatings/storefronts.ts`, from ASC
+reviews, so totals come from the JSON-LD on each public App Store page
+(`apps.apple.com/{storefront}/app/id…`), summed across all 175 storefronts (`src/appStoreRatings/storefronts.ts`, from ASC
 `/v1/territories`). The hourly cron (`[triggers]`) sweeps 40 storefronts per run
 sequentially into `NOTES_KV` (`app-store-ratings:state:v2`), publishes
 `app-store-ratings:summary:v2` only after every storefront has responded
-successfully, then rests until that sweep is 24 hours old. Failed or malformed
-lookups remain pending for the next hourly run. The previous complete summary
-stays available until its replacement is complete. Sequential lookups prevent
-timeouts from including time spent waiting for the Worker's outbound connections.
+successfully, then rests until that sweep is 7 days old. Failed or malformed
+lookups remain pending for the next hourly run. A batch in which every lookup
+fails logs a warning and pauses the sweep for 24 hours. The previous complete
+summary stays available until its replacement is complete, and a sweep that finds
+no ratings at all is not published. Sequential lookups prevent timeouts from
+including time spent waiting for the Worker's outbound connections.
+
+Don't switch back to `itunes.apple.com/lookup`: it has the same numbers (and more
+decimals on the average) but answers Workers with 403. Don't sweep all storefronts
+in one run either: the App Store site answered 429 after about 90 pages in a row.
 
 The route serves from the colo Cache API (`s-maxage` 6h) with a 1h edge-cached
 KV read on a miss, and returns `503 no-store` until the first complete sweep

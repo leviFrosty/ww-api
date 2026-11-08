@@ -3,7 +3,7 @@ import { HTTP_STATUS } from '../config'
 import { apiError } from '../errors'
 import { SUMMARY_KEY } from './ratings'
 
-/** The summary changes at most daily (see SWEEP_INTERVAL_MS). */
+/** The summary changes about weekly (see SWEEP_INTERVAL_MS). */
 const EDGE_TTL_SECONDS = 6 * 60 * 60
 const CLIENT_TTL_SECONDS = 24 * 60 * 60
 const KV_EDGE_TTL_SECONDS = 60 * 60

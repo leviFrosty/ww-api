@@ -83,7 +83,7 @@ export default Sentry.withSentry(
       environment: Environment,
       context: ExecutionContext
     ): Promise<void> {
-      // Hourly (wrangler.toml [triggers]); idle once a daily sweep is done.
+      // Hourly (wrangler.toml [triggers]); idle once a weekly sweep is done.
       context.waitUntil(runRatingsSweepStep({ kv: environment.NOTES_KV }));
       context.waitUntil(pruneAccountSessions(environment));
     },

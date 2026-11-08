@@ -4,6 +4,7 @@ import { makeMemoryKv } from '../test/memoryKv'
 import { APP_STORE_STOREFRONTS } from './storefronts'
 import {
   BATCH_SIZE,
+  FAILED_BATCH_RETRY_MS,
   STATE_KEY,
   SUMMARY_KEY,
   SWEEP_INTERVAL_MS,
@@ -13,18 +14,44 @@ import {
 } from './ratings'
 import { handleAppStoreRatingsRequest } from './route'
 
-const lookup = (count: number, average: number) =>
-  Response.json({
-    resultCount: 1,
-    results: [{ userRatingCount: count, averageUserRating: average }],
+/** An App Store page, shaped like Apple's: several JSON-LD blocks in the HTML. */
+const page = (softwareApplication: unknown) =>
+  new Response(
+    [
+      '<html><head>',
+      '<script id="organization" type="application/ld+json">{"@type":"Organization","name":"App Store"}</script>',
+      `<script id=software-application type="application/ld+json">${JSON.stringify(softwareApplication)}</script>`,
+      '<script id=schema:breadcrumb-list type="application/ld+json">{"@type":"BreadcrumbList"}</script>',
+      '</head></html>',
+    ].join('\n'),
+    { headers: { 'content-type': 'text/html' } },
+  )
+
+const rated = (reviewCount: unknown, ratingValue: unknown) =>
+  page({
+    '@type': 'SoftwareApplication',
+    name: 'WitnessWork',
+    aggregateRating: {
+      '@type': 'AggregateRating',
+      ratingValue,
+      reviewCount,
+      bestRating: '5',
+      worstRating: '1',
+    },
   })
+
+const unrated = () =>
+  page({ '@type': 'SoftwareApplication', name: 'WitnessWork' })
+
+const storefrontOf = (input: RequestInfo | URL) =>
+  new URL(String(input)).pathname.split('/')[1]
 
 /** US 100 × 5.0, BR 50 × 4.0, every other storefront unrated. */
 const appleFetch = vi.fn(async (input: RequestInfo | URL) => {
-  const country = new URL(String(input)).searchParams.get('country')
-  if (country === 'us') return lookup(100, 5)
-  if (country === 'br') return lookup(50, 4)
-  return Response.json({ resultCount: 0, results: [] })
+  const country = storefrontOf(input)
+  if (country === 'us') return rated(100, 5)
+  if (country === 'br') return rated(50, 4)
+  return unrated()
 }) as unknown as typeof fetch
 
 const runs = Math.ceil(APP_STORE_STOREFRONTS.length / BATCH_SIZE)
@@ -35,17 +62,63 @@ afterEach(() => {
 })
 
 describe('fetchStorefrontRating', () => {
-  it('distinguishes unrated storefronts from failed lookups', async () => {
-    expect(await fetchStorefrontRating('us', appleFetch)).toEqual({
+  const answering = (response: () => Response) =>
+    (async () => response()) as unknown as typeof fetch
+
+  it('reads the rating from the storefront page', async () => {
+    const seen: string[] = []
+    const recording = (async (input: RequestInfo | URL) => {
+      seen.push(String(input))
+      return rated(100, 4.9)
+    }) as unknown as typeof fetch
+    expect(await fetchStorefrontRating('us', recording)).toEqual({
+      count: 100,
+      average: 4.9,
+    })
+    expect(seen).toEqual(['https://apps.apple.com/us/app/id6469723047'])
+  })
+
+  it('treats a page with no rating as unrated', async () => {
+    expect(await fetchStorefrontRating('fr', answering(unrated))).toBeNull()
+    expect(
+      await fetchStorefrontRating('fr', answering(() => rated(0, 0))),
+    ).toBeNull()
+  })
+
+  it('treats a storefront that does not sell the app as unrated', async () => {
+    expect(
+      await fetchStorefrontRating(
+        'fr',
+        answering(() => new Response('', { status: 404 })),
+      ),
+    ).toBeNull()
+  })
+
+  it('does not count another storefront\'s rating after a redirect', async () => {
+    const redirected = answering(() => {
+      const response = rated(100, 5)
+      Object.defineProperty(response, 'url', {
+        value: 'https://apps.apple.com/us/app/witnesswork/id6469723047',
+      })
+      return response
+    })
+    expect(await fetchStorefrontRating('xk', redirected)).toBeNull()
+    expect(await fetchStorefrontRating('us', redirected)).toEqual({
       count: 100,
       average: 5,
     })
-    expect(await fetchStorefrontRating('fr', appleFetch)).toBeNull()
-    const unrated = (async () => lookup(0, 0)) as unknown as typeof fetch
-    expect(await fetchStorefrontRating('fr', unrated)).toBeNull()
-    const failing = (async () =>
-      new Response('', { status: 503 })) as unknown as typeof fetch
-    expect(await fetchStorefrontRating('us', failing)).toBeUndefined()
+  })
+
+  it.each([403, 429, 503])('retries after a %i', async (status) => {
+    expect(
+      await fetchStorefrontRating(
+        'us',
+        answering(() => new Response('', { status })),
+      ),
+    ).toBeUndefined()
+  })
+
+  it('retries when the request throws', async () => {
     const throwing = (async () => {
       throw new Error('offline')
     }) as unknown as typeof fetch
@@ -53,26 +126,29 @@ describe('fetchStorefrontRating', () => {
   })
 
   it.each([
-    {},
-    { results: [] },
-    { resultCount: 1, results: [] },
-    {
-      resultCount: 1,
-      results: [{ userRatingCount: -1, averageUserRating: 5 }],
-    },
-    {
-      resultCount: 1,
-      results: [{ userRatingCount: 1.5, averageUserRating: 5 }],
-    },
-    { resultCount: 1, results: [{ userRatingCount: 1, averageUserRating: 6 }] },
-  ])(
-    'treats malformed Apple bodies as retryable failures: %j',
-    async (body) => {
-      const malformed = (async () =>
-        Response.json(body)) as unknown as typeof fetch
-      expect(await fetchStorefrontRating('us', malformed)).toBeUndefined()
-    },
-  )
+    ['no JSON-LD', () => new Response('<html></html>')],
+    [
+      'only other JSON-LD',
+      () =>
+        new Response(
+          '<script type="application/ld+json">{"@type":"Organization"}</script>',
+        ),
+    ],
+    [
+      'broken JSON-LD',
+      () =>
+        new Response('<script type="application/ld+json">{oops</script>'),
+    ],
+    ['a negative count', () => rated(-1, 5)],
+    ['a fractional count', () => rated(1.5, 5)],
+    ['a string count', () => rated('12', 5)],
+    ['an average above 5', () => rated(1, 6)],
+    ['a missing average', () => rated(1, undefined)],
+  ])('retries on a page with %s, in case Apple changed it', async (_, response) => {
+    expect(
+      await fetchStorefrontRating('us', answering(response)),
+    ).toBeUndefined()
+  })
 })
 
 describe('summarize', () => {
@@ -108,7 +184,11 @@ describe('runRatingsSweepStep', () => {
     expect(maxActive).toBe(1)
   })
 
-  it('publishes a summary only after every storefront is swept, then rests a day', async () => {
+  it('sweeps once a week', () => {
+    expect(SWEEP_INTERVAL_MS).toBe(7 * 24 * 60 * 60 * 1000)
+  })
+
+  it('publishes a summary only after every storefront is swept, then rests a week', async () => {
     const kv = makeMemoryKv()
     for (let run = 1; run < runs; run++) {
       expect(
@@ -169,10 +249,7 @@ describe('runRatingsSweepStep', () => {
     const kv = makeMemoryKv()
     let failUs = true
     const partial = vi.fn(async (input: RequestInfo | URL) => {
-      if (
-        failUs &&
-        new URL(String(input)).searchParams.get('country') === 'us'
-      ) {
+      if (failUs && storefrontOf(input) === 'us') {
         return new Response('', { status: 503 })
       }
       return appleFetch(input)
@@ -210,6 +287,71 @@ describe('runRatingsSweepStep', () => {
       })
     }
     expect(kv.store.get(SUMMARY_KEY)).toBe(previous)
+  })
+})
+
+describe('runRatingsSweepStep when Apple refuses', () => {
+  const refusing = vi.fn(
+    async () => new Response('', { status: 429 }),
+  ) as unknown as typeof fetch
+
+  it('stops asking for a day after a whole batch fails, then resumes', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const kv = makeMemoryKv()
+    expect(await runRatingsSweepStep({ kv, now: 0, fetchFn: refusing })).toBe(
+      'progress',
+    )
+    expect(refusing).toHaveBeenCalledTimes(BATCH_SIZE)
+    expect(warn).toHaveBeenCalledTimes(1)
+
+    expect(
+      await runRatingsSweepStep({
+        kv,
+        now: FAILED_BATCH_RETRY_MS - 1,
+        fetchFn: refusing,
+      }),
+    ).toBe('idle')
+    expect(refusing).toHaveBeenCalledTimes(BATCH_SIZE)
+
+    expect(
+      await runRatingsSweepStep({
+        kv,
+        now: FAILED_BATCH_RETRY_MS,
+        fetchFn: appleFetch,
+      }),
+    ).toBe('progress')
+    expect(appleFetch).toHaveBeenCalledTimes(BATCH_SIZE)
+    expect(JSON.parse(kv.store.get(STATE_KEY)!).retryAt).toBeUndefined()
+    warn.mockRestore()
+  })
+
+  it('keeps going when only part of a batch fails', async () => {
+    const kv = makeMemoryKv()
+    const first = APP_STORE_STOREFRONTS[0]
+    const partial = (async (input: RequestInfo | URL) =>
+      storefrontOf(input) === first
+        ? new Response('', { status: 429 })
+        : unrated()) as unknown as typeof fetch
+    await runRatingsSweepStep({ kv, now: 0, fetchFn: partial })
+    const state = JSON.parse(kv.store.get(STATE_KEY)!)
+    expect(state.retryAt).toBeUndefined()
+    expect(state.pending.at(-1)).toBe(first)
+  })
+
+  it('keeps the served summary when a finished sweep found no ratings', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const kv = makeMemoryKv()
+    for (let run = 0; run < runs; run++) {
+      await runRatingsSweepStep({ kv, now: 0, fetchFn: appleFetch })
+    }
+    const served = kv.store.get(SUMMARY_KEY)
+    const empty = (async () => unrated()) as unknown as typeof fetch
+    for (let run = 0; run < runs; run++) {
+      await runRatingsSweepStep({ kv, now: SWEEP_INTERVAL_MS, fetchFn: empty })
+    }
+    expect(kv.store.get(SUMMARY_KEY)).toBe(served)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
   })
 })
 
