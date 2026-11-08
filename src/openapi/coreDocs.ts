@@ -169,7 +169,7 @@ export const appStoreRatingsDocs = describeRoute({
   tags: ['App Store'],
   summary: 'App Store rating totals',
   description:
-    'Paywall social proof: ratings summed across all 175 App Store storefronts. An hourly cron sweeps 40 storefronts a run and publishes a new summary once a day. Served from the edge cache (`s-maxage` 6 h).',
+    'Paywall social proof: ratings summed across all 175 App Store storefronts. An hourly cron sweeps 40 storefronts a run and publishes a new summary once a week. Served from the edge cache (`s-maxage` 6 h).',
   responses: {
     200: jsonResponse(
       'The latest completed sweep.',

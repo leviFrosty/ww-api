@@ -690,7 +690,7 @@ binding = "NOTES_KV"
 id = "92871586e6dc4558a6ad3552ed7ee28c"
 
 # App Store ratings sweep: BATCH_SIZE storefronts per run, resting once a
-# full sweep completes until it is a day old. Repeated under [env.dev.triggers].
+# full sweep completes until it is a week old. Repeated under [env.dev.triggers].
 [triggers]
 crons = ["17 * * * *"]
 

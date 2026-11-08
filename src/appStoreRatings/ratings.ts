@@ -4,12 +4,12 @@ import { APP_STORE_STOREFRONTS } from './storefronts'
  * Complete App Store ratings snapshots for the paywall.
  *
  * App Store Connect's API exposes written reviews only; star-only ratings (the
- * bulk of them) are published per storefront by Apple's public iTunes lookup
- * API. Totals therefore mean summing ~175 storefront lookups. That exceeds the
- * free-plan subrequest budget of a single invocation, so an hourly cron sweeps
- * `BATCH_SIZE` storefronts per run into KV and publishes the summary once a
- * full sweep finishes. Once complete, it rests until `SWEEP_INTERVAL_MS` has
- * passed, so Apple sees about one full sweep per day.
+ * bulk of them) appear per storefront in the JSON-LD of the public App Store
+ * page. Apple's iTunes lookup API has the same numbers but answers Workers with
+ * 403. Totals therefore mean reading ~175 pages, and Apple answers 429 after
+ * about 90 in a row, so an hourly cron reads `BATCH_SIZE` storefronts per run
+ * into KV and publishes the summary once a full sweep finishes. It then rests
+ * until `SWEEP_INTERVAL_MS` has passed, so Apple sees one sweep a week.
  */
 
 export const APP_STORE_APP_ID = '6469723047'
@@ -18,7 +18,9 @@ export const STATE_KEY = 'app-store-ratings:state:v2'
 export const SUMMARY_KEY = 'app-store-ratings:summary:v2'
 
 export const BATCH_SIZE = 40
-export const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000
+export const SWEEP_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000
+/** How long to leave Apple alone after a batch in which nothing succeeded. */
+export const FAILED_BATCH_RETRY_MS = 24 * 60 * 60 * 1000
 const LOOKUP_TIMEOUT_MS = 5_000
 
 export type RatingsKv = Pick<KVNamespace, 'get' | 'put'>
@@ -32,6 +34,8 @@ interface SweepState {
   pending: string[]
   /** When the last full sweep finished; null before the first one. */
   completedAt: number | null
+  /** Set after a batch in which every lookup failed: no lookups until then. */
+  retryAt?: number
   storefronts: Record<string, StorefrontRating>
 }
 
@@ -51,44 +55,52 @@ const emptyState = (): SweepState => ({
   storefronts: {},
 })
 
+const JSON_LD = /<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/g
+
+/** The page's SoftwareApplication JSON-LD block, if it has one. */
+function findSoftwareApplication(html: string): Record<string, unknown> | null {
+  for (const [, json] of html.matchAll(JSON_LD)) {
+    let block: unknown
+    try {
+      block = JSON.parse(json)
+    } catch {
+      continue
+    }
+    if ((block as { '@type'?: unknown } | null)?.['@type'] === 'SoftwareApplication') {
+      return block as Record<string, unknown>
+    }
+  }
+  return null
+}
+
 /**
- * One storefront's lookup. `null` means Apple reported no ratings there;
- * `undefined` means the lookup failed and the previous value should stand.
+ * One storefront's lookup. `null` means the storefront has no ratings or doesn't
+ * sell the app; `undefined` means the lookup failed and the previous value
+ * should stand.
  */
 export async function fetchStorefrontRating(
   country: string,
   fetchFn: typeof fetch = fetch,
 ): Promise<StorefrontRating | null | undefined> {
   try {
-    const url = `https://itunes.apple.com/lookup?id=${APP_STORE_APP_ID}&country=${country}`
+    const url = `https://apps.apple.com/${country}/app/id${APP_STORE_APP_ID}`
     const response = await fetchFn(url, {
       signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
     })
+    if (response.status === 404) return null
     if (!response.ok) return undefined
-    const body = (await response.json()) as {
-      resultCount?: unknown
-      results?: Array<{
-        userRatingCount?: unknown
-        averageUserRating?: unknown
-      }>
-    }
+    // A redirect to another storefront would count that storefront's ratings.
     if (
-      body.resultCount === 0 &&
-      Array.isArray(body.results) &&
-      body.results.length === 0
+      response.url &&
+      !new URL(response.url).pathname.startsWith(`/${country}/`)
     ) {
       return null
     }
-    if (
-      body.resultCount !== 1 ||
-      !Array.isArray(body.results) ||
-      body.results.length !== 1
-    ) {
-      return undefined
-    }
-    const app = body.results?.[0]
-    const count = app?.userRatingCount
-    const average = app?.averageUserRating
+    const app = findSoftwareApplication(await response.text())
+    if (!app) return undefined
+    if (app.aggregateRating === undefined) return null
+    const { reviewCount: count, ratingValue: average } =
+      app.aggregateRating as { reviewCount?: unknown; ratingValue?: unknown }
     if (
       typeof count !== 'number' ||
       !Number.isSafeInteger(count) ||
@@ -159,12 +171,16 @@ export async function runRatingsSweepStep({
   ) {
     return 'idle'
   }
+  if (state.retryAt !== undefined && now < state.retryAt) return 'idle'
+  delete state.retryAt
 
   if (state.pending.length === 0) state.pending = [...APP_STORE_STOREFRONTS]
   const batch = state.pending.splice(0, BATCH_SIZE)
+  let failed = 0
   for (const country of batch) {
     const result = await fetchStorefrontRating(country, fetchFn)
     if (result === undefined) {
+      failed += 1
       state.pending.push(country)
       continue
     }
@@ -172,10 +188,23 @@ export async function runRatingsSweepStep({
     else state.storefronts[country] = result
   }
 
+  if (failed === batch.length) {
+    state.retryAt = now + FAILED_BATCH_RETRY_MS
+    console.warn('app store ratings: every lookup in a batch failed', {
+      failed,
+    })
+  }
+
   const completed = state.pending.length === 0
   if (completed) {
     state.completedAt = now
-    await kv.put(SUMMARY_KEY, JSON.stringify(summarize(state.storefronts, now)))
+    const summary = summarize(state.storefronts, now)
+    // No storefront rated means Apple's page changed, not that ratings vanished.
+    if (summary.ratingCount > 0) {
+      await kv.put(SUMMARY_KEY, JSON.stringify(summary))
+    } else {
+      console.warn('app store ratings: sweep found no ratings; not publishing')
+    }
   }
   await kv.put(STATE_KEY, JSON.stringify(state))
   return completed ? 'completed' : 'progress'
