@@ -9,6 +9,16 @@ import {
 } from '../openapi/schemas'
 import { DEFAULT_SCRIBE_LIMITS, DEFAULT_SCRIBE_MODEL } from './config'
 import { TRANSCRIBE_MAX_BYTES } from './transcribe'
+import {
+  DOOR_OUTCOMES,
+  RANGE_SIDES,
+  STREET_NUMBERINGS,
+  TERRITORY_NOTES_MAX_CHARS,
+  TERRITORY_NOTES_MAX_LINES,
+  TERRITORY_NOTES_MAX_RANGE,
+  TERRITORY_NOTES_MAX_STREETS,
+  TERRITORY_NOTES_MAX_STREET_CHARS,
+} from './territoryNotes'
 import { SCRIBE_APP_PLATFORMS } from './wire'
 
 /**
@@ -62,7 +72,9 @@ const usageSnapshotSchema = z.object(usageSnapshotShape).meta({ id: 'ScribeUsage
 
 const scribeErrorSchema = apiErrorSchema
   .extend({
-    usage: usageSnapshotSchema.optional().meta({ description: 'On `limit_reached`.' }),
+    usage: usageSnapshotSchema
+      .optional()
+      .meta({ description: 'On `limit_reached`, and on a territory-notes `model_error` that was charged.' }),
     detail: z.string().optional().meta({ description: 'Development sessions only.' }),
   })
   .meta({
@@ -266,6 +278,77 @@ export const scribeTranscribeDocs = describeRoute({
       ['rate_limited', 'transcribe_limit']
     ),
     502: scribeError('The model failed; nothing is charged.', ['model_error']),
+    503: unavailable,
+  },
+})
+
+// --- POST /scribe/v1/territory-notes ----------------------------------------------
+
+const noteLine = z.number().int().min(0).meta({
+  description: 'Index of the source line: the notes with `\\r\\n?` → `\\n`, split on `\\n`.',
+})
+const noteStreet = z.string().nullable().meta({
+  description: 'A name from `streets` exactly, a street written in the notes, or null when none is named.',
+})
+const doorOutcome = z.enum(DOOR_OUTCOMES)
+
+export const scribeTerritoryNotesDocs = describeRoute({
+  tags: [TAG],
+  summary: 'Read territory notes into door results',
+  description: `Turns a publisher’s door-to-door notes, in any language and shorthand, into door results for the app’s review step; nothing is saved until the User reviews them on the device. Pre-flight like a page: bearer token (active account) → kill switch and provider → \`protocol\` → body → usage windows (402); then one model call, charged from its usage (an abort or the 45 s timeout is charged as the input estimate). The answer is validated: every number is written on its line, a street is the territory’s or written in the notes, ranges cover at most ${TERRITORY_NOTES_MAX_RANGE} houses, and nothing but doors, streets, and outcomes is returned (no names or reasons). A malformed answer is charged and answered 502 \`model_error\` with \`usage\`. The notes are never stored or logged. Rate-limited per IP in the \`scribe\` family.`,
+  security: bearerOnly,
+  requestBody: jsonBody(
+    z.object({
+      protocol: z.literal(1),
+      notes: z.string().meta({
+        description: `The notes as typed or scanned, ≤ ${TERRITORY_NOTES_MAX_CHARS} characters and ${TERRITORY_NOTES_MAX_LINES} lines.`,
+      }),
+      streets: z
+        .array(
+          z.object({
+            name: z.string().meta({ description: `≤ ${TERRITORY_NOTES_MAX_STREET_CHARS} characters.` }),
+            numbering: z.enum(STREET_NUMBERINGS).meta({
+              description: '`none`: houses have no numbers; doors are counted.',
+            }),
+          })
+        )
+        .meta({ description: `The territory’s streets, ≤ ${TERRITORY_NOTES_MAX_STREETS}.` }),
+      locale: z.string().meta({ description: 'The User’s app language (BCP 47).' }),
+    })
+  ),
+  responses: {
+    200: jsonResponse(
+      'The door results.',
+      z.object({
+        ok: z.literal(true),
+        doors: z.array(
+          z.object({ line: noteLine, street: noteStreet, door: z.string(), outcome: doorOutcome })
+        ),
+        ranges: z.array(
+          z.object({
+            line: noteLine,
+            street: noteStreet,
+            from: z.number().int(),
+            to: z.number().int(),
+            side: z.enum(RANGE_SIDES).meta({ description: '`odd` or `even` only when the notes say so.' }),
+            outcome: doorOutcome,
+          })
+        ),
+        unread: z.array(noteLine).meta({ description: 'Lines that record a house the model couldn’t read.' }),
+        usage: usageSnapshotSchema,
+      })
+    ),
+    400: scribeError('A malformed body.', ['bad_request']),
+    ...authResponses,
+    402: scribeError('A usage window is full; `usage` is the snapshot.', ['limit_reached']),
+    403: scribeError('The account is suspended.', ['suspended']),
+    413: scribeError('The notes or streets are over their caps.', ['too_large']),
+    426: scribeError('`protocol` below KV `scribe:protocol-min`.', ['upgrade_required']),
+    429: scribeError('`rate_limited` (per IP).', ['rate_limited']),
+    502: scribeError(
+      'The model failed, timed out, or answered malformed JSON; `usage` is present when it was charged.',
+      ['model_error']
+    ),
     503: unavailable,
   },
 })

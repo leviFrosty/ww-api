@@ -31,6 +31,7 @@ import { CALL_ID, estimateInputTokens, validateStepRequest } from './validate'
 const mocks = vi.hoisted(() => ({
   streamText: vi.fn(),
   transcribePage: vi.fn(),
+  readTerritoryNotes: vi.fn(),
   capture: vi.fn(async () => undefined),
 }))
 
@@ -51,6 +52,10 @@ vi.mock('ai', async (importOriginal) => ({
 vi.mock('./transcribe', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./transcribe')>()),
   transcribePage: mocks.transcribePage,
+}))
+vi.mock('./territoryNotes', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./territoryNotes')>()),
+  readTerritoryNotes: mocks.readTerritoryNotes,
 }))
 vi.mock('../analytics', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../analytics')>()),
@@ -173,6 +178,7 @@ beforeEach(async () => {
     fullStream: (scripts.shift() ?? REPLY)(args),
   }))
   mocks.transcribePage.mockReset()
+  mocks.readTerritoryNotes.mockReset()
   mocks.capture.mockClear()
 })
 
@@ -1043,6 +1049,145 @@ describe('POST /scribe/v1/transcribe', () => {
     const reply = await transcribe(await iosToken(), page())
     expect(reply.status).toBe(502)
     expect(reply.body.code).toBe('model_error')
+  })
+})
+
+// --- Territory notes ---------------------------------------------------------------------
+
+describe('POST /scribe/v1/territory-notes', () => {
+  const NOTES = 'Oak St\n12 NH, 14 spoke Bram Hale\n16-20 DNC'
+  const notesBody = (fields: Record<string, unknown> = {}) => ({
+    protocol: 1,
+    notes: NOTES,
+    streets: [{ name: 'Oak Street', numbering: 'both' }],
+    locale: 'en-US',
+    ...fields,
+  })
+  const readNotes = async (token: string, body: unknown) =>
+    json(await send('POST', '/scribe/v1/territory-notes', { headers: bearer(token), body }))
+  const answer = (text: string) => ({
+    text,
+    usage: usage(1_000, 0, 60),
+    resolvedProvider: 'Azure',
+    finishReason: 'stop',
+  })
+  const GOOD = JSON.stringify({
+    doors: [
+      { n: 1, street: 'Oak Street', door: '12', outcome: 'notHome' },
+      { n: 1, street: 'Oak Street', door: '14', outcome: 'spoke' },
+      { n: 1, street: 'Oak Street', door: 'Bram Hale', outcome: 'spoke' },
+    ],
+    ranges: [{ n: 2, street: 'Oak Street', from: 16, to: 20, side: 'even', outcome: 'doNotCall' }],
+    unread: [],
+  })
+
+  beforeEach(() => {
+    mocks.readTerritoryNotes.mockResolvedValue(answer(GOOD))
+  })
+
+  it('reads the notes into validated doors and charges their units', async () => {
+    const token = await iosToken()
+    const reply = await readNotes(token, notesBody())
+    expect(reply.status).toBe(200)
+    expect(reply.body).toEqual({
+      ok: true,
+      doors: [
+        { line: 1, street: 'Oak Street', door: '12', outcome: 'notHome' },
+        { line: 1, street: 'Oak Street', door: '14', outcome: 'spoke' },
+      ],
+      ranges: [{ line: 2, street: 'Oak Street', from: 16, to: 20, side: 'even', outcome: 'doNotCall' }],
+      unread: [],
+      usage: expect.objectContaining({
+        windows: [expect.objectContaining({ units: { used: 1_300, limit: 150_000 } })],
+      }),
+    })
+    expect(mocks.readTerritoryNotes.mock.calls[0][0]).toMatchObject({
+      target: { model: 'openai/gpt-6-luna', providers: ['azure'] },
+      user: expect.stringMatching(/^ww_[0-9a-f]{32}$/),
+      request: {
+        lines: ['Oak St', '12 NH, 14 spoke Bram Hale', '16-20 DNC'],
+        streets: [{ name: 'Oak Street', numbering: 'both' }],
+        locale: 'en-US',
+      },
+    })
+  })
+
+  it('logs and reports counts only, never the notes', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    await readNotes(await iosToken(), notesBody())
+    await flush()
+    const line = info.mock.calls.map((call) => String(call[0])).find((text) => text.includes('territory_notes'))
+    expect(JSON.parse(line!)).toMatchObject({
+      event: 'api_scribe_territory_notes',
+      plan: 'free',
+      platform: 'ios',
+      lines: 3,
+      notes_chars: '<200',
+      streets: 1,
+      doors: 2,
+      ranges: 1,
+      unread: 0,
+      dropped: 1,
+      malformed: false,
+      units: 1_300,
+      error_code: null,
+    })
+    const captured = JSON.stringify(
+      (mocks.capture.mock.calls as unknown as [unknown, unknown][]).map((call) => call[1])
+    )
+    expect(captured).toContain('api_scribe_territory_notes')
+    for (const text of [line!, captured]) {
+      expect(text).not.toContain('Bram')
+      expect(text).not.toContain('Oak')
+      expect(text).not.toContain('spoke')
+    }
+  })
+
+  it('400 bad_request for a malformed body, before the model', async () => {
+    const token = await iosToken()
+    expect((await readNotes(token, notesBody({ notes: '' }))).status).toBe(400)
+    expect((await readNotes(token, notesBody({ locale: 7 }))).status).toBe(400)
+    expect((await readNotes(token, notesBody({ protocol: 'one' }))).status).toBe(400)
+    expect((await readNotes(token, notesBody({ notes: 'x'.repeat(8_001) }))).status).toBe(413)
+    expect(mocks.readTerritoryNotes).not.toHaveBeenCalled()
+  })
+
+  it('401 without a session and 503 disabled behind the kill switch', async () => {
+    expect((await json(await send('POST', '/scribe/v1/territory-notes', { body: notesBody() }))).status).toBe(401)
+    await h.kv.put('scribe:enabled', 'off')
+    resetPublicScribeStatus(h.env)
+    const reply = await readNotes(await iosToken(), notesBody())
+    expect(reply.status).toBe(503)
+    expect(reply.body.code).toBe('disabled')
+    expect(mocks.readTerritoryNotes).not.toHaveBeenCalled()
+  })
+
+  it('402 limit_reached when the meter is full', async () => {
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1_000 } }))
+    const token = await iosToken()
+    expect((await readNotes(token, notesBody())).status).toBe(200)
+    const refused = await readNotes(token, notesBody())
+    expect(refused.status).toBe(402)
+    expect(refused.body).toMatchObject({ code: 'limit_reached', usage: { limited: true } })
+    expect(mocks.readTerritoryNotes).toHaveBeenCalledTimes(1)
+  })
+
+  it('502 model_error with usage when the answer is malformed, and charged', async () => {
+    mocks.readTerritoryNotes.mockResolvedValue(answer('Sure! Here are the doors: 12, 14'))
+    const reply = await readNotes(await iosToken(), notesBody())
+    expect(reply.status).toBe(502)
+    expect(reply.body).toMatchObject({
+      code: 'model_error',
+      usage: { windows: [expect.objectContaining({ units: { used: 1_300, limit: 150_000 } })] },
+    })
+  })
+
+  it('502 model_error, uncharged, when the model fails', async () => {
+    mocks.readTerritoryNotes.mockRejectedValue(new Error('upstream'))
+    const reply = await readNotes(await iosToken(), notesBody())
+    expect(reply.status).toBe(502)
+    expect(reply.body.code).toBe('model_error')
+    expect(reply.body.usage).toBeUndefined()
   })
 })
 

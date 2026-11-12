@@ -69,9 +69,13 @@ export type AdmitTranscribeResult =
   | { ok: false; code: 'limit_reached'; snapshot: UsageSnapshot }
   | { ok: false; code: 'transcribe_limit'; retryAfterMs: number }
 
+export type AdmitCallResult =
+  | { ok: true; snapshot: UsageSnapshot }
+  | { ok: false; code: 'limit_reached'; snapshot: UsageSnapshot }
+
 export interface ChargeArgs extends MeterContext {
   units: number
-  kind: 'step' | 'transcribe'
+  kind: 'step' | 'transcribe' | 'territory_notes'
 }
 
 export interface ResetUsageResult {
@@ -255,7 +259,27 @@ export class ScribeMeter extends DurableObject<Environment> {
     return { ok: true, snapshot: this.#snapshot(args, windows) }
   }
 
-  /** Charges a call outside a step (a transcribed page). */
+  /**
+   * A one-shot call's pre-flight (territory notes): the usage windows only,
+   * like a step 0 without turn grace. Charged afterwards through `charge`.
+   */
+  admitCall(args: MeterContext): AdmitCallResult {
+    const { now, limits } = args
+    this.#prune(now, limits)
+    const windows = this.#windows()
+    const decision = decideAdmission({
+      plan: args.plan,
+      windows,
+      limits,
+      now,
+      step: 0,
+      turnOpenedAt: null,
+    })
+    const snapshot = this.#snapshot(args, windows)
+    return decision.admitted ? { ok: true, snapshot } : { ok: false, code: 'limit_reached', snapshot }
+  }
+
+  /** Charges a call outside a step (a transcribed page, territory notes). */
   charge(args: ChargeArgs): UsageSnapshot {
     return this.#charge(args)
   }

@@ -39,7 +39,7 @@ export interface ScribeErrorBody {
   code: ScribeErrorCode
   /** Seconds; mirrored in `Retry-After`. */
   retryAfter?: number
-  /** On `limit_reached`. */
+  /** On `limit_reached`, and on a territory-notes `model_error` that was charged. */
   usage?: UsageSnapshot
   /** Dev-bypass callers only. */
   detail?: string
@@ -276,5 +276,31 @@ export interface TranscribeResponse {
   ok: true
   text: string
   truncated: boolean
+  usage: UsageSnapshot
+}
+
+// --- Territory notes --------------------------------------------------------
+
+export type TerritoryDoorOutcome = 'notHome' | 'spoke' | 'doNotCall'
+
+export interface TerritoryNotesRequestBody {
+  protocol: number
+  notes: string
+  streets: { name: string; numbering: 'both' | 'odd' | 'even' | 'none' }[]
+  locale: string
+}
+
+export interface TerritoryNotesResponse {
+  ok: true
+  doors: { line: number; street: string | null; door: string; outcome: TerritoryDoorOutcome }[]
+  ranges: {
+    line: number
+    street: string | null
+    from: number
+    to: number
+    side: 'all' | 'odd' | 'even'
+    outcome: TerritoryDoorOutcome
+  }[]
+  unread: number[]
   usage: UsageSnapshot
 }

@@ -250,7 +250,21 @@ implement it as written and list any deviation in the PR. Code: `src/scribe/`
 (`route.ts` handlers, `validate.ts` request rules, `render.ts` wire → model
 input, `step.ts` the model call, `meter.ts` + `meterDO.ts` metering,
 `status.ts` kill switch and provider health, `legacy.ts` the Notes Import
-cutover).
+cutover, `territoryNotes.ts` territory notes).
+
+`POST /scribe/v1/territory-notes` reads a publisher's door-to-door notes (any
+language, any shorthand) into door results for the app's Add Results From
+Notes review: one non-streaming call on `model`, reasoning and prompt caching
+off, behind the same session, kill switch and meter as a page (no page
+ceiling), charged from its usage (≈ 1,550–1,700 units for a typical note). The
+answer is validated (`parseTerritoryNotesOutput`: every number written on its
+line, streets the territory's or written in the notes, no other words), so no
+name or reason ever leaves the worker; a malformed answer is charged and
+answered 502 `model_error` with `usage`, and the app falls back to its own
+reader. The notes are never logged or stored. Quality is measured by the paid
+eval `src/e2e/scribeTerritoryNotes.e2e.test.ts` (English, Spanish,
+Portuguese and a messy note in `src/test/territoryNotesFixtures.ts`); run it
+after any change to the instructions.
 
 `app.platform` in the step body is `ios`, `android` or `web` (the browser app);
 anything else is a 400 `bad_request` (rule `app`). Nothing branches on it:
@@ -427,8 +441,9 @@ answers only while `scribe:legacy-notes-import` is on.
 
 One JSON line per step (`console.info`) and the same properties to PostHog as
 `api_scribe_step` (and `api_scribe_transcribe` per page), with `distinct_id`
-the hashed account id and no person profile. Properties: `protocol`, `step`,
-`plan`, `platform`, `app_version`, `conversation_id`, `turn_id`, `offered`
+the hashed account id and no person profile (territory notes log
+`api_scribe_territory_notes` with counts and usage only). Properties:
+`protocol`, `step`, `plan`, `platform`, `app_version`, `conversation_id`, `turn_id`, `offered`
 (tool names), `offered_count`, `dropped`, `tool_calls` (names), counts of
 unknown-tool and bad-args calls, `finish`, token counts (including
 `cache_write_tokens`), `units`, `usage_estimated`, `cost_usd` (OpenRouter's

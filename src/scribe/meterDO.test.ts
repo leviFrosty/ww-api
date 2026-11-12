@@ -207,6 +207,19 @@ describe('retention', () => {
     ).toMatchObject({ ok: false, code: 'limit_reached' })
   })
 
+  it('admits a one-shot call on the windows alone, without counting a page', () => {
+    const tight = limits({ free: { monthly: 10 } })
+    expect(meter.admitCall(context({ limits: tight }))).toMatchObject({ ok: true })
+    expect(rows('SELECT COUNT(*) AS n FROM page')).toEqual([{ n: 0 }])
+    meter.charge({ ...context({ limits: tight }), units: 10, kind: 'territory_notes' })
+    expect(meter.admitCall(context({ limits: tight }))).toMatchObject({
+      ok: false,
+      code: 'limit_reached',
+      snapshot: { limited: true },
+    })
+    expect(rows('SELECT kind FROM charge')).toEqual([{ kind: 'territory_notes' }])
+  })
+
   it('deletes the object 31 days after its last activity', async () => {
     admit(0)
     settle(0, 100)

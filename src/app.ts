@@ -58,6 +58,7 @@ import {
 import {
   handleScribeStatusRequest,
   handleScribeStepRequest,
+  handleScribeTerritoryNotesRequest,
   handleScribeTranscribeRequest,
   handleScribeUsageRequest,
 } from "./scribe/route";
@@ -67,6 +68,7 @@ import {
   scribeAdminResetDocs,
   scribeStatusDocs,
   scribeStepDocs,
+  scribeTerritoryNotesDocs,
   scribeTranscribeDocs,
   scribeUsageDocs,
 } from "./scribe/openapi";
@@ -187,6 +189,7 @@ app.use("/attestation/*", rateLimit("attestation"));
 // their handlers) instead.
 app.use("/scribe/v1/step", rateLimit("scribe"));
 app.use("/scribe/v1/transcribe", rateLimit("scribe"));
+app.use("/scribe/v1/territory-notes", rateLimit("scribe"));
 app.use("/admin/*", rateLimit("admin"));
 app.use("/route-planning/*", rateLimit("route-planning"));
 app.use("/maps/*", rateLimit("maps"));
@@ -295,8 +298,9 @@ app.post(
 // Legacy synchronous path (fallback during cutover).
 app.post("/notes-import", notesImportLegacyDocs, handleNotesImportRequest);
 // Scribe AI (witness-work docs/scribe-ai-protocol.md): the public status, the
-// account's usage windows, one model step over SSE, and paper pages. Bearer
-// account sessions; metered per account in the ScribeMeter DO.
+// account's usage windows, one model step over SSE, paper pages, and
+// territory notes. Bearer account sessions; metered per account in the
+// ScribeMeter DO.
 app.get("/scribe/v1/status", scribeStatusDocs, handleScribeStatusRequest);
 app.get("/scribe/v1/usage", scribeUsageDocs, handleScribeUsageRequest);
 app.post("/scribe/v1/step", scribeStepDocs, handleScribeStepRequest);
@@ -304,6 +308,11 @@ app.post(
   "/scribe/v1/transcribe",
   scribeTranscribeDocs,
   handleScribeTranscribeRequest
+);
+app.post(
+  "/scribe/v1/territory-notes",
+  scribeTerritoryNotesDocs,
+  handleScribeTerritoryNotesRequest
 );
 // Maintainer-only usage resets (secret auth inside handler; 404 fail-closed).
 app.post(

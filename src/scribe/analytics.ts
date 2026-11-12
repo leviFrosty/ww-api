@@ -11,12 +11,13 @@ import type { DropReason, ScribePlan, StepFinish, WireMessage } from './wire'
  * turn ULIDs, and a coarse gap since the previous turn.
  * Never message text, the context, tool descriptions or schemas, tool-call
  * arguments, tool results, Refs, names, the Authorization header, images, or
- * transcribed text.
+ * transcribed text, or territory notes (counts only).
  */
 
 export const SCRIBE_EVENTS = {
   step: 'api_scribe_step',
   transcribe: 'api_scribe_transcribe',
+  territoryNotes: 'api_scribe_territory_notes',
 } as const
 
 export type ScribePlatform = 'ios' | 'android' | 'dev' | 'web'
@@ -198,3 +199,75 @@ export const scribeTranscribeEvent = (
 
 export const scribeTranscribeLogLine = (fields: TranscribeLogFields): string =>
   JSON.stringify({ event: SCRIBE_EVENTS.transcribe, ...transcribeProperties(fields) })
+
+export interface TerritoryNotesLogFields {
+  plan: ScribePlan | null
+  platform: ScribePlatform
+  /** Non-blank lines in the notes. */
+  lines: number
+  notesChars: number
+  streets: number
+  doors: number
+  ranges: number
+  unread: number
+  /** Items the model returned that failed validation. */
+  dropped: number
+  /** The model answered with something other than the JSON asked for. */
+  malformed: boolean
+  truncated: boolean
+  inputTokens: number
+  cachedInputTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  units: number
+  usageEstimated: boolean
+  costUsd: number | null
+  model: string | null
+  provider: string | null
+  latencyMs: number
+  rule: string | null
+  errorCode: string | null
+}
+
+const charsBucket = (chars: number): string =>
+  chars < 200 ? '<200' : chars < 1_000 ? '200-1k' : chars < 4_000 ? '1-4k' : '4k+'
+
+const territoryNotesProperties = (
+  fields: TerritoryNotesLogFields
+): Record<string, AnalyticsValue> => ({
+  plan: fields.plan,
+  platform: fields.platform,
+  lines: fields.lines,
+  notes_chars: charsBucket(fields.notesChars),
+  streets: fields.streets,
+  doors: fields.doors,
+  ranges: fields.ranges,
+  unread: fields.unread,
+  dropped: fields.dropped,
+  malformed: fields.malformed,
+  truncated: fields.truncated,
+  input_tokens: fields.inputTokens,
+  cached_input_tokens: fields.cachedInputTokens,
+  cache_write_tokens: fields.cacheWriteTokens,
+  output_tokens: fields.outputTokens,
+  units: fields.units,
+  usage_estimated: fields.usageEstimated,
+  cost_usd: fields.costUsd,
+  model: fields.model,
+  provider: fields.provider,
+  latency_ms: fields.latencyMs,
+  rule: fields.rule,
+  error_code: fields.errorCode,
+})
+
+export const scribeTerritoryNotesEvent = (
+  distinctId: string,
+  fields: TerritoryNotesLogFields
+): AnalyticsEvent => ({
+  event: SCRIBE_EVENTS.territoryNotes,
+  distinctId,
+  properties: territoryNotesProperties(fields),
+})
+
+export const scribeTerritoryNotesLogLine = (fields: TerritoryNotesLogFields): string =>
+  JSON.stringify({ event: SCRIBE_EVENTS.territoryNotes, ...territoryNotesProperties(fields) })
