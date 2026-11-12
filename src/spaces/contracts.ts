@@ -112,6 +112,45 @@ export const SPACES_LIMITS = {
    * characters (always at least one), and says `more`.
    */
   syncChars: 4 * MIB,
+
+  // --- Scoped spaces (Territories, witness-work ADR 0046) -------------------
+
+  /** Scope ids an invite, a member, or `member/scopes` may name. */
+  scopesPerGrant: 100,
+  /** Scope ids a guest link may name (its `g.` record has to fit 16 KB). */
+  scopesPerLink: 30,
+  /** `link/create` `expiresAt ≤ now + this`: 24 hours, plus 5 minutes of clock slack. */
+  maxLinkLifetimeMs: DAY_MS + 5 * MINUTE_MS,
+  /** Links neither ended nor expired a space may hold. */
+  openLinks: 10,
+  /** Links created per space a rolling day. */
+  linksPerDay: 30,
+  linkWindowMs: DAY_MS,
+  /** `sync` lists a link until this long after its `expiresAt`, ended or not. */
+  linkListedMs: DAY_MS,
+  /**
+   * Guest requests (`guest/sync` and `guest/put`) a minute per network
+   * (IPv4 address, IPv6 /64), checked before any Durable Object wakes.
+   * Enforced by the `SPACES_GUEST_LIMITER` binding in `wrangler.toml`,
+   * which `guest.test.ts` keeps equal to this.
+   */
+  guestRequestsPerMinute: 120,
+  /** `guest/sync`s per link a rolling minute: a page polls every 15 s, so 30× for a few tabs. */
+  guestLinkSyncs: 120,
+  /** `guest/put`s per link a rolling minute: one per recorded door, a brisk walk is a few. */
+  guestLinkPuts: 30,
+  guestLinkWindowMs: MINUTE_MS,
+  /** Records a link puts a rolling day: a busy day's street is ~200 doors, 10×. */
+  guestLinkRecordsPerDay: 2_000,
+  guestLinkRecordWindowMs: DAY_MS,
+  /** Records per `guest/put`. */
+  guestPutRecords: 20,
+  /** One guest body. */
+  guestBodyBytes: 64 * KIB,
+  /** One guest record's sealed blob, decoded: a door is ~300 bytes. */
+  guestBlobBytes: 4 * KIB,
+  /** Records per `guest/sync` page; `limit` may ask for fewer. */
+  guestSyncRecords: 500,
 } as const
 
 /** Every op; each is `POST /spaces/v1/{op}`. */
@@ -126,9 +165,23 @@ export const SPACES_OPS = [
   'member/remove',
   'rekey',
   'delete',
+  'member/scopes',
+  'handoff/create',
+  'handoff/end',
+  'link/create',
+  'link/end',
 ] as const
 
 export type SpacesOp = (typeof SPACES_OPS)[number]
+
+/**
+ * The public guest ops (witness-work `docs/territories-protocol.md`, "Guest
+ * ops"): no session, a guest link's token instead. Each is `POST
+ * /spaces/v1/{op}`.
+ */
+export const SPACES_GUEST_OPS = ['guest/sync', 'guest/put'] as const
+
+export type SpacesGuestOp = (typeof SPACES_GUEST_OPS)[number]
 
 /** The live socket, `GET /spaces/v1/live`; not a POST op. */
 export const SPACES_LIVE_OP = 'live'
@@ -138,6 +191,9 @@ export const SPACES_ALWAYS_ALLOWED_OPS: ReadonlySet<SpacesOp> = new Set([
   'leave',
   'member/remove',
   'delete',
+  // Giving a street back and ending a guest link only take access away.
+  'handoff/end',
+  'link/end',
 ])
 
 /**
@@ -150,6 +206,10 @@ export const SPACES_SUSPENDED_REFUSED_OPS: ReadonlySet<SpacesOp> = new Set([
   'put',
   'invite/create',
   'join',
+  // These grant someone access to a street.
+  'member/scopes',
+  'handoff/create',
+  'link/create',
 ])
 
 export const SPACES_HEADERS = {
@@ -188,11 +248,16 @@ export const SPACES_ERROR_STATUS = {
 
 export type SpacesErrorCode = keyof typeof SPACES_ERROR_STATUS
 
+/** Why a guest link is `gone`: ended (by someone, or with its space), or past `expiresAt`. */
+export type SpacesGoneReason = 'ended' | 'expired'
+
 /** A refusal; time-bound limits say how long to wait (`Retry-After`). */
 export type SpacesFailure = {
   ok: false
   error: SpacesErrorCode
   retryAfterSeconds?: number
+  /** Only on a guest op's `gone`. */
+  reason?: SpacesGoneReason
 }
 
 /** What every `SharedSpace` method answers (RPC-serializable). */
@@ -206,14 +271,27 @@ export const fail = (
     ? { ok: false, error }
     : { ok: false, error, retryAfterSeconds }
 
-/** A refusal in the shared envelope, as Buddies and accounts send theirs. */
+/** A guest op's `gone`, saying why. */
+export const goneBecause = (reason: SpacesGoneReason): SpacesFailure => ({
+  ok: false,
+  error: 'gone',
+  reason,
+})
+
+/**
+ * A refusal in the shared envelope, as Buddies and accounts send theirs. A
+ * guest op's `gone` adds `reason`.
+ */
 export const spacesErrorResponse = (
   error: SpacesErrorCode,
-  options: { retryAfterSeconds?: number } = {}
+  options: { retryAfterSeconds?: number; reason?: SpacesGoneReason } = {}
 ): Response =>
   error === 'stale_key'
     ? apiError(SPACES_ERROR_STATUS[error], error)
-    : buddiesErrorResponse(error, options)
+    : buddiesErrorResponse(error, {
+        retryAfterSeconds: options.retryAfterSeconds,
+        ...(options.reason ? { extras: { reason: options.reason } } : {}),
+      })
 
 /** Logs a limit hit for tuning: the op and the limit's name, nothing else. */
 export const logSpacesLimitHit = (op: string, limit: string): void => {
@@ -258,6 +336,61 @@ export const mayPutRecord = (
   if (recordId.startsWith(KEY_RECORD_PREFIX)) return memberId === ownerId
   return true
 }
+
+/** A space's mode: absent for the original rules (cars), `scoped` for a territory. */
+export type SpaceMode = 'scoped'
+
+/**
+ * Record ids a scoped space takes (witness-work `docs/territories-protocol.md`,
+ * "Record ids"); anything else is `bad_request` there.
+ */
+export const SCOPED_RECORD_ID_PATTERN =
+  /^(h|s\.[A-Za-z0-9_-]{22}(\.(w|[0-9a-f-]{36}))?|d\.[0-9a-f-]{36}|[mig]\.[A-Za-z0-9_-]{22}|k\.[1-9][0-9]{0,8})$/
+
+/**
+ * What a scoped space's record id is, for its permissions: the territory's
+ * header `h`; a street's own record `s.<S>`; a record in a street,
+ * `s.<S>.w` or `s.<S>.<uuid>`; a territory-wide do-not-call `d.<uuid>`; a
+ * member's `m.`, an invite's `i.`, the key chain's `k.`, or a guest link's
+ * keys `g.<linkId>`.
+ */
+export type ScopedRecordClass =
+  | { kind: 'header' }
+  | { kind: 'street'; scope: string }
+  | { kind: 'inScope'; scope: string }
+  | { kind: 'territory' }
+  | { kind: 'member'; id: string }
+  | { kind: 'invite'; id: string }
+  | { kind: 'keys' }
+  | { kind: 'linkKeys'; id: string }
+
+/** `recordId`'s class in a scoped space, or null outside the grammar. */
+export const classifyScopedRecord = (recordId: string): ScopedRecordClass | null => {
+  if (!SCOPED_RECORD_ID_PATTERN.test(recordId)) return null
+  if (recordId === 'h') return { kind: 'header' }
+  const prefix = recordId.slice(0, 2)
+  const rest = recordId.slice(2)
+  switch (prefix) {
+    case 's.':
+      return rest.length === 22
+        ? { kind: 'street', scope: rest }
+        : { kind: 'inScope', scope: rest.slice(0, 22) }
+    case 'd.':
+      return { kind: 'territory' }
+    case 'm.':
+      return { kind: 'member', id: rest }
+    case 'i.':
+      return { kind: 'invite', id: rest }
+    case 'g.':
+      return { kind: 'linkKeys', id: rest }
+    default:
+      return { kind: 'keys' }
+  }
+}
+
+/** The scope a record is stored under (its street's), or null. */
+export const scopeOf = (record: ScopedRecordClass): string | null =>
+  record.kind === 'street' || record.kind === 'inScope' ? record.scope : null
 
 /** The 32 bytes of a canonical b64u value (tokens, secrets, hashes), or null. */
 export const bytes32 = (value: unknown): Uint8Array | null => {
@@ -329,6 +462,8 @@ export interface CreateFields {
   dhPub: string
   tokenHash: string
   wrap: string
+  /** `scoped` for a territory; null (absent) keeps the original rules. */
+  mode: SpaceMode | null
 }
 
 export interface SyncFields extends MemberFields {
@@ -354,6 +489,13 @@ export interface InviteCreateFields extends MemberFields {
   expiresAt: number
   /** The epoch of the key the invitation carries; must be current. */
   epoch: number
+  /**
+   * Scoped spaces: the streets the invitee gets (absent: the whole
+   * territory). Null when the body has none.
+   */
+  scopes: string[] | null
+  /** Scoped spaces: a hand-off of `scopes`' one street. Null when absent. */
+  handoff: boolean | null
 }
 
 export interface InviteDeleteFields extends MemberFields {
@@ -401,6 +543,56 @@ export interface RekeyFields extends MemberFields {
 /** The link's record id for a rekey to `epoch`: the owner's, as every `k.` is. */
 export const rekeyLinkId = (epoch: number): string => `${KEY_RECORD_PREFIX}${epoch}`
 
+export interface MemberScopesFields extends MemberFields {
+  target: string
+  /** The target's new streets, or null for the whole territory. */
+  scopes: string[] | null
+}
+
+export interface HandoffCreateFields extends MemberFields {
+  scopeId: string
+  target: string
+}
+
+export interface HandoffEndFields extends MemberFields {
+  scopeId: string
+}
+
+export interface LinkCreateFields extends MemberFields {
+  linkId: string
+  /** `b64u(SHA-256(linkToken))`. */
+  verifier: string
+  scopes: string[]
+  expiresAt: number
+  epoch: number
+}
+
+export interface LinkEndFields extends MemberFields {
+  linkId: string
+}
+
+/** A guest op's credentials, as the guest page sends them. */
+export interface GuestFields {
+  spaceId: string
+  linkId: string
+  /** The link token's 32 bytes; only its SHA-256 reaches the space DO. */
+  linkToken: Uint8Array
+}
+
+export interface GuestSyncFields extends GuestFields {
+  since: number
+  limit: number
+}
+
+export interface GuestPutFields extends GuestFields {
+  records: PutRecord[]
+}
+
+export interface SpacesGuestFields {
+  'guest/sync': GuestSyncFields
+  'guest/put': GuestPutFields
+}
+
 export interface SpacesFields {
   create: CreateFields
   sync: SyncFields
@@ -412,6 +604,11 @@ export interface SpacesFields {
   'member/remove': RemoveFields
   rekey: RekeyFields
   delete: MemberFields
+  'member/scopes': MemberScopesFields
+  'handoff/create': HandoffCreateFields
+  'handoff/end': HandoffEndFields
+  'link/create': LinkCreateFields
+  'link/end': LinkEndFields
 }
 
 const withMember = <T extends object>(
@@ -427,7 +624,8 @@ const asParsed = <T>(value: T | null): Parsed<T> =>
 
 const parseRecord = (
   value: unknown,
-  now: number
+  now: number,
+  blobBytes: number = SPACES_LIMITS.blobBytes
 ): Parsed<PutRecord> => {
   if (!isPlainObject(value)) return refused()
   const { recordId, epoch, stamp, deleted, blob } = value
@@ -443,23 +641,23 @@ const parseRecord = (
     !isB64u(blob)
   )
     return refused()
-  if (decodedLength(blob) > SPACES_LIMITS.blobBytes) return refused('too_large')
+  if (decodedLength(blob) > blobBytes) return refused('too_large')
   return parsed({ recordId, epoch, stamp, deleted: deleted === true, blob })
 }
 
-const parsePut = (
-  body: Record<string, unknown>,
-  now: number
-): Parsed<PutFields> => {
-  const member = memberFields(body)
-  const { records } = body
-  if (!member || !Array.isArray(records) || records.length === 0)
-    return refused()
-  if (records.length > SPACES_LIMITS.putRecords) return refused('too_large')
+/** A put's `records`: 1 to `max`, each blob at most `blobBytes`. */
+const parseRecords = (
+  records: unknown,
+  now: number,
+  max: number,
+  blobBytes: number
+): Parsed<PutRecord[]> => {
+  if (!Array.isArray(records) || records.length === 0) return refused()
+  if (records.length > max) return refused('too_large')
   const out: PutRecord[] = []
   let tooLarge = false
   for (const record of records) {
-    const result = parseRecord(record, now)
+    const result = parseRecord(record, now, blobBytes)
     if (!result.ok) {
       if (result.error === 'bad_request') return result
       tooLarge = true
@@ -467,7 +665,36 @@ const parsePut = (
     }
     out.push(result.value)
   }
-  return tooLarge ? refused('too_large') : parsed({ ...member, records: out })
+  return tooLarge ? refused('too_large') : parsed(out)
+}
+
+const parsePut = (
+  body: Record<string, unknown>,
+  now: number
+): Parsed<PutFields> => {
+  const member = memberFields(body)
+  if (!member) return refused()
+  const records = parseRecords(
+    body.records,
+    now,
+    SPACES_LIMITS.putRecords,
+    SPACES_LIMITS.blobBytes
+  )
+  return records.ok ? parsed({ ...member, records: records.value }) : records
+}
+
+/**
+ * Scope ids: 1 to `max` distinct 22-character ids. `undefined` is absent;
+ * anything malformed is null.
+ */
+const parseScopes = (value: unknown, max: number): string[] | null => {
+  if (!Array.isArray(value) || value.length === 0 || value.length > max) return null
+  const seen = new Set<string>()
+  for (const scope of value) {
+    if (!isId(scope) || seen.has(scope)) return null
+    seen.add(scope)
+  }
+  return value as string[]
 }
 
 const parseWraps = (wraps: unknown): RekeyWrap[] | null => {
@@ -535,13 +762,15 @@ export const SPACES_FIELD_PARSERS: Parsers = {
         isId(body.memberId) &&
         isDhPub(body.dhPub) &&
         isHash(body.tokenHash) &&
-        isWrap(body.wrap)
+        isWrap(body.wrap) &&
+        (body.mode === undefined || body.mode === 'scoped')
         ? {
             spaceId: body.spaceId,
             memberId: body.memberId,
             dhPub: body.dhPub,
             tokenHash: body.tokenHash,
             wrap: body.wrap,
+            mode: body.mode === 'scoped' ? ('scoped' as const) : null,
           }
         : null
     ),
@@ -575,7 +804,27 @@ export const SPACES_FIELD_PARSERS: Parsers = {
           expiresAt > now + SPACES_LIMITS.maxInviteLifetimeMs
         )
           return null
-        return { ...member, inviteId, joinVerifier, expiresAt, epoch }
+        let scopes: string[] | null = null
+        if (body.scopes !== undefined) {
+          scopes = parseScopes(body.scopes, SPACES_LIMITS.scopesPerGrant)
+          if (!scopes) return null
+        }
+        let handoff: boolean | null = null
+        if (body.handoff !== undefined) {
+          if (typeof body.handoff !== 'boolean') return null
+          handoff = body.handoff
+        }
+        // A hand-off is of exactly one street.
+        if (handoff === true && scopes?.length !== 1) return null
+        return {
+          ...member,
+          inviteId,
+          joinVerifier,
+          expiresAt,
+          epoch,
+          scopes,
+          handoff,
+        }
       })
     ),
   'invite/delete': (body) =>
@@ -619,6 +868,110 @@ export const SPACES_FIELD_PARSERS: Parsers = {
     ),
   rekey: parseRekey,
   delete: (body) => asParsed(memberFields(body)),
+  'member/scopes': (body) =>
+    asParsed(
+      withMember(body, (member) => {
+        if (!isId(body.target)) return null
+        if (body.scopes === null)
+          return { ...member, target: body.target, scopes: null }
+        const scopes = parseScopes(body.scopes, SPACES_LIMITS.scopesPerGrant)
+        return scopes ? { ...member, target: body.target, scopes } : null
+      })
+    ),
+  'handoff/create': (body) =>
+    asParsed(
+      withMember(body, (member) =>
+        isId(body.scopeId) && isId(body.target)
+          ? { ...member, scopeId: body.scopeId, target: body.target }
+          : null
+      )
+    ),
+  'handoff/end': (body) =>
+    asParsed(
+      withMember(body, (member) =>
+        isId(body.scopeId) ? { ...member, scopeId: body.scopeId } : null
+      )
+    ),
+  'link/create': (body, now) =>
+    asParsed(
+      withMember(body, (member) => {
+        const { linkId, verifier, expiresAt, epoch } = body
+        if (!isId(linkId) || !isHash(verifier)) return null
+        if (!isSafeInteger(epoch) || epoch < 1) return null
+        if (
+          !isSafeInteger(expiresAt) ||
+          expiresAt <= now ||
+          expiresAt > now + SPACES_LIMITS.maxLinkLifetimeMs
+        )
+          return null
+        const scopes = parseScopes(body.scopes, SPACES_LIMITS.scopesPerLink)
+        return scopes
+          ? { ...member, linkId, verifier, scopes, expiresAt, epoch }
+          : null
+      })
+    ),
+  'link/end': (body) =>
+    asParsed(
+      withMember(body, (member) =>
+        isId(body.linkId) ? { ...member, linkId: body.linkId } : null
+      )
+    ),
+}
+
+const guestFields = (body: Record<string, unknown>): GuestFields | null => {
+  const linkToken = bytes32(body.linkToken)
+  return isId(body.spaceId) && isId(body.linkId) && linkToken
+    ? { spaceId: body.spaceId, linkId: body.linkId, linkToken }
+    : null
+}
+
+type GuestParsers = {
+  [K in SpacesGuestOp]: (
+    body: Record<string, unknown>,
+    now: number
+  ) => Parsed<SpacesGuestFields[K]>
+}
+
+/**
+ * The guest ops' body parsers: `spaceId`, `linkId`, and the 32-byte
+ * `linkToken`, then `guest/sync`'s cursor (`limit` up to 500) or
+ * `guest/put`'s 1 to 20 records, each blob at most 4 KiB decoded (over it,
+ * or more records, is `too_large`), each id in the scoped grammar
+ * (`bad_request`). Whether the guest may write it is the space's to answer
+ * (`forbidden`).
+ */
+export const SPACES_GUEST_PARSERS: GuestParsers = {
+  'guest/sync': (body) => {
+    const guest = guestFields(body)
+    const { since, limit } = body
+    if (!guest || !isSafeInteger(since) || since < 0) return refused()
+    if (
+      limit !== undefined &&
+      (!isSafeInteger(limit) || limit < 1 || limit > SPACES_LIMITS.guestSyncRecords)
+    )
+      return refused()
+    return parsed({
+      ...guest,
+      since,
+      limit: (limit as number | undefined) ?? SPACES_LIMITS.guestSyncRecords,
+    })
+  },
+  'guest/put': (body, now) => {
+    const guest = guestFields(body)
+    if (!guest) return refused()
+    const records = parseRecords(
+      body.records,
+      now,
+      SPACES_LIMITS.guestPutRecords,
+      SPACES_LIMITS.guestBlobBytes
+    )
+    if (!records.ok) return records
+    // Only scoped spaces have links, so an id outside their grammar is
+    // refused here, before any space wakes.
+    if (records.value.some((record) => !SCOPED_RECORD_ID_PATTERN.test(record.recordId)))
+      return refused()
+    return parsed({ ...guest, records: records.value })
+  },
 }
 
 /** The body's size cap for `op`, checked before it's parsed. */

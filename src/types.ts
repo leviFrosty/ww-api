@@ -569,6 +569,20 @@ export interface Environment {
    */
   SPACES_ENABLED?: string;
 
+  /**
+   * The guest ops' kill-switch fallback (`"true"` enables) when KV
+   * `spaces:guests` is absent (witness-work ADR 0046). `"true"` in dev,
+   * `"false"` in prod.
+   */
+  SPACES_GUESTS?: string;
+
+  /**
+   * Per-network limiter for the public guest ops (`guest/sync`,
+   * `guest/put`), keyed by an HMAC of the client IP (IPv6 by /64), never
+   * the IP. Size in `SPACES_LIMITS.guestRequestsPerMinute`.
+   */
+  SPACES_GUEST_LIMITER: RateLimit;
+
   /** APNs auth key id (secret). Pushes are skipped when unset. */
   APNS_KEY_ID?: string;
 

@@ -5,6 +5,7 @@ import { BuddyRegistrationQuota } from '../buddies/registrationQuota'
 import { AccountHandoff } from '../accounts/handoffDO'
 import { AccountSync } from '../accounts/syncDO'
 import { SharedSpace } from '../spaces/spaceDO'
+import { SPACES_LIMITS } from '../spaces/contracts'
 import { AccountRateCounter } from '../accounts/rateCounterDO'
 import { AccountApproval } from '../accounts/approvalDO'
 import { BUDDIES_ABUSE_LIMITS } from '../buddies/limits'
@@ -124,6 +125,10 @@ export interface HarnessOptions {
   syncBucket?: boolean
   /** The `SPACES_ENABLED` var; `"true"` (dev's) by default. */
   spacesEnabled?: string
+  /** The `SPACES_GUESTS` var; `"true"` (dev's) by default. */
+  spacesGuests?: string
+  /** Per-minute limit of `SPACES_GUEST_LIMITER`; production's by default. */
+  guestLimit?: number
   /** Bind the Cloud Sync photo bucket (`ACCOUNT_PHOTOS`). Default true. */
   photoBucket?: boolean
   /**
@@ -200,6 +205,8 @@ export interface Harness {
   fcmResponse: (push: RecordedPush) => Response
   /** Keys the unsigned-op limiter saw, refused ones included. */
   rateLimitKeys: string[]
+  /** Keys the Shared Spaces guest limiter saw, refused ones included. */
+  guestLimitKeys: string[]
   /** The raw Response for a request to the relay routes. */
   request(path: string, init: RequestInit): Promise<Response>
   post(
@@ -283,6 +290,7 @@ export const createHarness = async (
   )
 
   const rateLimitKeys: string[] = []
+  const guestLimitKeys: string[] = []
   const limiters = Object.fromEntries(
     Object.entries(BUDDIES_ABUSE_LIMITS.edge).map(
       ([tier, { binding, perMinute }]) => [
@@ -307,6 +315,11 @@ export const createHarness = async (
     ...(options.photoBucket === false ? {} : { ACCOUNT_PHOTOS: photoBlobs }),
     SYNC_ENABLED: 'true',
     SPACES_ENABLED: options.spacesEnabled ?? 'true',
+    SPACES_GUESTS: options.spacesGuests ?? 'true',
+    SPACES_GUEST_LIMITER: fakeRateLimiter(
+      options.guestLimit ?? SPACES_LIMITS.guestRequestsPerMinute,
+      guestLimitKeys
+    ),
     WEB_APP_ORIGINS: `https://app-dev.witnesswork.app,${TEST_WEB_ORIGIN}`,
     ...(options.sessions === false
       ? {}
@@ -396,6 +409,7 @@ export const createHarness = async (
     apnsResponse: () => new Response(null, { status: 200 }),
     fcmResponse: () => Response.json({ name: 'projects/p/messages/1' }),
     rateLimitKeys,
+    guestLimitKeys,
     request: async () => {
       throw new Error('replaced below')
     },

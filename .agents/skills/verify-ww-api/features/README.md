@@ -48,6 +48,6 @@ Keep implementation details out of the map. Name only user paths, stable handles
 - [Web maps](./maps.md) covers MapKit JS tokens (`/maps/v1/mapkit-tokens`: 401, `maps_unconfigured`, minting with a throwaway key) and point-of-interest search (`/places/v1/search`).
 - [Passkeys and web sessions](./passkeys.md) covers registering, signing in, ticket web sessions, step-up, wraps, removal, and the refusals, with a software authenticator and a real Chromium virtual authenticator with PRF.
 - [Accounts and sessions](./accounts.md) covers sessions through the dev bypass, `GET /accounts/v1/account`, bearer handoff and backup, the legacy switch, and `/app/v1/config`.
-- [Shared Spaces](./shared-spaces.md) covers Shared Cars' spaces: create, invites and joins, put and sync, roles, rekeying, the live socket, and the kill switch.
+- [Shared Spaces](./shared-spaces.md) covers Shared Cars' spaces: create, invites and joins, put and sync, roles, rekeying, the live socket, and the kill switch; and Territories' scoped spaces: streets, hand-offs, and guest links.
 
 Not mapped yet: supporter route planning (`/route-planning`, needs `HERE_API_KEY`). Map it with `maintain-verification-skill` before relying on it.

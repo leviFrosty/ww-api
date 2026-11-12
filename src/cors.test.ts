@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Environment } from './types'
 import { makeMemoryD1 } from './test/memoryD1'
+import { makeMemoryKv } from './test/memoryKv'
 
 vi.mock('cloudflare:workers', () => ({ DurableObject: class {} }))
 
@@ -250,6 +251,31 @@ describe('responses', () => {
     expect(response.status).toBe(429)
     expect(response.headers.get('retry-after')).toBe('60')
     expectCors(response, WEB)
+  })
+
+  it('carry them, Date exposed, on the public guest ops, whose preflight needs no Authorization', async () => {
+    const BETA_WEB = 'https://beta.app.witnesswork.app'
+    const kv = makeMemoryKv()
+    await kv.put('spaces:enabled', 'true')
+    await kv.put('spaces:guests', 'false')
+    const env = makeEnv({ NOTES_KV: kv, WEB_APP_ORIGINS: `${PROD_WEB},${BETA_WEB}` })
+    for (const origin of [PROD_WEB, BETA_WEB]) {
+      for (const op of ['guest/sync', 'guest/put']) {
+        const allowed = await preflight(env, `/spaces/v1/${op}`, origin, 'content-type')
+        expect(allowed.status).toBe(204)
+        expect(allowed.headers.get('access-control-allow-origin')).toBe(origin)
+        expect(allowed.headers.get('access-control-allow-credentials')).toBeNull()
+        // Guest links switched off: still a CORS answer the page can read.
+        const response = await call(env, `/spaces/v1/${op}`, {
+          method: 'POST',
+          headers: { origin, 'content-type': 'application/json' },
+          body: '{}',
+        })
+        expect(response.status).toBe(503)
+        expectCors(response, origin)
+        expect(response.headers.get('access-control-expose-headers')).toContain('Date')
+      }
+    }
   })
 
   it('carry them on 404', async () => {

@@ -28,11 +28,18 @@ Preconditions:
 - **Switch on.** Run `curl -s -X POST $URL/spaces/v1/sync -H 'content-type: application/json' -H "cf-connecting-ip: 198.18.5.1" -d '{}'`. The body is `{"ok":false,"error":"unauthorized","code":"unauthorized"}`; `disabled` means KV `spaces:enabled` isn't `true` (`node scripts/verify/dev.mjs kv delete spaces:enabled`).
 - **Member cap.** Run `node scripts/verify/dev.mjs kv put spaces:maxMembers 2`, then a new space's second `invite/create` is 429 `limit` with no `Retry-After` (the owner plus one open invite fill it). Restore it with `node scripts/verify/dev.mjs kv delete spaces:maxMembers`.
 
-## Gotchas
+## Territories (scoped spaces and guest links)
+
+Spaces created with `mode: "scoped"` (witness-work ADR 0046) add streets as scopes, roles, hand-offs, and guest links with two public ops. AGENTS.md → "Territories: scoped spaces and guest links" has the rules.
+
+- **Whole flow.** Run `pnpm test:e2e src/e2e/territories.e2e.test.ts`. One space: the owner seeds `h`, three streets, and a do-not-call; Ann joins on S1 and Ben on the whole territory, and each reads the other's records only where allowed (Ann gets 403 on S2, never sees S2 or `d.`); the owner hands S2 to Cal (`invite/create` with `handoff`), after which the owner's S2 put is 403; Cal is refused a second hand-off both ways (403), shares S2 onward to Dee, and makes a guest link; the guest syncs and puts with no session (S2 only; bare `s.<S>` and S1 are 403); an unknown link and a wrong token get the same 404; `link/end` makes the next guest call 410 `gone` `reason: "ended"`; the owner's `handoff/end` removes Dee and Cal (410); the owner's `leave` is 400 and `delete` ends it. A second test pauses guests with KV `spaces:guests` = `false` (503 `disabled`, `Retry-After: 60`, `link/create` still 200) and restores it. Vitest reports 2 passed; `.verify/artifacts/e2e-territories-*.json` holds the exchanges.
+- **Per-network limit.** 121 `guest/sync` calls from addresses in one IPv6 /64 (`cf-connecting-ip: 2001:db8:77::<n>`) with an unknown link: 120 × 404, then 429 `rate_limited` with `Retry-After: 60`; another /64 still gets 404.
+
 
 - Every op needs a bearer token from a dev-bypass session (`openSession()` in `src/test/e2e.ts`); the space never sees which session calls, so any of a person's sessions work.
 - The member `token` is 32 random bytes (43 b64u characters) and `tokenHash` is `b64u(SHA-256(token bytes))`, not of the string.
 - `memberId` is `b64u(SHA-256("ww-spaces/v1/member-id|" + spaceId + "|" + dhPub)[0..16])`, `dhPub` as its b64u text (`spaceMemberId()` in `src/test/buddiesClient.ts`). Random 32 bytes stand in for a real X25519 key; the server only checks the commitment.
-- Restore `spaces:enabled` and `spaces:maxMembers` (`kv delete`) after flipping them.
+- Restore `spaces:enabled`, `spaces:guests`, and `spaces:maxMembers` (`kv delete`) after flipping them.
+- Guest ops take no bearer token, and the per-network limiter counts by `cf-connecting-ip` (as an HMAC): give each local request its own address, as `http()` does.
 - The unit tests' SQLite fake (`src/test/durableObjects.ts`) reads every cursor whole up front, so a cursor left unfinished only fails on real workerd. Prove anything that stops reading rows early here, with e2e. On `wrangler dev`, an unfinished cursor makes `DROP TABLE` fail with `SQLITE_LOCKED`, but not `deleteAll()`.
 - Under `wrangler dev`, the TCP connection lingers about 10 s after a server-sent close frame; the frame itself (4001, 4002) arrives at once.
