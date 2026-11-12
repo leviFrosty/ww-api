@@ -84,7 +84,7 @@ describe('ids, keys, and signatures', () => {
 
 describe('blob sizes (decoded bytes)', () => {
   it.each([
-    ['roster/put', 32 * 1024, {}],
+    ['roster/put', 128 * 1024, {}],
     ['card/put', 16 * 1024, { slotId: id('S') }],
     [
       'event/put',
@@ -222,7 +222,10 @@ describe('event kinds and templates', () => {
     ).toBeNull()
     expect(parse('device/register', { ...device, templates: [] })).toBeNull()
     const many = Object.fromEntries(
-      Array.from({ length: 33 }, (_, i) => [`k${i}`, template])
+      Array.from({ length: BUDDIES_LIMITS.templates + 1 }, (_, i) => [
+        `k${i}`,
+        template,
+      ])
     )
     expect(parse('device/register', { ...device, templates: many })).toBeNull()
     expect(
@@ -348,6 +351,34 @@ describe('inbox/live', () => {
     expect(parse('inbox/live', { ...signed, since: 3 })).toEqual(signed)
     expect(parse('inbox/live', { ...signed, inboxId: 'x' })).toBeNull()
     expect(BUDDIES_OPS).not.toContain('inbox/live')
+  })
+})
+
+describe('request ceiling', () => {
+  const b64Chars = (bytes: number) => Math.ceil((bytes * 4) / 3)
+  // The legacy form base64url-encodes the payload JSON a second time.
+  const legacyBody = (payload: object) =>
+    JSON.stringify({
+      payload: 'A'.repeat(
+        b64Chars(new TextEncoder().encode(JSON.stringify(payload)).length)
+      ),
+      signature: 'A'.repeat(86),
+    }).length
+
+  it('fits the largest roster and a full set of templates in one request', () => {
+    const roster = { ...signed, blob: 'A'.repeat(b64Chars(BUDDIES_LIMITS.rosterBytes)) }
+    expect(legacyBody(roster)).toBeLessThan(BUDDIES_LIMITS.requestBytes)
+
+    // Four UTF-8 bytes per character is the most a template can take.
+    const text = '😀'.repeat(BUDDIES_LIMITS.templateChars)
+    const templates = Object.fromEntries(
+      Array.from({ length: BUDDIES_LIMITS.templates }, (_, i) => [
+        `join.request.${String(i).padStart(12, '0')}`,
+        { title: text, body: text },
+      ])
+    )
+    const register = { ...signed, deviceId: 'A'.repeat(22), templates }
+    expect(legacyBody(register)).toBeLessThan(BUDDIES_LIMITS.requestBytes)
   })
 })
 
