@@ -78,7 +78,7 @@ import { spacesGuestDocs, spacesLiveDocs, spacesOpDocs } from './openapi'
  * make a space, the account's 20 spaces a rolling day. There's no Supporter
  * check.
  *
- * The guest ops (`guest/sync`, `guest/put`; witness-work ADR 0046) are
+ * The guest ops (`guest/sync`, `guest/put`; witness-work ADR 0047) are
  * the exception: no session, a guest link's token in the body instead.
  * Gates, in order: both switches (`spaces:enabled`, `spaces:guests`), 120
  * requests a minute per network (`SPACES_GUEST_LIMITER`, keyed by an HMAC

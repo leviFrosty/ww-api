@@ -31,7 +31,7 @@ vi.mock('cloudflare:workers', () => ({
 
 /**
  * Guest links' public ops, `guest/sync` and `guest/put` (witness-work ADR
- * 0046, `docs/territories-protocol.md` "Guest ops"): the API's first writes
+ * 0047, `docs/territories-protocol.md` "Guest ops"): the API's first writes
  * without a session. A guest reads and writes only its link's streets, stops
  * the moment the link ends or expires, can't tell an unknown space, link, or
  * token apart, and is turned away by the switches, the per-network limit,

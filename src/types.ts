@@ -571,7 +571,7 @@ export interface Environment {
 
   /**
    * The guest ops' kill-switch fallback (`"true"` enables) when KV
-   * `spaces:guests` is absent (witness-work ADR 0046). `"true"` in dev,
+   * `spaces:guests` is absent (witness-work ADR 0047). `"true"` in dev,
    * `"false"` in prod.
    */
   SPACES_GUESTS?: string;

@@ -2315,7 +2315,7 @@ wrangler kv key delete --binding NOTES_KV spaces:maxMembers
 
 ### Territories: scoped spaces and guest links
 
-Shared Territories (witness-work ADR 0046; wire contract
+Shared Territories (witness-work ADR 0047; wire contract
 `docs/territories-protocol.md` there) are Shared Spaces created with
 `mode: "scoped"`. A space without a mode (every car) keeps every rule above,
 unchanged; the mode never changes. Same files, plus `scoped.test.ts` and

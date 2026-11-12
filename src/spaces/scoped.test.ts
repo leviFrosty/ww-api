@@ -23,7 +23,7 @@ vi.mock('cloudflare:workers', () => ({
 }))
 
 /**
- * Scoped spaces (Territories, witness-work ADR 0046,
+ * Scoped spaces (Territories, witness-work ADR 0047,
  * `docs/territories-protocol.md`): the mode, the record id grammar, who
  * reads and writes which records, scoped invites and joins, hand-offs and
  * their ending, `member/scopes`, guest links as members manage them, and

@@ -168,7 +168,7 @@ SYNC_ENTITLEMENT = "everyone"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. On in dev.
 SPACES_ENABLED = "true"
-# Territories' guest links (witness-work ADR 0046): the public guest ops'
+# Territories' guest links (witness-work ADR 0047): the public guest ops'
 # fallback when KV `spaces:guests` is absent. On in dev.
 SPACES_GUESTS = "true"
 # The web app's origins (witness-work ADR 0038 §10): CORS and browser live
@@ -437,7 +437,7 @@ namespace_id = "2007"   # distinct from prod's 1007
   period = 60
 
 # Shared Spaces' public guest ops (guest/sync, guest/put; witness-work ADR
-# 0046), per network, keyed by an HMAC of the IP. Size:
+# 0047), per network, keyed by an HMAC of the IP. Size:
 # SPACES_LIMITS.guestRequestsPerMinute, which guest.test.ts keeps equal.
 [[env.dev.ratelimits]]
 name = "SPACES_GUEST_LIMITER"
@@ -537,7 +537,7 @@ SYNC_ENTITLEMENT = "everyone"
 # `spaces:enabled` is absent. Off in prod until KV `spaces:enabled` turns it
 # on, before the app release that shares cars. Repeated under [env.dev.vars].
 SPACES_ENABLED = "false"
-# Territories' guest links (witness-work ADR 0046): the public guest ops'
+# Territories' guest links (witness-work ADR 0047): the public guest ops'
 # (`guest/sync`, `guest/put`) fallback when KV `spaces:guests` is absent. Off
 # in prod until the owner turns them on for Beta testing (KV, with
 # `spaces:enabled`). Repeated under [env.dev.vars].
@@ -671,7 +671,7 @@ MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 #   wrangler kv key put --binding NOTES_KV spaces:enabled false      # off
 #   wrangler kv key put --binding NOTES_KV spaces:maxMembers 12      # raise the cap
 #   wrangler kv key delete --binding NOTES_KV spaces:enabled         # use the var
-# `spaces:guests` (Territories' guest links, ADR 0046): "true" turns the
+# `spaces:guests` (Territories' guest links, ADR 0047): "true" turns the
 # public guest/sync and guest/put on, anything else off (503 disabled);
 # absent falls back to SPACES_GUESTS. They also need spaces:enabled.
 #   wrangler kv key put --binding NOTES_KV spaces:guests true        # on
@@ -785,7 +785,7 @@ namespace_id = "1007"
   period = 60
 
 # Shared Spaces' public guest ops (guest/sync, guest/put; witness-work ADR
-# 0046): 120 a minute per network (IPv4, or IPv6 /64), keyed by an HMAC of
+# 0047): 120 a minute per network (IPv4, or IPv6 /64), keyed by an HMAC of
 # the IP under ACCOUNT_TICKET_SECRET, never the IP. Repeated under [env.dev].
 [[ratelimits]]
 name = "SPACES_GUEST_LIMITER"
