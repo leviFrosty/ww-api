@@ -31,7 +31,7 @@ import { SCRIBE_SYSTEM_PROMPT } from './prompt'
 import { hasUntrustedResults, isTurnTainted, offeredTools, renderModelInput } from './render'
 import { SSE_HEADERS, createSseWriter } from './sse'
 import { getPublicScribeStatus, resolveScribeAvailability } from './status'
-import type { AdmitStepResult, AdmitTranscribeResult } from './meterDO'
+import type { AdmitCallResult, AdmitStepResult, AdmitTranscribeResult } from './meterDO'
 import { admitWithPlan, resolvePlan } from './plan'
 import { cacheKeyFor, providerUserId, runScribeStep, type RawUsage } from './step'
 import {
@@ -43,6 +43,14 @@ import {
   transcribePage,
 } from './transcribe'
 import {
+  TERRITORY_NOTES_MAX_REQUEST_BYTES,
+  TERRITORY_NOTES_TIMEOUT_MS,
+  estimateNotesInputTokens,
+  parseTerritoryNotesOutput,
+  readTerritoryNotes,
+  validateTerritoryNotesRequest,
+} from './territoryNotes'
+import {
   ULID,
   estimateInputTokens,
   readBodyText,
@@ -52,11 +60,14 @@ import { scribeError, toScribeModelError, devDetail, type ScribeErrorOptions } f
 import {
   scribeStepEvent,
   scribeStepLogLine,
+  scribeTerritoryNotesEvent,
+  scribeTerritoryNotesLogLine,
   scribeTranscribeEvent,
   scribeTranscribeLogLine,
   turnGap,
   type ScribePlatform,
   type StepLogFields,
+  type TerritoryNotesLogFields,
   type TranscribeLogFields,
 } from './analytics'
 import {
@@ -635,4 +646,179 @@ export async function handleScribeTranscribeRequest(ctx: AppContext) {
   })
   emit()
   return ctx.json({ ok: true as const, text: output.text, truncated, usage: snapshot })
+}
+
+// --- POST /scribe/v1/territory-notes ---------------------------------------------
+
+/**
+ * Reads a publisher's territory notes into door results for the app's review
+ * step. Pre-flight like a page: auth → kill switch and provider → `protocol`
+ * → body → usage windows (402); then one model call, charged from its usage
+ * (an abort or timeout is charged as the input estimate). A malformed answer
+ * is charged and answered 502 `model_error` with `usage`, so the app falls
+ * back to its own reader. The notes are never logged or stored.
+ */
+export async function handleScribeTerritoryNotesRequest(ctx: AppContext) {
+  const startedAt = Date.now()
+  const auth = await authenticateAccount(ctx, { requireActive: true })
+  if (!auth.ok) return authRefusal(auth.error)
+  const { account } = auth
+  const dev = await resolveDevSession(ctx.env, account)
+  const devBypass = dev != null
+  // Never rejects; left unread when the request is refused first.
+  const planning = resolvePlan(ctx.env, account, dev, { useCache: true })
+  const distinctId = await analyticsDistinctId(account.accountId)
+  const log: TerritoryNotesLogFields = {
+    plan: null,
+    platform: platformOf(account),
+    lines: 0,
+    notesChars: 0,
+    streets: 0,
+    doors: 0,
+    ranges: 0,
+    unread: 0,
+    dropped: 0,
+    malformed: false,
+    truncated: false,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    units: 0,
+    usageEstimated: false,
+    costUsd: null,
+    model: null,
+    provider: null,
+    latencyMs: 0,
+    rule: null,
+    errorCode: null,
+  }
+  const emit = () => {
+    log.latencyMs = Date.now() - startedAt
+    console.info(scribeTerritoryNotesLogLine(log))
+    track(ctx, scribeTerritoryNotesEvent(distinctId, log))
+  }
+  const refuse = (
+    status: number,
+    code: ScribeErrorCode,
+    options: ScribeErrorOptions = {},
+    rule: string | null = null
+  ) => {
+    log.errorCode = code
+    log.rule = rule
+    emit()
+    return scribeError(status, code, options)
+  }
+
+  const availability = await resolveScribeAvailability({ env: ctx.env, waitUntil: waitUntilOf(ctx) })
+  if (!availability.enabled || !availability.target) {
+    return availability.reason === 'disabled'
+      ? refuse(503, 'disabled', { retryAfter: SWITCH_RETRY_AFTER_SECONDS })
+      : refuse(503, 'unavailable', { retryAfter: SWITCH_RETRY_AFTER_SECONDS })
+  }
+  const { config, target } = availability
+  const limits = meteredLimits(config.limits, dev)
+  log.model = target.model
+
+  const read = await readBodyText(ctx.req.raw, TERRITORY_NOTES_MAX_REQUEST_BYTES)
+  if (!read.ok)
+    return read.tooLarge
+      ? refuse(413, 'too_large', {}, 'request_bytes')
+      : refuse(400, 'bad_request', {}, 'body')
+  const body = parseJson(read.text)
+  if (!body) return refuse(400, 'bad_request', {}, 'json')
+  const protocol = checkProtocol(body.protocol, config)
+  if (!protocol.ok) return refuse(protocol.status, protocol.code, {}, protocol.rule)
+  const validated = validateTerritoryNotesRequest(body)
+  if (!validated.ok) return refuse(validated.status, validated.code, {}, validated.rule)
+  const request = validated.value
+  log.lines = request.lines.filter((line) => line.trim()).length
+  log.notesChars = request.lines.join('\n').length
+  log.streets = request.streets.length
+
+  const meter = meterFor(ctx.env, account.accountId)
+  const { plan: resolved, result: admitted } = await admitWithPlan<AdmitCallResult>(
+    planning,
+    () => resolvePlan(ctx.env, account, dev),
+    ({ plan, supporterCheckFailed }) =>
+      meter.admitCall({ plan, supporterCheckFailed, limits, now: Date.now() }),
+    (result) => !result.ok
+  )
+  log.plan = resolved.plan
+  const context = {
+    plan: resolved.plan,
+    supporterCheckFailed: resolved.supporterCheckFailed,
+    limits,
+  }
+  if (!admitted.ok)
+    return refuse(402, 'limit_reached', {
+      usage: admitted.snapshot,
+      retryAfter: retryAfterUntil(admitted.snapshot.resetsAt, Date.now()),
+    })
+
+  const timeout = AbortSignal.timeout(TERRITORY_NOTES_TIMEOUT_MS)
+  const signal = ctx.req.raw.signal ? AbortSignal.any([ctx.req.raw.signal, timeout]) : timeout
+  let output
+  try {
+    output = await readTerritoryNotes({
+      apiKey: ctx.env.OPENROUTER_API_KEY,
+      user: await providerUserId(account.accountId),
+      target,
+      request,
+      abortSignal: signal,
+    })
+  } catch (error) {
+    if (signal.aborted) {
+      // No reported usage: charge the input estimate (protocol: Metering).
+      const units = computeUnits(
+        {
+          inputTokens: estimateNotesInputTokens(request),
+          cachedInputTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+        },
+        limits.weights
+      )
+      const usage = await meter.charge({ ...context, units, kind: 'territory_notes', now: Date.now() })
+      log.units = units
+      log.usageEstimated = true
+      return refuse(502, 'model_error', { usage }, timeout.aborted ? 'timeout' : 'cancelled')
+    }
+    Sentry.captureException(toScribeModelError(error))
+    return refuse(502, 'model_error', { detail: devBypass ? devDetail(error) : undefined })
+  }
+
+  const usage = {
+    inputTokens: output.usage.inputTokens ?? 0,
+    cachedInputTokens: output.usage.inputTokenDetails?.cacheReadTokens ?? 0,
+    cacheWriteTokens: output.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
+    outputTokens: output.usage.outputTokens ?? 0,
+  }
+  const units = computeUnits(usage, limits.weights)
+  const snapshot = await meter.charge({ ...context, units, kind: 'territory_notes', now: Date.now() })
+  Object.assign(log, usage, {
+    units,
+    costUsd: output.costUsd ?? null,
+    provider: output.resolvedProvider ?? null,
+    truncated: output.finishReason === 'length',
+  })
+  const result = parseTerritoryNotesOutput(output.text, request)
+  if (!result) {
+    log.malformed = true
+    return refuse(502, 'model_error', { usage: snapshot }, 'malformed_output')
+  }
+  Object.assign(log, {
+    doors: result.doors.length,
+    ranges: result.ranges.length,
+    unread: result.unread.length,
+    dropped: result.dropped,
+  })
+  emit()
+  return ctx.json({
+    ok: true as const,
+    doors: result.doors,
+    ranges: result.ranges,
+    unread: result.unread,
+    usage: snapshot,
+  })
 }
