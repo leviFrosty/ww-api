@@ -19,7 +19,7 @@ import {
 } from '../test/e2e'
 
 /**
- * Territories (witness-work ADR 0046, `docs/territories-protocol.md`) over
+ * Territories (witness-work ADR 0047, `docs/territories-protocol.md`) over
  * real HTTP against the local worker's `SharedSpace`: an owner makes a
  * scoped space, two members write and sync street records, the owner hands
  * a street off, the holder shares it onward and is refused a second

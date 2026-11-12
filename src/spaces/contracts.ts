@@ -113,7 +113,7 @@ export const SPACES_LIMITS = {
    */
   syncChars: 4 * MIB,
 
-  // --- Scoped spaces (Territories, witness-work ADR 0046) -------------------
+  // --- Scoped spaces (Territories, witness-work ADR 0047) -------------------
 
   /** Scope ids an invite, a member, or `member/scopes` may name. */
   scopesPerGrant: 100,

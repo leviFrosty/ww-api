@@ -62,7 +62,7 @@ import {
  * tombstone in the same transaction as the decision, so later requests are
  * `gone` and the id can't be created again; `#purge` then frees the storage.
  *
- * A scoped space (a territory, witness-work ADR 0046 and
+ * A scoped space (a territory, witness-work ADR 0047 and
  * `docs/territories-protocol.md` there) adds roles and scopes on top: each
  * street is a scope the server sees only as an opaque id. Members carry the
  * streets they were given (`scopes`, null for the whole territory) and who

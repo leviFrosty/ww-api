@@ -30,7 +30,7 @@ Preconditions:
 
 ## Territories (scoped spaces and guest links)
 
-Spaces created with `mode: "scoped"` (witness-work ADR 0046) add streets as scopes, roles, hand-offs, and guest links with two public ops. AGENTS.md → "Territories: scoped spaces and guest links" has the rules.
+Spaces created with `mode: "scoped"` (witness-work ADR 0047) add streets as scopes, roles, hand-offs, and guest links with two public ops. AGENTS.md → "Territories: scoped spaces and guest links" has the rules.
 
 - **Whole flow.** Run `pnpm test:e2e src/e2e/territories.e2e.test.ts`. One space: the owner seeds `h`, three streets, and a do-not-call; Ann joins on S1 and Ben on the whole territory, and each reads the other's records only where allowed (Ann gets 403 on S2, never sees S2 or `d.`); the owner hands S2 to Cal (`invite/create` with `handoff`), after which the owner's S2 put is 403; Cal is refused a second hand-off both ways (403), shares S2 onward to Dee, and makes a guest link; the guest syncs and puts with no session (S2 only; bare `s.<S>` and S1 are 403); an unknown link and a wrong token get the same 404; `link/end` makes the next guest call 410 `gone` `reason: "ended"`; the owner's `handoff/end` removes Dee and Cal (410); the owner's `leave` is 400 and `delete` ends it. A second test pauses guests with KV `spaces:guests` = `false` (503 `disabled`, `Retry-After: 60`, `link/create` still 200) and restores it. Vitest reports 2 passed; `.verify/artifacts/e2e-territories-*.json` holds the exchanges.
 - **Per-network limit.** 121 `guest/sync` calls from addresses in one IPv6 /64 (`cf-connecting-ip: 2001:db8:77::<n>`) with an unknown link: 120 × 404, then 429 `rate_limited` with `Retry-After: 60`; another /64 still gets 404.
