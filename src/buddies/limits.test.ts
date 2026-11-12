@@ -634,9 +634,8 @@ describe('stored-event caps', () => {
   it('refuses events past the inbox’s byte cap', async () => {
     const owner = await Owner.create(h)
     const writers: Writer[] = []
-    for (let i = 0; i < BUDDIES_LIMITS.slotsPlusOpenInvites; i++)
-      writers.push(await owner.addWriter())
-    // More than today's 5 slots could hold, as more buddies one day might.
+    for (let i = 0; i < 5; i++) writers.push(await owner.addWriter())
+    // Four slots fill the inbox's cap, though each stays under its own.
     const perSlot = ABUSE.inboxEventBytes / 4 - 500
     for (const writer of writers.slice(0, 4)) {
       h.inboxes
@@ -703,7 +702,7 @@ describe('nonces', () => {
       writerPub: owner.key.publicKey,
     })
     expect(full.body).toEqual(relayError('limit'))
-    const accepted = 4 // the four slot/adds
+    const accepted = BUDDIES_LIMITS.slotsPlusOpenInvites - 1 // the slot/adds
     expect(nonceRows(owner.inboxId)).toBe(nonces + accepted)
     expect(limitHits()).toEqual([
       ...Array.from({ length: 25 }, () => [
@@ -851,7 +850,8 @@ describe('a heavy, legitimate user', () => {
       return result
     }
 
-    // One household IP for everything: the owner's 4 devices and all 5 buddies.
+    // One household IP for everything: the owner's 4 devices and 5 buddies.
+    // More buddies than that live elsewhere, as callers of their own.
     const owner = await Owner.create(h)
     const devices = Array.from({ length: 4 }, () => randomId())
     const eachDevice = (step: (device: string) => Promise<unknown>) =>
@@ -865,8 +865,7 @@ describe('a heavy, legitimate user', () => {
       await track('device', owner.registerDevice(device))
     })
     const buddies: Writer[] = []
-    for (let i = 0; i < BUDDIES_LIMITS.slotsPlusOpenInvites; i++)
-      buddies.push(await owner.addWriter())
+    for (let i = 0; i < 5; i++) buddies.push(await owner.addWriter())
     await track('roster', owner.send('roster/put', { blob: blobOfSize(20_000) }))
 
     const cursors = new Map(devices.map((device) => [device, 0]))

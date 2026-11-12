@@ -312,9 +312,15 @@ const KIB = 1_024
 /** Caps, windows, and retention from the contract's "Limits and retention". */
 export const BUDDIES_LIMITS = {
   /** `slot/add` and `invite/create` fail with `limit` at this many slots + open invites. */
-  slotsPlusOpenInvites: 5,
-  openInvites: 5,
-  inviteCreations: 20,
+  slotsPlusOpenInvites: 50,
+  /**
+   * As many as the spots: after an account key change the app invites every
+   * buddy back to its new inbox at once (witness-work ADR 0039 §5). The app
+   * holds the invites a User makes by hand to 5 itself.
+   */
+  openInvites: 50,
+  /** Twice the spots, so a key change's reconnect invites fit in one day. */
+  inviteCreations: 100,
   inviteCreationWindowMs: DAY_MS,
   writesPerSlot: 60,
   writeWindowMs: HOUR_MS,
@@ -333,14 +339,18 @@ export const BUDDIES_LIMITS = {
   maxInviteLifetimeMs: 7 * DAY_MS + 5 * MINUTE_MS,
   timestampSkewMs: 5 * MINUTE_MS,
   nonceRetentionMs: 10 * MINUTE_MS,
-  rosterBytes: 32 * KIB,
+  /** About 73 KiB for 50 buddies at their longest names and nicknames. */
+  rosterBytes: 128 * KIB,
   cardBytes: 16 * KIB,
   eventBytes: 8 * KIB,
   inviteBytes: 4 * KIB,
   claimBytes: 4 * KIB,
   templateChars: 200,
-  /** Not in the contract: bounds per-device template storage. */
-  templates: 32,
+  /**
+   * Not in the contract: bounds per-device template storage. The app
+   * registers 14 fixed kinds plus one `join.request.<tag>` per buddy (50).
+   */
+  templates: 96,
   kindChars: 40,
   /** Not in the contract: a whole-envelope ceiling checked before parsing. */
   requestBytes: 256 * KIB,

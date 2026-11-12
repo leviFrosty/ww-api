@@ -17,6 +17,7 @@ import {
   relayError,
   type Harness,
 } from '../test/buddies'
+import { BUDDIES_LIMITS } from './contracts'
 
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
@@ -821,9 +822,11 @@ describe('ending a connection', () => {
 })
 
 describe('caps and rate limits', () => {
-  it('limits slots + open invites to 5', async () => {
+  it('limits slots + open invites to 50', async () => {
+    expect(BUDDIES_LIMITS.slotsPlusOpenInvites).toBe(50)
     const owner = await Owner.create(h)
-    for (let i = 0; i < 3; i++) await owner.addWriter()
+    for (let i = 0; i < BUDDIES_LIMITS.slotsPlusOpenInvites - 2; i++)
+      await owner.addWriter()
     expect((await createInvite(owner)).response.body).toEqual({ ok: true })
     expect((await createInvite(owner)).response.body).toEqual({ ok: true })
 
@@ -842,9 +845,10 @@ describe('caps and rate limits', () => {
     ).toEqual(relayError('limit'))
   })
 
-  it('limits open invites to 5', async () => {
+  it('takes an invite for every spot at once, as a key change’s reconnects need', async () => {
+    expect(BUDDIES_LIMITS.openInvites).toBe(BUDDIES_LIMITS.slotsPlusOpenInvites)
     const owner = await Owner.create(h)
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < BUDDIES_LIMITS.openInvites; i++) {
       expect((await createInvite(owner)).response.status).toBe(200)
     }
     expect(
@@ -852,15 +856,16 @@ describe('caps and rate limits', () => {
     ).toEqual(relayError('limit'))
   })
 
-  it('limits invite creation to 20 per 24 hours, counting deleted invites', async () => {
+  it('limits invite creation to 100 per 24 hours, counting deleted invites', async () => {
+    expect(BUDDIES_LIMITS.inviteCreations).toBe(100)
     const owner = await Owner.create(h)
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < BUDDIES_LIMITS.inviteCreations; i++) {
       const invite = await createInvite(owner)
       expect(invite.response.status).toBe(200)
       await owner.send('invite/delete', { inviteId: invite.inviteId })
-      advance(HOUR_MS)
+      advance((20 * HOUR_MS) / BUDDIES_LIMITS.inviteCreations)
     }
-    // The oldest of the 20 leaves the rolling day in 4 hours.
+    // The oldest of the 100 leaves the rolling day in 4 hours.
     expect((await createInvite(owner)).response).toEqual({
       status: 429,
       body: relayError('rate_limited', { retryAfter: 4 * 60 * 60 }),
@@ -1178,14 +1183,17 @@ describe('invites', () => {
     ).toEqual([])
   })
 
-  it('stops counting a claimed invite as open, so its confirm can add the 5th slot', async () => {
+  it('stops counting a claimed invite as open, so its confirm can add the last slot', async () => {
     const owner = await Owner.create(h)
-    for (let i = 0; i < 4; i++) await owner.addWriter()
+    for (let i = 0; i < BUDDIES_LIMITS.slotsPlusOpenInvites - 1; i++)
+      await owner.addWriter()
     const invite = await createInvite(owner)
     expect(invite.response.status).toBe(200)
     expect((await claim(invite.inviteId, invite.claimSecret)).status).toBe(200)
     await owner.addWriter()
-    expect((await owner.sync()).body.slots).toHaveLength(5)
+    expect((await owner.sync()).body.slots).toHaveLength(
+      BUDDIES_LIMITS.slotsPlusOpenInvites
+    )
   })
 
   it('expires invites at expiresAt and deletes them after a short grace', async () => {
