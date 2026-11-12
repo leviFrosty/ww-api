@@ -169,10 +169,11 @@ export class SpaceMember {
 
   /**
    * Opens an invite at this member's epoch (7 days unless `expiresAt` says
-   * otherwise).
+   * otherwise); `extra` adds body fields (a scoped space's `scopes`, `handoff`).
    */
   async invite(
-    fields: Partial<Invite> = {}
+    fields: Partial<Invite> = {},
+    extra: Record<string, unknown> = {}
   ): Promise<Invite & { response: Awaited<ReturnType<SpaceMember['send']>> }> {
     const secret = await joinSecret()
     const invite: Invite = {
@@ -188,6 +189,7 @@ export class SpaceMember {
       joinVerifier: invite.joinVerifier,
       expiresAt: invite.expiresAt,
       epoch: invite.epoch,
+      ...extra,
     })
     return { ...invite, response }
   }
@@ -217,9 +219,12 @@ export class SpaceMember {
     })
   }
 
-  /** `invite` by `inviter`, then `join`; throws unless both succeed. */
-  async joinVia(inviter: SpaceMember): Promise<void> {
-    const invite = await inviter.invite()
+  /** `invite` by `inviter` (`extra` as `invite`'s), then `join`; throws unless both succeed. */
+  async joinVia(
+    inviter: SpaceMember,
+    extra: Record<string, unknown> = {}
+  ): Promise<void> {
+    const invite = await inviter.invite({}, extra)
     if (invite.response.status !== 200)
       throw new Error(`invite failed: ${JSON.stringify(invite.response.body)}`)
     const joined = await this.join(invite)
@@ -300,3 +305,87 @@ export class SpaceMember {
 
 /** The shared error body. */
 export const spacesError = (code: string) => ({ ok: false, error: code, code })
+
+// --- Territories (scoped spaces) and guest links ---------------------------
+
+/** A random lowercase RFC 9562 version 4 UUID, for a record id's last part. */
+export const uuid = (): string => crypto.randomUUID()
+
+/** A street's scope id: `b64u` of 16 random bytes. */
+export const scopeId = (): string => randomId()
+
+/** A link token and the verifier `link/create` sends for it. */
+export const linkSecret = async () => {
+  const bytes = randomBytes(32)
+  return { linkToken: b64u(bytes), verifier: await sha256B64u(bytes) }
+}
+
+/**
+ * A guest link's page in a browser: no session, the link's token, and a
+ * caller IP of its own (`cf-connecting-ip`).
+ */
+export class GuestPage {
+  epoch = 1
+
+  constructor(
+    readonly env: Environment,
+    readonly spaceId: string,
+    readonly linkId: string,
+    readonly linkToken: string,
+    public ip = '198.51.100.7'
+  ) {}
+
+  get fields() {
+    return { spaceId: this.spaceId, linkId: this.linkId, linkToken: this.linkToken }
+  }
+
+  send(op: string, body: unknown, headers: Record<string, string> = {}) {
+    return requestJson(spacesRoutes as never, this.env, 'POST', `/${op}`, body, {
+      'cf-connecting-ip': this.ip,
+      ...headers,
+    })
+  }
+
+  sync(since = 0, extra: Record<string, unknown> = {}) {
+    return this.send('guest/sync', { ...this.fields, since, ...extra })
+  }
+
+  put(records: RecordInput[]) {
+    return this.send('guest/put', {
+      ...this.fields,
+      records: records.map((record) => ({
+        recordId: record.recordId ?? randomId(),
+        epoch: record.epoch ?? this.epoch,
+        stamp: record.stamp ?? Date.now(),
+        ...(record.deleted === undefined ? {} : { deleted: record.deleted }),
+        blob: record.blob ?? blobOfSize(64),
+      })),
+    })
+  }
+}
+
+/** Opens a guest link on `scopes` as `creator` (24 hours unless told). */
+export const openLink = async (
+  creator: SpaceMember,
+  scopes: string[],
+  fields: Partial<{ linkId: string; expiresAt: number; epoch: number }> = {}
+) => {
+  const secret = await linkSecret()
+  const linkId = fields.linkId ?? randomId()
+  const expiresAt = fields.expiresAt ?? Date.now() + 24 * 60 * 60_000
+  const response = await creator.send('link/create', {
+    ...creator.fields,
+    linkId,
+    verifier: secret.verifier,
+    scopes,
+    expiresAt,
+    epoch: fields.epoch ?? creator.epoch,
+  })
+  return {
+    linkId,
+    expiresAt,
+    ...secret,
+    response,
+    guest: new GuestPage(creator.env, creator.spaceId, linkId, secret.linkToken),
+  }
+}

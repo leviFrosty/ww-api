@@ -15,15 +15,20 @@ import {
   SPACES_HEADERS,
   SPACES_LIMITS as LIMITS,
   SPACES_LIVE_CLOSE,
+  classifyScopedRecord,
   decodeLiveMember,
   fail,
+  goneBecause,
   logSpacesLimitHit,
   mayPutRecord,
   rekeyLinkId,
+  scopeOf,
   spacesErrorResponse,
   type PutRecord,
   type RekeyLink,
   type RekeyWrap,
+  type ScopedRecordClass,
+  type SpaceMode,
   type SpacesErrorCode,
   type SpacesFailure,
   type SpacesLiveMessage,
@@ -57,8 +62,19 @@ import {
  * tombstone in the same transaction as the decision, so later requests are
  * `gone` and the id can't be created again; `#purge` then frees the storage.
  *
- * Privacy: nothing here logs or reports ids, token hashes, keys, wraps, or
- * blobs.
+ * A scoped space (a territory, witness-work ADR 0046 and
+ * `docs/territories-protocol.md` there) adds roles and scopes on top: each
+ * street is a scope the server sees only as an opaque id. Members carry the
+ * streets they were given (`scopes`, null for the whole territory) and who
+ * invited them; `holder` says which member (or pending hand-off invite)
+ * holds a street; `link` holds guest links (a token's verifier, never the
+ * token). Reads are filtered and writes checked per record (`#mayRead`,
+ * `#mayWrite`). The owner never changes: it can't leave, and nothing passes
+ * the space on, so only the owner can hand a street off and a holder never
+ * can. Spaces without a mode keep every rule above, unchanged.
+ *
+ * Privacy: nothing here logs or reports ids, token hashes, keys, wraps,
+ * verifiers, or blobs.
  */
 
 type Empty = Record<string, never>
@@ -78,6 +94,8 @@ export interface CreateSpaceArgs {
   dhPub: string
   tokenHash: string
   wrap: string
+  /** `scoped` for a territory; null or absent keeps the original rules. */
+  mode?: SpaceMode | null
 }
 
 export interface SyncSpaceArgs extends MemberAuth {
@@ -102,6 +120,10 @@ export interface CreateSpaceInviteArgs extends MemberAuth {
   epoch: number
   /** Members plus open invites the space may hold (KV `spaces:maxMembers`). */
   maxMembers: number
+  /** Scoped spaces: the invitee's streets (null: the whole territory, or absent). */
+  scopes?: string[] | null
+  /** Scoped spaces: a hand-off of `scopes`' one street (null: absent). */
+  handoff?: boolean | null
 }
 
 export interface DeleteSpaceInviteArgs extends MemberAuth {
@@ -139,6 +161,49 @@ export interface RekeySpaceArgs extends MemberAuth {
   link: RekeyLinkArgs
 }
 
+export interface MemberScopesArgs extends MemberAuth {
+  target: string
+  scopes: string[] | null
+}
+
+export interface HandoffCreateArgs extends MemberAuth {
+  scopeId: string
+  target: string
+}
+
+export interface HandoffEndArgs extends MemberAuth {
+  scopeId: string
+}
+
+export interface LinkCreateArgs extends MemberAuth {
+  linkId: string
+  verifier: string
+  scopes: string[]
+  expiresAt: number
+  epoch: number
+}
+
+export interface LinkEndArgs extends MemberAuth {
+  linkId: string
+}
+
+/** A guest op's link, with its token already hashed by the Worker. */
+export interface GuestAuth {
+  spaceId: string
+  linkId: string
+  /** Canonical b64u of SHA-256(linkToken). */
+  verifier: string
+}
+
+export interface GuestSyncArgs extends GuestAuth {
+  since: number
+  limit: number
+}
+
+export interface GuestPutArgs extends GuestAuth {
+  records: PutRecordArgs[]
+}
+
 /** `create`'s answer. */
 export interface SpaceCreated {
   seq: number
@@ -165,6 +230,37 @@ export type SpaceMemberView = {
   memberId: string
   dhPub: string
   joinedAt: number
+  /** Scoped spaces only: the member's streets, or null for the whole territory. */
+  scopes?: string[] | null
+  /** Scoped spaces only: who invited them (null for the owner). */
+  invitedBy?: string | null
+}
+
+export type SpaceInviteView = {
+  inviteId: string
+  invitedBy: string
+  expiresAt: number
+  /** Scoped spaces only. */
+  scopes?: string[] | null
+  /** Scoped spaces only. */
+  handoff?: boolean
+}
+
+/** Who holds a street: a member, or (`memberId` null) a pending hand-off invite. */
+export type SpaceHolderView = {
+  scopeId: string
+  memberId: string | null
+  inviteId: string | null
+  since: number
+}
+
+export type SpaceLinkView = {
+  linkId: string
+  createdBy: string
+  scopes: string[]
+  createdAt: number
+  expiresAt: number
+  endedAt: number | null
 }
 
 export interface SpaceSyncView {
@@ -175,8 +271,22 @@ export interface SpaceSyncView {
   wrap: string
   ownerId: string
   members: SpaceMemberView[]
-  invites: { inviteId: string; invitedBy: string; expiresAt: number }[]
+  invites: SpaceInviteView[]
   rekeyNeeded: boolean
+  records: SpaceRecordView[]
+  more: boolean
+  /** Scoped spaces only, from here on. */
+  mode?: SpaceMode
+  holders?: SpaceHolderView[]
+  links?: SpaceLinkView[]
+}
+
+/** `guest/sync`'s answer. */
+export interface GuestSyncView {
+  seq: number
+  epoch: number
+  /** When the link stops working. */
+  expiresAt: number
   records: SpaceRecordView[]
   more: boolean
 }
@@ -189,6 +299,8 @@ export interface PutResult {
 type SpaceRow = {
   spaceId: string
   ownerId: string
+  /** Null for a space without a mode (cars). */
+  mode: SpaceMode | null
   epoch: number
   rekeyNeeded: number
   seq: number
@@ -204,6 +316,9 @@ type MemberRow = {
   tokenHash: string
   wrap: string
   joinedAt: number
+  /** Scoped spaces: a JSON array of scope ids, or null for the whole territory. */
+  scopes: string | null
+  invitedBy: string | null
 }
 
 type InviteRow = {
@@ -215,7 +330,52 @@ type InviteRow = {
   /** Set once the invite is used; kept until it expires, for a retried join. */
   joinedMemberId: string | null
   joinedTokenHash: string | null
+  /** Scoped spaces: a JSON array of scope ids, or null for the whole territory. */
+  scopes: string | null
+  handoff: number
 }
+
+type HoldRow = {
+  scopeId: string
+  memberId: string | null
+  inviteId: string | null
+  since: number
+}
+
+type LinkRow = {
+  linkId: string
+  createdBy: string
+  verifier: string
+  /** A JSON array of scope ids. */
+  scopes: string
+  createdAt: number
+  expiresAt: number
+  endedAt: number | null
+}
+
+/** A member of a scoped space, as its permissions see them. */
+type Caller = {
+  memberId: string
+  isOwner: boolean
+  /** Null: the whole territory (the owner, and whole members). */
+  scopes: ReadonlySet<string> | null
+  invitedBy: string | null
+}
+
+/** What a scoped space's permission checks read, once per request. */
+type Access = {
+  ownerId: string
+  holds: Map<string, HoldRow>
+  /** Memos of who made each invite and link the checks asked about. */
+  inviteAuthors: Map<string, string | null>
+  linkCreators: Map<string, string | null>
+}
+
+const scopeList = (value: string | null): string[] | null =>
+  value == null ? null : (JSON.parse(value) as string[])
+
+const sameScopes = (a: string | null, b: string[] | null | undefined): boolean =>
+  (a ?? null) === (b == null ? null : JSON.stringify(b))
 
 type StoredRecord = {
   stamp: number
@@ -234,6 +394,15 @@ type RecordRow = {
   seq: number
 }
 
+/** Which records a page reads: SQL that narrows the scan, and a final check. */
+type RecordFilter = {
+  where: string
+  bindings: (string | number)[]
+  keep: (row: RecordRow) => boolean
+}
+
+const EVERY_RECORD: RecordFilter = { where: '', bindings: [], keep: () => true }
+
 /**
  * Every table is created by `create`, never for a probe: an unknown space
  * stores nothing, and a deleted one keeps only `tombstone`. A space made
@@ -250,14 +419,17 @@ const SCHEMA = [
      record_count   INTEGER NOT NULL,
      blob_bytes     INTEGER NOT NULL,
      created_at     INTEGER NOT NULL,
-     last_active_at INTEGER NOT NULL
+     last_active_at INTEGER NOT NULL,
+     mode           TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS member (
      member_id  TEXT PRIMARY KEY,
      dh_pub     TEXT NOT NULL,
      token_hash TEXT NOT NULL,
      wrap       TEXT NOT NULL,
-     joined_at  INTEGER NOT NULL
+     joined_at  INTEGER NOT NULL,
+     scopes     TEXT,
+     invited_by TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS invite (
      invite_id         TEXT PRIMARY KEY,
@@ -267,7 +439,9 @@ const SCHEMA = [
      created_at        INTEGER NOT NULL,
      bad_joins         INTEGER NOT NULL,
      joined_member_id  TEXT,
-     joined_token_hash TEXT
+     joined_token_hash TEXT,
+     scopes            TEXT,
+     handoff           INTEGER NOT NULL DEFAULT 0
    )`,
   // Invites closed before they were used (deleted, burned, or closed by a
   // leave, removal, or rekey): only the id, until it would have expired, so
@@ -284,7 +458,8 @@ const SCHEMA = [
      blob       TEXT NOT NULL,
      blob_hash  TEXT NOT NULL,
      blob_bytes INTEGER NOT NULL,
-     seq        INTEGER NOT NULL
+     seq        INTEGER NOT NULL,
+     scope      TEXT
    )`,
   'CREATE INDEX IF NOT EXISTS record_seq ON record (seq)',
   // Records put per hour over the last day: counts, not a list of puts.
@@ -300,6 +475,66 @@ const SCHEMA = [
      puts      INTEGER NOT NULL,
      PRIMARY KEY (member_id, at)
    )`,
+  // Scoped spaces. Who holds each held street: a member, or a pending
+  // hand-off invite (member_id null).
+  `CREATE TABLE IF NOT EXISTS holder (
+     scope_id  TEXT PRIMARY KEY,
+     member_id TEXT,
+     invite_id TEXT,
+     since     INTEGER NOT NULL
+   )`,
+  // Guest links: the token's verifier, never the token or the link's secret.
+  // Kept as long as the space, so a link id is never reused and its
+  // creator can always rewrite its `g.` record.
+  `CREATE TABLE IF NOT EXISTS link (
+     link_id    TEXT PRIMARY KEY,
+     created_by TEXT NOT NULL,
+     verifier   TEXT NOT NULL,
+     scopes     TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     expires_at INTEGER NOT NULL,
+     ended_at   INTEGER
+   )`,
+  // Who made each invite of a scoped space, for its `i.` record, which
+  // outlives the invite itself.
+  `CREATE TABLE IF NOT EXISTS invite_author (
+     invite_id  TEXT PRIMARY KEY,
+     invited_by TEXT NOT NULL
+   )`,
+  // Each link's guest syncs and puts over the last minute, per millisecond.
+  `CREATE TABLE IF NOT EXISTS link_request (
+     link_id TEXT NOT NULL,
+     kind    TEXT NOT NULL,
+     at      INTEGER NOT NULL,
+     count   INTEGER NOT NULL,
+     PRIMARY KEY (link_id, kind, at)
+   )`,
+  // Records each link put per hour over the last day.
+  `CREATE TABLE IF NOT EXISTS link_record_hour (
+     link_id TEXT NOT NULL,
+     hour    INTEGER NOT NULL,
+     records INTEGER NOT NULL,
+     PRIMARY KEY (link_id, hour)
+   )`,
+]
+
+/**
+ * Columns added for scoped spaces, as `[table, column, definition]`: a
+ * space made before them gets them (`ALTER TABLE`, only when missing) when
+ * its object next starts, null or 0 throughout, so it keeps its old rules.
+ */
+const ADDED_COLUMNS: [string, string, string][] = [
+  ['space', 'mode', 'TEXT'],
+  ['member', 'scopes', 'TEXT'],
+  ['member', 'invited_by', 'TEXT'],
+  ['invite', 'scopes', 'TEXT'],
+  ['invite', 'handoff', 'INTEGER NOT NULL DEFAULT 0'],
+  ['record', 'scope', 'TEXT'],
+]
+
+/** Indexes on added columns, made after them. */
+const ADDED_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS record_scope ON record (scope, seq)',
 ]
 
 const SPACE_TABLES = [
@@ -309,6 +544,11 @@ const SPACE_TABLES = [
   'member',
   'put_hour',
   'member_put',
+  'holder',
+  'link',
+  'invite_author',
+  'link_request',
+  'link_record_hour',
   'space',
 ]
 
@@ -363,8 +603,15 @@ const refusal = (error: SpacesErrorCode, retryAfter?: number): Change<never> => 
   result: fail(error, retryAfter),
 })
 
-/** The open invites a close takes: one, those a member made, or all. */
-type OpenInvites = { inviteId: string } | { invitedBy: string } | 'all'
+/**
+ * The open invites a close takes: one, those a member made (naming one
+ * street, when `scope` says), or all.
+ */
+type OpenInvites =
+  | { inviteId: string }
+  | { invitedBy: string }
+  | { invitedBy: string; scope: string }
+  | 'all'
 
 /**
  * Which of `others` (oldest first) a new socket of `opener` replaces when
@@ -454,14 +701,16 @@ export class SharedSpace extends DurableObject<Environment> {
       this.#ensureSchema()
       this.#sql.exec(
         `INSERT INTO space (singleton, space_id, owner_id, epoch, rekey_needed,
-                            seq, record_count, blob_bytes, created_at, last_active_at)
-         VALUES (1, ?, ?, 1, 0, 1, 0, 0, ?, ?)`,
+                            seq, record_count, blob_bytes, created_at, last_active_at,
+                            mode)
+         VALUES (1, ?, ?, 1, 0, 1, 0, 0, ?, ?, ?)`,
         args.spaceId,
         args.memberId,
         now,
-        now
+        now,
+        args.mode ?? null
       )
-      this.#insertMember(args, now)
+      this.#insertMember({ ...args, scopes: null, invitedBy: null }, now)
       created = true
       return { result: ok({ seq: 1, joinedAt: now }) }
     })
@@ -501,9 +750,10 @@ export class SharedSpace extends DurableObject<Environment> {
   async join(args: JoinSpaceArgs): Promise<SpacesResult<SpaceJoined>> {
     return this.#commit((now): Change<SpaceJoined> => {
       if (this.#deleted()) return refusal('gone')
-      const space = this.#space()
-      if (!space || space.spaceId !== args.spaceId) return refusal('not_found')
+      if (!this.#space() || this.#space()!.spaceId !== args.spaceId)
+        return refusal('not_found')
       this.#prune(now)
+      const space = this.#space()!
       const invite = this.#invite(args.inviteId)
       if (!invite) return refusal('not_found')
       const secretMatches = timingSafeEqual(args.joinHash, invite.joinVerifier)
@@ -530,9 +780,14 @@ export class SharedSpace extends DurableObject<Environment> {
       // `leave` and `member/remove` close their member's invites; this holds
       // even for one that slipped past them.
       if (!this.#member(invite.invitedBy)) return refusal('not_found')
+      // A scoped invite stays good only while what it gives is still the
+      // inviter's to give: a holder's streets still theirs, a hand-off's
+      // street still held by it.
+      if (space.mode === 'scoped' && !this.#inviteStillGood(space, invite))
+        return refusal('not_found')
       if (!secretMatches) {
         if (invite.badJoins + 1 >= LIMITS.badJoins) {
-          this.#closeInvites({ inviteId: args.inviteId })
+          this.#closeInvites({ inviteId: args.inviteId }, now)
           this.#advance()
           return { result: fail('forbidden'), changed: true }
         }
@@ -551,7 +806,15 @@ export class SharedSpace extends DurableObject<Environment> {
         logSpacesLimitHit('spaces/join', 'maxMembers')
         return refusal('limit')
       }
-      this.#insertMember(args, now)
+      const scoped = space.mode === 'scoped'
+      this.#insertMember(
+        {
+          ...args,
+          scopes: scoped ? invite.scopes : null,
+          invitedBy: scoped ? invite.invitedBy : null,
+        },
+        now
+      )
       this.#sql.exec(
         `UPDATE invite SET joined_member_id = ?, joined_token_hash = ?
          WHERE invite_id = ?`,
@@ -559,6 +822,15 @@ export class SharedSpace extends DurableObject<Environment> {
         args.tokenHash,
         args.inviteId
       )
+      // A hand-off invite's street is now held by the one who joined.
+      if (scoped && invite.handoff === 1)
+        this.#sql.exec(
+          `UPDATE holder SET member_id = ?, invite_id = NULL, since = ?
+           WHERE invite_id = ?`,
+          args.memberId,
+          now,
+          args.inviteId
+        )
       const seq = this.#advance()
       return {
         result: ok({ seq, epoch: space.epoch, joinedAt: now }),
@@ -580,11 +852,13 @@ export class SharedSpace extends DurableObject<Environment> {
       const auth = this.#authenticate(args)
       if (!auth.ok) return { result: auth }
       this.#prune(now)
-      if (now - auth.value.lastActiveAt > LIMITS.activityGranularityMs)
+      // Pruning can advance `seq` (a hand-off invite that lapsed).
+      const space = this.#space()!
+      if (now - space.lastActiveAt > LIMITS.activityGranularityMs)
         this.#touch(now)
       return {
         result: ok(
-          this.#snapshot(auth.value, args.memberId, args.since, args.limit, now)
+          this.#snapshot(space, args.memberId, args.since, args.limit, now)
         ),
       }
     }).result
@@ -608,8 +882,22 @@ export class SharedSpace extends DurableObject<Environment> {
       const auth = this.#authenticate(args)
       if (!auth.ok) return { result: auth }
       const space = auth.value
-      // Both refused before anything is written, so neither costs a put.
-      if (
+      // Refused before anything is written, so none of them costs a put.
+      let scopes: (string | null)[] | null = null
+      if (space.mode === 'scoped') {
+        const classes = args.records.map((record) =>
+          classifyScopedRecord(record.recordId)
+        )
+        if (classes.some((record) => record == null)) return refusal('bad_request')
+        this.#prune(now)
+        const access = this.#access(space)
+        const caller = this.#caller(space, args.memberId)!
+        if (
+          classes.some((record) => !this.#mayWrite(access, caller, record!))
+        )
+          return refusal('forbidden')
+        scopes = classes.map((record) => scopeOf(record!))
+      } else if (
         args.records.some(
           (record) => !mayPutRecord(record.recordId, args.memberId, space.ownerId)
         )
@@ -626,37 +914,54 @@ export class SharedSpace extends DurableObject<Environment> {
       // counted in this transaction, so a put that throws costs nothing.
       this.#countPut(args.memberId, now)
 
-      const plan = this.#plan(args.records)
-      // Running counts, so a put never scans the table.
-      const capped = this.#refuseOverCaps('spaces/put', space, plan)
-      if (capped) return { result: capped }
-      const budget = this.#refuseOverDailyRecords(args.records.length, now)
-      if (budget) return { result: budget }
-
-      let seq = space.seq
-      const results: PutResult[] = []
-      args.records.forEach((record, index) => {
-        const verdict = plan.verdicts[index]
-        if (verdict === 'newer') this.#storeRecord(record, ++seq)
-        results.push({ recordId: record.recordId, stored: verdict !== 'older' })
-      })
-      this.#sql.exec(
-        `INSERT INTO put_hour (hour, records) VALUES (?, ?)
-         ON CONFLICT (hour) DO UPDATE SET records = records + excluded.records`,
-        Math.floor(now / HOUR_MS),
-        args.records.length
-      )
-      this.#sql.exec(
-        `UPDATE space SET seq = ?, record_count = record_count + ?,
-                          blob_bytes = blob_bytes + ?, last_active_at = ?
-         WHERE singleton = 1`,
-        seq,
-        plan.added,
-        plan.bytes,
-        now
-      )
-      return { result: ok({ seq, results }), changed: seq !== space.seq }
+      return this.#store('spaces/put', args.records, scopes, now)
     }).result
+  }
+
+  /**
+   * Stores a put's records (each under its scope, when the space is scoped)
+   * once every check that refuses without counting has passed: the record
+   * and byte caps (`limit`), then the space's records a rolling day
+   * (`rate_limited`). Each stored record takes the next `seq`.
+   */
+  #store(
+    op: string,
+    records: PutRecordArgs[],
+    scopes: (string | null)[] | null,
+    now: number
+  ): Change<{ seq: number; results: PutResult[] }> {
+    // Re-read: pruning may have advanced `seq`.
+    const space = this.#space()!
+    const plan = this.#plan(records)
+    // Running counts, so a put never scans the table.
+    const capped = this.#refuseOverCaps(op, space, plan)
+    if (capped) return { result: capped }
+    const budget = this.#refuseOverDailyRecords(op, records.length, now)
+    if (budget) return { result: budget }
+
+    let seq = space.seq
+    const results: PutResult[] = []
+    records.forEach((record, index) => {
+      const verdict = plan.verdicts[index]
+      if (verdict === 'newer') this.#storeRecord(record, ++seq, scopes?.[index] ?? null)
+      results.push({ recordId: record.recordId, stored: verdict !== 'older' })
+    })
+    this.#sql.exec(
+      `INSERT INTO put_hour (hour, records) VALUES (?, ?)
+       ON CONFLICT (hour) DO UPDATE SET records = records + excluded.records`,
+      Math.floor(now / HOUR_MS),
+      records.length
+    )
+    this.#sql.exec(
+      `UPDATE space SET seq = ?, record_count = record_count + ?,
+                        blob_bytes = blob_bytes + ?, last_active_at = ?
+       WHERE singleton = 1`,
+      seq,
+      plan.added,
+      plan.bytes,
+      now
+    )
+    return { result: ok({ seq, results }), changed: seq !== space.seq }
   }
 
   // --- Invites ---------------------------------------------------------------
@@ -672,6 +977,8 @@ export class SharedSpace extends DurableObject<Environment> {
     return this.#commit((now): Change<Empty> => {
       const auth = this.#authenticate(args)
       if (!auth.ok) return { result: auth }
+      if (auth.value.mode === 'scoped') return this.#createScopedInvite(auth.value, args, now)
+      if (args.scopes != null || args.handoff != null) return refusal('bad_request')
       // A rekey closes every open invite, so an open one always matches.
       if (args.epoch !== auth.value.epoch) return refusal('stale_key')
       this.#prune(now)
@@ -705,6 +1012,80 @@ export class SharedSpace extends DurableObject<Environment> {
   }
 
   /**
+   * `invite/create` in a scoped space. Only the owner (the whole territory,
+   * or streets nobody holds) and holders (only streets they hold, never a
+   * hand-off) invite; anyone else is `forbidden`, checked before
+   * `stale_key`. A hand-off invite's street must be unheld (`conflict`) and
+   * becomes held by the invite at once; a share naming a held street is
+   * `forbidden`. The rest is as in a space without a mode.
+   */
+  #createScopedInvite(
+    space: SpaceRow,
+    args: CreateSpaceInviteArgs,
+    now: number
+  ): Change<Empty> {
+    this.#prune(now)
+    const caller = this.#caller(space, args.memberId)!
+    const scopes = args.scopes ?? null
+    const handoff = args.handoff === true
+    const holds = this.#holds()
+    if (!caller.isOwner) {
+      const held = this.#heldBy(holds, args.memberId)
+      if (handoff || scopes == null || held.size === 0) return refusal('forbidden')
+      if (scopes.some((scope) => !held.has(scope))) return refusal('forbidden')
+    }
+    if (args.epoch !== space.epoch) return refusal('stale_key')
+    const existing = this.#invite(args.inviteId)
+    if (existing) {
+      const same =
+        existing.joinedMemberId == null &&
+        existing.invitedBy === args.memberId &&
+        existing.expiresAt === args.expiresAt &&
+        sameScopes(existing.scopes, scopes) &&
+        existing.handoff === (handoff ? 1 : 0) &&
+        timingSafeEqual(existing.joinVerifier, args.joinVerifier)
+      return same ? { result: ok({}) } : refusal('conflict')
+    }
+    if (this.#inviteClosed(args.inviteId)) return refusal('conflict')
+    if (this.#count('SELECT COUNT(*) AS n FROM invite_author WHERE invite_id = ?', args.inviteId) > 0)
+      return refusal('conflict')
+    if (caller.isOwner && scopes) {
+      const taken = scopes.some((scope) => holds.has(scope))
+      if (taken) return refusal(handoff ? 'conflict' : 'forbidden')
+    }
+    if (this.#memberCount() + this.#openInviteCount(now) >= args.maxMembers) {
+      logSpacesLimitHit('spaces/invite/create', 'maxMembers')
+      return refusal('limit')
+    }
+    this.#sql.exec(
+      `INSERT INTO invite (invite_id, invited_by, join_verifier, expires_at,
+                           created_at, bad_joins, scopes, handoff)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+      args.inviteId,
+      args.memberId,
+      args.joinVerifier,
+      args.expiresAt,
+      now,
+      scopes ? JSON.stringify(scopes) : null,
+      handoff ? 1 : 0
+    )
+    this.#sql.exec(
+      'INSERT INTO invite_author (invite_id, invited_by) VALUES (?, ?)',
+      args.inviteId,
+      args.memberId
+    )
+    if (handoff)
+      this.#sql.exec(
+        'INSERT INTO holder (scope_id, member_id, invite_id, since) VALUES (?, NULL, ?, ?)',
+        scopes![0],
+        args.inviteId,
+        now
+      )
+    this.#advance()
+    return { result: ok({}), changed: true }
+  }
+
+  /**
    * Closes an open invite: its inviter's or the owner's to close
    * (`forbidden` for anyone else). Idempotent: an unknown, closed, used, or
    * expired invite is already closed, so any member gets `ok` and nothing
@@ -719,7 +1100,7 @@ export class SharedSpace extends DurableObject<Environment> {
       if (!invite || invite.joinedMemberId != null) return { result: ok({}) }
       if (invite.invitedBy !== args.memberId && auth.value.ownerId !== args.memberId)
         return refusal('forbidden')
-      this.#closeInvites({ inviteId: args.inviteId })
+      this.#closeInvites({ inviteId: args.inviteId }, now)
       this.#advance()
       return { result: ok({}), changed: true }
     }).result
@@ -736,7 +1117,14 @@ export class SharedSpace extends DurableObject<Environment> {
     return this.#run((now): Change<Empty> => {
       const auth = this.#authenticate(args)
       if (!auth.ok) return { result: auth }
-      this.#dropMember(args.memberId)
+      if (auth.value.mode === 'scoped') {
+        // A territory's owner never changes: they delete it instead.
+        if (auth.value.ownerId === args.memberId) return refusal('bad_request')
+        const dropped = this.#dropMember(args.memberId, now)
+        this.#advance()
+        return { result: ok({}), changed: true, dropped }
+      }
+      this.#dropMember(args.memberId, now)
       if (this.#memberCount() === 0) {
         this.#wipe(now)
         return { result: ok({}), wiped: true }
@@ -762,16 +1150,42 @@ export class SharedSpace extends DurableObject<Environment> {
    * `removeId` is `ok` and changes nothing.
    */
   async removeMember(args: RemoveSpaceMemberArgs): Promise<SpacesResult<Empty>> {
-    return this.#run((): Change<Empty> => {
+    return this.#run((now): Change<Empty> => {
+      const scoped = this.#authenticate(args)
+      if (scoped.ok && scoped.value.mode === 'scoped')
+        return this.#removeScopedMember(scoped.value, args, now)
       const auth = this.#authenticateOwner(args)
       if (!auth.ok) return { result: auth }
       if (args.removeId === args.memberId) return refusal('bad_request')
       if (!this.#member(args.removeId)) return { result: ok({}) }
-      this.#dropMember(args.removeId)
-      this.#closeInvites('all')
+      this.#dropMember(args.removeId, now)
+      this.#closeInvites('all', now)
       this.#advance()
       return { result: ok({}), changed: true, dropped: [args.removeId] }
     })
+  }
+
+  /**
+   * `member/remove` in a scoped space: the owner removes anyone but
+   * themselves; anyone else only members they invited (only holders
+   * invite). Removing a holder first gives back each street they hold
+   * (`#endHold`), which can remove their onward members too. An unknown
+   * `removeId` is `ok` for any member.
+   */
+  #removeScopedMember(
+    space: SpaceRow,
+    args: RemoveSpaceMemberArgs,
+    now: number
+  ): Change<Empty> {
+    if (args.removeId === args.memberId) return refusal('bad_request')
+    const target = this.#member(args.removeId)
+    if (!target) return { result: ok({}) }
+    if (space.ownerId !== args.memberId && target.invitedBy !== args.memberId)
+      return refusal('forbidden')
+    const dropped = this.#dropMember(args.removeId, now)
+    this.#closeInvites('all', now)
+    this.#advance()
+    return { result: ok({}), changed: true, dropped }
   }
 
   /**
@@ -830,7 +1244,7 @@ export class SharedSpace extends DurableObject<Environment> {
         'UPDATE space SET epoch = ?, rekey_needed = 0 WHERE singleton = 1',
         args.epoch
       )
-      this.#closeInvites('all')
+      this.#closeInvites('all', Date.now())
       const seq = this.#advance() + 1
       this.#storeRecord(link, seq)
       this.#sql.exec(
@@ -853,6 +1267,271 @@ export class SharedSpace extends DurableObject<Environment> {
       this.#wipe(now)
       return { result: ok({}), wiped: true }
     })
+  }
+
+  // --- Territories: scopes, hand-offs, guest links ---------------------------
+
+  /**
+   * The owner sets the streets of a member they invited (never their own):
+   * `scopes`, or null for the whole territory. The new streets must keep
+   * every street the target holds, and may add none someone else holds or a
+   * pending hand-off holds (`conflict`); a street the target already had
+   * stays even if it's held now. Narrowing asks for a rekey. An unknown
+   * target is `conflict` (the owner's device syncs and tries again).
+   */
+  async setMemberScopes(args: MemberScopesArgs): Promise<SpacesResult<Empty>> {
+    return this.#commit((now): Change<Empty> => {
+      const auth = this.#authenticateScopedOwner(args)
+      if (!auth.ok) return { result: auth }
+      this.#prune(now)
+      if (args.target === args.memberId) return refusal('bad_request')
+      const target = this.#member(args.target)
+      if (!target) return refusal('conflict')
+      if (target.invitedBy !== args.memberId) return refusal('forbidden')
+      const before = scopeList(target.scopes)
+      if (args.scopes) {
+        const next = new Set(args.scopes)
+        const holds = this.#holds()
+        for (const scope of this.#heldBy(holds, args.target))
+          if (!next.has(scope)) return refusal('conflict')
+        const had = new Set(before ?? [])
+        for (const scope of next) {
+          const hold = holds.get(scope)
+          if (hold && hold.memberId !== args.target && !had.has(scope))
+            return refusal('conflict')
+        }
+      }
+      const narrowed =
+        args.scopes != null &&
+        (before == null || before.some((scope) => !args.scopes!.includes(scope)))
+      this.#sql.exec(
+        'UPDATE member SET scopes = ? WHERE member_id = ?',
+        args.scopes ? JSON.stringify(args.scopes) : null,
+        args.target
+      )
+      if (narrowed)
+        this.#sql.exec('UPDATE space SET rekey_needed = 1 WHERE singleton = 1')
+      this.#advance()
+      return { result: ok({}), changed: true }
+    }).result
+  }
+
+  /**
+   * The owner makes a member (not themselves) the holder of one street
+   * nobody holds (`conflict` when it's held or a hand-off is pending). A
+   * street-scoped target gains it. Only the owner hands off (`forbidden`
+   * for anyone else), and the owner never changes, so a holder can't hand
+   * a street on. An unknown target is `conflict`.
+   */
+  async createHandoff(
+    args: HandoffCreateArgs
+  ): Promise<SpacesResult<{ seq: number }>> {
+    return this.#commit((now): Change<{ seq: number }> => {
+      const auth = this.#authenticateScopedOwner(args)
+      if (!auth.ok) return { result: auth }
+      this.#prune(now)
+      if (args.target === args.memberId) return refusal('bad_request')
+      if (this.#holds().has(args.scopeId)) return refusal('conflict')
+      const target = this.#member(args.target)
+      if (!target) return refusal('conflict')
+      const scopes = scopeList(target.scopes)
+      if (scopes && !scopes.includes(args.scopeId))
+        this.#sql.exec(
+          'UPDATE member SET scopes = ? WHERE member_id = ?',
+          JSON.stringify([...scopes, args.scopeId]),
+          args.target
+        )
+      this.#sql.exec(
+        'INSERT INTO holder (scope_id, member_id, invite_id, since) VALUES (?, ?, NULL, ?)',
+        args.scopeId,
+        args.target,
+        now
+      )
+      return { result: ok({ seq: this.#advance() }), changed: true }
+    }).result
+  }
+
+  /**
+   * Takes a street back (the owner) or gives it back (its holder):
+   * `#endHold`. Idempotent: a street nobody holds is `ok` for any member.
+   * Anyone but the owner and the holder is `forbidden`.
+   */
+  async endHandoff(args: HandoffEndArgs): Promise<SpacesResult<{ seq: number }>> {
+    return this.#run((now): Change<{ seq: number }> => {
+      const auth = this.#authenticateScoped(args)
+      if (!auth.ok) return { result: auth }
+      this.#prune(now)
+      const hold = this.#holds().get(args.scopeId)
+      if (!hold) return { result: ok({ seq: this.#space()!.seq }) }
+      if (auth.value.ownerId !== args.memberId && hold.memberId !== args.memberId)
+        return refusal('forbidden')
+      const dropped = this.#endHold(args.scopeId, now)
+      return { result: ok({ seq: this.#advance() }), changed: true, dropped }
+    })
+  }
+
+  /**
+   * Opens a guest link on `scopes`: the owner's on streets nobody holds,
+   * a holder's on streets they hold (`forbidden` otherwise). `epoch` must be
+   * current (`stale_key`). At most 10 open links a space and 30 made a
+   * rolling day (`limit`). An identical retry by its creator is `ok`; any
+   * other reuse of the id, ever, is `conflict`.
+   */
+  async createLink(args: LinkCreateArgs): Promise<SpacesResult<{ seq: number }>> {
+    return this.#commit((now): Change<{ seq: number }> => {
+      const auth = this.#authenticateScoped(args)
+      if (!auth.ok) return { result: auth }
+      this.#prune(now)
+      const existing = this.#link(args.linkId)
+      if (existing) {
+        const same =
+          existing.createdBy === args.memberId &&
+          existing.expiresAt === args.expiresAt &&
+          sameScopes(existing.scopes, args.scopes) &&
+          timingSafeEqual(existing.verifier, args.verifier)
+        return same ? { result: ok({ seq: this.#space()!.seq }) } : refusal('conflict')
+      }
+      const holds = this.#holds()
+      const allowed =
+        auth.value.ownerId === args.memberId
+          ? args.scopes.every((scope) => !holds.has(scope))
+          : (() => {
+              const held = this.#heldBy(holds, args.memberId)
+              return held.size > 0 && args.scopes.every((scope) => held.has(scope))
+            })()
+      if (!allowed) return refusal('forbidden')
+      if (args.epoch !== auth.value.epoch) return refusal('stale_key')
+      const open = this.#count(
+        'SELECT COUNT(*) AS n FROM link WHERE ended_at IS NULL AND expires_at > ?',
+        now
+      )
+      if (open >= LIMITS.openLinks) {
+        logSpacesLimitHit('spaces/link/create', 'openLinks')
+        return refusal('limit')
+      }
+      const today = this.#count(
+        'SELECT COUNT(*) AS n FROM link WHERE created_at > ?',
+        now - LIMITS.linkWindowMs
+      )
+      if (today >= LIMITS.linksPerDay) {
+        logSpacesLimitHit('spaces/link/create', 'linksPerDay')
+        return refusal('limit')
+      }
+      this.#sql.exec(
+        `INSERT INTO link (link_id, created_by, verifier, scopes, created_at,
+                           expires_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+        args.linkId,
+        args.memberId,
+        args.verifier,
+        JSON.stringify(args.scopes),
+        now,
+        args.expiresAt
+      )
+      return { result: ok({ seq: this.#advance() }), changed: true }
+    }).result
+  }
+
+  /**
+   * Ends a guest link at once: its creator's or the owner's to end
+   * (`forbidden` for anyone else). Idempotent: an unknown, ended, or
+   * expired link is `ok` for any member.
+   */
+  async endLink(args: LinkEndArgs): Promise<SpacesResult<{ seq: number }>> {
+    return this.#commit((now): Change<{ seq: number }> => {
+      const auth = this.#authenticateScoped(args)
+      if (!auth.ok) return { result: auth }
+      const link = this.#link(args.linkId)
+      if (!link || link.endedAt != null || link.expiresAt <= now)
+        return { result: ok({ seq: auth.value.seq }) }
+      if (link.createdBy !== args.memberId && auth.value.ownerId !== args.memberId)
+        return refusal('forbidden')
+      this.#sql.exec('UPDATE link SET ended_at = ? WHERE link_id = ?', now, args.linkId)
+      return { result: ok({ seq: this.#advance() }), changed: true }
+    }).result
+  }
+
+  // --- Guests ----------------------------------------------------------------
+
+  /**
+   * A guest link's page reads `g.<linkId>` and the streets it may read
+   * (`#guestScopes`), past `since`, up to `limit`. Checked: the link
+   * (`#authenticateGuest`), then 120 syncs a link a rolling minute.
+   */
+  async guestSync(args: GuestSyncArgs): Promise<SpacesResult<GuestSyncView>> {
+    return this.#commit((now): Change<GuestSyncView> => {
+      const auth = this.#authenticateGuest(args, now)
+      if (!auth.ok) return { result: auth }
+      const limited = this.#refuseOverLinkRequests(args.linkId, 'sync', now)
+      if (limited) return { result: limited }
+      this.#prune(now)
+      const space = this.#space()!
+      if (now - space.lastActiveAt > LIMITS.activityGranularityMs) this.#touch(now)
+      const scopes = this.#guestScopes(space, auth.value)
+      const page = this.#readRecords(args.since, args.limit, {
+        where: ` AND (record_id = ? OR scope IN (SELECT value FROM json_each(?)))`,
+        bindings: [`g.${args.linkId}`, JSON.stringify([...scopes])],
+        keep: () => true,
+      })
+      return {
+        result: ok({
+          seq: page.more ? page.records[page.records.length - 1].seq : space.seq,
+          epoch: space.epoch,
+          expiresAt: auth.value.expiresAt,
+          records: page.records,
+          more: page.more,
+        }),
+      }
+    }).result
+  }
+
+  /**
+   * A guest link's page stores records in its streets: `s.<S>.w` and
+   * `s.<S>.<uuid>` only (never `s.<S>`), for streets it may write. Checked
+   * in order: the link, 30 puts a link a rolling minute (`rate_limited`),
+   * the ids' grammar (`bad_request`), each record (`forbidden`, nothing
+   * stored), the epoch (`stale_key`), 2,000 records a link a rolling day
+   * (`rate_limited`), then the space's caps as `put`.
+   */
+  async guestPut(
+    args: GuestPutArgs
+  ): Promise<SpacesResult<{ seq: number; results: PutResult[] }>> {
+    return this.#commit((now): Change<{ seq: number; results: PutResult[] }> => {
+      const auth = this.#authenticateGuest(args, now)
+      if (!auth.ok) return { result: auth }
+      const limited = this.#refuseOverLinkRequests(args.linkId, 'put', now)
+      if (limited) return { result: limited }
+      const classes = args.records.map((record) => classifyScopedRecord(record.recordId))
+      if (classes.some((record) => record == null)) return refusal('bad_request')
+      this.#prune(now)
+      const space = this.#space()!
+      const scopes = this.#guestScopes(space, auth.value)
+      if (
+        classes.some(
+          (record) => record!.kind !== 'inScope' || !scopes.has(record!.scope)
+        )
+      )
+        return refusal('forbidden')
+      if (args.records.some((record) => record.epoch !== space.epoch))
+        return refusal('stale_key')
+      const daily = this.#refuseOverLinkRecords(args.linkId, args.records.length, now)
+      if (daily) return { result: daily }
+      const change = this.#store(
+        'spaces/guest/put',
+        args.records,
+        classes.map((record) => scopeOf(record!)),
+        now
+      )
+      if (change.result.ok)
+        this.#sql.exec(
+          `INSERT INTO link_record_hour (link_id, hour, records) VALUES (?, ?, ?)
+           ON CONFLICT (link_id, hour) DO UPDATE SET records = records + excluded.records`,
+          args.linkId,
+          Math.floor(now / HOUR_MS),
+          args.records.length
+        )
+      return change
+    }).result
   }
 
   // --- Retention -------------------------------------------------------------
@@ -955,15 +1634,20 @@ export class SharedSpace extends DurableObject<Environment> {
    */
   #commit<T>(work: (now: number) => Change<T>): Change<T> {
     const now = Date.now()
+    this.#advanced = false
     const change = this.ctx.storage.transactionSync(() => work(now))
     if (change.wiped) {
       this.#closeSockets(null)
     } else {
       if (change.dropped?.length) this.#closeSockets(new Set(change.dropped))
-      if (change.changed) this.#broadcast()
+      // A refusal can still have advanced `seq` (pruning a lapsed hand-off).
+      if (change.changed || this.#advanced) this.#broadcast()
     }
     return change
   }
+
+  /** Set by `#advance` during a `#commit`, so a refusal that changed `seq` still signals. */
+  #advanced = false
 
   /** `#commit`, then `#purge` once the space is wiped. */
   async #run<T>(work: (now: number) => Change<T>): Promise<SpacesResult<T>> {
@@ -988,9 +1672,20 @@ export class SharedSpace extends DurableObject<Environment> {
     return this.#schemaReady
   }
 
-  /** Creates the space's tables; the caller sets `#schemaReady` once committed. */
+  /**
+   * Creates the space's tables, and adds the columns and indexes a space
+   * made before them lacks; the caller sets `#schemaReady` once committed.
+   */
   #ensureSchema(): void {
     for (const statement of SCHEMA) this.#sql.exec(statement)
+    for (const [table, column, definition] of ADDED_COLUMNS) {
+      const has = this.#sql
+        .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+        .toArray()
+        .some((row) => row.name === column)
+      if (!has) this.#sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    }
+    for (const statement of ADDED_INDEXES) this.#sql.exec(statement)
   }
 
   /** True once the space was deleted (only its tombstone is left). */
@@ -1060,7 +1755,7 @@ export class SharedSpace extends DurableObject<Environment> {
     return (
       this.#sql
         .exec<SpaceRow>(
-          `SELECT space_id AS spaceId, owner_id AS ownerId, epoch,
+          `SELECT space_id AS spaceId, owner_id AS ownerId, mode, epoch,
                   rekey_needed AS rekeyNeeded, seq, record_count AS recordCount,
                   blob_bytes AS blobBytes, last_active_at AS lastActiveAt
            FROM space WHERE singleton = 1`
@@ -1084,6 +1779,7 @@ export class SharedSpace extends DurableObject<Environment> {
       member != null &&
       space.spaceId === args.spaceId &&
       space.ownerId === args.memberId &&
+      (space.mode ?? null) === (args.mode ?? null) &&
       member.dhPub === args.dhPub &&
       member.wrap === args.wrap &&
       timingSafeEqual(args.tokenHash, member.tokenHash)
@@ -1111,12 +1807,48 @@ export class SharedSpace extends DurableObject<Environment> {
     return space
   }
 
+  /** `#authenticate`, then only a scoped space (`bad_request` for one without a mode). */
+  #authenticateScoped(auth: MemberAuth): SpacesResult<SpaceRow> {
+    const space = this.#authenticate(auth)
+    if (space.ok && space.value.mode !== 'scoped') return fail('bad_request')
+    return space
+  }
+
+  /** `#authenticateScoped`, then only the owner (`forbidden`). */
+  #authenticateScopedOwner(auth: MemberAuth): SpacesResult<SpaceRow> {
+    const space = this.#authenticateScoped(auth)
+    if (space.ok && space.value.ownerId !== auth.memberId) return fail('forbidden')
+    return space
+  }
+
+  /**
+   * A guest link of a scoped space, for a token whose hash matches its
+   * verifier (compared in constant time). A space that never existed (or
+   * has no mode), an unknown link, and a wrong token are all `not_found`,
+   * the same answer. Past that: a deleted space or an ended link is `gone`
+   * with `reason: "ended"`, and a link past `expiresAt` `gone` with
+   * `reason: "expired"`. A wrong token never ends or counts against a link.
+   */
+  #authenticateGuest(auth: GuestAuth, now: number): SpacesResult<LinkRow> {
+    if (this.#deleted()) return goneBecause('ended')
+    const space = this.#space()
+    if (!space || space.spaceId !== auth.spaceId || space.mode !== 'scoped')
+      return fail('not_found')
+    const link = this.#link(auth.linkId)
+    // Compared even for an unknown link, so the answer takes as long.
+    const matches = timingSafeEqual(auth.verifier, link?.verifier ?? auth.verifier.replace(/./g, '-'))
+    if (!link || !matches) return fail('not_found')
+    if (link.endedAt != null) return goneBecause('ended')
+    if (link.expiresAt <= now) return goneBecause('expired')
+    return ok(link)
+  }
+
   #member(memberId: string): MemberRow | null {
     return (
       this.#sql
         .exec<MemberRow>(
           `SELECT member_id AS memberId, dh_pub AS dhPub, token_hash AS tokenHash,
-                  wrap, joined_at AS joinedAt
+                  wrap, joined_at AS joinedAt, scopes, invited_by AS invitedBy
            FROM member WHERE member_id = ?`,
           memberId
         )
@@ -1125,43 +1857,122 @@ export class SharedSpace extends DurableObject<Environment> {
   }
 
   #insertMember(
-    member: Pick<MemberRow, 'memberId' | 'dhPub' | 'tokenHash' | 'wrap'>,
+    member: Pick<MemberRow, 'memberId' | 'dhPub' | 'tokenHash' | 'wrap' | 'scopes' | 'invitedBy'>,
     now: number
   ): void {
     this.#sql.exec(
-      `INSERT INTO member (member_id, dh_pub, token_hash, wrap, joined_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO member (member_id, dh_pub, token_hash, wrap, joined_at,
+                           scopes, invited_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       member.memberId,
       member.dhPub,
       member.tokenHash,
       member.wrap,
-      now
+      now,
+      member.scopes,
+      member.invitedBy
     )
   }
 
   /**
    * Takes a member off the space: their token hash, key, and wrap go, and
    * the invites they made that nobody used close, freeing those places. The
-   * owner should rekey.
+   * owner should rekey. In a scoped space it first gives back every street
+   * they hold (`#endHold`, which can remove their onward members too) and
+   * ends the guest links they made. Returns everyone it removed.
    */
-  #dropMember(memberId: string): void {
+  #dropMember(memberId: string, now: number): string[] {
+    const dropped = [memberId]
+    if (this.#space()?.mode === 'scoped') {
+      for (const scope of this.#heldBy(this.#holds(), memberId))
+        dropped.push(...this.#endHold(scope, now, memberId))
+      this.#sql.exec(
+        'UPDATE link SET ended_at = ? WHERE created_by = ? AND ended_at IS NULL',
+        now,
+        memberId
+      )
+    }
     this.#sql.exec('DELETE FROM member WHERE member_id = ?', memberId)
-    this.#closeInvites({ invitedBy: memberId })
+    this.#closeInvites({ invitedBy: memberId }, now)
     this.#sql.exec('UPDATE space SET rekey_needed = 1 WHERE singleton = 1')
+    return dropped
+  }
+
+  /**
+   * Ends the hold on `scope` (`handoff/end`): the hold clears, and a pending
+   * hand-off invite closes. Then, for a member's hold: `scope` leaves the
+   * scopes of the holder (unless they're a whole member) and of every member
+   * the holder invited, and anyone left with no streets is removed (but
+   * `except`, whom the caller is removing already); the holder's open
+   * invites and guest links naming it close; and if anyone was removed,
+   * every open invite closes and the owner should rekey. Returns everyone
+   * it removed. The caller advances `seq`.
+   */
+  #endHold(scope: string, now: number, except?: string): string[] {
+    const hold = this.#holds().get(scope)
+    if (!hold) return []
+    this.#sql.exec('DELETE FROM holder WHERE scope_id = ?', scope)
+    if (hold.memberId == null) {
+      if (hold.inviteId) this.#closeInvites({ inviteId: hold.inviteId }, now)
+      return []
+    }
+    const holder = hold.memberId
+    // Else someone could still join through them with the street.
+    this.#closeInvites({ invitedBy: holder, scope }, now)
+    this.#sql.exec(
+      `UPDATE link SET ended_at = ?
+       WHERE created_by = ? AND ended_at IS NULL
+         AND EXISTS (SELECT 1 FROM json_each(link.scopes) WHERE value = ?)`,
+      now,
+      holder,
+      scope
+    )
+    const affected = this.#sql
+      .exec<{ memberId: string; scopes: string }>(
+        `SELECT member_id AS memberId, scopes FROM member
+         WHERE (member_id = ? OR invited_by = ?) AND scopes IS NOT NULL
+         ORDER BY joined_at, member_id`,
+        holder,
+        holder
+      )
+      .toArray()
+    const emptied: string[] = []
+    for (const member of affected) {
+      const scopes = scopeList(member.scopes)!
+      if (!scopes.includes(scope)) continue
+      const left = scopes.filter((each) => each !== scope)
+      this.#sql.exec(
+        'UPDATE member SET scopes = ? WHERE member_id = ?',
+        JSON.stringify(left),
+        member.memberId
+      )
+      if (left.length === 0 && member.memberId !== except) emptied.push(member.memberId)
+    }
+    const removed: string[] = []
+    for (const memberId of emptied)
+      if (this.#member(memberId)) removed.push(...this.#dropMember(memberId, now))
+    if (removed.length) this.#closeInvites('all', now)
+    return removed
   }
 
   /**
    * Closes `which` open invites: each one's id moves to `closed_invite`
    * until it would have expired, so it can't be opened again. Used ones
-   * stay until they expire, for a retried join.
+   * stay until they expire, for a retried join. A pending hand-off whose
+   * invite closed is no longer held.
    */
-  #closeInvites(which: OpenInvites): void {
+  #closeInvites(which: OpenInvites, now: number): void {
     const [filter, bindings]: [string, string[]] =
       which === 'all'
         ? ['', []]
         : 'inviteId' in which
           ? [' AND invite_id = ?', [which.inviteId]]
-          : [' AND invited_by = ?', [which.invitedBy]]
+          : 'scope' in which
+            ? [
+                ' AND invited_by = ? AND EXISTS (SELECT 1 FROM json_each(invite.scopes) WHERE value = ?)',
+                [which.invitedBy, which.scope],
+              ]
+            : [' AND invited_by = ?', [which.invitedBy]]
     this.#sql.exec(
       `INSERT OR REPLACE INTO closed_invite (invite_id, expires_at)
        SELECT invite_id, expires_at FROM invite
@@ -1172,6 +1983,270 @@ export class SharedSpace extends DurableObject<Environment> {
       `DELETE FROM invite WHERE joined_member_id IS NULL${filter}`,
       ...bindings
     )
+    this.#clearLapsedHolds(now)
+  }
+
+  /**
+   * Clears every pending hand-off whose invite is no longer open (closed,
+   * or expired), so its street is the owner's again. True when it cleared
+   * one; the caller advances `seq`.
+   */
+  #clearLapsedHolds(now: number): boolean {
+    const lapsed = this.#count(
+      `SELECT COUNT(*) AS n FROM holder
+       WHERE member_id IS NULL AND invite_id NOT IN (
+         SELECT invite_id FROM invite WHERE joined_member_id IS NULL AND expires_at > ?)`,
+      now
+    )
+    if (lapsed === 0) return false
+    this.#sql.exec(
+      `DELETE FROM holder
+       WHERE member_id IS NULL AND invite_id NOT IN (
+         SELECT invite_id FROM invite WHERE joined_member_id IS NULL AND expires_at > ?)`,
+      now
+    )
+    return true
+  }
+
+  // --- Scoped permissions ----------------------------------------------------
+
+  /** Every held street: by a member, or by a pending hand-off invite. */
+  #holds(): Map<string, HoldRow> {
+    return new Map(
+      this.#sql
+        .exec<HoldRow>(
+          `SELECT scope_id AS scopeId, member_id AS memberId,
+                  invite_id AS inviteId, since
+           FROM holder ORDER BY scope_id`
+        )
+        .toArray()
+        .map((row) => [row.scopeId, row])
+    )
+  }
+
+  /** The streets `memberId` holds. */
+  #heldBy(holds: Map<string, HoldRow>, memberId: string): Set<string> {
+    const held = new Set<string>()
+    for (const hold of holds.values()) if (hold.memberId === memberId) held.add(hold.scopeId)
+    return held
+  }
+
+  #caller(space: SpaceRow, memberId: string): Caller | null {
+    const member = this.#member(memberId)
+    if (!member) return null
+    const scopes = scopeList(member.scopes)
+    return {
+      memberId,
+      isOwner: memberId === space.ownerId,
+      scopes: scopes ? new Set(scopes) : null,
+      invitedBy: member.invitedBy,
+    }
+  }
+
+  #access(space: SpaceRow): Access {
+    return {
+      ownerId: space.ownerId,
+      holds: this.#holds(),
+      inviteAuthors: new Map(),
+      linkCreators: new Map(),
+    }
+  }
+
+  /**
+   * Whether `caller` may write street `scope`. Held by a member: the holder,
+   * and members the holder invited who have the street. Held by a pending
+   * hand-off: nobody. Not held: the owner, whole members, and members the
+   * owner invited who have the street.
+   */
+  #mayWriteScope(access: Access, caller: Caller, scope: string): boolean {
+    const hold = access.holds.get(scope)
+    if (hold) {
+      if (hold.memberId == null) return false
+      if (caller.memberId === hold.memberId) return true
+      return caller.invitedBy === hold.memberId && caller.scopes?.has(scope) === true
+    }
+    if (caller.isOwner || caller.scopes == null) return true
+    return caller.invitedBy === access.ownerId && caller.scopes.has(scope)
+  }
+
+  /** Whether `caller` may read street `scope`: the whole territory, or a street they have. */
+  #mayReadScope(caller: Caller, scope: string): boolean {
+    return caller.isOwner || caller.scopes == null || caller.scopes.has(scope)
+  }
+
+  #inviteAuthor(access: Access, inviteId: string): string | null {
+    if (!access.inviteAuthors.has(inviteId))
+      access.inviteAuthors.set(
+        inviteId,
+        this.#sql
+          .exec<{ by: string }>(
+            'SELECT invited_by AS by FROM invite_author WHERE invite_id = ?',
+            inviteId
+          )
+          .toArray()[0]?.by ?? null
+      )
+    return access.inviteAuthors.get(inviteId)!
+  }
+
+  #linkCreator(access: Access, linkId: string): string | null {
+    if (!access.linkCreators.has(linkId))
+      access.linkCreators.set(linkId, this.#link(linkId)?.createdBy ?? null)
+    return access.linkCreators.get(linkId)!
+  }
+
+  /**
+   * Whether `caller` may put a record of class `record` in a scoped space
+   * (the protocol's "Who reads and writes which records").
+   */
+  #mayWrite(access: Access, caller: Caller, record: ScopedRecordClass): boolean {
+    switch (record.kind) {
+      case 'header':
+      case 'keys':
+        return caller.isOwner
+      case 'street':
+      case 'inScope':
+        return this.#mayWriteScope(access, caller, record.scope)
+      case 'territory':
+        return caller.isOwner || caller.scopes == null
+      case 'member':
+        return record.id === caller.memberId
+      case 'invite':
+        return caller.isOwner || this.#inviteAuthor(access, record.id) === caller.memberId
+      case 'linkKeys':
+        return this.#linkCreator(access, record.id) === caller.memberId
+    }
+  }
+
+  /** Whether `caller` may read a record of class `record` in a scoped space. */
+  #mayRead(access: Access, caller: Caller, record: ScopedRecordClass): boolean {
+    switch (record.kind) {
+      case 'header':
+      case 'keys':
+      case 'member':
+        return true
+      case 'street':
+      case 'inScope':
+        return this.#mayReadScope(caller, record.scope)
+      case 'territory':
+        return caller.isOwner || caller.scopes == null
+      case 'invite':
+        return (
+          caller.isOwner ||
+          caller.scopes == null ||
+          this.#inviteAuthor(access, record.id) === caller.memberId
+        )
+      case 'linkKeys':
+        return (
+          caller.isOwner ||
+          caller.scopes == null ||
+          this.#linkCreator(access, record.id) === caller.memberId
+        )
+    }
+  }
+
+  /**
+   * Whether a scoped invite still gives only what its inviter may give: a
+   * holder's invite, streets they still hold; a hand-off invite, a street
+   * it still holds.
+   */
+  #inviteStillGood(space: SpaceRow, invite: InviteRow): boolean {
+    const holds = this.#holds()
+    const scopes = scopeList(invite.scopes)
+    if (invite.handoff === 1)
+      return scopes != null && holds.get(scopes[0])?.inviteId === invite.inviteId
+    if (invite.invitedBy === space.ownerId) return true
+    const held = this.#heldBy(holds, invite.invitedBy)
+    return scopes != null && scopes.every((scope) => held.has(scope))
+  }
+
+  #link(linkId: string): LinkRow | null {
+    return (
+      this.#sql
+        .exec<LinkRow>(
+          `SELECT link_id AS linkId, created_by AS createdBy, verifier, scopes,
+                  created_at AS createdAt, expires_at AS expiresAt, ended_at AS endedAt
+           FROM link WHERE link_id = ?`,
+          linkId
+        )
+        .toArray()[0] ?? null
+    )
+  }
+
+  /**
+   * The streets a guest link reads and writes now: those of its scopes its
+   * creator may write now. None once its creator is off the space.
+   */
+  #guestScopes(space: SpaceRow, link: LinkRow): Set<string> {
+    const creator = this.#caller(space, link.createdBy)
+    if (!creator) return new Set()
+    const access = this.#access(space)
+    return new Set(
+      scopeList(link.scopes)!.filter((scope) => this.#mayWriteScope(access, creator, scope))
+    )
+  }
+
+  /**
+   * `rate_limited` when a link has used its guest `kind` requests (`sync`
+   * or `put`) for the rolling minute; else counts this one. Drops every
+   * link's counts older than the minute.
+   */
+  #refuseOverLinkRequests(
+    linkId: string,
+    kind: 'sync' | 'put',
+    now: number
+  ): SpacesFailure | null {
+    this.#sql.exec(
+      'DELETE FROM link_request WHERE at <= ?',
+      now - LIMITS.guestLinkWindowMs
+    )
+    const buckets = this.#sql
+      .exec<WindowBucket>(
+        `SELECT at AS start, count FROM link_request
+         WHERE link_id = ? AND kind = ? ORDER BY at`,
+        linkId,
+        kind
+      )
+      .toArray()
+    const limit = kind === 'sync' ? LIMITS.guestLinkSyncs : LIMITS.guestLinkPuts
+    const wait = rollingWindowWaitMs(buckets, 1, limit, LIMITS.guestLinkWindowMs, now)
+    if (wait != null) {
+      logSpacesLimitHit(`spaces/guest/${kind}`, kind === 'sync' ? 'guestLinkSyncs' : 'guestLinkPuts')
+      return fail('rate_limited', retryAfterSeconds(wait))
+    }
+    this.#sql.exec(
+      `INSERT INTO link_request (link_id, kind, at, count) VALUES (?, ?, ?, 1)
+       ON CONFLICT (link_id, kind, at) DO UPDATE SET count = count + 1`,
+      linkId,
+      kind,
+      now
+    )
+    return null
+  }
+
+  /** `rate_limited` when `count` more records would pass a link's records a rolling day. */
+  #refuseOverLinkRecords(linkId: string, count: number, now: number): SpacesFailure | null {
+    const windowHours = Math.round(LIMITS.guestLinkRecordWindowMs / HOUR_MS)
+    this.#sql.exec(
+      'DELETE FROM link_record_hour WHERE hour <= ?',
+      Math.floor(now / HOUR_MS) - windowHours
+    )
+    const buckets = this.#sql
+      .exec<{ hour: number; records: number }>(
+        'SELECT hour, records FROM link_record_hour WHERE link_id = ? ORDER BY hour',
+        linkId
+      )
+      .toArray()
+      .map((bucket) => ({ start: bucket.hour * HOUR_MS, count: bucket.records }))
+    const wait = rollingWindowWaitMs(
+      buckets,
+      count,
+      LIMITS.guestLinkRecordsPerDay,
+      windowHours * HOUR_MS,
+      now
+    )
+    if (wait == null) return null
+    logSpacesLimitHit('spaces/guest/put', 'guestLinkRecordsPerDay')
+    return fail('rate_limited', retryAfterSeconds(wait))
   }
 
   /** Whether `inviteId` was closed before it was used, and hasn't expired. */
@@ -1191,7 +2266,7 @@ export class SharedSpace extends DurableObject<Environment> {
           `SELECT invite_id AS inviteId, invited_by AS invitedBy,
                   join_verifier AS joinVerifier, expires_at AS expiresAt,
                   bad_joins AS badJoins, joined_member_id AS joinedMemberId,
-                  joined_token_hash AS joinedTokenHash
+                  joined_token_hash AS joinedTokenHash, scopes, handoff
            FROM invite WHERE invite_id = ?`,
           inviteId
         )
@@ -1211,17 +2286,17 @@ export class SharedSpace extends DurableObject<Environment> {
     )
   }
 
-  /** Writes `record` as the version the space holds, at `seq`. */
-  #storeRecord(record: PutRecordArgs, seq: number): void {
+  /** Writes `record` as the version the space holds, at `seq`, under its street's `scope`. */
+  #storeRecord(record: PutRecordArgs, seq: number, scope: string | null = null): void {
     this.#sql.exec(
       `INSERT INTO record (record_id, epoch, stamp, deleted, blob, blob_hash,
-                           blob_bytes, seq)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           blob_bytes, seq, scope)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (record_id) DO UPDATE SET
          epoch = excluded.epoch, stamp = excluded.stamp,
          deleted = excluded.deleted, blob = excluded.blob,
          blob_hash = excluded.blob_hash, blob_bytes = excluded.blob_bytes,
-         seq = excluded.seq`,
+         seq = excluded.seq, scope = excluded.scope`,
       record.recordId,
       record.epoch,
       record.stamp,
@@ -1229,7 +2304,8 @@ export class SharedSpace extends DurableObject<Environment> {
       record.blob,
       record.blobHash,
       decodedLength(record.blob),
-      seq
+      seq,
+      scope
     )
   }
 
@@ -1304,11 +2380,14 @@ export class SharedSpace extends DurableObject<Environment> {
 
   /**
    * Expired invites go, used and closed ones included: a retried join can't
-   * outlive them, and a retried `invite/create` can't name a past expiry.
+   * outlive them, and a retried `invite/create` can't name a past expiry. A
+   * pending hand-off whose invite expired is no longer held, which advances
+   * `seq`.
    */
   #prune(now: number): void {
     this.#sql.exec('DELETE FROM invite WHERE expires_at <= ?', now)
     this.#sql.exec('DELETE FROM closed_invite WHERE expires_at <= ?', now)
+    if (this.#clearLapsedHolds(now)) this.#advance()
   }
 
   #touch(now: number): void {
@@ -1317,6 +2396,7 @@ export class SharedSpace extends DurableObject<Environment> {
 
   #advance(): number {
     this.#sql.exec('UPDATE space SET seq = seq + 1 WHERE singleton = 1')
+    this.#advanced = true
     return this.#space()?.seq ?? 0
   }
 
@@ -1358,7 +2438,7 @@ export class SharedSpace extends DurableObject<Environment> {
    * a rolling day, until enough of the oldest hours leave the window; or
    * null.
    */
-  #refuseOverDailyRecords(count: number, now: number): SpacesFailure | null {
+  #refuseOverDailyRecords(op: string, count: number, now: number): SpacesFailure | null {
     const windowHours = Math.round(LIMITS.spaceRecordWindowMs / HOUR_MS)
     this.#sql.exec(
       'DELETE FROM put_hour WHERE hour <= ?',
@@ -1378,30 +2458,30 @@ export class SharedSpace extends DurableObject<Environment> {
       now
     )
     if (wait == null) return null
-    logSpacesLimitHit('spaces/put', 'spaceRecordsPerDay')
+    logSpacesLimitHit(op, 'spaceRecordsPerDay')
     return fail('rate_limited', retryAfterSeconds(wait))
   }
 
   /**
-   * `sync`'s answer for `memberId`; see `SpaceSyncView`. Records are read in
-   * whole chunks (`readSeqPage`), so a page cut short by `limit` or the
-   * size budget leaves no cursor open to block a later `#wipe`.
+   * Records with `seq > since` that `filter` lets through, in `seq` order,
+   * up to `limit` and the page's size budget. Records are read in whole
+   * chunks (`readSeqPage`), so a page cut short leaves no cursor open to
+   * block a later `#wipe`.
    */
-  #snapshot(
-    space: SpaceRow,
-    memberId: string,
+  #readRecords(
     since: number,
     limit: number,
-    now: number
-  ): SpaceSyncView {
+    filter: RecordFilter = EVERY_RECORD
+  ): { records: SpaceRecordView[]; more: boolean } {
     let chars = 0
     const page = readSeqPage(
       (after, count) =>
         this.#sql
           .exec<RecordRow>(
             `SELECT record_id AS recordId, epoch, stamp, deleted, blob, seq
-             FROM record WHERE seq > ? ORDER BY seq LIMIT ?`,
+             FROM record WHERE seq > ?${filter.where} ORDER BY seq LIMIT ?`,
             after,
+            ...filter.bindings,
             count
           )
           .toArray(),
@@ -1416,31 +2496,128 @@ export class SharedSpace extends DurableObject<Environment> {
         return true
       },
       // One past `limit` tells whether there's more.
-      Math.min(SEQ_PAGE_CHUNK, limit + 1)
+      Math.min(SEQ_PAGE_CHUNK, limit + 1),
+      filter.keep
     )
-    const records = page.rows.map((row) => ({ ...row, deleted: row.deleted === 1 }))
     return {
+      records: page.rows.map((row) => ({ ...row, deleted: row.deleted === 1 })),
+      more: page.more,
+    }
+  }
+
+  /**
+   * Which records `caller` reads in a scoped space: the SQL leaves out
+   * streets a street member doesn't have, and `#mayRead` decides the rest.
+   */
+  #scopedFilter(access: Access, caller: Caller): RecordFilter {
+    const keep = (row: RecordRow) => {
+      const record = classifyScopedRecord(row.recordId)
+      return record != null && this.#mayRead(access, caller, record)
+    }
+    if (caller.isOwner || caller.scopes == null) return { where: '', bindings: [], keep }
+    return {
+      where: ' AND (scope IS NULL OR scope IN (SELECT value FROM json_each(?)))',
+      bindings: [JSON.stringify([...caller.scopes])],
+      keep,
+    }
+  }
+
+  /**
+   * `sync`'s answer for `memberId`; see `SpaceSyncView`. A scoped space's
+   * adds its mode, each member's streets and inviter, holders, and links,
+   * and leaves out records the member may not read; invites and links are
+   * everyone's for the owner and whole members, and only their own for
+   * anyone else.
+   */
+  #snapshot(
+    space: SpaceRow,
+    memberId: string,
+    since: number,
+    limit: number,
+    now: number
+  ): SpaceSyncView {
+    const scoped = space.mode === 'scoped'
+    const access = scoped ? this.#access(space) : null
+    const caller = scoped ? this.#caller(space, memberId)! : null
+    const page = this.#readRecords(
+      since,
+      limit,
+      scoped ? this.#scopedFilter(access!, caller!) : EVERY_RECORD
+    )
+    const records = page.records
+    const base: SpaceSyncView = {
       seq: page.more ? records[records.length - 1].seq : space.seq,
       epoch: space.epoch,
       wrap: this.#member(memberId)?.wrap ?? '',
       ownerId: space.ownerId,
-      members: this.#sql
-        .exec<SpaceMemberView>(
+      members: [],
+      invites: [],
+      rekeyNeeded: space.rekeyNeeded === 1,
+      records,
+      more: page.more,
+    }
+    if (!scoped) {
+      base.members = this.#sql
+        .exec<{ memberId: string; dhPub: string; joinedAt: number }>(
           `SELECT member_id AS memberId, dh_pub AS dhPub, joined_at AS joinedAt
            FROM member ORDER BY joined_at, member_id`
         )
-        .toArray(),
-      invites: this.#sql
+        .toArray()
+      base.invites = this.#sql
         .exec<{ inviteId: string; invitedBy: string; expiresAt: number }>(
           `SELECT invite_id AS inviteId, invited_by AS invitedBy, expires_at AS expiresAt
            FROM invite WHERE joined_member_id IS NULL AND expires_at > ?
            ORDER BY created_at, invite_id`,
           now
         )
-        .toArray(),
-      rekeyNeeded: space.rekeyNeeded === 1,
-      records,
-      more: page.more,
+        .toArray()
+      return base
+    }
+    const everything = caller!.isOwner || caller!.scopes == null
+    const own = everything ? '' : ' AND invited_by = ?'
+    const ownLinks = everything ? '' : ' AND created_by = ?'
+    const mine = everything ? [] : [memberId]
+    return {
+      ...base,
+      mode: 'scoped',
+      members: this.#sql
+        .exec<{ memberId: string; dhPub: string; joinedAt: number; scopes: string | null; invitedBy: string | null }>(
+          `SELECT member_id AS memberId, dh_pub AS dhPub, joined_at AS joinedAt,
+                  scopes, invited_by AS invitedBy
+           FROM member ORDER BY joined_at, member_id`
+        )
+        .toArray()
+        .map((row) => ({ ...row, scopes: scopeList(row.scopes) })),
+      invites: this.#sql
+        .exec<{ inviteId: string; invitedBy: string; expiresAt: number; scopes: string | null; handoff: number }>(
+          `SELECT invite_id AS inviteId, invited_by AS invitedBy, expires_at AS expiresAt,
+                  scopes, handoff
+           FROM invite WHERE joined_member_id IS NULL AND expires_at > ?${own}
+           ORDER BY created_at, invite_id`,
+          now,
+          ...mine
+        )
+        .toArray()
+        .map((row) => ({ ...row, scopes: scopeList(row.scopes), handoff: row.handoff === 1 })),
+      holders: [...access!.holds.values()],
+      links: this.#sql
+        .exec<LinkRow>(
+          `SELECT link_id AS linkId, created_by AS createdBy, scopes,
+                  created_at AS createdAt, expires_at AS expiresAt, ended_at AS endedAt
+           FROM link WHERE expires_at > ?${ownLinks}
+           ORDER BY created_at, link_id`,
+          now - LIMITS.linkListedMs,
+          ...mine
+        )
+        .toArray()
+        .map((row) => ({
+          linkId: row.linkId,
+          createdBy: row.createdBy,
+          scopes: scopeList(row.scopes)!,
+          createdAt: row.createdAt,
+          expiresAt: row.expiresAt,
+          endedAt: row.endedAt,
+        })),
     }
   }
 

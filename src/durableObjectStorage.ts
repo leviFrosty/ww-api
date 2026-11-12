@@ -37,7 +37,9 @@ export const SEQ_PAGE_CHUNK = 64
  * A page of rows in `seq` order after `since`, read `chunk` rows at a time
  * with `toArray()`, until `take` turns a row down or they run out; `more`
  * says `take` turned one down. `read(after, count)` returns up to `count`
- * rows with `seq > after`, in `seq` order.
+ * rows with `seq > after`, in `seq` order. Rows `keep` turns down are
+ * skipped, as if they weren't there (Shared Spaces leaves out records the
+ * caller may not read).
  *
  * Why chunks: a page that stops early must not leave its `exec()` cursor
  * unfinished. An open cursor keeps its statement running, and SQLite then
@@ -48,13 +50,15 @@ export const readSeqPage = <T extends { seq: number }>(
   read: (after: number, count: number) => T[],
   since: number,
   take: (row: T, taken: readonly T[]) => boolean,
-  chunk: number = SEQ_PAGE_CHUNK
+  chunk: number = SEQ_PAGE_CHUNK,
+  keep: (row: T) => boolean = () => true
 ): { rows: T[]; more: boolean } => {
   const rows: T[] = []
   let after = since
   for (;;) {
     const batch = read(after, chunk)
     for (const row of batch) {
+      if (!keep(row)) continue
       if (!take(row, rows)) return { rows, more: true }
       rows.push(row)
     }

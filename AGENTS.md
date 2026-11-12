@@ -2298,6 +2298,86 @@ wrangler kv key delete --binding NOTES_KV spaces:maxMembers
 # Add --env dev to each for the dev worker.
 ```
 
+### Territories: scoped spaces and guest links
+
+Shared Territories (witness-work ADR 0046; wire contract
+`docs/territories-protocol.md` there) are Shared Spaces created with
+`mode: "scoped"`. A space without a mode (every car) keeps every rule above,
+unchanged; the mode never changes. Same files, plus `scoped.test.ts` and
+`guest.test.ts`, and `src/e2e/territories.e2e.test.ts` for the local worker.
+
+| Route | What |
+| --- | --- |
+| `POST /spaces/v1/create` | adds optional `mode: "scoped"` (part of an identical retry) |
+| `POST /spaces/v1/invite/create` | adds `scopes?` (1-100 street ids; absent = whole territory) and `handoff?` (exactly one scope) |
+| `POST /spaces/v1/member/scopes` | owner: member, `target`, `scopes` (or null) → `{ ok }` |
+| `POST /spaces/v1/handoff/create`, `handoff/end` | member, `scopeId` (+ `target`) → `{ ok, seq }` |
+| `POST /spaces/v1/link/create`, `link/end` | member, `linkId` (+ `verifier`, `scopes` 1-30, `expiresAt` ≤ 24 h 5 min, `epoch`) → `{ ok, seq }` |
+| `POST /spaces/v1/guest/sync`, `guest/put` | **no session**: `spaceId`, `linkId`, `linkToken` (+ `since`/`limit` ≤ 500, or `records` 1-20) |
+
+- **Streets are scopes**: opaque 22-character ids (`b64u` of the street
+  UUID). Record ids must match the protocol's grammar (`h`, `s.<S>`,
+  `s.<S>.w`, `s.<S>.<uuid>`, `d.<uuid>`, `m.`/`i.`/`g.<22>`, `k.<n>`;
+  `SCOPED_RECORD_ID_PATTERN`), else 400. Each record is stored with its
+  scope (`record.scope`, indexed with `seq`), `sync` leaves out what the
+  caller may not read (they don't count toward `limit`), and `put` refuses a
+  record the caller may not write (403, nothing stored, before `stale_key`).
+  The rules (`#mayRead`, `#mayWrite`, `#mayWriteScope` in `spaceDO.ts`)
+  follow the protocol's tables. A street held by a member is written by the
+  holder and members they invited who have it; one held by a pending
+  hand-off invite, by nobody; an unheld one by the owner, whole members, and
+  members the owner invited who have it.
+- **Roles are server state**: `member.scopes` (JSON, null = whole),
+  `member.invited_by`, `holder` (street → member, or a pending hand-off
+  invite), `link` (verifier, creator, scopes, times; kept for the space's
+  life so ids never repeat), `invite_author` (who made each invite, for its
+  `i.` record). The owner never changes: `leave` by the owner is 400 and
+  nothing passes a scoped space on. Only the owner hands off
+  (`invite/create` with `handoff`, `handoff/create`), so a holder is refused
+  (403) both ways. A hold clears whenever its pending invite closes
+  (delete, expiry at the next prune, a burn, a rekey, `member/remove`).
+  `handoff/end` (`#endHold`) removes the street from the holder and their
+  invitees, removes anyone left with none, ends the holder's links and open
+  invites on it, and if anyone was removed closes every open invite and
+  sets `rekeyNeeded`; a holder's `leave` or removal runs it for each street
+  first, and any member who leaves or is removed ends the links they made.
+  `join` refuses (404) a holder's invite for a street they no longer hold.
+- **Guest ops** are the API's only writes without a session. Order: both
+  switches (503 `disabled`), 120 a minute per network
+  (`SPACES_GUEST_LIMITER`, keyed by `counterName(…, 'spaces-guest',
+  buddiesCallerKey(ip))`, an HMAC under `ACCOUNT_TICKET_SECRET`; without
+  that secret they answer `disabled`; a failing limiter allows), the body
+  (64 KiB, 20 records, 4 KiB blobs, the grammar), and only then the space.
+  There an unknown space, unknown link, wrong token, or a space without a
+  mode are the same 404 `not_found`; a deleted space or ended link is 410
+  `gone` with `reason: "ended"`, a lapsed one `reason: "expired"`. Then 120
+  syncs and 30 puts a link a rolling minute and 2,000 records a link a
+  rolling day (`link_request`, `link_record_hour`), then the records: only
+  `s.<S>.w` and `s.<S>.<uuid>` on streets of the link its creator may write
+  now (403 otherwise), then `stale_key` and the space's caps as `put`. A
+  wrong token never ends or counts against a link. CORS is the global
+  `WEB_APP_ORIGINS` list (`Date` and `Retry-After` exposed, no credentials).
+- **Switches and suspension**: `handoff/end` and `link/end` work with
+  `spaces:enabled` off, like `leave`. `member/scopes`, `handoff/create`, and
+  `link/create` answer 403 `suspended` for a suspended account.
+- **Privacy**: never log or report a link token, verifier, link id, IP, or
+  blob. Sentry drops `cf-connecting-ip` and the other IP headers from every
+  event (`SECRET_HEADER` in `src/sentry.ts`).
+- **Schema**: added with `CREATE TABLE IF NOT EXISTS` and guarded `ALTER
+  TABLE` (`ADDED_COLUMNS`) when an object starts, so older spaces pick it up
+  with nulls and keep their rules. No new Durable Object class or migration
+  tag.
+
+```bash
+# Guest links on (they also need spaces:enabled = true)
+wrangler kv key put --binding NOTES_KV spaces:guests true
+# Pause guest links only (link/create keeps working; pages show "paused")
+wrangler kv key put --binding NOTES_KV spaces:guests false
+# Fall back to the SPACES_GUESTS var (dev "true", prod "false")
+wrangler kv key delete --binding NOTES_KV spaces:guests
+# Add --env dev to each for the dev worker.
+```
+
 ## App Store ratings (paywall social proof)
 
 `GET /app-store/ratings` returns `{complete: true, averageRating, ratingCount,

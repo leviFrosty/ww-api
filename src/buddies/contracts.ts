@@ -369,7 +369,7 @@ export const BUDDIES_LIMITS = {
  * right away instead of waiting out the 60 s push spacing, but still count
  * toward the daily cap. Updates and cancellations keep the spacing, and so
  * does `car.reply` (the shared-cars protocol makes only `car.invite`
- * immediate). `invite.claimed` is a relay event outside the slot budget
+ * immediate) and `territory.reply`. `invite.claimed` is a relay event outside the slot budget
  * altogether.
  */
 export const BUDDIES_IMMEDIATE_PUSH_KINDS: ReadonlySet<string> = new Set([
@@ -378,6 +378,10 @@ export const BUDDIES_IMMEDIATE_PUSH_KINDS: ReadonlySet<string> = new Set([
   'plan.invite',
   'followup.invite',
   'car.invite',
+  // Territories (witness-work `docs/territories-protocol.md`): an invitation
+  // to a territory, and a street handed to someone already on it.
+  'territory.invite',
+  'territory.handoff',
 ])
 /** `join.request.<tag>`: the tag is per buddy, so it matches by prefix. */
 export const BUDDIES_IMMEDIATE_PUSH_PREFIX = 'join.request.'

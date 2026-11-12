@@ -16,7 +16,9 @@ import {
   EDGE_RETRY_AFTER_SECONDS,
   allowBuddiesCaller,
   buddiesAccountCallerKey,
+  buddiesCallerKey,
 } from '../buddies/limits'
+import { counterName } from '../accounts/rateCounter'
 import {
   authenticateAccount,
   refuseInactiveAccount,
@@ -26,6 +28,8 @@ import { quotaName, refuseOverDailyQuota } from '../accounts/signed'
 import {
   SPACES_ALWAYS_ALLOWED_OPS,
   SPACES_FIELD_PARSERS,
+  SPACES_GUEST_OPS,
+  SPACES_GUEST_PARSERS,
   SPACES_HEADERS,
   SPACES_LIMITS,
   SPACES_LIVE_OP,
@@ -40,12 +44,18 @@ import {
   type MemberFields,
   type SpacesErrorCode,
   type SpacesFields,
+  type SpacesGuestFields,
+  type SpacesGuestOp,
   type SpacesOp,
   type SpacesResult,
 } from './contracts'
 import type { CreateSpaceArgs, MemberAuth } from './spaceDO'
-import { isSpacesEnabled, spacesMaxMembers } from './switches'
-import { spacesLiveDocs, spacesOpDocs } from './openapi'
+import {
+  isSpacesEnabled,
+  isSpacesGuestsEnabled,
+  spacesMaxMembers,
+} from './switches'
+import { spacesGuestDocs, spacesLiveDocs, spacesOpDocs } from './openapi'
 
 /**
  * `POST /spaces/v1/{op}` and the `GET /spaces/v1/live` socket: Shared
@@ -68,10 +78,17 @@ import { spacesLiveDocs, spacesOpDocs } from './openapi'
  * make a space, the account's 20 spaces a rolling day. There's no Supporter
  * check.
  *
+ * The guest ops (`guest/sync`, `guest/put`; witness-work ADR 0046) are
+ * the exception: no session, a guest link's token in the body instead.
+ * Gates, in order: both switches (`spaces:enabled`, `spaces:guests`), 120
+ * requests a minute per network (`SPACES_GUEST_LIMITER`, keyed by an HMAC
+ * of the IP, never the IP), the body (64 KiB) and its fields; only then
+ * does a space wake, and it checks the link and its own limits.
+ *
  * Privacy: every id and secret travels in the body (or the live upgrade's
  * headers), never the URL, and nothing here logs or reports a body, header,
- * token, key, id, or blob. A failure reaches Sentry as `spaces/<op>` alone.
- * Errors are the shared `{ ok: false, error, code }`.
+ * token, key, id, IP, or blob. A failure reaches Sentry as `spaces/<op>`
+ * alone. Errors are the shared `{ ok: false, error, code }`.
  */
 
 /** The Buddies edge tier each op counts against, named by a Buddies op of it. */
@@ -86,6 +103,11 @@ const EDGE_TIER_OP: Record<SpacesOp | typeof SPACES_LIVE_OP, BuddiesRouteOp> = {
   'member/remove': 'event/put',
   rekey: 'event/put',
   delete: 'event/put',
+  'member/scopes': 'event/put',
+  'handoff/create': 'event/put',
+  'handoff/end': 'event/put',
+  'link/create': 'event/put',
+  'link/end': 'event/put',
   live: 'inbox/live',
 }
 
@@ -101,7 +123,10 @@ const errorResponse = (
 const reply = <T extends object>(c: AppContext, result: SpacesResult<T>): Response =>
   result.ok
     ? c.json({ ok: true, ...result.value })
-    : errorResponse(result.error, result.retryAfterSeconds)
+    : spacesErrorResponse(result.error, {
+        retryAfterSeconds: result.retryAfterSeconds,
+        reason: result.reason,
+      })
 
 const hashOf = async (bytes: Uint8Array): Promise<string> =>
   bytesToBase64Url(await sha256Bytes(bytes))
@@ -240,6 +265,8 @@ const RUNNERS: Runners = {
         expiresAt: fields.expiresAt,
         epoch: fields.epoch,
         maxMembers: await spacesMaxMembers(c.env),
+        scopes: fields.scopes,
+        handoff: fields.handoff,
       })
     ),
   'invite/delete': async (c, fields) =>
@@ -292,6 +319,52 @@ const RUNNERS: Runners = {
     reply(
       c,
       await space(c.env, fields.spaceId).deleteSpace(await memberAuth(fields))
+    ),
+  'member/scopes': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).setMemberScopes({
+        ...(await memberAuth(fields)),
+        target: fields.target,
+        scopes: fields.scopes,
+      })
+    ),
+  'handoff/create': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).createHandoff({
+        ...(await memberAuth(fields)),
+        scopeId: fields.scopeId,
+        target: fields.target,
+      })
+    ),
+  'handoff/end': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).endHandoff({
+        ...(await memberAuth(fields)),
+        scopeId: fields.scopeId,
+      })
+    ),
+  'link/create': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).createLink({
+        ...(await memberAuth(fields)),
+        linkId: fields.linkId,
+        verifier: fields.verifier,
+        scopes: fields.scopes,
+        expiresAt: fields.expiresAt,
+        epoch: fields.epoch,
+      })
+    ),
+  'link/end': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).endLink({
+        ...(await memberAuth(fields)),
+        linkId: fields.linkId,
+      })
     ),
 }
 
@@ -361,11 +434,121 @@ const handleLive = async (c: AppContext): Promise<Response> => {
   }
 }
 
+type GuestRunners = {
+  [K in SpacesGuestOp]: (
+    c: AppContext,
+    fields: SpacesGuestFields[K]
+  ) => Promise<Response>
+}
+
+/** A guest op's link as the space DO takes it: the token hashed. */
+const guestAuth = async (fields: SpacesGuestFields[SpacesGuestOp]) => ({
+  spaceId: fields.spaceId,
+  linkId: fields.linkId,
+  verifier: await hashOf(fields.linkToken),
+})
+
+const GUEST_RUNNERS: GuestRunners = {
+  'guest/sync': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).guestSync({
+        ...(await guestAuth(fields)),
+        since: fields.since,
+        limit: fields.limit,
+      })
+    ),
+  'guest/put': async (c, fields) => {
+    const records = await Promise.all(
+      fields.records.map(async (record) => ({
+        ...record,
+        blobHash: await blobHash(record.blob),
+      }))
+    )
+    return reply(
+      c,
+      await space(c.env, fields.spaceId).guestPut({
+        ...(await guestAuth(fields)),
+        records,
+      })
+    )
+  },
+}
+
+const reportedGuestLimiterOutage = { value: false }
+
+/**
+ * Counts a guest request against its network's budget
+ * (`SPACES_GUEST_LIMITER`), keyed by an HMAC of the client IP (IPv4, or
+ * IPv6 by /64) under a key from `ACCOUNT_TICKET_SECRET`, never the IP: null
+ * admits; 429 `rate_limited` over it. Without that secret the guest ops
+ * can't key the limit, so they answer `disabled`. A limiter that fails lets
+ * the request on (logged once per isolate), as Buddies' do: the space's
+ * per-link limits still hold.
+ */
+const refuseGuestCaller = async (c: AppContext): Promise<Response | null> => {
+  let key: string
+  try {
+    key = await counterName(
+      c.env,
+      'spaces-guest',
+      buddiesCallerKey(c.req.header('CF-Connecting-IP'))
+    )
+  } catch {
+    return errorResponse('disabled')
+  }
+  try {
+    const { success } = await c.env.SPACES_GUEST_LIMITER.limit({ key })
+    if (success) return null
+  } catch {
+    if (!reportedGuestLimiterOutage.value) {
+      reportedGuestLimiterOutage.value = true
+      console.warn('spaces: guest limiter unavailable; allowing')
+    }
+    return null
+  }
+  logSpacesLimitHit('spaces/guest', 'guestRequestsPerMinute')
+  return errorResponse('rate_limited', EDGE_RETRY_AFTER_SECONDS)
+}
+
+const runGuestOp = <K extends SpacesGuestOp>(
+  op: K,
+  c: AppContext,
+  fields: SpacesGuestFields[K]
+): Promise<Response> => (GUEST_RUNNERS[op] as GuestRunners[K])(c, fields)
+
+/**
+ * `guest/sync` and `guest/put`: both switches, the network's limit, the
+ * body, and only then the space (which checks the link, its own limits, and
+ * each record). A request refused before the space never wakes it.
+ */
+const handleGuestOp = async (c: AppContext, op: SpacesGuestOp): Promise<Response> => {
+  try {
+    if (!(await isSpacesEnabled(c.env)) || !(await isSpacesGuestsEnabled(c.env)))
+      return errorResponse('disabled')
+    const refused = await refuseGuestCaller(c)
+    if (refused) return refused
+    const body = await readJsonBody(c.req.raw, SPACES_LIMITS.guestBodyBytes)
+    if (!body.ok) return errorResponse(body.error)
+    if (!isPlainObject(body.value)) return errorResponse('bad_request')
+    const fields = SPACES_GUEST_PARSERS[op](body.value, Date.now())
+    if (!fields.ok) return errorResponse(fields.error)
+    return await runGuestOp(op, c, fields.value)
+  } catch (error) {
+    // The op alone: never the body, the link, its token, or the caller.
+    console.error('spaces: request failed', { op })
+    captureOperationFailure(error, `spaces/${op}`)
+    return buddiesInternalError()
+  }
+}
+
 /** Mounted at `/spaces/v1` by the Worker entry point. */
 export const createSpacesRoutes = () => {
   const routes = new Hono<AppEnv>()
   for (const op of SPACES_OPS)
     routes.post(`/${op}`, spacesOpDocs[op], (c) => handleSpacesOp(c, op))
+  for (const op of SPACES_GUEST_OPS)
+    routes.post(`/${op}`, spacesGuestDocs[op], (c) => handleGuestOp(c, op))
   routes.get(`/${SPACES_LIVE_OP}`, spacesLiveDocs, handleLive)
   return routes
 }

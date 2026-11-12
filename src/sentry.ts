@@ -214,9 +214,13 @@ function scrubStrings(value: unknown, seen = new WeakSet<object>()): unknown {
  * - `x-ww-space-auth`, `x-ww-space-token` (and the Worker's own
  *   `x-ww-space-member-token`): the Shared Spaces live socket's space id and
  *   member id, its member token, and the token's hash.
+ * - `cf-connecting-ip`, `cf-connecting-ipv6`, `cf-pseudo-ipv4`,
+ *   `true-client-ip`, `x-real-ip`, `x-forwarded-for`: the caller's IP. The
+ *   public guest ops (Shared Spaces' guest links) promise never to report
+ *   a guest's IP, and no other route needs it in an event either.
  */
 const SECRET_HEADER =
-  /^(authorization$|sec-websocket-protocol$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id|space-auth|space-token|space-member-token)$)/i;
+  /^(authorization$|sec-websocket-protocol$|x-ww-admin-token$|x-ww-dev-bypass$|x-buddies-|x-ww-(p|s|payload|signature|slot-id|space-auth|space-token|space-member-token)$|cf-connecting-ipv?6?$|cf-pseudo-ipv4$|true-client-ip$|x-real-ip$|x-forwarded-for$)/i;
 
 function dropSecretHeaders(event: Event): void {
   const headers = event.request?.headers;

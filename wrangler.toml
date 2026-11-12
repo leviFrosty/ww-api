@@ -168,6 +168,9 @@ SYNC_ENTITLEMENT = "everyone"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. On in dev.
 SPACES_ENABLED = "true"
+# Territories' guest links (witness-work ADR 0046): the public guest ops'
+# fallback when KV `spaces:guests` is absent. On in dev.
+SPACES_GUESTS = "true"
 # The web app's origins (witness-work ADR 0038 §10): CORS and browser live
 # sockets admit exactly these (comma-separated, no wildcards). Dev serves
 # app-dev plus the local web dev servers (Expo/Metro 8081-8082, Expo web
@@ -433,6 +436,17 @@ namespace_id = "2007"   # distinct from prod's 1007
   limit = 600
   period = 60
 
+# Shared Spaces' public guest ops (guest/sync, guest/put; witness-work ADR
+# 0046), per network, keyed by an HMAC of the IP. Size:
+# SPACES_LIMITS.guestRequestsPerMinute, which guest.test.ts keeps equal.
+[[env.dev.ratelimits]]
+name = "SPACES_GUEST_LIMITER"
+namespace_id = "2008"   # distinct from prod's 1008
+
+  [env.dev.ratelimits.simple]
+  limit = 120
+  period = 60
+
 # Cloudflare Workers Observability — not inherited, so repeated for dev.
 # Full sampling on dev to capture everything while iterating.
 [env.dev.observability]
@@ -523,6 +537,11 @@ SYNC_ENTITLEMENT = "everyone"
 # `spaces:enabled` is absent. Off in prod until KV `spaces:enabled` turns it
 # on, before the app release that shares cars. Repeated under [env.dev.vars].
 SPACES_ENABLED = "false"
+# Territories' guest links (witness-work ADR 0046): the public guest ops'
+# (`guest/sync`, `guest/put`) fallback when KV `spaces:guests` is absent. Off
+# in prod until the owner turns them on for Beta testing (KV, with
+# `spaces:enabled`). Repeated under [env.dev.vars].
+SPACES_GUESTS = "false"
 # The web app's origins (witness-work ADR 0038 §10): CORS and browser live
 # sockets admit exactly these (comma-separated, no wildcards; never localhost
 # here). Not inherited by [env.dev], which has its own list.
@@ -652,6 +671,12 @@ MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
 #   wrangler kv key put --binding NOTES_KV spaces:enabled false      # off
 #   wrangler kv key put --binding NOTES_KV spaces:maxMembers 12      # raise the cap
 #   wrangler kv key delete --binding NOTES_KV spaces:enabled         # use the var
+# `spaces:guests` (Territories' guest links, ADR 0046): "true" turns the
+# public guest/sync and guest/put on, anything else off (503 disabled);
+# absent falls back to SPACES_GUESTS. They also need spaces:enabled.
+#   wrangler kv key put --binding NOTES_KV spaces:guests true        # on
+#   wrangler kv key put --binding NOTES_KV spaces:guests false       # pause guest links
+#   wrangler kv key delete --binding NOTES_KV spaces:guests          # use the var
 # (add `--env dev` for the dev worker).
 #
 # Web sign-up kill switch (cacheTtl 60): "off" refuses web/signup/options and
@@ -757,6 +782,17 @@ namespace_id = "1007"
 
   [ratelimits.simple]
   limit = 600
+  period = 60
+
+# Shared Spaces' public guest ops (guest/sync, guest/put; witness-work ADR
+# 0046): 120 a minute per network (IPv4, or IPv6 /64), keyed by an HMAC of
+# the IP under ACCOUNT_TICKET_SECRET, never the IP. Repeated under [env.dev].
+[[ratelimits]]
+name = "SPACES_GUEST_LIMITER"
+namespace_id = "1008"
+
+  [ratelimits.simple]
+  limit = 120
   period = 60
 
 # Anonymous accounts (witness-work ADR 0024). Without this binding, accounts

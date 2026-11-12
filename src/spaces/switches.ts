@@ -10,13 +10,18 @@ import { SPACES_LIMITS } from './contracts'
  * - `spaces:maxMembers`: members plus open invites a space may hold, a
  *   whole number from 1 to `maxMembersCeiling`; absent or anything else,
  *   `defaultMaxMembers` (10).
+ * - `spaces:guests`: `"true"` turns the public guest ops (`guest/sync`,
+ *   `guest/put`) on, anything else off; absent (or unreadable), the
+ *   `SPACES_GUESTS` var decides the same way. They also need
+ *   `spaces:enabled`. `link/create` works either way.
  */
 
 export const SPACES_ENABLED_KEY = 'spaces:enabled'
+export const SPACES_GUESTS_KEY = 'spaces:guests'
 export const SPACES_MAX_MEMBERS_KEY = 'spaces:maxMembers'
 const CACHE_TTL_SECONDS = 60
 
-export type SpacesSwitchEnv = Pick<Environment, 'SPACES_ENABLED'> & {
+export type SpacesSwitchEnv = Pick<Environment, 'SPACES_ENABLED' | 'SPACES_GUESTS'> & {
   NOTES_KV: Pick<KVNamespace, 'get'>
 }
 
@@ -35,6 +40,14 @@ const read = async (
 export const isSpacesEnabled = async (env: SpacesSwitchEnv): Promise<boolean> => {
   const value = await read(env, SPACES_ENABLED_KEY)
   return (value ?? env.SPACES_ENABLED ?? '').trim() === 'true'
+}
+
+/** Whether the guest ops run (`spaces:guests`, then `SPACES_GUESTS`). */
+export const isSpacesGuestsEnabled = async (
+  env: SpacesSwitchEnv
+): Promise<boolean> => {
+  const value = await read(env, SPACES_GUESTS_KEY)
+  return (value ?? env.SPACES_GUESTS ?? '').trim() === 'true'
 }
 
 /** The member cap a space's invites and joins are held to right now. */
