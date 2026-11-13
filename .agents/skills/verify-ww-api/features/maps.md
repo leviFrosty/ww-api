@@ -18,7 +18,6 @@ The web app's map frame gets a MapKit JS token from `POST /maps/v1/mapkit-tokens
 
 - The web app opens a map (the Map tab, Route Planning, a contact's pin picker): it asks for a token and hands it to the frame on `maps(-dev).witnesswork.app`.
 - The web app's place field (a Plan location, "search places") types a query.
-- A territory's streets prefill their house numbers from its outline (`/maps/v1/addresses`).
 - No native app build calls either route today.
 
 ## Driving it with verify-ww-api

@@ -2518,18 +2518,6 @@ setup, and decisions: [`docs/maps.md`](docs/maps.md). Code in `src/maps/`.
 - `GET /places/v1/search`: HERE Discover for points of interest, public in the
   per-IP `places` bucket like `/autocomplete`. Reads only `q`, `at`, `limit`,
   `lang`; answers a trimmed shape, never HERE's raw body.
-- `POST /maps/v1/addresses`: Bearer (`requireActive`), the OpenStreetMap
-  house numbers (`{ street, number, latitude, longitude }`) inside a
-  territory outline (3–200 points, bounding box at most 3 km a side, else 413
-  `area_too_large`), from Overpass at `OVERPASS_URL` (var, default
-  overpass-api.de; it needs the descriptive `User-Agent` or answers 406). 6 a
-  minute and 60 a day per account under `territory-addresses:account:<id>`,
-  plus the per-IP `maps` bucket. Answers are cached 7 days in
-  `caches.default` under a SHA-256 of the rounded outline; the quota counts
-  cache hits too. Overpass 429/502/503/504, its own timeout, or no answer in
-  55 s is 503 `upstream_busy`; anything else 502 `upstream_error`. The public
-  instance can take 30–50 s under load. Never log the outline, coordinates,
-  or account.
 - Directions for the web are the existing `POST /route-planning/directions`.
 
 ## API docs (OpenAPI + Scalar)
