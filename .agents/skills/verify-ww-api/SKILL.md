@@ -102,7 +102,7 @@ After the run, a canary inbox's full `inbox/sync` must equal its pre-fuzz snapsh
   - For every mutation, read the result back through a second route: `inbox/sync` after `card/put`/`event/put`/`roster/put`, `invite/fetch` after `invite/create`/`claim`/`delete`, `GET /app-store/ratings` after the KV seed.
   - Assert status and body, not just status.
 - **The dev bypass is a test mode.** It skips App Attest only; rate limits, the kill switch, and the Notes Import gate still run. Real assertions need a device and the deployed dev worker; see AGENTS.md.
-- **Report skipped paths as skipped.** HERE and the paid kickoff are skipped unless explicitly enabled (see Credentials). Never claim them as verified from a different path.
+- **Report skipped paths as skipped.** HERE, Overpass, and the paid kickoff are skipped unless explicitly enabled (see Credentials). Never claim them as verified from a different path.
 
 ## Cleanup
 
@@ -128,6 +128,7 @@ Only names are listed here; never print values.
 | `APPLE_TEAM_ID` | AASA app ids | `VERIFY0000` (synthetic) |
 | `HERE_API_KEY` | `/geocode` + `/autocomplete` + `/places/v1/search` smoke (one call each) | unset, so skipped; set `WW_API_E2E_SKIP_HERE=1` to skip even when set |
 | `MAPKIT_JS_PRIVATE_KEY`, `MAPKIT_JS_KEY_ID`, `MAPKIT_JS_ORIGINS` | `POST /maps/v1/mapkit-tokens` minting (a throwaway P-256 key; PEM on one line with `\n` escapes) | unset, so the route answers `maps_unconfigured` |
+| `WW_API_E2E_OVERPASS=1` | the real `POST /maps/v1/addresses` search (one public Overpass query, keyless) | off |
 | `OPENROUTER_API_KEY` | real provider health and the paid kickoff | unset; the status probe fails open |
 | `REVENUECAT_API_KEY` | Supporter lookups during a paid kickoff | unset |
 | `WW_API_E2E_ALLOW_PAID=1` | opt-in to an import plus correction (two real model calls; OpenRouter spend) | off |

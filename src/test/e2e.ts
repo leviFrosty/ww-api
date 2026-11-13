@@ -115,7 +115,13 @@ const clip = (text: string, max = 600) =>
 export const http = async (
   method: string,
   path: string,
-  init: { body?: unknown; headers?: Record<string, string>; raw?: string } = {}
+  init: {
+    body?: unknown
+    headers?: Record<string, string>
+    raw?: string
+    /** Defaults to 10 s; routes that wait on a slow upstream need longer. */
+    timeoutMs?: number
+  } = {}
 ): Promise<Exchange> => {
   const headers: Record<string, string> = {
     ...callerHeaders(),
@@ -131,7 +137,7 @@ export const http = async (
     method,
     headers,
     body: requestBody,
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(init.timeoutMs ?? 10_000),
   })
   const text = await response.text()
   const ms = Date.now() - started

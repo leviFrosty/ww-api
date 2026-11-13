@@ -10,7 +10,9 @@ import {
 
 /**
  * The web map's routes (witness-work ADR 0037 §8): MapKit JS tokens and
- * point-of-interest search. With `MAPKIT_JS_*` passed to the launcher
+ * point-of-interest search, and territory house numbers. The real Overpass
+ * call is opt-in (`WW_API_E2E_OVERPASS=1`) so CI doesn't load the public
+ * instance. With `MAPKIT_JS_*` passed to the launcher
  * (`up --secrets-from`, a throwaway P-256 key is enough) the token path mints;
  * without them it must answer `maps_unconfigured`. The HERE call is opt-in
  * like the proxy's.
@@ -113,4 +115,97 @@ describe('GET /places/v1/search', () => {
       true
     )
   })
+})
+
+describe('POST /maps/v1/addresses', () => {
+  /** A small block at Alamo Square, San Francisco: OSM maps its houses. */
+  const ALAMO_SQUARE = [
+    { latitude: 37.7758, longitude: -122.4338 },
+    { latitude: 37.7758, longitude: -122.4312 },
+    { latitude: 37.7772, longitude: -122.4312 },
+    { latitude: 37.7772, longitude: -122.4338 },
+  ]
+
+  it('needs a bearer token', async () => {
+    const res = await http('POST', '/maps/v1/addresses', {
+      body: { outline: ALAMO_SQUARE },
+    })
+    expect(res.status).toBe(401)
+    expect(res.body).toMatchObject({ ok: false, code: 'unauthorized' })
+  })
+
+  it.skipIf(!DEV_BYPASS_TOKEN)(
+    'refuses a bad outline or a large area without asking Overpass',
+    async () => {
+      const session = await openSession()
+      const headers = bearerHeaders(session)
+      const short = await http('POST', '/maps/v1/addresses', {
+        headers,
+        body: { outline: ALAMO_SQUARE.slice(0, 2) },
+      })
+      expect(short.status).toBe(400)
+      expect(short.body).toMatchObject({ code: 'bad_request', field: 'outline' })
+      const extra = await http('POST', '/maps/v1/addresses', {
+        headers,
+        body: { outline: ALAMO_SQUARE, name: 'x' },
+      })
+      expect(extra.status).toBe(400)
+      expect(extra.body).toMatchObject({ code: 'bad_request', field: 'body' })
+      const large = await http('POST', '/maps/v1/addresses', {
+        headers,
+        body: {
+          outline: [
+            { latitude: 37.75, longitude: -122.46 },
+            { latitude: 37.75, longitude: -122.41 },
+            { latitude: 37.79, longitude: -122.41 },
+          ],
+        },
+      })
+      expect(large.status).toBe(413)
+      expect(large.body).toMatchObject({ code: 'area_too_large' })
+    }
+  )
+
+  // One real Overpass query (public, keyless), only when asked.
+  it.skipIf(!DEV_BYPASS_TOKEN || !process.env.WW_API_E2E_OVERPASS)(
+    'lists the house numbers OpenStreetMap has inside the outline',
+    async () => {
+      const session = await openSession()
+      const res = await http('POST', '/maps/v1/addresses', {
+        headers: bearerHeaders(session),
+        body: { outline: ALAMO_SQUARE },
+        timeoutMs: 70_000,
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('cache-control')).toBe('no-store')
+      expect(res.body).toMatchObject({
+        ok: true,
+        source: 'openstreetmap',
+        attribution: '© OpenStreetMap contributors',
+      })
+      expect(res.body.addresses.length).toBeGreaterThan(10)
+      const seen = new Set<string>()
+      for (const address of res.body.addresses) {
+        expect(typeof address.street).toBe('string')
+        expect(address.number.length).toBeLessThanOrEqual(12)
+        expect(address.number).not.toMatch(/[;,]/)
+        expect(Math.abs(address.latitude - 37.7765)).toBeLessThan(0.01)
+        expect(Math.abs(address.longitude + 122.4325)).toBeLessThan(0.01)
+        const key = `${address.street}|${address.number}`
+        expect(seen.has(key)).toBe(false)
+        seen.add(key)
+      }
+
+      // The same territory again comes from the edge cache.
+      const again = await http('POST', '/maps/v1/addresses', {
+        headers: bearerHeaders(session),
+        body: { outline: [...ALAMO_SQUARE, ALAMO_SQUARE[0]] },
+        timeoutMs: 70_000,
+      })
+      expect(again.status).toBe(200)
+      expect(again.body).toEqual(res.body)
+      expect(again.ms).toBeLessThan(res.ms)
+    },
+    180_000
+  )
 })

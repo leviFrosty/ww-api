@@ -203,6 +203,9 @@ SCRIBE_SUPPORTER_WEEKLY = "1550000"
 # tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
 # A local frame (http://localhost:<port>) belongs in .dev.vars, never here.
 MAPKIT_JS_ORIGINS = "https://maps-dev.witnesswork.app"
+# The Overpass API interpreter POST /maps/v1/addresses asks for OpenStreetMap
+# house numbers (src/maps/territoryAddresses.ts). Public; the default if unset.
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 # Anonymous Notes Import usage events (src/analytics.ts). Off on dev so test
 # runs stay out of the production dashboards; uncomment to check delivery
 # (events carry `environment: development`).
@@ -582,6 +585,9 @@ POSTHOG_PROJECT_TOKEN = "phc_rTisLfzXzn6yTmrKVKU8dnHNeyd7HNi4Sq6HDhAayt25"
 # tokens (witness-work ADR 0037 §8). Comma-separated; the first is the default.
 # Production never accepts an http:// origin.
 MAPKIT_JS_ORIGINS = "https://maps.witnesswork.app"
+# The Overpass API interpreter POST /maps/v1/addresses asks for OpenStreetMap
+# house numbers (src/maps/territoryAddresses.ts). Public; the default if unset.
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 # Notes Import metadata store (legacy App Attest compatibility state, runtime
 # policy, and short-lived capabilities). Authoritative App Attest identity state

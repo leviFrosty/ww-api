@@ -7,6 +7,10 @@ HERE_API_KEY=your_here_api_key_here
 # Sentry DSN from https://sentry.io/
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project-id
 
+# Overpass API interpreter for POST /maps/v1/addresses (OpenStreetMap house
+# numbers). wrangler.toml already sets the public one; override to use a mirror.
+# OVERPASS_URL=https://overpass-api.de/api/interpreter
+
 # Apple Developer Team ID (10-character string) — used by the AASA endpoint
 # for iOS universal links AND as the App Attest app-id prefix. Same value as
 # APPLE_TEAM_ID in the witness-work Expo app config.
