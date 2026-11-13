@@ -4,17 +4,19 @@ The web app's map (witness-work ADR 0037 §8) is Apple MapKit JS running in a
 sandboxed frame on its own origin: `https://maps.witnesswork.app` in
 production, `https://maps-dev.witnesswork.app` for dev (ADR 0042 §1). The
 frame gets only coordinates and pin styles by `postMessage`, never names or
-notes. ww-api serves three things for it:
+notes. ww-api serves three things for it, and a fourth for territories:
 
 | Route | Auth | What |
 | --- | --- | --- |
 | `POST /maps/v1/mapkit-tokens` | Bearer | A 30-minute MapKit JS token for the frame |
 | `GET /places/v1/search` | None (per-IP) | Points of interest and addresses near a coordinate (HERE Discover) |
 | `POST /route-planning/directions` | Bearer | Driving legs with road shapes (HERE Routing); unchanged, already shipped for Android |
+| `POST /maps/v1/addresses` | Bearer | The OpenStreetMap house numbers inside a territory outline (Overpass), to prefill each street |
 
 Code: `src/maps/` (`route.ts` handlers, `mapkitToken.ts` signing and config,
-`placeSearch.ts` HERE Discover, `config.ts` limits, `openapi.ts` docs). The
-reference for every field is `/docs` (tags **Maps** and **Places**). CORS for
+`placeSearch.ts` HERE Discover, `territoryAddresses.ts` Overpass, `config.ts`
+limits, `openapi.ts` docs). The reference for every field is `/docs` (tags
+**Maps** and **Places**). CORS for
 the web app's origins is a separate change (witness-work ADR 0038 §10).
 
 ## MapKit JS tokens
@@ -197,6 +199,120 @@ longitude }`, so a pick needs no second request.
 Sentry already redacts `q` and `at` from every URL it records, and HERE is
 called with the `fetch` captured before Sentry wraps it.
 
+## Territory house numbers
+
+`POST /maps/v1/addresses`
+
+Every OpenStreetMap element with an `addr:housenumber` inside a territory's
+outline, so the app can prefill each street's house numbers (native and web).
+Apple's MapKit/CLGeocoder and HERE's reverse geocoder return only the nearest
+address to a point (HERE gave about 4 scattered numbers per street), so
+neither can list a street's houses. OSM address points are dense where
+they're mapped (a San Francisco block: 20 or more per street) and absent
+elsewhere (a Plano, TX suburb: none). An empty list is a normal answer; the
+app keeps its own behavior then.
+
+**Request.** `Authorization: Bearer <accessToken>`, any active account.
+JSON, at most 16 KiB, unknown fields refused:
+
+```json
+{
+  "outline": [
+    { "latitude": 37.7758, "longitude": -122.4338 },
+    { "latitude": 37.7758, "longitude": -122.4312 },
+    { "latitude": 37.7772, "longitude": -122.4312 },
+    { "latitude": 37.7772, "longitude": -122.4338 }
+  ]
+}
+```
+
+3 to 200 points in order, in range; repeating the first point to close the
+ring is optional. The outline's bounding box may be at most 3 km on each side
+(measured east–west at its middle latitude).
+
+**Response 200** (`Cache-Control: no-store`). A real answer for the outline
+above (Alamo Square, San Francisco: 80 addresses on Fillmore, Grove, Hayes,
+and Steiner Streets), cut to five:
+
+```json
+{
+  "ok": true,
+  "source": "openstreetmap",
+  "attribution": "© OpenStreetMap contributors",
+  "addresses": [
+    { "street": "Fillmore Street", "number": "803", "latitude": 37.77692, "longitude": -122.43191 },
+    { "street": "Fillmore Street", "number": "716", "latitude": 37.77645, "longitude": -122.43108 },
+    { "street": "Fillmore Street", "number": "718", "latitude": 37.77645, "longitude": -122.43108 },
+    { "street": "Fillmore Street", "number": "720", "latitude": 37.77645, "longitude": -122.43108 },
+    { "street": "Fillmore Street", "number": "722", "latitude": 37.77653, "longitude": -122.43107 }
+  ]
+}
+```
+
+- `street` is `addr:street`, or `addr:place` when there's no street;
+  elements with neither are skipped. Trimmed.
+- `number` is one house number. A multi-value tag (`629;631;633`, `629,631`)
+  becomes one entry per number at the same point. Trimmed; anything longer
+  than 12 characters is dropped. Not always numeric (`12A`, `1-3`).
+- The position is a node's own, or a way's or relation's center, rounded to
+  5 decimals.
+- Each street and number appears once (the first found), in OpenStreetMap's
+  order, at most 3,000.
+- Show `attribution` wherever the numbers appear (ODbL).
+
+**Errors** (shared envelope, `error` = `code`):
+
+| Status | `code` | When |
+| --- | --- | --- |
+| 400 | `bad_request` + `field` (`body`, `outline`) | Invalid JSON, an unknown field (`body`), or a bad outline: too few or many points, a coordinate out of range or not a number, an extra point field (`outline`) |
+| 401 | `unauthorized` | No, expired, or invalid access token |
+| 403 | `suspended` | The account is suspended |
+| 413 | `too_large` | Body over 16 KiB |
+| 413 | `area_too_large` | The outline's bounding box is over 3 km on a side |
+| 429 | `rate_limited` | 6 searches per account in a rolling minute, or the per-IP `maps` bucket (60/min) |
+| 429 | `daily_limit` | 60 searches per account in a rolling 24 hours |
+| 502 | `upstream_error` | Overpass unreachable, failed (another status), or unreadable (one grouped Sentry warning) |
+| 503 | `upstream_busy` | Overpass answered 429, 502, 503, or 504 (its "at capacity, queue full" pages), its query ran out of time (a `runtime error` remark), or it didn't answer in 55 s. `Retry-After` from Overpass, else 60 |
+| 503 | `disabled` | Accounts are off on this worker |
+
+Validation runs before the quota, so a malformed request doesn't spend a
+search. A cached answer still counts.
+
+**Upstream.** The worker POSTs form data `data=<query>` to `OVERPASS_URL`
+(var, default `https://overpass-api.de/api/interpreter`) with
+`User-Agent: WitnessWork-API/1.0 (+https://witnesswork.app)`; without a
+descriptive agent overpass-api.de answers 406. The query, with the outline
+rounded to 5 decimals (about a metre):
+
+```
+[out:json][timeout:25];nwr["addr:housenumber"](poly:"lat lng lat lng …");out tags center;
+```
+
+`[timeout:25]` bounds only the query's run. Under load the public instance
+queues it first: measured from here, a four-block outline answered in
+26–48 s, and a trivial query got its own 504 after about 57 s. The worker
+waits up to 55 s, so the app should allow about a minute and treat
+`upstream_busy` as "try again later".
+
+**Cache.** A successful answer is kept in the colo's Cache API
+(`caches.default`) for 7 days, keyed by a SHA-256 of the normalized outline
+(rounded to 5 decimals, without a closing point) on a synthetic path of the
+worker's own host (`/maps/v1/addresses/cache/v1/<hex>`), so a repeat search
+of the same territory doesn't ask Overpass and the coordinates never appear in
+a key. The answer is the same for every account; nothing account-specific is
+stored. Failures aren't cached. The Cache API is per colo, and a no-op on
+`*.workers.dev` hosts, so the dev worker's workers.dev URL always asks
+Overpass.
+
+**Limits.** 6 a minute and 60 a day per account, in the `RoutePlanningQuota`
+Durable Object under `territory-addresses:account:<accountId>` (timestamps
+only), plus the per-IP `maps` bucket.
+
+**Privacy.** Overpass gets only the rounded outline, in a form body (never a
+URL), never with the account, through the fetch captured before Sentry wraps
+it, so no trace span records it. Nothing logs the outline, the coordinates,
+the answer, or the account.
+
 ## Directions
 
 `POST /route-planning/directions` (see `src/routePlanning/`) already covers
@@ -226,6 +342,17 @@ coordinates it's sent.
   so a pick needs no lookup. Browse needs category ids, and Autosuggest
   returns query suggestions that need a second call.
 - **No caching** of HERE results, matching `/geocode` and `/autocomplete`.
+- **OpenStreetMap for house numbers.** Apple and HERE geocode one point to its
+  nearest address, so listing every house on a street would take a request
+  per guessed house and still miss most. OSM lists address points directly
+  where they're mapped; where they aren't, the answer is empty and the app
+  does what it did before. Overpass is free and keyless, so the per-account
+  quota and the week-long cache are what keep us a fair user of the public
+  instance; point `OVERPASS_URL` at a mirror or our own instance if we
+  outgrow it.
+- **House numbers are cached, place search isn't.** The answer depends only
+  on the outline and slowly changing public map data, not on the account,
+  and Overpass is slow (tens of seconds) and shared.
 
 ## Verifying locally
 
@@ -242,4 +369,5 @@ node scripts/verify/dev.mjs down
 
 Without the `MAPKIT_JS_*` names the e2e expects `maps_unconfigured`; with
 them it mints and checks the token. The HERE search runs only with
-`HERE_API_KEY` set.
+`HERE_API_KEY` set, and the real Overpass search (Alamo Square, then the same
+outline again from the cache) only with `WW_API_E2E_OVERPASS=1`.

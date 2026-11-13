@@ -625,6 +625,13 @@ export interface Environment {
    * origins count only on development workers. The first is the default.
    */
   MAPKIT_JS_ORIGINS?: string;
+
+  /**
+   * The Overpass API interpreter `POST /maps/v1/addresses` asks for
+   * OpenStreetMap house numbers. Defaults to
+   * `https://overpass-api.de/api/interpreter`.
+   */
+  OVERPASS_URL?: string;
 }
 
 /** Request-scoped values routes share through `c.var`. */

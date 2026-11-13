@@ -78,7 +78,7 @@ export const OPENAPI_TAGS = [
   {
     name: 'Maps',
     description:
-      'MapKit JS tokens for the web app’s map, which runs in a sandboxed frame on its own origin and gets only coordinates and pin styles (witness-work ADR 0037 §8).',
+      'MapKit JS tokens for the web app’s map, which runs in a sandboxed frame on its own origin and gets only coordinates and pin styles (witness-work ADR 0037 §8), and the OpenStreetMap house numbers inside a territory outline.',
   },
   {
     name: 'App Store',
