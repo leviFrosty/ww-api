@@ -108,6 +108,7 @@ const EDGE_TIER_OP: Record<SpacesOp | typeof SPACES_LIVE_OP, BuddiesRouteOp> = {
   'handoff/end': 'event/put',
   'link/create': 'event/put',
   'link/end': 'event/put',
+  'link/expiry': 'event/put',
   live: 'inbox/live',
 }
 
@@ -364,6 +365,15 @@ const RUNNERS: Runners = {
       await space(c.env, fields.spaceId).endLink({
         ...(await memberAuth(fields)),
         linkId: fields.linkId,
+      })
+    ),
+  'link/expiry': async (c, fields) =>
+    reply(
+      c,
+      await space(c.env, fields.spaceId).setLinkExpiry({
+        ...(await memberAuth(fields)),
+        linkId: fields.linkId,
+        expiresAt: fields.expiresAt,
       })
     ),
 }

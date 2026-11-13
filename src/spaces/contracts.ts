@@ -119,8 +119,11 @@ export const SPACES_LIMITS = {
   scopesPerGrant: 100,
   /** Scope ids a guest link may name (its `g.` record has to fit 16 KB). */
   scopesPerLink: 30,
-  /** `link/create` `expiresAt ≤ now + this`: 24 hours, plus 5 minutes of clock slack. */
-  maxLinkLifetimeMs: DAY_MS + 5 * MINUTE_MS,
+  /**
+   * `link/create` `expiresAt ≤ now + this`: 30 days, plus 5 minutes of clock
+   * slack. The app offers a day by default; the link's creator may pick longer.
+   */
+  maxLinkLifetimeMs: 30 * DAY_MS + 5 * MINUTE_MS,
   /** Links neither ended nor expired a space may hold. */
   openLinks: 10,
   /** Links created per space a rolling day. */
@@ -170,6 +173,7 @@ export const SPACES_OPS = [
   'handoff/end',
   'link/create',
   'link/end',
+  'link/expiry',
 ] as const
 
 export type SpacesOp = (typeof SPACES_OPS)[number]
@@ -210,6 +214,7 @@ export const SPACES_SUSPENDED_REFUSED_OPS: ReadonlySet<SpacesOp> = new Set([
   'member/scopes',
   'handoff/create',
   'link/create',
+  'link/expiry',
 ])
 
 export const SPACES_HEADERS = {
@@ -571,6 +576,11 @@ export interface LinkEndFields extends MemberFields {
   linkId: string
 }
 
+export interface LinkExpiryFields extends MemberFields {
+  linkId: string
+  expiresAt: number
+}
+
 /** A guest op's credentials, as the guest page sends them. */
 export interface GuestFields {
   spaceId: string
@@ -609,6 +619,7 @@ export interface SpacesFields {
   'handoff/end': HandoffEndFields
   'link/create': LinkCreateFields
   'link/end': LinkEndFields
+  'link/expiry': LinkExpiryFields
 }
 
 const withMember = <T extends object>(
@@ -915,6 +926,18 @@ export const SPACES_FIELD_PARSERS: Parsers = {
       withMember(body, (member) =>
         isId(body.linkId) ? { ...member, linkId: body.linkId } : null
       )
+    ),
+  'link/expiry': (body, now) =>
+    asParsed(
+      withMember(body, (member) => {
+        const { linkId, expiresAt } = body
+        return isId(linkId) &&
+          isSafeInteger(expiresAt) &&
+          expiresAt > now &&
+          expiresAt <= now + SPACES_LIMITS.maxLinkLifetimeMs
+          ? { ...member, linkId, expiresAt }
+          : null
+      })
     ),
 }
 
