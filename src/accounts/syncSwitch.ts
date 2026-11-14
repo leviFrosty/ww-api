@@ -14,11 +14,15 @@ import type { SessionCapability } from './contracts'
  * - `sync:photos`: `"off"` (or `"false"`) refuses photo puts
  *   (`photos_disabled`); anything else keeps them on. Absent (or
  *   unreadable), the `SYNC_PHOTOS` var decides the same way, else on.
+ * - `sync:changes`: `"true"` or `"on"` turns record changes on (witness-work
+ *   ADR 0060), anything else off (`changes_disabled`). Absent (or
+ *   unreadable), the `SYNC_CHANGES` var decides the same way, else off.
  */
 
 export const SYNC_ENABLED_KEY = 'sync:enabled'
 export const SYNC_ENTITLEMENT_KEY = 'sync:entitlement'
 export const SYNC_PHOTOS_KEY = 'sync:photos'
+export const SYNC_CHANGES_KEY = 'sync:changes'
 const OFF = new Set(['off', 'false'])
 const CACHE_TTL_SECONDS = 60
 const ON = new Set(['true', 'on'])
@@ -27,7 +31,7 @@ export type SyncEntitlement = 'supporter' | 'everyone'
 
 export type SyncSwitchEnv = Pick<
   Environment,
-  'SYNC_ENABLED' | 'SYNC_ENTITLEMENT' | 'SYNC_PHOTOS'
+  'SYNC_ENABLED' | 'SYNC_ENTITLEMENT' | 'SYNC_PHOTOS' | 'SYNC_CHANGES'
 > & { NOTES_KV: Pick<KVNamespace, 'get'> }
 
 const read = async (
@@ -61,6 +65,12 @@ export const syncEntitlement = async (
 export const isSyncPhotosOn = async (env: SyncSwitchEnv): Promise<boolean> => {
   const value = await read(env, SYNC_PHOTOS_KEY)
   return !OFF.has((value ?? env.SYNC_PHOTOS ?? '').trim().toLowerCase())
+}
+
+/** Whether record changes are on (`sync:changes`, then `SYNC_CHANGES`, else off). */
+export const isSyncChangesOn = async (env: SyncSwitchEnv): Promise<boolean> => {
+  const value = await read(env, SYNC_CHANGES_KEY)
+  return ON.has((value ?? env.SYNC_CHANGES ?? '').trim().toLowerCase())
 }
 
 /** Both switches, as `GET /app/v1/config` and `GET /accounts/v1/sync` say them. */

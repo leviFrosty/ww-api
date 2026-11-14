@@ -19,7 +19,10 @@ import {
  * in `/app/v1/config` and `GET /accounts/v1/sync`, a Supporter-only refusal
  * (with `sync:entitlement supporter` in the launcher's local KV), then put,
  * list, get, the live socket's `hello` and `changed`, `If-Match`, the kill
- * switch, and delete, and the Cloud Sync request.
+ * switch, and delete, and the Cloud Sync request. Then record changes
+ * (ADR 0060): a change put reaches the other device on its socket and over
+ * `sync/changes/list`, a base folds it in, a signed-out session's token is
+ * refused, and the changes switch.
  */
 
 afterAll(() => {
@@ -71,6 +74,7 @@ describe('Cloud Sync switches', () => {
     expect(config.status).toBe(200)
     expect(config.body.sync).toEqual({
       enabled: expect.any(Boolean),
+      changes: expect.any(Boolean),
       entitlement: expect.stringMatching(/^(supporter|everyone)$/),
     })
   })
@@ -328,3 +332,142 @@ describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync with a session', () => {
   )
 })
 
+
+describe.skipIf(!DEV_BYPASS_TOKEN)('Cloud Sync record changes', () => {
+  const change = () => ({ changeId: b64u(randomBytes(16)), blob: b64u(randomBytes(512)) })
+
+  it('sends a change to the other device, folds it into the base, and refuses a signed-out session', async () => {
+    const phone = await openSession(undefined, CURRENT_APP)
+    const tablet = await openSession(phone.key, CURRENT_APP)
+    const phoneSlot = slot()
+    const tabletSlot = slot()
+    expect((await put(phone, phoneSlot, randomBytes(2_000))).status).toBe(200)
+    expect((await put(tablet, tabletSlot, randomBytes(2_000))).status).toBe(200)
+
+    const live = await openLive(
+      { ...bearerHeaders(tablet), upgrade: 'websocket', 'x-ww-slot-id': tabletSlot },
+      '/accounts/v1/sync/live'
+    )
+    expect(live.status).toBe(101)
+    if (live.status !== 101) return
+    try {
+      expect(JSON.parse(await live.connection.next())).toEqual({ type: 'hello', seq: 2 })
+
+      // The catch-up on the socket: nothing new is the listing and no changes.
+      live.connection.send(JSON.stringify({ type: 'sync', afterSequence: 2 }))
+      const caught = JSON.parse(await live.connection.next())
+      expect(caught).toMatchObject({
+        type: 'sync',
+        sequence: 2,
+        changes: [],
+        more: false,
+        requestedAt: null,
+      })
+      expect(caught.slots).toHaveLength(2)
+
+      // A change is a few hundred bytes and reaches the socket sealed.
+      const first = change()
+      const sent = await syncOp(phone, 'changes/put', { slotId: phoneSlot, ...first })
+      expect(sent.status).toBe(200)
+      expect(sent.body).toMatchObject({ ok: true, sequence: 3, tailCount: 1, tailBytes: 512 })
+      expect(JSON.parse(await live.connection.next())).toEqual({
+        type: 'change',
+        change: {
+          sequence: 3,
+          slotId: phoneSlot,
+          changeId: first.changeId,
+          keyEpoch: 0,
+          createdAt: expect.any(Number),
+          blob: first.blob,
+        },
+      })
+
+      // The same over HTTP, and a retry is the same change.
+      const again = await syncOp(phone, 'changes/put', { slotId: phoneSlot, ...first })
+      expect(again.body).toMatchObject({ sequence: 3, tailCount: 1 })
+      const listed = await syncOp(tablet, 'changes/list', { slotId: tabletSlot, afterSequence: 2 })
+      expect(listed.status).toBe(200)
+      expect(listed.body).toMatchObject({
+        ok: true,
+        sequence: 3,
+        more: false,
+        changes: [{ sequence: 3, slotId: phoneSlot, changeId: first.changeId, blob: first.blob }],
+      })
+      // Its own slot's changes are left out.
+      const own = await syncOp(phone, 'changes/list', { slotId: phoneSlot, afterSequence: 0 })
+      expect(own.body.changes).toEqual([])
+
+      // A malformed change, and a slot with no base.
+      const unpadded = await syncOp(phone, 'changes/put', {
+        slotId: phoneSlot,
+        changeId: b64u(randomBytes(16)),
+        blob: b64u(randomBytes(300)),
+      })
+      expect(unpadded.status).toBe(400)
+      const noBase = await syncOp(phone, 'changes/put', { slotId: slot(), ...change() })
+      expect([noBase.status, noBase.body.code]).toEqual([409, 'no_slot'])
+
+      // The base folds the change in: devices past it don't read the base.
+      await new Promise((resolve) => setTimeout(resolve, 2_100))
+      const base = await put(phone, phoneSlot, randomBytes(2_000), {
+        'x-ww-covers-sequence': '3',
+      })
+      expect(base.status).toBe(200)
+      expect(base.body).toMatchObject({ seq: 4, floorSequence: 3 })
+      expect(JSON.parse(await live.connection.next())).toEqual({ type: 'changed', seq: 4 })
+      const folded = await syncOp(tablet, 'changes/list', { slotId: tabletSlot, afterSequence: 0 })
+      expect(folded.body.changes).toEqual([])
+      expect(
+        folded.body.slots.find((each: { slotId: string }) => each.slotId === phoneSlot)
+      ).toMatchObject({ floorSequence: 3 })
+
+      // An app that reads only snapshots lists; the others are told.
+      expect(folded.body.snapshotReaders).toBe(false)
+      expect((await syncOp(tablet, 'list')).status).toBe(200)
+      const told = await syncOp(phone, 'changes/put', { slotId: phoneSlot, ...change() })
+      expect(told.body).toMatchObject({ sequence: 5, snapshotReaders: true })
+      expect(JSON.parse(await live.connection.next())).toMatchObject({
+        type: 'change',
+        change: { sequence: 5 },
+      })
+
+      // Signed out: the token is still valid for minutes, but adds nothing.
+      const closed = await http('DELETE', '/accounts/v1/sessions/current', {
+        headers: bearerHeaders(tablet),
+      })
+      expect(closed.status).toBe(200)
+      // Its socket closes at once.
+      expect(await live.connection.closed).toEqual({ code: 4006, reason: 'session_ended' })
+      const refused = await syncOp(tablet, 'changes/put', { slotId: tabletSlot, ...change() })
+      expect(refused.status).toBe(401)
+      expect((await syncOp(tablet, 'changes/list', { slotId: tabletSlot, afterSequence: 0 })).status).toBe(401)
+      // The other device goes on.
+      const after = await syncOp(phone, 'changes/put', { slotId: phoneSlot, ...change() })
+      expect(after.status).toBe(200)
+    } finally {
+      live.connection.end()
+      await syncOp(phone, 'delete')
+    }
+  })
+
+  it.skipIf(!LOCAL_LAUNCHER)('refuses changes while the switch is off, and leaves snapshots alone', async () => {
+    const session = await openSession(undefined, CURRENT_APP)
+    const mine = slot()
+    expect((await put(session, mine, randomBytes(500))).status).toBe(200)
+    localKv('put', 'sync:changes', 'false')
+    try {
+      const off = await syncOp(session, 'changes/put', { slotId: mine, ...change() })
+      expect([off.status, off.body.code]).toEqual([503, 'changes_disabled'])
+      const read = await syncOp(session, 'changes/list', { slotId: mine, afterSequence: 0 })
+      expect([read.status, read.body.code]).toEqual([503, 'changes_disabled'])
+      const status = await http('GET', '/accounts/v1/sync', { headers: bearerHeaders(session) })
+      expect(status.body).toMatchObject({ enabled: true, changes: false })
+      expect((await http('GET', '/app/v1/config')).body.sync).toMatchObject({ changes: false })
+      // Snapshots go on as before.
+      expect((await syncOp(session, 'list')).status).toBe(200)
+    } finally {
+      localKv('delete', 'sync:changes')
+      await syncOp(session, 'delete')
+    }
+  })
+})

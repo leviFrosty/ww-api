@@ -1,7 +1,12 @@
 import type { Environment } from '../types'
 import { bytesToBase64Url, sha256Bytes } from '../crypto'
 import { BUDDIES_ID_PATTERN, decodeB64u, isPlainObject } from '../buddies/contracts'
-import { ACCOUNT_LIMITS, isAccountId } from './contracts'
+import {
+  ACCOUNT_LIMITS,
+  SESSION_CAPABILITIES,
+  isAccountId,
+  type SessionCapability,
+} from './contracts'
 import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
 
 /**
@@ -12,8 +17,11 @@ import { SESSION_PLATFORMS, type SessionPlatform } from './schema'
  *
  * Claims: the registered `iss`, `aud`, `sub` (the account id), `iat`, and
  * `exp`, plus `sid` (the session id, as in OpenID Connect), `platform`
- * (`ios`, `android`, `dev`, or `web`), and `kep`, the session's key epoch
- * (ADR 0039; a token without one counts as `0`).
+ * (`ios`, `android`, `dev`, or `web`), `kep`, the session's key epoch
+ * (ADR 0039; a token without one counts as `0`), and `cap`, the session's
+ * capabilities when the issuer knew them (witness-work ADR 0060), so a route
+ * on the write path needn't read them from D1. A token without `cap` says
+ * nothing: the route reads the session.
  *
  * Rotation: the header's `kid` is derived from the secret that signed it, so
  * moving the old secret to `ACCOUNT_TOKEN_SECRET_PREVIOUS` keeps its tokens
@@ -58,6 +66,11 @@ export interface AccessTokenClaims {
   platform: SessionPlatform
   /** The session's key epoch when the token was issued (`kep`). */
   keyEpoch: number
+  /**
+   * The session's capabilities when the token was issued (`cap`); undefined
+   * on a token without the claim.
+   */
+  capabilities?: SessionCapability[]
   /** Epoch milliseconds. */
   expiresAt: number
 }
@@ -267,6 +280,8 @@ export const signAccessToken = async (
      * after a key change, a write with it is refused.
      */
     keyEpoch?: number
+    /** The session's capabilities (`cap`); left out when not known here. */
+    capabilities?: readonly SessionCapability[] | null
     sessionExpiresAt?: number
   },
   now: number = Date.now()
@@ -286,6 +301,7 @@ export const signAccessToken = async (
     sid: session.sessionId,
     platform: session.platform,
     kep: session.keyEpoch ?? 0,
+    ...(session.capabilities == null ? {} : { cap: [...session.capabilities] }),
     iat,
     exp,
   })
@@ -308,6 +324,12 @@ const isSeconds = (value: unknown): value is number =>
 
 const isKeyEpoch = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+
+/** `cap`: the names this server knows; undefined when absent or malformed. */
+const readCapabilities = (value: unknown): SessionCapability[] | undefined =>
+  Array.isArray(value)
+    ? SESSION_CAPABILITIES.filter((name) => value.includes(name))
+    : undefined
 
 /**
  * The claims of a token this worker signed and that hasn't expired, or null.
@@ -367,6 +389,9 @@ export const verifyAccessToken = async (
     sessionId: sid,
     platform,
     keyEpoch: kep,
+    ...(claims.cap === undefined
+      ? {}
+      : { capabilities: readCapabilities(claims.cap) ?? [] }),
     expiresAt: exp * 1_000,
   }
 }

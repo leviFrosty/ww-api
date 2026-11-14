@@ -165,6 +165,9 @@ TURNSTILE_HOSTNAMES = "verify-dev.witnesswork.app"
 # `sync:entitlement` are absent. On in dev; free for everyone (ADR 0040).
 SYNC_ENABLED = "true"
 SYNC_ENTITLEMENT = "everyone"
+# Record changes (witness-work ADR 0060) fallback when KV `sync:changes` is
+# absent. On in dev. Only apps that send changes use it.
+SYNC_CHANGES = "true"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. On in dev.
 SPACES_ENABLED = "true"
@@ -536,6 +539,11 @@ WEB_RECOVERY_PER_IP_DAY = "10"
 # [env.dev.vars].
 SYNC_ENABLED = "false"
 SYNC_ENTITLEMENT = "everyone"
+# Record changes (witness-work ADR 0060) fallback when KV `sync:changes` is
+# absent. Off in prod until KV `sync:changes` turns it on, after the app
+# release that sends changes. Off, devices publish whole snapshots. Repeated
+# under [env.dev.vars].
+SYNC_CHANGES = "false"
 # Shared Spaces (Shared Cars, witness-work ADR 0037) fallback when KV
 # `spaces:enabled` is absent. Off in prod until KV `spaces:enabled` turns it
 # on, before the app release that shares cars. Repeated under [env.dev.vars].
@@ -666,6 +674,13 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 #   wrangler kv key delete --binding NOTES_KV sync:enabled            # use the var
 #   wrangler kv key put --binding NOTES_KV sync:photos off            # photo puts off
 #   wrangler kv key delete --binding NOTES_KV sync:photos             # use SYNC_PHOTOS
+# `sync:changes`: "true" (or "on") lets devices send record changes
+# (witness-work ADR 0060); anything else refuses sync/changes/* and the live
+# socket's catch-up with 503 changes_disabled, and devices publish whole
+# snapshots. Absent falls back to SYNC_CHANGES, else off.
+#   wrangler kv key put --binding NOTES_KV sync:changes true          # on
+#   wrangler kv key put --binding NOTES_KV sync:changes false         # off
+#   wrangler kv key delete --binding NOTES_KV sync:changes            # use the var
 # (add `--env dev` for the dev worker).
 #
 # Shared Spaces switches (cacheTtl 60; witness-work ADR 0037, Shared Cars).

@@ -82,6 +82,9 @@ import {
   supporterStatusDocs,
   syncDeleteDocs,
   syncGetDocs,
+  syncChangePutDocs,
+  syncChangeResealDocs,
+  syncChangesListDocs,
   syncListDocs,
   syncLiveDocs,
   syncPhotoDeleteDocs,
@@ -237,6 +240,13 @@ export const createAccountsRoutes = () => {
   routes.post('/sync/list', syncListDocs, syncHandlers.list)
   routes.post('/sync/get', syncGetDocs, syncHandlers.get)
   routes.post('/sync/delete', syncDeleteDocs, syncHandlers.delete)
+  routes.post('/sync/changes/put', syncChangePutDocs, syncHandlers.changePut)
+  routes.post('/sync/changes/list', syncChangesListDocs, syncHandlers.changesList)
+  routes.post(
+    '/sync/changes/reseal',
+    syncChangeResealDocs,
+    syncHandlers.changeReseal
+  )
   routes.post('/sync/request', syncSwitchRequestDocs, syncHandlers.switchRequest)
   routes.get('/sync/live', syncLiveDocs, syncHandlers.live)
   routes.post('/sync/photos/put', syncPhotoPutDocs, syncPhotoHandlers.put)

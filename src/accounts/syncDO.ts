@@ -4,6 +4,7 @@ import { captureFailure } from '../sentry'
 import {
   BUDDIES_LIMITS,
   fail,
+  isPlainObject,
   ok,
   type BuddiesFailure,
   type BuddiesResult,
@@ -13,16 +14,15 @@ import { buddiesErrorResponse } from '../buddies/errorResponse'
 import { logLimitHit } from '../buddies/limits'
 import {
   closeExpiredSockets,
-  readLiveExpiry,
-  readLiveTicketHash,
   isTicketOpen,
-  LIVE_TICKET_HEADER,
   soonestSocketExpiry,
 } from '../liveSubprotocol'
 import { accountsDb } from './store'
 import { isSessionLive, listLiveSessions } from './sessionStore'
 import type { SessionPlatform } from './schema'
+import { isSyncChangesOn, isSyncPhotosOn } from './syncSwitch'
 import {
+  SYNC_CHANGE_LIMITS,
   SYNC_HEADERS,
   SYNC_LIMITS,
   SYNC_LIVE_CLOSE,
@@ -33,8 +33,11 @@ import {
   syncPhotoLimitBytes,
   syncPhotoObjectKey,
   syncPrefix,
+  type SyncCatchUp,
+  type SyncChangeView,
   type SyncIfMatch,
   type SyncLiveMessage,
+  type SyncSlotCatchUp,
   type SyncPhotoListed,
   type SyncPhotoUsage,
   type SyncPhotoView,
@@ -78,6 +81,22 @@ import {
  * the name (a new object) can't be purged. A delete during an upload cancels
  * its reservation: the commit answers `conflict` and deletes its object.
  *
+ * Record changes (witness-work ADR 0060): a slot's snapshot is its base, and
+ * each edit a device sends is a small sealed change kept here (`change`)
+ * under the next `seq`, until the device folds it into its base. A base put
+ * that says which change it covers deletes the slot's changes up to it and
+ * makes it the slot's floor; any other base put deletes the whole tail and
+ * moves the floor to its own `seq`, so every device reads it. A device asks
+ * for what it missed since its cursor (`catchUp`), over HTTP or the live
+ * socket, and a socket that asked also gets each change as it's put.
+ *
+ * A change is admitted without reading D1, so the object keeps the two facts
+ * that read was for: the account's key epoch (the rekey route tells it, and
+ * it takes the highest on any valid token) and the sessions that ended
+ * (every route that ends one tells it; kept until the session's last token
+ * has expired). A socket gets changes only while its session was confirmed
+ * live within `liveConfirmMs`.
+ *
  * Privacy: nothing here logs or reports ids, sessions, names, metas, digests,
  * sizes, or bytes.
  */
@@ -88,6 +107,56 @@ type SlotRow = {
   size: number
   updatedAt: number
   sessionId: string
+  floorSequence: number
+  /** The last base put or change; null for a slot from before changes. */
+  changedAt: number | null
+  /** The last catch-up that named the slot. */
+  seenAt: number | null
+}
+
+const SLOT_COLUMNS = `slot_id AS slotId, etag, size, updated_at AS updatedAt,
+  session_id AS sessionId, floor_sequence AS floorSequence,
+  changed_at AS changedAt, seen_at AS seenAt`
+
+/** When the slot's device last wrote or read: what retention counts from. */
+const slotActiveAt = (slot: SlotRow): number =>
+  Math.max(slot.updatedAt, slot.changedAt ?? 0, slot.seenAt ?? 0)
+
+/** Who the Worker verified, for the routes that don't read the session. */
+export interface SyncCaller {
+  sessionId: string
+  /** The token's key epoch (`kep`). */
+  keyEpoch: number
+  platform: SessionPlatform
+}
+
+/** Who a live socket is for, as the Worker verified it (`admitLive`). */
+export interface LiveAdmission {
+  accountId: string
+  /** The device's own slot. */
+  slotId: string
+  sessionId: string
+  /** The token's key epoch; null for a browser's ticket, which has none. */
+  keyEpoch: number | null
+  /** A native socket's token expiry (epoch ms). */
+  tokenExpiresAt: number | null
+  /** A browser socket's token expiry (epoch ms), when it closes. */
+  expiresAt: number | null
+  /** A browser socket's ticket's hash. */
+  ticket: string | null
+}
+
+/** A refusal; `unauthorized` for a token from before a key change says why. */
+export type SyncChangeFailure = BuddiesFailure & { reason?: 'key_changed' }
+
+export interface SyncChangePutView {
+  sequence: number
+  /** The slot's tail after this change. */
+  tailCount: number
+  tailBytes: number
+  snapshotReaders: boolean
+  /** The slot's last base put or change: this one, unless it's a retry. */
+  changedAt: number
 }
 
 /** A slot as `list` gives it to the Worker, which adds the session's state. */
@@ -124,6 +193,12 @@ export interface CommitSyncPutArgs {
   updatedAt: number
   sessionId: string
   platform: SessionPlatform
+  /**
+   * `x-ww-covers-sequence`: the slot's changes up to it are in this base.
+   * Null (an older app, or a base that replaces everything) deletes the
+   * whole tail.
+   */
+  coversSequence?: number | null
 }
 
 export interface SyncPutView {
@@ -131,6 +206,8 @@ export interface SyncPutView {
   size: number
   updatedAt: number
   seq: number
+  /** A device whose cursor is behind this reads the base. */
+  floorSequence: number
 }
 
 const SCHEMA = [
@@ -172,6 +249,36 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS request_nonce (
     nonce TEXT PRIMARY KEY,
     at    INTEGER NOT NULL
+  )`,
+  // A slot's tail: the sealed changes its base doesn't hold yet, each under
+  // the account's `seq` when it was put. `blob` is unpadded base64url.
+  `CREATE TABLE IF NOT EXISTS change (
+    sequence   INTEGER PRIMARY KEY,
+    slot_id    TEXT NOT NULL,
+    change_id  TEXT NOT NULL,
+    key_epoch  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    blob       TEXT NOT NULL
+  )`,
+  'CREATE UNIQUE INDEX IF NOT EXISTS change_slot ON change (slot_id, change_id)',
+  // Changes put, in one-minute buckets: a slot's (the minute's limit) and
+  // the account's under slot '' (the rolling day's).
+  `CREATE TABLE IF NOT EXISTS change_rate (
+    slot_id TEXT NOT NULL,
+    minute  INTEGER NOT NULL,
+    n       INTEGER NOT NULL,
+    PRIMARY KEY (slot_id, minute)
+  )`,
+  // Sessions that ended, refused until their last token has expired.
+  `CREATE TABLE IF NOT EXISTS ended_session (
+    session_id TEXT PRIMARY KEY,
+    until      INTEGER NOT NULL
+  )`,
+  // Sessions whose app reads only snapshots, and when each last listed.
+  `CREATE TABLE IF NOT EXISTS snapshot_reader (
+    session_id TEXT PRIMARY KEY,
+    read_at    INTEGER NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS photo (
     name       TEXT PRIMARY KEY,
@@ -259,7 +366,14 @@ const placeholders = (count: number): string =>
   Array.from({ length: count }, () => '?').join(', ')
 
 /** Columns added to a table after it shipped: `[table, column, definition]`. */
-const ADDED_COLUMNS = [['slot', 'platform', 'TEXT']] as const
+const ADDED_COLUMNS = [
+  ['slot', 'platform', 'TEXT'],
+  ['slot', 'floor_sequence', 'INTEGER NOT NULL DEFAULT 0'],
+  ['slot', 'changed_at', 'INTEGER'],
+  ['slot', 'seen_at', 'INTEGER'],
+  // The account's key epoch, as far as this object was told or saw.
+  ['meta', 'key_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+] as const
 
 /** Sessions that can switch to Cloud Sync when the account asks. */
 const PHONE_PLATFORMS: ReadonlySet<string> = new Set(['ios', 'android', 'dev'])
@@ -279,6 +393,12 @@ type LiveAttachment = {
   slotId: string
   expiresAt?: number
   ticket?: string
+  /** The socket's session; a socket without one gets notices only. */
+  sessionId?: string
+  /** The session counts as live until then (epoch ms); see `#confirmLive`. */
+  confirmedUntil?: number
+  /** It asked for a catch-up, so it reads changes (ADR 0060 §6). */
+  changes?: boolean
 }
 
 const attachmentOf = (ws: WebSocket): LiveAttachment | null =>
@@ -307,6 +427,10 @@ const failure = (result: BuddiesFailure): Response =>
 
 export class AccountSync extends DurableObject<Environment> {
   #schemaReady = false
+  /** Sockets whose session D1 is being asked about right now. */
+  #confirming = new Set<WebSocket>()
+  /** Live upgrades admitted and not yet opened, by their one-use id. */
+  #admissions = new Map<string, LiveAdmission & { at: number }>()
 
   constructor(ctx: DurableObjectState, env: Environment) {
     super(ctx, env)
@@ -410,35 +534,62 @@ export class AccountSync extends DurableObject<Environment> {
             args.size,
             args.slotId
           )
+          // The same base too: its tail and its floor stay.
           return ok({
             etag: args.etag,
             size: args.size,
             updatedAt: existing.updatedAt,
             seq: this.#advance(),
+            floorSequence: existing.floorSequence,
           })
         }
+        const existing = this.#slot(args.slotId)
         this.#sql.exec(
-          `INSERT INTO slot (slot_id, etag, size, updated_at, session_id, platform)
-           VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO slot (slot_id, etag, size, updated_at, session_id, platform, changed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (slot_id) DO UPDATE SET
              etag = excluded.etag, size = excluded.size,
              updated_at = excluded.updated_at, session_id = excluded.session_id,
-             platform = excluded.platform`,
+             platform = excluded.platform, changed_at = excluded.changed_at`,
           args.slotId,
           args.etag,
           args.size,
           args.updatedAt,
           args.sessionId,
-          args.platform
+          args.platform,
+          args.updatedAt
         )
         // A slot put restarts the no-slot day.
         this.#sql.exec('UPDATE photo_state SET no_slot_since = NULL')
         const seq = this.#advance()
+        // A base that names the change it covers keeps the changes after
+        // it, and devices already past it skip the base. Any other base
+        // replaces the tail, and every device reads it.
+        const covers =
+          existing && args.coversSequence != null
+            ? Math.min(args.coversSequence, seq)
+            : null
+        const floorSequence =
+          covers == null ? seq : Math.max(existing!.floorSequence, covers)
+        if (covers == null)
+          this.#sql.exec('DELETE FROM change WHERE slot_id = ?', args.slotId)
+        else
+          this.#sql.exec(
+            'DELETE FROM change WHERE slot_id = ? AND sequence <= ?',
+            args.slotId,
+            covers
+          )
+        this.#sql.exec(
+          'UPDATE slot SET floor_sequence = ? WHERE slot_id = ?',
+          floorSequence,
+          args.slotId
+        )
         return ok({
           etag: args.etag,
           size: args.size,
           updatedAt: args.updatedAt,
           seq,
+          floorSequence,
         })
       }
     )
@@ -463,8 +614,20 @@ export class AccountSync extends DurableObject<Environment> {
 
   // --- Reads ---------------------------------------------------------------
 
-  async list(): Promise<{ seq: number; slots: SyncSlotListed[] }> {
+  /**
+   * Every slot and the account's `seq`. `reader` is the caller's session
+   * and whether its app reads changes. One that reads only snapshots is
+   * noted (at most hourly), so devices that send changes also keep their
+   * base current (`snapshotReaders`) until that session reads changes or
+   * ends.
+   */
+  async list(
+    args: { reader?: { sessionId: string; changes: boolean } } = {}
+  ): Promise<{ seq: number; slots: SyncSlotListed[] }> {
     if (!this.#ready()) return { seq: 0, slots: [] }
+    if (args.reader?.changes) this.#readsChanges(args.reader.sessionId)
+    else if (args.reader)
+      this.#noteSnapshotReader(args.reader.sessionId, Date.now())
     const slots = this.#sql
       .exec<SyncSlotListed>(
         `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt,
@@ -505,6 +668,7 @@ export class AccountSync extends DurableObject<Environment> {
       for (const id of rows) {
         this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', id)
         this.#sql.exec('DELETE FROM reservation WHERE slot_id = ?', id)
+        this.#sql.exec('DELETE FROM change WHERE slot_id = ?', id)
       }
       // Every slot takes every photo with it (Delete Buddies on the last device).
       const photos = args.slotId == null ? this.#softDeletePhotos(null, now) : 0
@@ -515,6 +679,189 @@ export class AccountSync extends DurableObject<Environment> {
     this.#broadcast(seq, null)
     await this.#ensureAlarm()
     return { seq }
+  }
+
+  // --- Record changes (witness-work ADR 0060) --------------------------------
+
+  /**
+   * Stores one sealed change in the slot's tail under the next `seq` and
+   * sends it to the account's other sockets that read changes. One
+   * transaction, no D1 and no R2. The slot needs a base (`no_slot`). The
+   * same `changeId` again answers the first put's sequence. `tail_full`
+   * once the tail holds `tailChanges` or `tailBytes`: the device folds it
+   * into its base.
+   */
+  async putChange(args: {
+    slotId: string
+    changeId: string
+    /** Unpadded base64url, checked by the Worker (`sealedChangeBytes`). */
+    blob: string
+    size: number
+    caller: SyncCaller
+  }): Promise<{ ok: true; value: SyncChangePutView } | SyncChangeFailure> {
+    if (!this.#ready()) return fail('no_slot')
+    const now = Date.now()
+    const { slotId, changeId, caller } = args
+    const result = this.ctx.storage.transactionSync(
+      ():
+        | { ok: true; value: SyncChangePutView; change?: SyncChangeView }
+        | SyncChangeFailure => {
+        const refused = this.#refuseCaller(caller, now)
+        if (refused) return refused
+        if (!this.#slot(slotId)) return fail('no_slot')
+        const first = this.#sql
+          .exec<{ sequence: number }>(
+            'SELECT sequence FROM change WHERE slot_id = ? AND change_id = ?',
+            slotId,
+            changeId
+          )
+          .toArray()[0]
+        if (first) return ok(this.#changePutView(first.sequence, slotId, now))
+        const tail = this.#tail(slotId)
+        if (
+          tail.count >= SYNC_CHANGE_LIMITS.tailChanges ||
+          tail.bytes + args.size > SYNC_CHANGE_LIMITS.tailBytes
+        ) {
+          logLimitHit('sync/changes/put', 'tail')
+          return fail('tail_full')
+        }
+        const limited = this.#refuseOverChangeRate(slotId, now)
+        if (limited) return limited
+        const sequence = this.#advance()
+        this.#sql.exec(
+          `INSERT INTO change (sequence, slot_id, change_id, key_epoch, created_at, size, blob)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          sequence,
+          slotId,
+          changeId,
+          caller.keyEpoch,
+          now,
+          args.size,
+          args.blob
+        )
+        // A change is the device's write: retention and the Cloud Sync
+        // request count it, under the session that sent it.
+        this.#sql.exec(
+          'UPDATE slot SET changed_at = ?, session_id = ?, platform = ? WHERE slot_id = ?',
+          now,
+          caller.sessionId,
+          caller.platform,
+          slotId
+        )
+        return {
+          ...ok(this.#changePutView(sequence, slotId, now)),
+          change: {
+            sequence,
+            slotId,
+            changeId,
+            keyEpoch: caller.keyEpoch,
+            createdAt: now,
+            blob: args.blob,
+          },
+        }
+      }
+    )
+    if (!result.ok) return result
+    if (result.change) this.#broadcastChange(result.change)
+    return ok(result.value)
+  }
+
+  /**
+   * What the caller's device missed since `afterSequence`: every slot with
+   * its floor, and the other slots' changes after it, a page at a time. One
+   * read, no D1 unless a Cloud Sync request stands. Marks the caller's slot
+   * as seen, at most daily, so a device that only reads keeps its slot.
+   */
+  async catchUp(args: {
+    slotId: string
+    afterSequence: number
+    caller: SyncCaller
+  }): Promise<{ ok: true; value: SyncCatchUp } | SyncChangeFailure> {
+    const now = Date.now()
+    if (this.#ready()) {
+      const refused = this.#refuseCaller(args.caller, now)
+      if (refused) return refused
+      this.#readsChanges(args.caller.sessionId)
+    }
+    return ok(await this.#catchUp(args.slotId, args.afterSequence, now))
+  }
+
+  /**
+   * Replaces one change's bytes with the same change under a new account
+   * key (ADR 0039, ADR 0060 §10): its sequence, slot, and time stay.
+   * `not_found` once the change is gone (its device folded it into a base).
+   */
+  async resealChange(args: {
+    sequence: number
+    changeId: string
+    blob: string
+    size: number
+    keyEpoch: number
+  }): Promise<BuddiesResult<{ sequence: number }>> {
+    if (!this.#ready()) return fail('not_found')
+    return this.ctx.storage.transactionSync(() => {
+      const found = this.#count(
+        'SELECT COUNT(*) AS n FROM change WHERE sequence = ? AND change_id = ?',
+        args.sequence,
+        args.changeId
+      )
+      if (!found) return fail('not_found')
+      this.#sql.exec(
+        'UPDATE change SET blob = ?, size = ?, key_epoch = ? WHERE sequence = ?',
+        args.blob,
+        args.size,
+        args.keyEpoch,
+        args.sequence
+      )
+      this.#noteKeyEpoch(args.keyEpoch)
+      return ok({ sequence: args.sequence })
+    })
+  }
+
+  /**
+   * Sessions of the account just ended. The ones named (signed out,
+   * revoked, renewed) have their sockets closed at once, and their tokens
+   * are refused here until the last one has expired. A session replaced at
+   * the device cap isn't named, so every other socket's session is checked
+   * against D1 again, in the background, before it gets another change. An
+   * account that never synced keeps nothing: it has no slot a change could
+   * go to.
+   */
+  async sessionsEnded(args: { sessionIds: string[] }): Promise<void> {
+    if (!this.#ready()) return
+    const now = Date.now()
+    const ended = new Set(args.sessionIds)
+    this.ctx.storage.transactionSync(() => {
+      this.#sql.exec('DELETE FROM ended_session WHERE until <= ?', now)
+      this.#sql.exec(
+        'DELETE FROM snapshot_reader WHERE read_at <= ?',
+        now - SYNC_CHANGE_LIMITS.snapshotReaderMs
+      )
+      for (const sessionId of ended) {
+        this.#sql.exec(
+          'INSERT OR REPLACE INTO ended_session (session_id, until) VALUES (?, ?)',
+          sessionId,
+          now + SYNC_CHANGE_LIMITS.endedSessionMs
+        )
+        this.#readsChanges(sessionId)
+      }
+    })
+    const { code, reason } = SYNC_LIVE_CLOSE.sessionEnded
+    const others: WebSocket[] = []
+    for (const ws of this.#liveSockets()) {
+      const attachment = attachmentOf(ws)
+      if (attachment?.sessionId == null) continue
+      if (ended.has(attachment.sessionId)) {
+        closeQuietly(ws, code, reason)
+        continue
+      }
+      ws.serializeAttachment({
+        ...attachment,
+        confirmedUntil: 0,
+      } satisfies LiveAttachment)
+      if (!this.#confirming.has(ws)) others.push(ws)
+    }
+    if (others.length) this.ctx.waitUntil(this.#confirmThenNotify(others, false))
   }
 
   // --- Photos --------------------------------------------------------------
@@ -852,7 +1199,8 @@ export class AccountSync extends DurableObject<Environment> {
     if (!accountId) return this.#setRetentionAt(null)
     const expired: string[] = []
     for (const slot of this.#slots()) {
-      const age = now - slot.updatedAt
+      // A change, or a catch-up, counts as the device's last write.
+      const age = now - slotActiveAt(slot)
       if (age > SYNC_LIMITS.maxRetentionMs) expired.push(slot.slotId)
       else if (
         age > SYNC_LIMITS.endedSessionRetentionMs &&
@@ -871,8 +1219,10 @@ export class AccountSync extends DurableObject<Environment> {
       }
       if (expired.length) {
         const seq = this.ctx.storage.transactionSync(() => {
-          for (const id of expired)
+          for (const id of expired) {
             this.#sql.exec('DELETE FROM slot WHERE slot_id = ?', id)
+            this.#sql.exec('DELETE FROM change WHERE slot_id = ?', id)
+          }
           this.#markIfNoSlot(now)
           return this.#advance()
         })
@@ -884,6 +1234,11 @@ export class AccountSync extends DurableObject<Environment> {
     }
     this.#dropExpiredReservations(now)
     this.#sql.exec('DELETE FROM put_log WHERE at <= ?', now - DAY_MS)
+    this.#sql.exec('DELETE FROM ended_session WHERE until <= ?', now)
+    this.#sql.exec(
+      'DELETE FROM change_rate WHERE minute < ?',
+      Math.floor((now - DAY_MS) / MINUTE_MS)
+    )
     try {
       await this.#photoRetention(accountId, now)
     } catch (error) {
@@ -898,40 +1253,71 @@ export class AccountSync extends DurableObject<Environment> {
   // --- Live socket ---------------------------------------------------------
 
   /**
-   * `GET sync/live`, forwarded by the Worker after it verified the token,
-   * the switches, and the entitlement: the account in
-   * `SYNC_HEADERS.account` (which only the Worker sets) and the device's own
-   * slot in `x-ww-slot-id`, so its own puts don't echo back, and for a
-   * browser socket its token's expiry in `SYNC_HEADERS.expiresAt`, when the
-   * alarm closes it, and its ticket's hash in `LIVE_TICKET_HEADER`: while a
-   * socket on that ticket is open, another is 409 `conflict`, so a copied
-   * ticket can't push the account's sockets off. Says `hello` with the
-   * current `seq`; past the cap the oldest sockets close.
+   * Admits a live socket the Worker verified (the token or the ticket, the
+   * switches, the entitlement): who it's for, kept in memory for the upgrade
+   * that follows (`fetch`) under a random one-use id. Nothing about the
+   * caller travels in the upgrade's headers, which Workers Logs record.
+   *
+   * `slotId` is the device's own slot, so its own puts don't echo back.
+   * `expiresAt` is a browser socket's token expiry, when the alarm closes
+   * it, and `ticket` its ticket's hash: while a socket on that ticket is
+   * open, another is 409 `conflict`, so a copied ticket can't push the
+   * account's sockets off. `tokenExpiresAt` is a native socket's token
+   * expiry: its session counts as live until then. A session this object
+   * was told ended, or a token from before a key change, is refused.
+   */
+  async admitLive(args: LiveAdmission): Promise<
+    { ok: true; value: { admission: string } } | SyncChangeFailure
+  > {
+    const now = Date.now()
+    for (const [id, admitted] of this.#admissions)
+      if (now - admitted.at > SYNC_CHANGE_LIMITS.admissionMs)
+        this.#admissions.delete(id)
+    if (
+      args.ticket != null &&
+      isTicketOpen(this.#liveSockets(), args.ticket, ticketOf)
+    )
+      return fail('conflict')
+    this.#ensure(args.accountId)
+    const refused = this.#refuseCaller(args, now)
+    if (refused) return refused
+    const admission = crypto.randomUUID()
+    this.#admissions.set(admission, { ...args, at: now })
+    return ok({ admission })
+  }
+
+  /**
+   * `GET sync/live`, forwarded by the Worker with the admission `admitLive`
+   * gave it in `SYNC_HEADERS.admission`. Says `hello` with the current
+   * `seq`; past the cap the oldest sockets close.
    */
   async fetch(request: Request): Promise<Response> {
     if (!isWebSocketUpgrade(request)) return failure(fail('upgrade_required'))
-    const accountId = request.headers.get(SYNC_HEADERS.account)
-    const slotId = request.headers.get(SYNC_HEADERS.slotId)
-    const expiresAt = readLiveExpiry(request.headers.get(SYNC_HEADERS.expiresAt))
-    const ticket = readLiveTicketHash(request.headers.get(LIVE_TICKET_HEADER))
+    const admission = request.headers.get(SYNC_HEADERS.admission) ?? ''
+    const admitted = this.#admissions.get(admission)
+    this.#admissions.delete(admission)
     if (
-      !accountId ||
-      !isSyncSlotId(slotId) ||
-      expiresAt === undefined ||
-      ticket === undefined
+      !admitted ||
+      Date.now() - admitted.at > SYNC_CHANGE_LIMITS.admissionMs
     )
       return failure(fail('bad_request'))
+    const { slotId, sessionId, expiresAt, ticket, tokenExpiresAt } = admitted
+    // Two admissions on one ticket: the first socket wins.
     if (ticket != null && isTicketOpen(this.#liveSockets(), ticket, ticketOf))
       return failure(fail('conflict'))
-    this.#ensure(accountId)
 
     const [client, server] = Object.values(new WebSocketPair())
     this.ctx.acceptWebSocket(server)
+    // The token that opened the socket proves its session live until the
+    // token expires; after that, D1 has to (`#confirmLive`).
+    const confirmedUntil = expiresAt ?? tokenExpiresAt
     const attachment: LiveAttachment = {
       openedAt: Date.now(),
       slotId,
       ...(expiresAt == null ? {} : { expiresAt }),
       ...(ticket == null ? {} : { ticket }),
+      sessionId,
+      ...(confirmedUntil == null ? {} : { confirmedUntil }),
     }
     server.serializeAttachment(attachment)
     const others = this.#liveSockets()
@@ -951,13 +1337,65 @@ export class AccountSync extends DurableObject<Environment> {
    * 0039), after a key change: the other sessions ended, and the device that
    * changed the key reconnects with its new token.
    */
-  async closeForKeyChange(): Promise<void> {
+  async closeForKeyChange(args: { keyEpoch?: number } = {}): Promise<void> {
+    // Tokens from before the change are refused here from now on.
+    if (args.keyEpoch != null && this.#ready()) this.#noteKeyEpoch(args.keyEpoch)
     const { code, reason } = SYNC_LIVE_CLOSE.keyChanged
     for (const ws of this.#liveSockets()) closeQuietly(ws, code, reason)
   }
 
-  /** Sockets only listen; anything but the auto-answered `ping` is ignored. */
-  webSocketMessage(): void {}
+  /**
+   * `{ "type": "sync", "afterSequence": n }`: the device's catch-up, answered
+   * on the socket (`catchUp`'s answer as a `sync` message), and from then on
+   * the socket gets other slots' changes as they're put. Refused with an
+   * `error` message while the changes switch is off (`changes_disabled`) or
+   * the session can't be confirmed (`unavailable`); the device then uses
+   * `sync/changes/list`. Anything else, but the auto-answered `ping`, is
+   * ignored.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (
+      typeof message !== 'string' ||
+      message.length > SYNC_CHANGE_LIMITS.messageChars
+    )
+      return
+    let body: unknown
+    try {
+      body = JSON.parse(message)
+    } catch {
+      return
+    }
+    if (!isPlainObject(body) || body.type !== 'sync') return
+    const { afterSequence } = body
+    const attachment = attachmentOf(ws)
+    if (
+      !attachment ||
+      typeof afterSequence !== 'number' ||
+      !Number.isSafeInteger(afterSequence) ||
+      afterSequence < 0
+    )
+      return this.#signal(ws, { type: 'error', error: 'bad_request' })
+    try {
+      if (!(await isSyncChangesOn(this.env)))
+        return this.#signal(ws, { type: 'error', error: 'changes_disabled' })
+      const live = await this.#confirmLive(ws)
+      if (live === false) return
+      if (live == null)
+        return this.#signal(ws, { type: 'error', error: 'unavailable' })
+      // Before the read, so no change falls between it and the first one sent.
+      ws.serializeAttachment({
+        ...attachmentOf(ws)!,
+        changes: true,
+      } satisfies LiveAttachment)
+      if (attachment.sessionId != null) this.#readsChanges(attachment.sessionId)
+      const page = await this.#catchUp(attachment.slotId, afterSequence, Date.now())
+      this.#signal(ws, { type: 'sync', ...page })
+    } catch (error) {
+      console.error('sync: live catch-up failed')
+      captureFailure(error, 'sync live catch-up')
+      this.#signal(ws, { type: 'error', error: 'unavailable' })
+    }
+  }
 
   /** Completes the close the client started. */
   webSocketClose(ws: WebSocket): void {
@@ -1062,7 +1500,8 @@ export class AccountSync extends DurableObject<Environment> {
     return phones.every(
       (sessionId) =>
         this.#count(
-          'SELECT COUNT(*) AS n FROM slot WHERE session_id = ? AND updated_at >= ?',
+          `SELECT COUNT(*) AS n FROM slot
+           WHERE session_id = ? AND MAX(updated_at, COALESCE(changed_at, 0)) >= ?`,
           sessionId,
           since
         ) > 0
@@ -1100,12 +1539,7 @@ export class AccountSync extends DurableObject<Environment> {
   #slot(slotId: string): SlotRow | null {
     return (
       this.#sql
-        .exec<SlotRow>(
-          `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt,
-                  session_id AS sessionId
-           FROM slot WHERE slot_id = ?`,
-          slotId
-        )
+        .exec<SlotRow>(`SELECT ${SLOT_COLUMNS} FROM slot WHERE slot_id = ?`, slotId)
         .toArray()[0] ?? null
     )
   }
@@ -1113,11 +1547,7 @@ export class AccountSync extends DurableObject<Environment> {
   #slots(): SlotRow[] {
     if (!this.#ready()) return []
     return this.#sql
-      .exec<SlotRow>(
-        `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt,
-                session_id AS sessionId
-         FROM slot`
-      )
+      .exec<SlotRow>(`SELECT ${SLOT_COLUMNS} FROM slot`)
       .toArray()
   }
 
@@ -1273,6 +1703,309 @@ export class AccountSync extends DurableObject<Environment> {
       cursor = page.cursor
     }
     await this.#deleteObjects(bucket, orphans)
+  }
+
+  // --- Change helpers --------------------------------------------------------
+
+  #changePutView(sequence: number, slotId: string, now: number): SyncChangePutView {
+    const tail = this.#tail(slotId)
+    const slot = this.#slot(slotId)
+    return {
+      sequence,
+      tailCount: tail.count,
+      tailBytes: tail.bytes,
+      snapshotReaders: this.#snapshotReaders(now),
+      changedAt: slot ? (slot.changedAt ?? slot.updatedAt) : now,
+    }
+  }
+
+  #tail(slotId: string): { count: number; bytes: number } {
+    return this.#sql
+      .exec<{ count: number; bytes: number }>(
+        `SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+         FROM change WHERE slot_id = ?`,
+        slotId
+      )
+      .one()
+  }
+
+  #meta(): { keyEpoch: number } {
+    return (
+      this.#sql
+        .exec<{ keyEpoch: number }>(
+          'SELECT key_epoch AS keyEpoch FROM meta WHERE singleton = 1'
+        )
+        .toArray()[0] ?? { keyEpoch: 0 }
+    )
+  }
+
+  /** Whether a session that reads only snapshots listed the account lately. */
+  #snapshotReaders(now: number): boolean {
+    return (
+      this.#count(
+        'SELECT COUNT(*) AS n FROM snapshot_reader WHERE read_at > ?',
+        now - SYNC_CHANGE_LIMITS.snapshotReaderMs
+      ) > 0
+    )
+  }
+
+  #noteSnapshotReader(sessionId: string, now: number): void {
+    const noted = this.#count(
+      'SELECT COUNT(*) AS n FROM snapshot_reader WHERE session_id = ? AND read_at > ?',
+      sessionId,
+      now - SYNC_CHANGE_LIMITS.snapshotReaderNoteMs
+    )
+    if (noted) return
+    this.#sql.exec(
+      'INSERT OR REPLACE INTO snapshot_reader (session_id, read_at) VALUES (?, ?)',
+      sessionId,
+      now
+    )
+  }
+
+  /** The session's app reads changes (or the session ended): it no longer counts. */
+  #readsChanges(sessionId: string): void {
+    this.#sql.exec('DELETE FROM snapshot_reader WHERE session_id = ?', sessionId)
+  }
+
+  /** The account's key epoch never goes back. */
+  #noteKeyEpoch(keyEpoch: number): void {
+    this.#sql.exec(
+      'UPDATE meta SET key_epoch = ? WHERE singleton = 1 AND key_epoch < ?',
+      keyEpoch,
+      keyEpoch
+    )
+  }
+
+  /**
+   * What `requireLiveSession` is for, without the D1 read: a session this
+   * object was told ended is `unauthorized`, and so is a token from before
+   * the account's key change, with why. A token from after one this object
+   * hasn't heard of yet raises its epoch.
+   */
+  #refuseCaller(
+    caller: { sessionId: string; keyEpoch?: number | null },
+    now: number
+  ): SyncChangeFailure | null {
+    const ended = this.#count(
+      'SELECT COUNT(*) AS n FROM ended_session WHERE session_id = ? AND until > ?',
+      caller.sessionId,
+      now
+    )
+    if (ended) return fail('unauthorized')
+    // A browser's ticket has no epoch; a key change closes its socket.
+    if (caller.keyEpoch == null) return null
+    const { keyEpoch } = this.#meta()
+    if (caller.keyEpoch < keyEpoch)
+      return { ...fail('unauthorized'), reason: 'key_changed' }
+    if (caller.keyEpoch > keyEpoch) this.#noteKeyEpoch(caller.keyEpoch)
+    return null
+  }
+
+  /**
+   * Counts this change against the slot's minute and the account's rolling
+   * day, or answers `rate_limited` with when to send again.
+   */
+  #refuseOverChangeRate(slotId: string, now: number): BuddiesFailure | null {
+    const minute = Math.floor(now / MINUTE_MS)
+    const oldestKept = Math.floor((now - DAY_MS) / MINUTE_MS)
+    // A slot's buckets matter for their own minute only.
+    this.#sql.exec(
+      `DELETE FROM change_rate WHERE minute < ? OR (slot_id != '' AND minute < ?)`,
+      oldestKept,
+      minute
+    )
+    const inMinute =
+      this.#sql
+        .exec<{ n: number }>(
+          'SELECT n FROM change_rate WHERE slot_id = ? AND minute = ?',
+          slotId,
+          minute
+        )
+        .toArray()[0]?.n ?? 0
+    if (inMinute >= SYNC_CHANGE_LIMITS.slotChangesPerMinute) {
+      logLimitHit('sync/changes/put', 'slotChangesPerMinute')
+      return fail('rate_limited', seconds((minute + 1) * MINUTE_MS - now))
+    }
+    const day = this.#sql
+      .exec<{ n: number; oldest: number | null }>(
+        `SELECT COALESCE(SUM(n), 0) AS n, MIN(minute) AS oldest
+         FROM change_rate WHERE slot_id = ''`
+      )
+      .one()
+    if (day.n >= SYNC_CHANGE_LIMITS.accountChangesPerDay) {
+      logLimitHit('sync/changes/put', 'accountChangesPerDay')
+      return fail(
+        'rate_limited',
+        seconds(((day.oldest ?? minute) + 1) * MINUTE_MS + DAY_MS - now)
+      )
+    }
+    for (const key of [slotId, ''])
+      this.#sql.exec(
+        `INSERT INTO change_rate (slot_id, minute, n) VALUES (?, ?, 1)
+         ON CONFLICT (slot_id, minute) DO UPDATE SET n = n + 1`,
+        key,
+        minute
+      )
+    return null
+  }
+
+  /** `catchUp`'s answer; an account that never synced has nothing. */
+  async #catchUp(
+    slotId: string,
+    afterSequence: number,
+    now: number
+  ): Promise<SyncCatchUp> {
+    const photos =
+      this.env.ACCOUNT_PHOTOS != null && (await isSyncPhotosOn(this.env))
+    if (!this.#ready())
+      return {
+        sequence: 0,
+        slots: [],
+        changes: [],
+        more: false,
+        snapshotReaders: false,
+        requestedAt: null,
+        photos,
+      }
+    const requestedAt = await this.#standingRequest(now)
+    return this.ctx.storage.transactionSync(() => {
+      this.#sql.exec(
+        `UPDATE slot SET seen_at = ?
+         WHERE slot_id = ? AND (seen_at IS NULL OR seen_at <= ?)`,
+        now,
+        slotId,
+        now - SYNC_CHANGE_LIMITS.seenNoteMs
+      )
+      const slots = this.#sql
+        .exec<SyncSlotCatchUp>(
+          `SELECT slot_id AS slotId, etag, size, updated_at AS updatedAt, platform,
+                  floor_sequence AS floorSequence,
+                  COALESCE(changed_at, updated_at) AS changedAt
+           FROM slot ORDER BY slot_id`
+        )
+        .toArray()
+      // Sizes first, so a page never loads more sealed bytes than it sends.
+      const sizes = this.#sql
+        .exec<{ sequence: number; size: number }>(
+          `SELECT sequence, size FROM change
+           WHERE sequence > ? AND slot_id != ? ORDER BY sequence LIMIT ?`,
+          afterSequence,
+          slotId,
+          SYNC_CHANGE_LIMITS.pageChanges + 1
+        )
+        .toArray()
+      let taken = 0
+      let bytes = 0
+      for (const row of sizes) {
+        if (taken === SYNC_CHANGE_LIMITS.pageChanges) break
+        if (taken > 0 && bytes + row.size > SYNC_CHANGE_LIMITS.pageBytes) break
+        bytes += row.size
+        taken += 1
+      }
+      const changes =
+        taken === 0
+          ? []
+          : this.#sql
+              .exec<SyncChangeView>(
+                `SELECT sequence, slot_id AS slotId, change_id AS changeId,
+                        key_epoch AS keyEpoch, created_at AS createdAt, blob
+                 FROM change
+                 WHERE sequence > ? AND sequence <= ? AND slot_id != ?
+                 ORDER BY sequence`,
+                afterSequence,
+                sizes[taken - 1].sequence,
+                slotId
+              )
+              .toArray()
+      return {
+        sequence: this.#seq(),
+        slots,
+        changes,
+        more: taken < sizes.length,
+        snapshotReaders: this.#snapshotReaders(now),
+        requestedAt,
+        photos,
+      }
+    })
+  }
+
+  /**
+   * Whether the socket's session counts as live: it was confirmed within
+   * `liveConfirmMs`, or D1 says so now. False closes the socket; null when
+   * the read failed (nothing is sent, and the socket stays).
+   */
+  async #confirmLive(ws: WebSocket): Promise<boolean | null> {
+    const sessionId = attachmentOf(ws)?.sessionId
+    if (sessionId == null) return false
+    if ((attachmentOf(ws)?.confirmedUntil ?? 0) > Date.now()) return true
+    const db = this.env.ACCOUNTS_DB
+    const accountId = this.#accountId()
+    if (!db || !accountId) return null
+    let live: boolean
+    try {
+      live = await isSessionLive(accountsDb(db), accountId, sessionId)
+    } catch (error) {
+      console.error('sync: session read failed')
+      captureFailure(error, 'sync live session')
+      return null
+    }
+    if (!live) {
+      const { code, reason } = SYNC_LIVE_CLOSE.sessionEnded
+      closeQuietly(ws, code, reason)
+      return false
+    }
+    const attachment = attachmentOf(ws)
+    if (!attachment) return false
+    ws.serializeAttachment({
+      ...attachment,
+      confirmedUntil: Date.now() + SYNC_CHANGE_LIMITS.liveConfirmMs,
+    } satisfies LiveAttachment)
+    return true
+  }
+
+  /**
+   * The change to every socket that reads changes but its own slot's. A
+   * socket whose session wasn't confirmed lately gets nothing yet: once D1
+   * confirms it, in the background so the writer never waits, it gets a
+   * `changed` and catches up. Never fails the write that committed.
+   */
+  #broadcastChange(change: SyncChangeView): void {
+    try {
+      const now = Date.now()
+      const unconfirmed: WebSocket[] = []
+      for (const ws of this.#liveSockets()) {
+        const attachment = attachmentOf(ws)
+        if (!attachment?.changes || attachment.slotId === change.slotId) continue
+        if ((attachment.confirmedUntil ?? 0) > now)
+          this.#signal(ws, { type: 'change', change })
+        else if (!this.#confirming.has(ws)) unconfirmed.push(ws)
+      }
+      if (unconfirmed.length)
+        this.ctx.waitUntil(this.#confirmThenNotify(unconfirmed, true))
+    } catch {
+      // The write already committed; a socket problem must not surface.
+    }
+  }
+
+  /**
+   * Confirms each socket's session (`#confirmLive`); `notify` then tells a
+   * confirmed socket to catch up on the change it was not sent.
+   */
+  async #confirmThenNotify(sockets: WebSocket[], notify: boolean): Promise<void> {
+    for (const ws of sockets) this.#confirming.add(ws)
+    await Promise.all(
+      sockets.map(async (ws) => {
+        try {
+          if ((await this.#confirmLive(ws)) && notify)
+            this.#signal(ws, { type: 'changed', seq: this.#seq() })
+        } catch {
+          // The next change tries again.
+        } finally {
+          this.#confirming.delete(ws)
+        }
+      })
+    )
   }
 
   // --- Photo helpers -------------------------------------------------------

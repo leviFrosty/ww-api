@@ -1638,6 +1638,10 @@ ${readTier}`,
           description:
             "Whether photo puts are on (KV `sync:photos`, then the `SYNC_PHOTOS` var, else on) and this worker has the photo bucket.",
         }),
+        changes: z.boolean().meta({
+          description:
+            "Whether devices send record changes (witness-work ADR 0060; KV `sync:changes`, then the `SYNC_CHANGES` var, else off). False: publish whole snapshots.",
+        }),
       }),
     ),
     ...bearerReadErrors,
@@ -1711,6 +1715,8 @@ export const syncPutDocs = describeRoute({
 
 **Re-sealing** (\`x-ww-reseal: 1\`): after a key change, a device re-seals every slot, other devices’ too, under the new key. The slot keeps the session and platform that wrote it and its \`updatedAt\`, so retention and the Cloud Sync request see no new write. It needs \`If-Match: "<etag>"\` with the strong ETag the device read (400 \`bad_request\` without one or with a weak \`W/"…"\` one, and 412 when the slot changed since, so a re-seal never overwrites newer bytes), the slot must exist, and it’s allowed only within 7 days of the account’s last key change (403 \`forbidden\`).
 
+**The base and its changes** (witness-work ADR 0060): the snapshot is the slot’s base, and \`sync/changes/put\` adds changes on top. \`x-ww-covers-sequence: N\` says the snapshot includes this slot’s changes up to sequence \`N\`: they’re deleted, \`N\` becomes the slot’s \`floorSequence\`, and devices whose cursor is past it don’t read the base. A put without the header replaces everything: the slot’s changes are all deleted and its floor is the put’s own \`seq\`, so every device reads it. An app from before record changes always puts this way. A re-seal keeps the slot’s changes and floor, and can’t send the header.
+
 Needs a live session: ${ENDED_SESSION}
 
 ${SYNC_ENTITLED}
@@ -1756,6 +1762,14 @@ ${ID_IN_BODY}`,
       description:
         "`1` to re-seal an existing slot after a key change, with a strong quoted-ETag `If-Match`; see above. Any other value is `bad_request`.",
     },
+    {
+      name: "x-ww-covers-sequence",
+      in: "header" as const,
+      required: false,
+      schema: { type: "integer" as const },
+      description:
+        "The sequence of this slot’s last change the snapshot includes; see above. Not with `x-ww-reseal`.",
+    },
   ],
   requestBody: { required: true, ...syncBinary("The encrypted snapshot.") },
   responses: {
@@ -1767,6 +1781,10 @@ ${ID_IN_BODY}`,
         size: z.number().int().meta({ description: "Bytes." }),
         updatedAt: epochMs("When the slot was written, the server’s clock"),
         seq: syncSeq,
+        floorSequence: z.number().int().min(0).meta({
+          description:
+            "The slot’s floor now: a device whose cursor is behind it reads this base.",
+        }),
       }),
     ),
     400: errorResponse(
@@ -1802,6 +1820,8 @@ export const syncListDocs = describeRoute({
   tags: ["Accounts"],
   summary: "List the account’s sync slots",
   description: `Every slot’s ETag, size, last write, the platform of the session that wrote it and whether that session is live, and the account’s \`seq\`. A pull downloads only slots whose ETag changed since its last read. Send \`{}\`.
+
+An app that reads record changes (witness-work ADR 0060) sends \`x-ww-sync-changes: 1\`. A list without it is a session that reads only snapshots: \`snapshotReaders\` is true for 14 days after, or until that session reads changes or ends, and devices that send changes also keep their base current.
 
 ${SYNC_ENTITLED}
 
@@ -1915,10 +1935,224 @@ ${ID_IN_BODY}`,
   },
 });
 
+const SYNC_CHANGES_ON =
+  "Needs record changes on (KV `sync:changes`, then the `SYNC_CHANGES` var, else off): 503 `changes_disabled` otherwise, and the device publishes whole snapshots.";
+const syncChangesOff = {
+  503: errorResponse(
+    "Cloud Sync is off (`disabled`), record changes are off (`changes_disabled`: publish whole snapshots), or RevenueCat couldn’t be read (`unavailable`).",
+    ["disabled", "changes_disabled", "unavailable"],
+  ),
+};
+const syncSequence = z.number().int().min(0).meta({
+  description:
+    "The account’s sequence (`seq` on the snapshot routes): every put, change, and delete takes the next one.",
+});
+const syncChangeId = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{22}$/)
+  .meta({
+    description: "The change’s id: 16 random bytes the device made, base64url.",
+  });
+const syncChangeBlob = z.string().meta({
+  description:
+    "The sealed change, unpadded base64url: a whole number of 256-byte blocks, at most 256 KiB.",
+});
+const syncSnapshotReaders = z.boolean().meta({
+  description:
+    "A device that reads only snapshots listed the account in the last 14 days: also write the base (with `x-ww-covers-sequence`) a few seconds after a change.",
+});
+const syncChange = z.object({
+  sequence: syncSequence,
+  slotId: syncSlotId,
+  changeId: syncChangeId,
+  keyEpoch: z.number().int().min(0).meta({
+    description:
+      "The key epoch of the session that sealed it, or re-sealed it: which account key opens it.",
+  }),
+  createdAt: epochMs("When the change was put, the server’s clock"),
+  blob: syncChangeBlob,
+});
+const syncChangeUnauthorized = errorResponse(
+  'Missing, expired, or invalid token, or the token’s session ended; with `reason: "key_changed"`, the token is from before the account’s key change (refresh and retry).',
+  ["unauthorized"],
+);
+
+export const syncChangePutDocs = describeRoute({
+  tags: ["Accounts"],
+  summary: "Send one record change",
+  description: `Stores one small sealed change in this device’s slot (witness-work ADR 0060): the records that changed, sealed like a snapshot under the account’s sync key (\`0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305\`, AAD \`ww-account/v1/sync-change\\n<accountId>\\n<slotId>\\n<changeId>\`), padded to a whole number of 256-byte blocks. The server sees the slot, the padded size, and the time. It takes the account’s next sequence, and every other socket of the account that reads changes gets it as \`{"type":"change","change":…}\`.
+
+The slot needs a base first (\`sync/put\`; 409 \`no_slot\`). The same \`changeId\` again answers the first put’s sequence. A slot’s changes stay until the device folds them into its base: \`sync/put\` with \`x-ww-covers-sequence\`.
+
+This route reads no database: the access token carries the session’s capabilities, and the account’s Durable Object refuses a session that ended and a token from before a key change. A notice of an ended session that was lost lets its last token add changes for at most 15 minutes. It can’t replace or delete anything.
+
+${SYNC_ENTITLED}
+
+${SYNC_CHANGES_ON}
+
+Limits: 256 KiB a change, 200 changes and 1 MiB in a slot’s tail (409 \`tail_full\`: write the base, then send again), 60 changes a slot a minute and 3,000 an account a rolling day, and the Buddies write tier. ${syncNotes}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({ slotId: syncSlotId, changeId: syncChangeId, blob: syncChangeBlob }),
+    "The change.",
+  ),
+  responses: {
+    200: jsonResponse(
+      "Stored (or already stored under this `changeId`).",
+      z.object({
+        ok: z.literal(true),
+        sequence: syncSequence,
+        tailCount: z.number().int().meta({
+          description: "Changes in the slot’s tail now.",
+        }),
+        tailBytes: z.number().int().meta({
+          description: "Sealed bytes in the slot’s tail now.",
+        }),
+        snapshotReaders: syncSnapshotReaders,
+        changedAt: epochMs(
+          "The slot’s last base put or change, the server’s clock",
+        ),
+      }),
+    ),
+    400: errorResponse(
+      "Malformed JSON, a bad `slotId` or `changeId`, or a `blob` that isn’t base64url of a whole number of 256-byte blocks.",
+      ["bad_request"],
+    ),
+    401: syncChangeUnauthorized,
+    ...syncUnentitled,
+    409: errorResponse(
+      "The slot has no base (`no_slot`), or its tail is full (`tail_full`).",
+      ["no_slot", "tail_full"],
+    ),
+    413: errorResponse("Over 256 KiB.", ["too_large"]),
+    429: errorResponse("Over a rate, with `Retry-After`.", ["rate_limited"]),
+    ...internal,
+    ...syncChangesOff,
+  },
+});
+
+export const syncChangesListDocs = describeRoute({
+  tags: ["Accounts"],
+  summary: "Catch up on record changes",
+  description: `What this device missed since its cursor (witness-work ADR 0060 §4), in one read: every slot with its \`floorSequence\`, and the other slots’ changes after \`afterSequence\`, oldest first. A device reads a slot’s base (\`sync/get\`) only when \`floorSequence\` is past its cursor, or its cursor is 0. Once it merged everything, its cursor is \`sequence\`. With \`more\`, ask again from the last change’s sequence.
+
+\`slotId\` is the device’s own slot: its changes are left out, and the slot is marked as seen (at most daily), which retention counts as a write. The answer also carries \`requestedAt\` and \`photos\` from \`GET /accounts/v1/sync\`, so a launch needn’t read that too.
+
+The live socket answers the same on \`{"type":"sync","afterSequence":N}\`. No database is read, as on \`sync/changes/put\`.
+
+${SYNC_ENTITLED}
+
+${SYNC_CHANGES_ON}
+
+${readTier}
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({
+      slotId: syncSlotId,
+      afterSequence: z.number().int().min(0).meta({
+        description: "The device’s cursor; 0 for everything.",
+      }),
+    }),
+    "The device’s slot and cursor.",
+  ),
+  responses: {
+    200: jsonResponse(
+      "What the device missed.",
+      z.object({
+        ok: z.literal(true),
+        sequence: syncSequence,
+        slots: z.array(
+          z.object({
+            slotId: syncSlotId,
+            etag: syncEtag,
+            size: z.number().int().meta({ description: "The base’s bytes." }),
+            updatedAt: epochMs("When the base was last written"),
+            platform: z.enum(["ios", "android", "dev", "web"]).nullable(),
+            floorSequence: syncSequence.meta({
+              description:
+                "A device whose cursor is behind this reads the slot’s base: changes up to it are folded in, or the base replaced everything.",
+            }),
+            changedAt: epochMs("The slot’s last base put or change"),
+          }),
+        ),
+        changes: z.array(syncChange),
+        more: z.boolean().meta({
+          description:
+            "More changes follow: ask again with the last change’s `sequence`.",
+        }),
+        snapshotReaders: syncSnapshotReaders,
+        requestedAt: syncRequestedAt,
+        photos: z.boolean().meta({
+          description: "Whether photo puts are on, as `GET /accounts/v1/sync` says.",
+        }),
+      }),
+    ),
+    400: errorResponse("Malformed JSON, or a bad `slotId` or `afterSequence`.", [
+      "bad_request",
+    ]),
+    401: syncChangeUnauthorized,
+    ...syncUnentitled,
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncChangesOff,
+  },
+});
+
+export const syncChangeResealDocs = describeRoute({
+  tags: ["Accounts"],
+  summary: "Re-seal a record change after a key change",
+  description: `Replaces one change’s bytes with the same change sealed under the new account key (ADR 0039, witness-work ADR 0060 §10), as \`x-ww-reseal\` does for a slot. Its sequence, slot, and time stay, its \`keyEpoch\` becomes the token’s, and no socket is told. Allowed only within 7 days of the account’s last key change (403 \`forbidden\`).
+
+Needs a live session: ${ENDED_SESSION}
+
+${SYNC_ENTITLED}
+
+${SYNC_CHANGES_ON}
+
+Counts against the Buddies write tier.
+
+${ID_IN_BODY}`,
+  security: [{ bearerAuth: [] }],
+  requestBody: jsonBody(
+    z.object({
+      sequence: syncSequence,
+      changeId: syncChangeId,
+      blob: syncChangeBlob,
+    }),
+    "The change, and its bytes under the new key.",
+  ),
+  responses: {
+    200: jsonResponse(
+      "Re-sealed.",
+      z.object({ ok: z.literal(true), sequence: syncSequence }),
+    ),
+    400: errorResponse("Malformed JSON, or a bad `sequence`, `changeId` or `blob`.", [
+      "bad_request",
+    ]),
+    401: bearerReadErrors[401],
+    403: errorResponse(
+      "More than 7 days after the account’s last key change (`forbidden`), or the account isn’t entitled (`supporter_required`).",
+      ["forbidden", "supporter_required"],
+    ),
+    404: errorResponse(
+      "No such change: its device folded it into its base. Nothing to re-seal.",
+      ["not_found"],
+    ),
+    413: errorResponse("Over 256 KiB.", ["too_large"]),
+    429: bearerReadErrors[429],
+    ...internal,
+    ...syncChangesOff,
+  },
+});
+
 export const syncLiveDocs = describeRoute({
   tags: ["Accounts"],
   summary: "Cloud Sync live socket (WebSocket)",
-  description: `Upgrades to a WebSocket that says *that* another device of the account changed its slot, so the app pulls at once while in the foreground. It never carries data: everything it prompts is read with the bearer token.
+  description: `Upgrades to a WebSocket that says *that* another device of the account changed its slot, so the app pulls at once while in the foreground. A socket that asks for a catch-up also gets the other devices’ record changes on it, sealed (witness-work ADR 0060); any other socket gets notices only.
 
 Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \`x-ww-slot-id\`, the device’s own slot, so its own puts don’t echo back.
 
@@ -1928,8 +2162,15 @@ Headers: \`Authorization: Bearer <access token>\`, \`Upgrade: websocket\`, and \
 
 - \`{"type":"hello","seq":N}\` right after the upgrade (as Buddies' inbox socket); pull when \`N\` differs from the last \`seq\` pulled.
 - \`{"type":"changed","seq":N}\` after every put by another slot, and every delete.
+- \`{"type":"change","change":{…}}\`: another slot’s record change, sealed, as \`sync/changes/list\` gives it. Only to a socket that asked for a catch-up.
+- \`{"type":"sync",…}\`: the answer to a catch-up, the body of \`sync/changes/list\` without \`ok\`.
+- \`{"type":"error","error":…}\`: a catch-up that wasn’t answered: \`changes_disabled\` (publish whole snapshots), \`unavailable\` (use \`sync/changes/list\`), or \`bad_request\`.
 
-**Keepalive:** send the text \`ping\` about every 25 s; the server answers \`pong\` without waking the account’s Durable Object. Anything else the app sends is ignored.
+**App → server:** \`{"type":"sync","afterSequence":N}\` (witness-work ADR 0060 §6) asks for what the device missed since its cursor, and from then on the socket gets other slots’ changes as they’re put. Merge a \`change\` at once; move the cursor only when its \`sequence\` follows the cursor, else ask again. A launch with nothing new is this socket and nothing else.
+
+**The socket is its session’s.** It closes with \`4006 "session_ended"\` when the session signs out, is signed out from another device, or is found ended. It gets changes only while its session was confirmed live in the last 15 minutes: the token that opened it counts until it expires, and after that the server checks the session before it sends, never while a writer waits.
+
+**Keepalive:** send the text \`ping\` about every 25 s; the server answers \`pong\` without waking the account’s Durable Object. Anything else the app sends, but the \`sync\` request, is ignored.
 
 **Close codes:** \`4000 "replaced"\`: a 21st socket opened and closed the oldest (at most 20 per account, browser sockets included). \`4004 "expired"\` (browser sockets only): the access token its ticket was minted with expired; refresh, mint a ticket, and reconnect. Header sockets outlive their token, so a browser session’s (\`web\`) token is refused there with \`403 forbidden\`. Reconnect with backoff while in the foreground.
 

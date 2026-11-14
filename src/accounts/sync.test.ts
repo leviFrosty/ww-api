@@ -174,6 +174,7 @@ describe('put, list, get, delete', () => {
       size: 5_000,
       updatedAt: START,
       seq: 1,
+      floorSequence: 1,
     })
     expect(stored.headers.get('etag')).toBe(`"${etag}"`)
     expect(h.syncBlobs.objects.get(`v1/${s.accountId}/${phone}`)?.bytes).toEqual(
@@ -497,6 +498,7 @@ describe('switches and entitlement', () => {
       supporter: false,
       requestedAt: null,
       photos: true,
+      changes: false,
     })
     supporterStatus.mockResolvedValue({ supporter: true, expiresAt: null, customers: 1 })
     resetSyncEntitlementCache()
@@ -1080,21 +1082,29 @@ describe('browser live socket', () => {
     expect(headers['sec-websocket-protocol']).toBeUndefined()
     expect(headers.authorization).toBeUndefined()
     expect(JSON.stringify(headers)).not.toContain(minted)
-    expect(headers['x-ww-sync-account']).toBe(s.accountId)
-    expect(headers['x-ww-slot-id']).toBe(phone)
-    expect(headers['x-ww-sync-expires-at']).toBe(String(s.accessExpiresAt))
-    // The ticket's hash, which can't open anything, so one ticket opens one socket.
-    expect(headers['x-ww-live-ticket']).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    // Who the socket is for goes to the DO in a call (`admitLive`), never
+    // in a header: Workers Logs record the forwarded request's headers. The
+    // upgrade carries only the one-use id that call answered with.
+    expect(headers['x-ww-sync-admission']).toMatch(/^[0-9a-f-]{36}$/)
+    for (const id of [s.accountId, s.sessionId, phone])
+      expect(JSON.stringify(headers)).not.toContain(id)
+    expect(headers['x-ww-sync-account']).toBeUndefined()
+    expect(headers['x-ww-sync-expires-at']).toBeUndefined()
+    expect(headers['x-ww-live-ticket']).toBeUndefined()
     expect(seen[0].url).not.toContain(phone)
   })
 
   it('takes the slot from the ticket, never a header', async () => {
-    const seen = forwarded()
     const s = await session()
     const phone = slot()
-    const live = await browserLive(await offer(s, phone), { 'x-ww-slot-id': slot() })
+    const claimed = slot()
+    const live = await browserLive(await offer(s, phone), { 'x-ww-slot-id': claimed })
     expect(live.status).toBe(101)
-    expect(seen[0].headers.get('x-ww-slot-id')).toBe(phone)
+    // The socket is the ticket's slot's: its puts don't echo, the header's do.
+    expect((await put(s, phone)).status).toBe(200)
+    expect(live.socket!.messages()).toEqual([{ type: 'hello', seq: 0 }])
+    expect((await put(s, claimed)).status).toBe(200)
+    expect(live.socket!.messages().at(-1)).toEqual({ type: 'changed', seq: 2 })
   })
 
   it('needs ww.v1 in the offer, and echoes it', async () => {
@@ -1173,19 +1183,23 @@ describe('browser live socket', () => {
 
   it('takes a client’s ticket header on neither path', async () => {
     const seen = forwarded()
+    const admitted = vi.spyOn(AccountSync.prototype, 'admitLive')
     const s = await session()
     const first = await browserLive(await offer(s, slot()))
-    const hash = seen[0].headers.get('x-ww-live-ticket')!
+    // The ticket's hash, which can't open anything, so one ticket opens one socket.
+    const hash = admitted.mock.calls[0][0].ticket!
     expect(hash).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(first.status).toBe(101)
     // A header-path socket naming the open ticket opens, without it.
     const native = await live(s, slot(), { 'x-ww-live-ticket': hash })
     expect(native.status).toBe(101)
+    expect(admitted.mock.calls[1][0].ticket).toBeNull()
     expect(seen[1].headers.get('x-ww-live-ticket')).toBeNull()
     // A browser one gets its own ticket's hash, never the client's.
     const other = await browserLive(await offer(s, slot()), { 'x-ww-live-ticket': hash })
     expect(other.status).toBe(101)
-    expect(seen[2].headers.get('x-ww-live-ticket')).not.toBe(hash)
+    expect(admitted.mock.calls[2][0].ticket).not.toBe(hash)
+    expect(seen[2].headers.get('x-ww-live-ticket')).toBeNull()
   })
 
   it('mints only for a live session; a ticket minted before still opens', async () => {
@@ -1582,7 +1596,15 @@ describe('sessions without sync-everyone', () => {
   })
 
   it('refuses when the session’s capabilities can’t be read', async () => {
-    const s = await session()
+    // A token from before tokens carried them (`cap`): the session is read.
+    const opened = await session()
+    const keys = (await accessTokenKeys(h.env as never))!
+    const { accessToken } = await signAccessToken(keys, {
+      accountId: opened.accountId,
+      sessionId: opened.sessionId,
+      platform: 'dev',
+    })
+    const s = { ...opened, accessToken }
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const sessions = await import('./sessionStore')
     vi.spyOn(sessions, 'cachedSessionCapabilities').mockRejectedValue(new Error('d1 down'))

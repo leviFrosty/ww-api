@@ -38,7 +38,7 @@ describe('GET /app/v1/config', () => {
     expect(await response.json()).toEqual({
       ok: true,
       minAppVersion: '1.42.0',
-      sync: { enabled: false, entitlement: 'everyone' },
+      sync: { enabled: false, changes: false, entitlement: 'everyone' },
       webSignup: { enabled: false, turnstileSiteKey: null },
       country: null,
       regionCode: null,
@@ -52,7 +52,7 @@ describe('GET /app/v1/config', () => {
     )
     expect(await response.json()).toEqual({
       ok: true,
-      sync: { enabled: false, entitlement: 'everyone' },
+      sync: { enabled: false, changes: false, entitlement: 'everyone' },
       webSignup: { enabled: false, turnstileSiteKey: null },
       country: null,
       regionCode: null,
@@ -77,6 +77,7 @@ describe('GET /app/v1/config', () => {
     // Free for everyone unless something says otherwise (ADR 0040).
     expect(await config({ ...bound, SYNC_ENABLED: 'true' })).toEqual({
       enabled: true,
+      changes: false,
       entitlement: 'everyone',
     })
     expect(
@@ -84,20 +85,21 @@ describe('GET /app/v1/config', () => {
         { ...bound, SYNC_ENABLED: 'true', SYNC_ENTITLEMENT: 'everyone' },
         { 'sync:entitlement': 'supporter' }
       )
-    ).toEqual({ enabled: true, entitlement: 'supporter' })
+    ).toEqual({ enabled: true, changes: false, entitlement: 'supporter' })
     // KV wins over the vars, both ways.
     expect(
       await config(
         { ...bound, SYNC_ENABLED: 'true', SYNC_ENTITLEMENT: 'supporter' },
         { 'sync:enabled': 'false', 'sync:entitlement': 'everyone' }
       )
-    ).toEqual({ enabled: false, entitlement: 'everyone' })
+    ).toEqual({ enabled: false, changes: false, entitlement: 'everyone' })
     expect(
       await config({ ...bound, SYNC_ENTITLEMENT: 'everyone' }, { 'sync:enabled': 'on' })
-    ).toEqual({ enabled: true, entitlement: 'everyone' })
+    ).toEqual({ enabled: true, changes: false, entitlement: 'everyone' })
     // Without the bucket there's no Cloud Sync to offer.
     expect(await config({ SYNC_ENABLED: 'true' })).toEqual({
       enabled: false,
+      changes: false,
       entitlement: 'everyone',
     })
   })
@@ -115,16 +117,18 @@ describe('GET /app/v1/config', () => {
       ).sync
     // An app that never sends `sync-everyone` must not turn Cloud Sync on by
     // itself for a device that never chose (ADR 0040 §2), at any version.
-    expect(await sync('')).toEqual({ enabled: true, entitlement: 'supporter' })
-    expect(await sync('?appVersion=1.47.0')).toEqual({ enabled: true, entitlement: 'supporter' })
-    expect(await sync('?capabilities=sync-later')).toEqual({ enabled: true, entitlement: 'supporter' })
-    expect(await sync('?capabilities=sync-everyone')).toEqual({ enabled: true, entitlement: 'everyone' })
+    expect(await sync('')).toEqual({ enabled: true, changes: false, entitlement: 'supporter' })
+    expect(await sync('?appVersion=1.47.0')).toEqual({ enabled: true, changes: false, entitlement: 'supporter' })
+    expect(await sync('?capabilities=sync-later')).toEqual({ enabled: true, changes: false, entitlement: 'supporter' })
+    expect(await sync('?capabilities=sync-everyone')).toEqual({ enabled: true, changes: false, entitlement: 'everyone' })
     expect(await sync('?capabilities=sync-later&capabilities=sync-everyone')).toEqual({
       enabled: true,
+      changes: false,
       entitlement: 'everyone',
     })
     expect(await sync('?capabilities=sync-later,sync-everyone')).toEqual({
       enabled: true,
+      changes: false,
       entitlement: 'everyone',
     })
   })

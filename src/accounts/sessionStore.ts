@@ -73,6 +73,12 @@ export interface SessionRecord {
   platform: SessionPlatform
   /** The account's key epoch the session holds (its tokens' `kep`). */
   keyEpoch: number
+  /**
+   * The capabilities the session holds, for its tokens' `cap`; undefined
+   * when this read doesn't know them (a renewal that carried the old
+   * session's).
+   */
+  capabilities?: SessionCapability[]
   /** Epoch milliseconds. */
   expiresAt: number
 }
@@ -175,6 +181,7 @@ const sessionColumns = {
   revokedAt: accountSessions.revokedAt,
   rotatedAt: accountSessions.rotatedAt,
   endedReason: accountSessions.endedReason,
+  capabilities: accountSessions.capabilities,
 }
 
 type SessionRow = {
@@ -188,6 +195,7 @@ type SessionRow = {
   revokedAt: Date | null
   rotatedAt: Date | null
   endedReason: SessionEndReason | null
+  capabilities: SessionCapability[] | null
 }
 
 const isLive = (row: SessionRow, now: number): boolean =>
@@ -198,6 +206,7 @@ const record = (row: SessionRow): SessionRecord => ({
   accountId: row.accountId,
   platform: row.platform,
   keyEpoch: row.keyEpoch,
+  capabilities: row.capabilities ?? [],
   expiresAt: row.expiresAt.getTime(),
 })
 
@@ -371,6 +380,12 @@ export const prepareSession = async (
       accountId: input.accountId,
       platform: input.platform,
       keyEpoch: input.keyEpoch,
+      // A renewal that sent none carries the old session's, unread here.
+      ...(input.capabilities != null
+        ? { capabilities: input.capabilities }
+        : renews == null
+          ? { capabilities: [] }
+          : {}),
       expiresAt,
     },
     refreshToken: refresh.token,
@@ -728,7 +743,11 @@ const refreshStep = async (
       ? {
           done: {
             issued: {
-              session: record({ ...row, expiresAt }),
+              session: record({
+                ...row,
+                expiresAt,
+                capabilities: capabilities ?? row.capabilities,
+              }),
               refreshToken: next.token,
             },
           },

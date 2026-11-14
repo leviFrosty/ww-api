@@ -89,6 +89,29 @@ describe('access tokens', () => {
     })
   })
 
+  it('carries the session’s capabilities when the issuer knew them', async () => {
+    const keys = await keysFor()
+    const verify = async (capabilities?: readonly string[] | null) =>
+      (await verifyAccessToken(
+        keys,
+        (
+          await signAccessToken(
+            keys,
+            { ...SESSION, capabilities: capabilities as never },
+            NOW
+          )
+        ).accessToken,
+        NOW
+      ))!.capabilities
+    expect(await verify(['sync-everyone'])).toEqual(['sync-everyone'])
+    // Known to have none is not the same as not known.
+    expect(await verify([])).toEqual([])
+    expect(await verify()).toBeUndefined()
+    expect(await verify(null)).toBeUndefined()
+    // Only the names this server knows.
+    expect(await verify(['sync-everyone', 'sync-later'])).toEqual(['sync-everyone'])
+  })
+
   it('expires at exp, and never outlives its session', async () => {
     const keys = await keysFor()
     const { accessToken } = await signAccessToken(keys, SESSION, NOW)
