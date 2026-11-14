@@ -207,6 +207,7 @@ describe('spaces without a mode', () => {
       ['handoff/create', { scopeId: S, target: member.memberId }],
       ['handoff/end', { scopeId: S }],
       ['link/end', { linkId: randomId() }],
+      ['link/expiry', { linkId: randomId(), expiresAt: Date.now() + DAY }],
     ] as const)
       expect((await owner.send(op, { ...owner.fields, ...body })).body, op).toEqual(
         spacesError('bad_request')
@@ -846,9 +847,9 @@ describe('links, as members manage them', () => {
   it('checks the expiry and epoch, takes an identical retry, and never reuses an id', async () => {
     const owner = await territory()
     const S = scopeId()
-    for (const expiresAt of [Date.now(), Date.now() + DAY + 5 * MINUTE + 1])
+    for (const expiresAt of [Date.now(), Date.now() + 30 * DAY + 5 * MINUTE + 1])
       expect((await openLink(owner, [S], { expiresAt })).response.body).toEqual(spacesError('bad_request'))
-    expect((await openLink(owner, [S], { expiresAt: Date.now() + DAY + 5 * MINUTE })).response.status).toBe(200)
+    expect((await openLink(owner, [S], { expiresAt: Date.now() + 30 * DAY + 5 * MINUTE })).response.status).toBe(200)
     expect((await openLink(owner, [S], { epoch: 2 })).response.body).toEqual(spacesError('stale_key'))
     expect((await openLink(owner, Array.from({ length: 31 }, () => scopeId()))).response.body).toEqual(
       spacesError('bad_request')
@@ -906,6 +907,28 @@ describe('links, as members manage them', () => {
     expect((await t.O.sync()).body.links).toHaveLength(2)
     advance(DAY)
     expect((await t.O.sync()).body.links).toEqual([])
+  })
+
+  it('moves a live link’s expiry for its creator or the owner, and the guest sees it', async () => {
+    const t = await everyRole()
+    const move = (member: SpaceMember, linkId: string, expiresAt: number) =>
+      member.send('link/expiry', { ...member.fields, linkId, expiresAt })
+    const week = Date.now() + 7 * DAY
+    expect((await move(t.W, t.ownerLink.linkId, week)).body).toEqual(spacesError('forbidden'))
+    expect((await move(t.H, t.ownerLink.linkId, week)).body).toEqual(spacesError('forbidden'))
+    for (const expiresAt of [Date.now(), Date.now() + 30 * DAY + 5 * MINUTE + 1])
+      expect((await move(t.O, t.ownerLink.linkId, expiresAt)).body).toEqual(spacesError('bad_request'))
+    expect((await move(t.O, t.ownerLink.linkId, week)).body).toEqual({ ok: true, seq: expect.any(Number) })
+    expect((await move(t.O, t.ownerLink.linkId, week)).status).toBe(200)
+    expect((await t.ownerLink.guest.sync()).body).toMatchObject({ ok: true, expiresAt: week })
+    expect((await move(t.H, t.holderLink.linkId, week)).status).toBe(200)
+    expect((await move(t.O, t.holderLink.linkId, Date.now() + HOUR)).status).toBe(200)
+    advance(2 * DAY)
+    expect((await t.ownerLink.guest.sync()).status).toBe(200)
+    expect((await move(t.O, t.holderLink.linkId, Date.now() + DAY)).body).toEqual(spacesError('not_found'))
+    expect((await move(t.O, randomId(), Date.now() + DAY)).body).toEqual(spacesError('not_found'))
+    await t.O.send('link/end', { ...t.O.fields, linkId: t.ownerLink.linkId })
+    expect((await move(t.O, t.ownerLink.linkId, Date.now() + DAY)).body).toEqual(spacesError('not_found'))
   })
 })
 

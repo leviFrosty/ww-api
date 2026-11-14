@@ -187,6 +187,11 @@ export interface LinkEndArgs extends MemberAuth {
   linkId: string
 }
 
+export interface LinkExpiryArgs extends MemberAuth {
+  linkId: string
+  expiresAt: number
+}
+
 /** A guest op's link, with its token already hashed by the Worker. */
 export interface GuestAuth {
   spaceId: string
@@ -1447,6 +1452,26 @@ export class SharedSpace extends DurableObject<Environment> {
       if (link.createdBy !== args.memberId && auth.value.ownerId !== args.memberId)
         return refusal('forbidden')
       this.#sql.exec('UPDATE link SET ended_at = ? WHERE link_id = ?', now, args.linkId)
+      return { result: ok({ seq: this.#advance() }), changed: true }
+    }).result
+  }
+
+  /**
+   * Moves a live guest link's `expiresAt`, sooner or later: its creator's
+   * or the owner's (`forbidden` for anyone else). An unknown, ended, or
+   * expired link is `not_found`: make a new one. The Worker has already
+   * held `expiresAt` to the longest a link may last from now.
+   */
+  async setLinkExpiry(args: LinkExpiryArgs): Promise<SpacesResult<{ seq: number }>> {
+    return this.#commit((now): Change<{ seq: number }> => {
+      const auth = this.#authenticateScoped(args)
+      if (!auth.ok) return { result: auth }
+      const link = this.#link(args.linkId)
+      if (!link || link.endedAt != null || link.expiresAt <= now) return refusal('not_found')
+      if (link.createdBy !== args.memberId && auth.value.ownerId !== args.memberId)
+        return refusal('forbidden')
+      if (link.expiresAt === args.expiresAt) return { result: ok({ seq: auth.value.seq }) }
+      this.#sql.exec('UPDATE link SET expires_at = ? WHERE link_id = ?', args.expiresAt, args.linkId)
       return { result: ok({ seq: this.#advance() }), changed: true }
     }).result
   }

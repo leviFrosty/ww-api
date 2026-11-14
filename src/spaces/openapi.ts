@@ -664,7 +664,7 @@ export const spacesOpDocs: Record<SpacesOp, MiddlewareHandler> = {
     summary: 'Open a guest link (scoped)',
     description: paragraphs(
       'Opens a guest link on `scopes`: the owner’s on streets nobody holds, a holder’s on streets they hold. The server keeps `verifier` (`b64u(SHA-256(linkToken))`), never the token or the link’s secret. A guest reads and writes a street only while its link’s creator may write it. An identical retry by the creator is `ok`; any other reuse of `linkId`, ever, is `conflict`. Works while the guest ops are switched off.',
-      `${SCOPED_ONLY} Limits: ${SPACES_LIMITS.openLinks} open links a space, ${SPACES_LIMITS.linksPerDay} made a rolling day, ${SPACES_LIMITS.scopesPerLink} streets a link, 24 hours a link, and ${tier('write')}.`
+      `${SCOPED_ONLY} Limits: ${SPACES_LIMITS.openLinks} open links a space, ${SPACES_LIMITS.linksPerDay} made a rolling day, ${SPACES_LIMITS.scopesPerLink} streets a link, 30 days a link at most, and ${tier('write')}.`
     ),
     requestBody: jsonBody(
       z.object({
@@ -672,7 +672,7 @@ export const spacesOpDocs: Record<SpacesOp, MiddlewareHandler> = {
         linkId,
         verifier: bytes32('`b64u(SHA-256(linkToken))`'),
         scopes: scopeList(SPACES_LIMITS.scopesPerLink, 'The link’s streets.'),
-        expiresAt: epochMs('When it stops working: in the future and at most 24 hours (plus 5 minutes) away'),
+        expiresAt: epochMs('When it stops working: in the future and at most 30 days (plus 5 minutes) away'),
         epoch: epoch.meta({ description: 'Must be current.' }),
       })
     ),
@@ -702,6 +702,29 @@ export const spacesOpDocs: Record<SpacesOp, MiddlewareHandler> = {
         ...memberRefusals('write', { killSwitch: false }),
         bad_request: 'Malformed fields, or a space without a mode.',
         forbidden: 'Your member token is wrong, or the link is open and you’re neither its creator nor the owner.',
+      }),
+    },
+  }),
+  'link/expiry': describeOp({
+    summary: 'Change when a guest link stops working (scoped)',
+    description: paragraphs(
+      'Moves a live guest link’s `expiresAt`, sooner or later. Its creator’s or the owner’s to change. The link, its token and its guests stay as they are; `guest/sync` answers the new `expiresAt`.',
+      `${SCOPED_ONLY} Limits: 30 days a link at most from now, and ${tier('write')}.`
+    ),
+    requestBody: jsonBody(
+      z.object({
+        ...memberShape,
+        linkId,
+        expiresAt: epochMs('When it stops working: in the future and at most 30 days (plus 5 minutes) away'),
+      })
+    ),
+    responses: {
+      200: jsonResponse('Changed.', z.object({ ok: z.literal(true), seq })),
+      ...refusals({
+        ...memberRefusals('write'),
+        bad_request: 'Malformed fields, `expiresAt` out of range, or a space without a mode.',
+        forbidden: 'Your member token is wrong, or you’re neither the link’s creator nor the owner.',
+        not_found: 'No such space, or the link is unknown, ended or expired.',
       }),
     },
   }),
