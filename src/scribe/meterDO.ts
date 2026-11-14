@@ -85,6 +85,13 @@ export interface ResetUsageResult {
 
 type Row = Record<string, unknown>
 
+/**
+ * A `usage_window` row beside the three windows: `started_at` is the start of
+ * the account's welcome weekly window (its first), so that window is known
+ * for as long as it runs.
+ */
+const WELCOME_ROW = 'welcome'
+
 export const slotOf = (turnId: string, step: number) => `${turnId}:${step}`
 
 export class ScribeMeter extends DurableObject<Environment> {
@@ -333,15 +340,16 @@ export class ScribeMeter extends DurableObject<Environment> {
     const windows = applyCharge(this.#windows(), units, now, windowLengthsMs(limits))
     const sql = this.ctx.storage.sql
     if (units > 0) {
-      for (const id of WINDOW_IDS) {
+      const upsert = (id: string, startedAt: number | null, used: number) =>
         sql.exec(
           `INSERT INTO usage_window (id, started_at, used) VALUES (?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET started_at = excluded.started_at, used = excluded.used`,
           id,
-          windows[id].startedAt,
-          windows[id].used
+          startedAt,
+          used
         )
-      }
+      for (const id of WINDOW_IDS) upsert(id, windows[id].startedAt, windows[id].used)
+      if (windows.weekly.welcome) upsert(WELCOME_ROW, windows.weekly.startedAt, 0)
       sql.exec('INSERT INTO charge (at, units, kind) VALUES (?, ?, ?)', now, units, kind)
       this.#scheduleCleanup(now)
     }
@@ -361,7 +369,12 @@ export class ScribeMeter extends DurableObject<Environment> {
 
   #windows(): WindowStates {
     const windows = emptyWindows()
+    let welcomeStartedAt: number | null = null
     for (const row of this.#rows('SELECT id, started_at, used FROM usage_window')) {
+      if (row.id === WELCOME_ROW) {
+        welcomeStartedAt = row.started_at == null ? null : Number(row.started_at)
+        continue
+      }
       const id = row.id as UsageWindowId
       if (!WINDOW_IDS.includes(id)) continue
       windows[id] = {
@@ -369,6 +382,8 @@ export class ScribeMeter extends DurableObject<Environment> {
         used: Number(row.used),
       }
     }
+    if (welcomeStartedAt != null && windows.weekly.startedAt === welcomeStartedAt)
+      windows.weekly.welcome = true
     return windows
   }
 

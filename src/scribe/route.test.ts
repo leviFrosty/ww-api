@@ -362,14 +362,18 @@ describe('GET /scribe/v1/usage', () => {
     expect(reply.body).toMatchObject({ ok: false, code: 'unauthorized' })
   })
 
-  it('shows a free account its monthly window, starting nothing', async () => {
+  it('shows a free account its weekly window, starting nothing', async () => {
     const reply = await usageOf(await iosToken())
     expect(reply.status).toBe(200)
     expect(reply.body).toEqual({
       ok: true,
       plan: 'free',
       supporterCheckFailed: false,
-      windows: [{ id: 'monthly', percentUsed: 0, resetsAt: null, units: { used: 0, limit: 150_000 } }],
+      // Apps before 1.47.0 read the same week under `monthly`.
+      windows: [
+        { id: 'weekly', percentUsed: 0, resetsAt: null, units: { used: 0, limit: 150_000 } },
+        { id: 'monthly', percentUsed: 0, resetsAt: null, units: { used: 0, limit: 150_000 } },
+      ],
       limited: false,
       resetsAt: null,
       asOf: START,
@@ -387,8 +391,8 @@ describe('GET /scribe/v1/usage', () => {
     const reply = await usageOf(token)
     expect(reply.body.plan).toBe('supporter')
     expect(reply.body.windows.map((window: Event) => [window.id, window.units.limit])).toEqual([
-      ['session', 540_000],
-      ['weekly', 1_550_000],
+      ['session', 200_000],
+      ['weekly', 500_000],
     ])
   })
 
@@ -554,7 +558,7 @@ describe('POST /scribe/v1/step refusals', () => {
   })
 
   it('402 limit_reached with the usage snapshot, after turn grace lets the open turn finish', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1_000 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1_000, welcome: 1_000 } }))
     const token = await iosToken()
     const turn = newTurn()
     scripts.push(play({ type: 'tool-call', toolCallId: 'call_a', toolName: 'plans_list', input: {} }, ...ending('tool-calls', usage(5_000, 0, 40))))
@@ -569,10 +573,10 @@ describe('POST /scribe/v1/step refusals', () => {
     expect(refused.body).toMatchObject({
       ok: false,
       code: 'limit_reached',
-      retryAfter: 30 * 86_400,
-      usage: { plan: 'free', limited: true, resetsAt: START + 30 * DAY },
+      retryAfter: 7 * 86_400,
+      usage: { plan: 'free', limited: true, resetsAt: START + 7 * DAY },
     })
-    expect(refused.headers.get('retry-after')).toBe(String(30 * 86_400))
+    expect(refused.headers.get('retry-after')).toBe(String(7 * 86_400))
     expect((await usageOf(token)).body.limited).toBe(true)
   })
 
@@ -940,7 +944,7 @@ describe('POST /scribe/v1/step stream', () => {
   })
 
   it('never refuses a new Supporter because of a cached free plan', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1_000 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1_000, welcome: 1_000 } }))
     const token = await iosToken()
     // Free: the first step fills the month, the next is refused (and the plan cached).
     await runStep(token, firstStep(newTurn()))
@@ -959,7 +963,7 @@ describe('POST /scribe/v1/step stream', () => {
   })
 
   it('meters a dev session as unlimited', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1, welcome: 1 } }))
     const session = await devSession()
     await runStep(session.accessToken, firstStep(newTurn()))
     const { terminal } = await runStep(session.accessToken, firstStep(newTurn()))
@@ -967,7 +971,7 @@ describe('POST /scribe/v1/step stream', () => {
   })
 
   it('402 limit_reached for a dev session that keeps real limits', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1, welcome: 1 } }))
     await h.kv.put('scribe:dev-session', JSON.stringify({ limits: 'real' }))
     const session = await devSession()
     await runStep(session.accessToken, firstStep(newTurn()))
@@ -1008,7 +1012,10 @@ describe('POST /scribe/v1/transcribe', () => {
       ok: true,
       text: 'Oct 12 2 hrs',
       truncated: false,
-      usage: { windows: [expect.objectContaining({ units: { used: 1_650, limit: 150_000 } })] },
+      usage: { windows: [
+          expect.objectContaining({ id: 'weekly', units: { used: 1_650, limit: 150_000 } }),
+          expect.objectContaining({ id: 'monthly' }),
+        ] },
     })
     expect(mocks.transcribePage.mock.calls[0][0]).toMatchObject({
       target: { model: 'openai/gpt-6-luna', providers: ['azure'] },
@@ -1036,7 +1043,7 @@ describe('POST /scribe/v1/transcribe', () => {
   })
 
   it('402 limit_reached when the meter is full', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1_000 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1_000, welcome: 1_000 } }))
     const token = await iosToken()
     expect((await transcribe(token, page())).status).toBe(200)
     const refused = await transcribe(token, page())
@@ -1098,7 +1105,10 @@ describe('POST /scribe/v1/territory-notes', () => {
       ranges: [{ line: 2, street: 'Oak Street', from: 16, to: 20, side: 'even', outcome: 'doNotCall' }],
       unread: [],
       usage: expect.objectContaining({
-        windows: [expect.objectContaining({ units: { used: 1_300, limit: 150_000 } })],
+        windows: [
+          expect.objectContaining({ id: 'weekly', units: { used: 1_300, limit: 150_000 } }),
+          expect.objectContaining({ id: 'monthly' }),
+        ],
       }),
     })
     expect(mocks.readTerritoryNotes.mock.calls[0][0]).toMatchObject({
@@ -1163,7 +1173,7 @@ describe('POST /scribe/v1/territory-notes', () => {
   })
 
   it('402 limit_reached when the meter is full', async () => {
-    await h.kv.put('scribe:limits', JSON.stringify({ free: { monthly: 1_000 } }))
+    await h.kv.put('scribe:limits', JSON.stringify({ free: { weekly: 1_000, welcome: 1_000 } }))
     const token = await iosToken()
     expect((await readNotes(token, notesBody())).status).toBe(200)
     const refused = await readNotes(token, notesBody())
@@ -1178,7 +1188,10 @@ describe('POST /scribe/v1/territory-notes', () => {
     expect(reply.status).toBe(502)
     expect(reply.body).toMatchObject({
       code: 'model_error',
-      usage: { windows: [expect.objectContaining({ units: { used: 1_300, limit: 150_000 } })] },
+      usage: { windows: [
+          expect.objectContaining({ id: 'weekly', units: { used: 1_300, limit: 150_000 } }),
+          expect.objectContaining({ id: 'monthly' }),
+        ] },
     })
   })
 

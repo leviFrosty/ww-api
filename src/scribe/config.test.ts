@@ -28,7 +28,7 @@ const kvOf = (entries: Record<string, string>) => ({
 
 describe('limitEnvName', () => {
   it('snake-cases the field path under SCRIBE_', () => {
-    expect(limitEnvName(['free', 'monthly'])).toBe('SCRIBE_FREE_MONTHLY')
+    expect(limitEnvName(['free', 'weekly'])).toBe('SCRIBE_FREE_WEEKLY')
     expect(limitEnvName(['windowLengths', 'sessionHours'])).toBe(
       'SCRIBE_WINDOW_LENGTHS_SESSION_HOURS'
     )
@@ -47,9 +47,9 @@ describe('resolveLimits', () => {
   it('takes each field from KV, then the env var, then the default', () => {
     const limits = resolveLimits(
       env({ SCRIBE_FREE_MONTHLY: '1000', SCRIBE_SUPPORTER_SESSION: '2000' }),
-      JSON.stringify({ free: { monthly: 500 } })
+      JSON.stringify({ free: { weekly: 500 } })
     )
-    expect(limits.free.monthly).toBe(500)
+    expect(limits.free.weekly).toBe(500)
     expect(limits.supporter.session).toBe(2000)
     expect(limits.supporter.weekly).toBe(DEFAULT_SCRIBE_LIMITS.supporter.weekly)
   })
@@ -60,14 +60,14 @@ describe('resolveLimits', () => {
       JSON.stringify({
         graceUnits: 'lots',
         activeStepCap: 0,
-        free: { monthly: -2 },
+        free: { weekly: -2 },
         weights: { output: 4, cacheWrite: -1 },
         windowLengths: { sessionHours: 0.01 },
       })
     )
     expect(limits.graceUnits).toBe(10)
     expect(limits.activeStepCap).toBe(DEFAULT_SCRIBE_LIMITS.activeStepCap)
-    expect(limits.free.monthly).toBe(DEFAULT_SCRIBE_LIMITS.free.monthly)
+    expect(limits.free.weekly).toBe(DEFAULT_SCRIBE_LIMITS.free.weekly)
     expect(limits.weights).toEqual({ input: 1, cachedInput: 0.1, cacheWrite: 1.25, output: 4 })
     // Fractional window lengths are allowed, for short dev windows.
     expect(limits.windowLengths.sessionHours).toBe(0.01)
@@ -76,9 +76,9 @@ describe('resolveLimits', () => {
   it('accepts -1 (unlimited) for allowances only', () => {
     const limits = resolveLimits(
       env(),
-      JSON.stringify({ free: { monthly: -1 }, maxTools: -1, graceUnits: -1 })
+      JSON.stringify({ free: { weekly: -1 }, maxTools: -1, graceUnits: -1 })
     )
-    expect(limits.free.monthly).toBe(-1)
+    expect(limits.free.weekly).toBe(-1)
     expect(limits.maxTools).toBe(DEFAULT_SCRIBE_LIMITS.maxTools)
     expect(limits.graceUnits).toBe(DEFAULT_SCRIBE_LIMITS.graceUnits)
   })
@@ -89,15 +89,15 @@ describe('resolveLimits', () => {
   })
 
   it('never mutates the defaults', () => {
-    resolveLimits(env(), JSON.stringify({ free: { monthly: 1 } }))
-    expect(DEFAULT_SCRIBE_LIMITS.free.monthly).toBe(150_000)
+    resolveLimits(env(), JSON.stringify({ free: { weekly: 1 } }))
+    expect(DEFAULT_SCRIBE_LIMITS.free.weekly).toBe(25_000)
   })
 })
 
 describe('withDevBypass', () => {
   it('makes every usage limit unlimited and keeps request caps', () => {
     const limits = withDevBypass(DEFAULT_SCRIBE_LIMITS, true)
-    expect(limits.free.monthly).toBe(-1)
+    expect(limits.free).toEqual({ weekly: -1, welcome: -1, graceUnits: 15_000 })
     expect(limits.supporter).toEqual({ session: -1, weekly: -1 })
     expect(limits.transcribePagesPerDay).toEqual({ free: -1, supporter: -1 })
     expect(limits.maxStepsPerTurn).toBe(DEFAULT_SCRIBE_LIMITS.maxStepsPerTurn)
@@ -283,14 +283,14 @@ describe('resolveScribeConfig', () => {
         'scribe:disabled-tools': 'visits_delete',
         'scribe:protocol-min': '1',
         'scribe:min-version': '1.40.0',
-        'scribe:limits': '{"free":{"monthly":10}}',
+        'scribe:limits': '{"free":{"weekly":10}}',
         'scribe:model': '{"reasoningEffort":"medium"}',
       })
     )
     expect(config.enabled).toBe(false)
     expect(config.disabledTools).toEqual(['visits_delete'])
     expect(config.minAppVersion).toBe('1.40.0')
-    expect(config.limits.free.monthly).toBe(10)
+    expect(config.limits.free.weekly).toBe(10)
     expect(config.model.reasoningEffort).toBe('medium')
   })
 

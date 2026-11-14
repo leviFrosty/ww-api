@@ -24,6 +24,11 @@ const limits = (overrides: Partial<ScribeLimits> = {}): ScribeLimits => ({
   ...overrides,
 })
 
+/** A free plan with one limit for every week, the first included. */
+const freeOf = (weekly: number) => ({
+  free: { ...DEFAULT_SCRIBE_LIMITS.free, weekly, welcome: weekly },
+})
+
 const charged = (units: number, at = NOW, windows: WindowStates = emptyWindows()) =>
   applyCharge(windows, units, at, LENGTHS)
 
@@ -150,7 +155,7 @@ describe('windows', () => {
     const windows = charged(100)
     expect(windows).toEqual({
       session: { startedAt: NOW, used: 100 },
-      weekly: { startedAt: NOW, used: 100 },
+      weekly: { startedAt: NOW, used: 100, welcome: true },
       monthly: { startedAt: NOW, used: 100 },
     })
     const later = charged(50, NOW + HOUR, windows)
@@ -161,7 +166,14 @@ describe('windows', () => {
     const windows = charged(100)
     const after = charged(30, NOW + 5 * HOUR, windows)
     expect(after.session).toEqual({ startedAt: NOW + 5 * HOUR, used: 30 })
-    expect(after.weekly).toEqual({ startedAt: NOW, used: 130 })
+    expect(after.weekly).toEqual({ startedAt: NOW, used: 130, welcome: true })
+  })
+
+  it('marks only an account’s first weekly window as its welcome window', () => {
+    const first = charged(100)
+    expect(first.weekly.welcome).toBe(true)
+    const second = charged(40, NOW + 7 * DAY, first)
+    expect(second.weekly).toEqual({ startedAt: NOW + 7 * DAY, used: 40 })
   })
 
   it('starts nothing for a zero charge', () => {
@@ -171,7 +183,7 @@ describe('windows', () => {
 
   it('shows the plan’s windows, shortest first', () => {
     expect(planWindows('supporter')).toEqual(['session', 'weekly'])
-    expect(planWindows('free')).toEqual(['monthly'])
+    expect(planWindows('free')).toEqual(['weekly'])
   })
 
   it('switches the windows shown when the plan changes, keeping the totals', () => {
@@ -190,7 +202,10 @@ describe('windows', () => {
       limits: limits(),
       now: NOW,
     })
-    expect(asFree.windows.map((w) => [w.id, w.units.used])).toEqual([['monthly', 1_000]])
+    expect(asFree.windows.map((w) => [w.id, w.units.used])).toEqual([
+      ['weekly', 1_000],
+      ['monthly', 1_000],
+    ])
     expect(asSupporter.windows.map((w) => [w.id, w.units.used])).toEqual([
       ['session', 1_000],
       ['weekly', 1_000],
@@ -214,33 +229,72 @@ describe('percentUsed', () => {
 
 describe('usageSnapshot', () => {
   it('reports a full window as limited until it resets', () => {
-    const windows = charged(150_000)
+    const windows = charged(25_000, NOW + 7 * DAY, charged(10))
     const snapshot = usageSnapshot({
       plan: 'free',
       supporterCheckFailed: true,
       windows,
       limits: limits(),
-      now: NOW + DAY,
+      now: NOW + 8 * DAY,
     })
+    const week = {
+      percentUsed: 100,
+      resetsAt: NOW + 14 * DAY,
+      units: { used: 25_000, limit: 25_000 },
+    }
     expect(snapshot).toEqual({
       plan: 'free',
       supporterCheckFailed: true,
+      // Apps before 1.47.0 read the same week under `monthly`.
       windows: [
-        {
-          id: 'monthly',
-          percentUsed: 100,
-          resetsAt: NOW + 30 * DAY,
-          units: { used: 150_000, limit: 150_000 },
-        },
+        { id: 'weekly', ...week },
+        { id: 'monthly', ...week },
       ],
       limited: true,
-      resetsAt: NOW + 30 * DAY,
-      asOf: NOW + DAY,
+      resetsAt: NOW + 14 * DAY,
+      asOf: NOW + 8 * DAY,
     })
   })
 
+  it('gives a free account the welcome limit in its first week only', () => {
+    const free = (windows: WindowStates, now: number) =>
+      usageSnapshot({ plan: 'free', supporterCheckFailed: false, windows, limits: limits(), now })
+    expect(free(emptyWindows(), NOW).windows[0].units).toEqual({ used: 0, limit: 150_000 })
+    const first = charged(30_000)
+    expect(free(first, NOW).windows[0]).toMatchObject({
+      percentUsed: 20,
+      units: { used: 30_000, limit: 150_000 },
+    })
+    expect(free(first, NOW).limited).toBe(false)
+    const second = charged(30_000, NOW + 7 * DAY, first)
+    expect(free(second, NOW + 7 * DAY).windows[0].units).toEqual({ used: 30_000, limit: 25_000 })
+    expect(free(second, NOW + 7 * DAY).limited).toBe(true)
+  })
+
+  it('never gives a Supporter the welcome limit', () => {
+    const snapshot = usageSnapshot({
+      plan: 'supporter',
+      supporterCheckFailed: false,
+      windows: charged(10),
+      limits: limits(),
+      now: NOW,
+    })
+    expect(snapshot.windows.map((w) => w.units.limit)).toEqual([200_000, 500_000])
+  })
+
+  it('keeps the weekly limit when the welcome limit is smaller', () => {
+    const snapshot = usageSnapshot({
+      plan: 'free',
+      supporterCheckFailed: false,
+      windows: charged(10),
+      limits: limits({ free: { weekly: 25_000, welcome: 0, graceUnits: 0 } }),
+      now: NOW,
+    })
+    expect(snapshot.windows[0].units.limit).toBe(25_000)
+  })
+
   it('takes the latest reset among full windows', () => {
-    const windows = charged(1_550_000)
+    const windows = charged(500_000)
     const snapshot = usageSnapshot({
       plan: 'supporter',
       supporterCheckFailed: false,
@@ -264,7 +318,7 @@ describe('usageSnapshot', () => {
       id: 'session',
       percentUsed: 0,
       resetsAt: null,
-      units: { used: 0, limit: 540_000 },
+      units: { used: 0, limit: 200_000 },
     })
     expect(snapshot.limited).toBe(false)
     expect(snapshot.resetsAt).toBeNull()
@@ -275,7 +329,7 @@ describe('usageSnapshot', () => {
       plan: 'free',
       supporterCheckFailed: false,
       windows: charged(10_000_000),
-      limits: limits({ free: { monthly: -1 } }),
+      limits: limits(freeOf(-1)),
       now: NOW,
     })
     expect(snapshot.limited).toBe(false)
@@ -284,7 +338,7 @@ describe('usageSnapshot', () => {
 })
 
 describe('decideAdmission', () => {
-  const capped = limits({ free: { monthly: 1_000 } })
+  const capped = limits(freeOf(1_000))
   const admit = (
     windows: WindowStates,
     fields: { step?: number; turnOpenedAt?: number | null; now?: number } = {}
@@ -316,13 +370,27 @@ describe('decideAdmission', () => {
   })
 
   it('refuses past graceUnits', () => {
-    expect(admit(charged(1_000 + 50_000), { step: 2, turnOpenedAt: NOW })).toEqual({
+    expect(admit(charged(1_000 + 15_000), { step: 2, turnOpenedAt: NOW })).toEqual({
       admitted: false,
     })
-    expect(admit(charged(1_000 + 49_999), { step: 2, turnOpenedAt: NOW })).toEqual({
+    expect(admit(charged(1_000 + 14_999), { step: 2, turnOpenedAt: NOW })).toEqual({
       admitted: true,
       grace: true,
     })
+  })
+
+  it('gives a Supporter the larger turn grace', () => {
+    const supporter = (used: number) =>
+      decideAdmission({
+        plan: 'supporter',
+        windows: charged(used),
+        limits: limits(),
+        now: NOW,
+        step: 1,
+        turnOpenedAt: NOW,
+      })
+    expect(supporter(200_000 + 49_999)).toEqual({ admitted: true, grace: true })
+    expect(supporter(200_000 + 50_000)).toEqual({ admitted: false })
   })
 
   it('refuses after turnGraceMinutes', () => {
@@ -333,7 +401,7 @@ describe('decideAdmission', () => {
   })
 
   it('admits again once the full window has ended', () => {
-    expect(admit(charged(5_000), { now: NOW + 30 * DAY })).toEqual({
+    expect(admit(charged(5_000), { now: NOW + 7 * DAY })).toEqual({
       admitted: true,
       grace: false,
     })
@@ -342,7 +410,7 @@ describe('decideAdmission', () => {
   it('needs every supporter window under its limit', () => {
     const decision = decideAdmission({
       plan: 'supporter',
-      windows: { ...charged(10), weekly: { startedAt: NOW, used: 1_550_000 } },
+      windows: { ...charged(10), weekly: { startedAt: NOW, used: 500_000 } },
       limits: limits(),
       now: NOW,
       step: 0,
@@ -354,7 +422,7 @@ describe('decideAdmission', () => {
   it('charges an admitted overshoot in full', () => {
     const windows = charged(999)
     expect(admit(windows).admitted).toBe(true)
-    expect(charged(40_000, NOW, windows).monthly.used).toBe(40_999)
+    expect(charged(40_000, NOW, windows).weekly.used).toBe(40_999)
   })
 })
 
