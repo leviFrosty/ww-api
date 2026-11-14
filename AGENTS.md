@@ -298,7 +298,7 @@ taking the others with it. A failed KV read counts as absent (fail open).
 | `scribe:dev-session` | JSON `{"limits":"real","plan":"supporter"}`, either field | Dev sessions only (no effect in prod, which has none): keep the real limits instead of unlimited, and meter as that plan. For verifying the limit card and Supporter windows |
 
 Environment variables are `SCRIBE_` plus the field path in snake case:
-`SCRIBE_FREE_MONTHLY`, `SCRIBE_SUPPORTER_SESSION`, `SCRIBE_SUPPORTER_WEEKLY`,
+`SCRIBE_FREE_WEEKLY`, `SCRIBE_FREE_WELCOME`, `SCRIBE_SUPPORTER_SESSION`, `SCRIBE_SUPPORTER_WEEKLY`,
 `SCRIBE_WINDOW_LENGTHS_SESSION_HOURS`, `SCRIBE_GRACE_UNITS`,
 `SCRIBE_MAX_INPUT_TOKENS`, `SCRIBE_STEP_TIMEOUT_MS`,
 `SCRIBE_TRANSCRIBE_PAGES_PER_DAY_FREE`, and so on, plus `SCRIBE_MODEL`,
@@ -311,8 +311,9 @@ Environment variables are `SCRIBE_` plus the field path in snake case:
 wrangler kv key put --binding NOTES_KV scribe:enabled off
 # Withdraw a tool the app defines
 wrangler kv key put --binding NOTES_KV scribe:disabled-tools '["visits_log"]'
-# Change limits (fields not named keep their var or default)
-wrangler kv key put --binding NOTES_KV scribe:limits '{"free":{"monthly":120000}}'
+# Change limits (fields not named keep their var or default). `free.welcome`
+# is a free account's limit in its first week; it never goes below `free.weekly`.
+wrangler kv key put --binding NOTES_KV scribe:limits '{"free":{"weekly":30000}}'
 # Less reasoning (faster and cheaper, but drops actions more often; see below)
 wrangler kv key put --binding NOTES_KV scribe:model '{"reasoningEffort":"low"}'
 # Spread prompt-cache traffic over 4 keys (see Model notes before turning it on)
@@ -383,11 +384,11 @@ scribe:dev-session '{"limits":"real","plan":"supporter"}'` plus a small
 - Limits are sized from these measurements at medium reasoning and a 50 %
   cache hit rate (real sessions pause between turns, so the prefix cache often
   goes cold), with cache writes at 1.25×: a 7-turn conversation ≈ 54.6k units
-  and a quick edit ≈ 7.2k, so the free 150k month fits two longer
-  conversations and three quick edits (130.8k) with headroom. Supporter: 540k
-  per 5 hours (≈ 9 longer conversations), 1.55M per week (≈ 28). Metering
-  writes raised every limit by ≈ 1.19×, which keeps each one's real cost
-  where it was.
+  and a quick edit ≈ 7.2k. The limits were resized in November 2026 from three
+  weeks of production usage (witness-work `docs/scribe-ai-protocol.md` →
+  Measured usage): free 25k per week (three or four quick edits), 150k in an
+  account's first week; Supporter 200k per 5 hours and 500k per week, about
+  three times the heaviest use seen.
 - Steps and pages read the account's plan through a 30-second per-isolate
   cache (`src/scribe/plan.ts`), started alongside the body read. `GET
   /scribe/v1/usage` always asks afresh, and a refusal never rests on a cached

@@ -225,7 +225,7 @@ describe.skipIf(!PAID)('Scribe AI on the real model', { timeout: 900_000 }, () =
   it('caps a fresh free account: grace finishes the turn, the next turn is 402', async () => {
     const fresh = await openSession()
     const freshToken = await iosToken(fresh)
-    localKv('put', 'scribe:limits', JSON.stringify({ free: { monthly: 500 } }))
+    localKv('put', 'scribe:limits', JSON.stringify({ free: { weekly: 500, welcome: 500 } }))
     try {
       const convo = new Conversation(BASE_URL, headersFor(freshToken), { contextSeed: seed() })
       // Needs a read: step 0 is admitted under the cap and pushes past it;
@@ -257,7 +257,7 @@ describe.skipIf(!PAID)('Scribe AI on the real model', { timeout: 900_000 }, () =
       expect(second[0].code).toBe('limit_reached')
       expect(refused.error).toMatchObject({
         code: 'limit_reached',
-        usage: { plan: 'free', limited: true, windows: [{ id: 'monthly', percentUsed: 100 }] },
+        usage: { plan: 'free', limited: true, windows: [{ id: 'weekly', percentUsed: 100 }, { id: 'monthly', percentUsed: 100 }] },
       })
       expect(usage.limited).toBe(true)
     } finally {

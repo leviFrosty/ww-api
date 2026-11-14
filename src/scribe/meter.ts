@@ -18,7 +18,7 @@ export const WINDOW_IDS: readonly UsageWindowId[] = ['session', 'weekly', 'month
 
 /** The windows that limit and are shown for a plan, shortest first. */
 export const planWindows = (plan: ScribePlan): UsageWindowId[] =>
-  plan === 'supporter' ? ['session', 'weekly'] : ['monthly']
+  plan === 'supporter' ? ['session', 'weekly'] : ['weekly']
 
 /** One window's stored state. */
 export interface WindowState {
@@ -26,6 +26,11 @@ export interface WindowState {
   startedAt: number | null
   /** Units charged since `startedAt`. */
   used: number
+  /**
+   * The weekly window only: this is the account's first, so a free account
+   * gets `free.welcome` in it.
+   */
+  welcome?: boolean
 }
 
 export type WindowStates = Record<UsageWindowId, WindowState>
@@ -98,22 +103,39 @@ export const isRunning = (state: WindowState, length: number, now: number): bool
 export const usedNow = (state: WindowState, length: number, now: number): number =>
   isRunning(state, length, now) ? state.used : 0
 
-/** The limit of one window under a plan's limits; -1 is unlimited. */
-export const windowLimit = (limits: ScribeLimits, id: UsageWindowId): number => {
-  switch (id) {
-    case 'session':
-      return limits.supporter.session
-    case 'weekly':
-      return limits.supporter.weekly
-    case 'monthly':
-      return limits.free.monthly
-  }
+/**
+ * A free account's weekly limit: `welcome` in its first window (and before
+ * it has started one), when larger.
+ */
+const freeWeeklyLimit = (limits: ScribeLimits, state: WindowState): number => {
+  const { weekly, welcome } = limits.free
+  if (!state.welcome && state.startedAt != null) return weekly
+  return weekly === -1 || welcome === -1 ? -1 : Math.max(weekly, welcome)
 }
 
 /**
+ * The limit of one of a plan's windows (`planWindows`), given the window's
+ * state; -1 is unlimited.
+ */
+export const windowLimit = (
+  limits: ScribeLimits,
+  plan: ScribePlan,
+  id: UsageWindowId,
+  state: WindowState
+): number => {
+  if (plan === 'free') return freeWeeklyLimit(limits, state)
+  return id === 'session' ? limits.supporter.session : limits.supporter.weekly
+}
+
+/** The turn grace a plan gets past its limits. */
+export const planGraceUnits = (limits: ScribeLimits, plan: ScribePlan): number =>
+  plan === 'free' ? limits.free.graceUnits : limits.graceUnits
+
+/**
  * Charges every window, starting any that isn't running at `now`. Every
- * charge accrues to all three; the plan only decides which ones limit. A
- * charge of 0 units starts nothing.
+ * charge accrues to all three; the plan only decides which ones limit (the
+ * monthly window limits no plan now, and is kept for the record). A charge of
+ * 0 units starts nothing.
  */
 export const applyCharge = (
   windows: WindowStates,
@@ -126,9 +148,11 @@ export const applyCharge = (
   for (const id of WINDOW_IDS) {
     const state = windows[id]
     next[id] = isRunning(state, lengths[id], now)
-      ? { startedAt: state.startedAt, used: state.used + units }
+      ? { ...state, used: state.used + units }
       : { startedAt: now, used: units }
   }
+  // The first weekly window an account ever starts is its welcome window.
+  if (windows.weekly.startedAt == null) next.weekly.welcome = true
   return next
 }
 
@@ -165,7 +189,7 @@ export const usageSnapshot = ({
     const state = windows[id]
     const running = isRunning(state, lengths[id], now)
     const used = running ? state.used : 0
-    const limit = windowLimit(limits, id)
+    const limit = windowLimit(limits, plan, id, state)
     const windowResetsAt = running ? state.startedAt! + lengths[id] : null
     if (isFull(used, limit)) {
       limited = true
@@ -179,6 +203,10 @@ export const usageSnapshot = ({
       units: { used, limit },
     }
   })
+  // Apps before 1.47.0 only read a free account's `monthly` window, so it
+  // repeats the weekly one for them. Drop it once those apps are unsupported.
+  if (plan === 'free')
+    shown.push(...shown.map((window) => ({ ...window, id: 'monthly' as const })))
   return {
     plan,
     supporterCheckFailed,
@@ -209,7 +237,7 @@ export type AdmissionDecision =
  * Meter + turn grace (protocol: Enforcement). Admit when every window of the
  * plan has `used < limit`; a step > 0 of a turn admitted at step 0 within
  * `turnGraceMinutes` is also admitted while every window has
- * `used < limit + graceUnits`. An admitted step is charged in full, whatever
+ * `used < limit + graceUnits` (`free.graceUnits` for a free account). An admitted step is charged in full, whatever
  * it overshoots.
  */
 export const decideAdmission = ({
@@ -223,7 +251,7 @@ export const decideAdmission = ({
   const lengths = windowLengthsMs(limits)
   const usage = planWindows(plan).map((id) => ({
     used: usedNow(windows[id], lengths[id], now),
-    limit: windowLimit(limits, id),
+    limit: windowLimit(limits, plan, id, windows[id]),
   }))
   const under = (slack: number) =>
     usage.every(({ used, limit }) => limit === -1 || used < limit + slack)
@@ -232,7 +260,7 @@ export const decideAdmission = ({
     step > 0 &&
     turnOpenedAt != null &&
     now - turnOpenedAt <= limits.turnGraceMinutes * 60_000
-  if (inGrace && under(limits.graceUnits)) return { admitted: true, grace: true }
+  if (inGrace && under(planGraceUnits(limits, plan))) return { admitted: true, grace: true }
   return { admitted: false }
 }
 

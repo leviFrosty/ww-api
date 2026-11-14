@@ -24,7 +24,12 @@ export type ReasoningEffort =
   | null
 
 export interface ScribeLimits {
-  free: { monthly: number }
+  /**
+   * `weekly` limits a free account. `welcome` replaces it in the account's
+   * first weekly window, so a first import isn't cut short. `graceUnits` is
+   * the free plan's turn grace.
+   */
+  free: { weekly: number; welcome: number; graceUnits: number }
   supporter: { session: number; weekly: number }
   windowLengths: { sessionHours: number; weeklyDays: number; monthlyDays: number }
   weights: { input: number; cachedInput: number; cacheWrite: number; output: number }
@@ -47,8 +52,8 @@ export interface ScribeLimits {
 
 /** The protocol's defaults (`docs/scribe-ai-protocol.md` → Configuration). */
 export const DEFAULT_SCRIBE_LIMITS: ScribeLimits = {
-  free: { monthly: 150_000 },
-  supporter: { session: 540_000, weekly: 1_550_000 },
+  free: { weekly: 25_000, welcome: 150_000, graceUnits: 15_000 },
+  supporter: { session: 200_000, weekly: 500_000 },
   windowLengths: { sessionHours: 5, weeklyDays: 7, monthlyDays: 30 },
   weights: { input: 1, cachedInput: 0.1, cacheWrite: 1.25, output: 5 },
   graceUnits: 50_000,
@@ -76,7 +81,9 @@ export const DEFAULT_SCRIBE_LIMITS: ScribeLimits = {
 type FieldKind = 'allowance' | 'count' | 'cap' | 'length' | 'weight'
 
 const LIMIT_FIELDS: readonly (readonly [readonly string[], FieldKind])[] = [
-  [['free', 'monthly'], 'allowance'],
+  [['free', 'weekly'], 'allowance'],
+  [['free', 'welcome'], 'allowance'],
+  [['free', 'graceUnits'], 'count'],
   [['supporter', 'session'], 'allowance'],
   [['supporter', 'weekly'], 'allowance'],
   [['windowLengths', 'sessionHours'], 'length'],
@@ -185,7 +192,7 @@ export const withDevBypass = (limits: ScribeLimits, devBypass: boolean): ScribeL
   devBypass
     ? {
         ...limits,
-        free: { monthly: -1 },
+        free: { ...limits.free, weekly: -1, welcome: -1 },
         supporter: { session: -1, weekly: -1 },
         transcribePagesPerDay: { free: -1, supporter: -1 },
       }

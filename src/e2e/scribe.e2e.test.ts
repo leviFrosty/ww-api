@@ -136,7 +136,7 @@ describe.skipIf(!LOCAL)('on an account session', () => {
     const dev = await http('GET', '/scribe/v1/usage', { headers: bearer(session.accessToken) })
     expect(dev.status).toBe(200)
     expect(dev.body).toMatchObject({ ok: true, plan: 'free', limited: false })
-    expect(dev.body.windows[0]).toMatchObject({ id: 'monthly', units: { limit: -1 } })
+    expect(dev.body.windows[0]).toMatchObject({ id: 'weekly', units: { limit: -1 } })
     if (!ACCOUNT_TOKEN_SECRET) return
     const ios = await http('GET', '/scribe/v1/usage', {
       headers: bearer(await iosToken(session)),
@@ -202,7 +202,7 @@ describe.skipIf(!LOCAL)('on an account session', () => {
 
   it.skipIf(!ACCOUNT_TOKEN_SECRET)('402 limit_reached at a zero allowance, with the snapshot', async () => {
     restore = kvSnapshot()
-    localKv('put', 'scribe:limits', JSON.stringify({ free: { monthly: 0 } }))
+    localKv('put', 'scribe:limits', JSON.stringify({ free: { weekly: 0, welcome: 0 } }))
     const res = await step(await iosToken(session), body())
     expect(res.status).toBe(402)
     expect(res.body).toMatchObject({

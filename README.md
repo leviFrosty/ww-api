@@ -394,8 +394,9 @@ contract is the app repo's
   propose: nothing changes until the User taps Add in the app.
 - **Metering** is in units, `ceil(uncached input + 0.1 × cached input + 5 ×
   output)`, charged per step to a per-account `ScribeMeter` Durable Object.
-  Free accounts have a monthly window; Supporters a 5-hour session window and
-  a weekly window. A turn admitted at step 0 may finish over the limit within
+  Free accounts have a weekly window, with a larger limit in an account's
+  first week; Supporters a 5-hour session window and a weekly window. A turn
+  admitted at step 0 may finish over the limit within
   the turn grace. Admission also checks the step's idempotency key and the
   active-step cap.
 - **Model**: `openai/gpt-6-luna` on Azure through OpenRouter, ZDR-only

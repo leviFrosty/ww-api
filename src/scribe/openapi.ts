@@ -59,7 +59,8 @@ const usageSnapshotShape = {
     description: 'RevenueCat was unreachable while the account’s record was stale: metered as free.',
   }),
   windows: z.array(usageWindowSchema).meta({
-    description: 'The windows that limit this plan, shortest first: free → `monthly`; Supporter → `session`, `weekly`.',
+    description:
+      'The windows that limit this plan, shortest first: free → `weekly`; Supporter → `session`, `weekly`. A free account also gets `monthly`, a copy of its weekly window for apps before 1.47.0.',
   }),
   limited: z.boolean().meta({ description: 'A window is at or over its limit.' }),
   resetsAt: z.number().int().nullable().meta({

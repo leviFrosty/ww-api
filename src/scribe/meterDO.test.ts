@@ -40,6 +40,11 @@ const limits = (overrides: Partial<ScribeLimits> = {}): ScribeLimits => ({
   ...overrides,
 })
 
+/** A free plan with one limit for every week, the first included. */
+const freeOf = (weekly: number) => ({
+  free: { ...DEFAULT_SCRIBE_LIMITS.free, weekly, welcome: weekly },
+})
+
 const context = (
   fields: { now?: number; plan?: ScribePlan; limits?: ScribeLimits } = {}
 ) => ({
@@ -122,13 +127,14 @@ describe('windows', () => {
   it('charges every window on settle and answers the same snapshot as usage()', () => {
     admit(0)
     const snapshot = settle(0, 5_000)
+    const week = {
+      percentUsed: 3,
+      resetsAt: NOW + 7 * DAY,
+      units: { used: 5_000, limit: 150_000 },
+    }
     expect(snapshot.windows).toEqual([
-      {
-        id: 'monthly',
-        percentUsed: 3,
-        resetsAt: NOW + 30 * DAY,
-        units: { used: 5_000, limit: 150_000 },
-      },
+      { id: 'weekly', ...week },
+      { id: 'monthly', ...week },
     ])
     expect(meter.usage(context())).toEqual(snapshot)
     expect(meter.usage(context({ plan: 'supporter' })).windows.map((w) => w.units.used)).toEqual([
@@ -137,7 +143,7 @@ describe('windows', () => {
   })
 
   it('refuses with a snapshot once full, and lets an open turn finish within grace', () => {
-    const tight = limits({ free: { monthly: 1_000 } })
+    const tight = limits(freeOf(1_000))
     admit(0, { limits: tight })
     settle(0, 1_200, { limits: tight })
     const next = admit(1, { limits: tight })
@@ -147,11 +153,32 @@ describe('windows', () => {
     expect(refused).toMatchObject({ ok: false, code: 'limit_reached' })
     if (refused.ok || refused.code !== 'limit_reached') throw new Error('expected limit_reached')
     expect(refused.snapshot.limited).toBe(true)
-    expect(refused.snapshot.resetsAt).toBe(NOW + 30 * DAY)
+    expect(refused.snapshot.resetsAt).toBe(NOW + 7 * DAY)
+  })
+
+  it('gives a free account the welcome limit in its first week, then the weekly one', () => {
+    admit(0)
+    settle(0, 30_000)
+    // Past the weekly limit, inside the welcome one.
+    expect(meter.usage(context()).windows[0].units).toEqual({ used: 30_000, limit: 150_000 })
+    expect(admit(0, { turnId: 'T2' }).ok).toBe(true)
+    settle(0, 10, { turnId: 'T2' })
+
+    const nextWeek = NOW + 7 * DAY
+    expect(admit(0, { turnId: 'T3', now: nextWeek }).ok).toBe(true)
+    settle(0, 30_000, { turnId: 'T3', now: nextWeek })
+    expect(meter.usage(context({ now: nextWeek })).windows[0].units).toEqual({
+      used: 30_000,
+      limit: 25_000,
+    })
+    expect(admit(0, { turnId: 'T4', now: nextWeek })).toMatchObject({
+      ok: false,
+      code: 'limit_reached',
+    })
   })
 
   it('closes the grace after turnGraceMinutes', () => {
-    const tight = limits({ free: { monthly: 1_000 } })
+    const tight = limits(freeOf(1_000))
     admit(0, { limits: tight })
     settle(0, 1_200, { limits: tight })
     expect(
@@ -200,7 +227,7 @@ describe('retention', () => {
   })
 
   it('refuses a page when the meter is full', () => {
-    const tight = limits({ free: { monthly: 10 } })
+    const tight = limits(freeOf(10))
     meter.charge({ ...context({ limits: tight }), units: 10, kind: 'step' })
     expect(
       meter.admitTranscribe({ ...context({ limits: tight }), pageLimit: 40 })
@@ -208,7 +235,7 @@ describe('retention', () => {
   })
 
   it('admits a one-shot call on the windows alone, without counting a page', () => {
-    const tight = limits({ free: { monthly: 10 } })
+    const tight = limits(freeOf(10))
     expect(meter.admitCall(context({ limits: tight }))).toMatchObject({ ok: true })
     expect(rows('SELECT COUNT(*) AS n FROM page')).toEqual([{ n: 0 }])
     meter.charge({ ...context({ limits: tight }), units: 10, kind: 'territory_notes' })
