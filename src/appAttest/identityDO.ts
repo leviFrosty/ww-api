@@ -9,7 +9,6 @@ import {
   deleteKeyRecord,
   getKeyRecord,
   getUuidOwner,
-  listKeyRecordsForUuid,
   putKeyRecord,
   putUuidOwner,
   type DeviceKeyRecord,
@@ -421,11 +420,9 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       )
     }
 
-    // A full legacy scan is needed only for ownerless migration. Do it after a
-    // valid Apple attestation so malformed random-UUID binds cannot amplify KV.
-    const legacy = await this.#loadOrImportLegacyIdentity(request.uuid, {
-      scanForUuid: true,
-    })
+    // Read the legacy owner index only after a valid Apple attestation, so
+    // malformed random-UUID binds cannot amplify KV reads.
+    const legacy = await this.#loadOrImportLegacyIdentity(request.uuid)
     if (!(await this.#flushMirrorOutbox())) return mirrorUnavailable()
 
     const result = this.#completeOperation<V2RegistrationResponse>(
@@ -621,11 +618,8 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       )
     }
 
-    // A holder of one ownerless legacy key must not choose the winner when stale
-    // duplicate rows exist. Scan only after that key proves possession.
     const imported = await this.#loadOrImportLegacyIdentity(request.uuid, {
       presentedKeyId: request.keyId,
-      scanForUuid: true,
     })
     identity = imported.identity
     if (!(await this.#flushMirrorOutbox())) return mirrorUnavailable()
@@ -756,7 +750,6 @@ export class AppAttestIdentity extends DurableObject<Environment> {
 
     const imported = await this.#loadOrImportLegacyIdentity(request.uuid, {
       presentedKeyId: request.keyId,
-      scanForUuid: true,
     })
     identity = imported.identity
     if (!(await this.#flushMirrorOutbox())) return mirrorUnavailable()
@@ -849,9 +842,7 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       return fromCryptographyError(error, 'attestation')
     }
 
-    const legacy = await this.#loadOrImportLegacyIdentity(request.uuid, {
-      scanForUuid: true,
-    })
+    const legacy = await this.#loadOrImportLegacyIdentity(request.uuid)
     if (!(await this.#flushMirrorOutbox())) return mirrorUnavailable()
     if (legacy.identity && legacy.identity.keyId !== request.keyId) {
       return this.#inactiveKeyFailure()
@@ -956,7 +947,6 @@ export class AppAttestIdentity extends DurableObject<Environment> {
 
     const imported = await this.#loadOrImportLegacyIdentity(request.uuid, {
       presentedKeyId: request.keyId,
-      scanForUuid: true,
     })
     identity = imported.identity
     if (!(await this.#flushMirrorOutbox())) return mirrorUnavailable()
@@ -1219,7 +1209,6 @@ export class AppAttestIdentity extends DurableObject<Environment> {
     uuid: string,
     options: {
       presentedKeyId?: string
-      scanForUuid?: boolean
       deferOwnerlessImport?: boolean
     } = {}
   ): Promise<LegacyIdentity> {
@@ -1237,24 +1226,12 @@ export class AppAttestIdentity extends DurableObject<Environment> {
       if (!legacyRecord || legacyRecord.uuid !== uuid) {
         return { identity: null, owner }
       }
-    } else if (options.scanForUuid) {
-      // A missing reverse index does not mean the UUID is unclaimed: deployed
-      // writes could have committed key:<id> first. Scan every page before a
-      // fresh bind so a new key can never take over that ownerless identity.
-      const matches = await listKeyRecordsForUuid(
-        this.#environment.NOTES_KV,
-        uuid
-      )
-      if (matches.length > 1) {
-        throw new Error('ambiguous ownerless legacy App Attest identity')
-      }
-      if (matches.length === 1) {
-        legacyKeyId = matches[0].keyId
-        legacyRecord = matches[0].record
-      }
     } else if (options.presentedKeyId) {
-      // Assertion/enrollment already present the key id. This direct lookup
-      // avoids a global scan while still requiring the record's UUID pin.
+      // Assertion/enrollment present the key id: a direct lookup that still
+      // requires the record's UUID pin. Never list the legacy key space. Since
+      // the Durable Object cutover every identity mirrors its owner index with
+      // its key row, so a scan for a UUID with no owner finds nothing, and it
+      // reads every row: fresh binds took 15s to over 2 minutes.
       const candidate = await getKeyRecord(
         this.#environment.NOTES_KV,
         options.presentedKeyId
