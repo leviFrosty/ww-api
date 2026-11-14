@@ -1,3 +1,5 @@
+> **This repository has moved.** The API now lives in the WitnessWork repository at [`services/api`](https://github.com/leviFrosty/witness-work/tree/main/services/api). This copy is read-only and no longer deploys anything.
+
 # WW API
 
 A lightweight Cloudflare Workers api and proxy service for HERE API endpoints, iOS universal links, etc. with Sentry monitoring.
