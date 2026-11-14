@@ -8,8 +8,10 @@ import {
   parseRefreshToken,
   type AccountFields,
   type AccountKeyPayload,
+  type SessionCapability,
 } from './contracts'
 import { authenticateAccount, readPlainJson, type AccountAuth } from './auth'
+import { noteSessionsEnded, noteSessionsEndedSoon } from './sync'
 import { isSessionDevBypass, verifySessionAttestation } from './attestation'
 import {
   guarded,
@@ -105,6 +107,7 @@ const issueTokens = async (
     accountId: string
     platform: SessionPlatform
     keyEpoch: number
+    capabilities?: SessionCapability[]
     expiresAt: number
   },
   refreshToken: string
@@ -114,6 +117,7 @@ const issueTokens = async (
     sessionId: session.id,
     platform: session.platform,
     keyEpoch: session.keyEpoch,
+    capabilities: session.capabilities,
     sessionExpiresAt: session.expiresAt,
   })
   return { ...access, refreshToken, sessionExpiresAt: session.expiresAt }
@@ -245,8 +249,11 @@ export const opened = async (
   account: { id: string; status: AccountStatus },
   issued: IssuedSession,
   extras: Record<string, unknown> = {}
-) =>
-  c.json(
+) => {
+  // Opening may have ended sessions (a renewal's, or the oldest past the
+  // cap): the sync index checks its sockets' sessions again (ADR 0060 §6).
+  await noteSessionsEndedSoon(c, account.id)
+  return c.json(
     {
       ok: true,
       accountId: account.id,
@@ -259,6 +266,7 @@ export const opened = async (
     201,
     { Location: CURRENT_SESSION_PATH }
   )
+}
 
 const encoder = new TextEncoder()
 
@@ -414,6 +422,7 @@ const handleClose = guarded('session/close', async (c) => {
     auth.account.accountId,
     auth.account.sessionId
   )
+  await noteSessionsEnded(c.env, auth.account.accountId, [auth.account.sessionId])
   return c.json({ ok: true })
 })
 
@@ -481,6 +490,8 @@ const handleRevoke = guarded('session/revoke', async (c) => {
   })
   if (outcome === 'not_found') return buddiesErrorResponse('not_found')
   if (outcome === 'caller_ended') return buddiesErrorResponse('unauthorized')
+  // The id may be one a renewal replaced; the index checks the rest itself.
+  await noteSessionsEnded(c.env, auth.account.accountId, [body.sessionId])
   return c.json({ ok: true })
 })
 

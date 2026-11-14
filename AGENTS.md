@@ -1305,13 +1305,21 @@ other route.
   only a close (1006) to page script. So the web app mints a fresh ticket
   on every connect, never reuses one, and reconnects with backoff; when
   the mint itself answers 401, it refreshes its access token first.
-- **Forwarding**: the DO gets the internal headers it already trusts
-  (`x-ww-sync-account` and `x-ww-slot-id`; `x-buddies-session-account` and
+- **Forwarding, Cloud Sync**: the Worker tells the DO who the socket is for
+  in a call (`admitLive`: account, session, slot, the token's `kep` and
+  expiry, the ticket's hash), and the forwarded upgrade carries only the
+  one-use id that call answers with (`x-ww-sync-admission`, good for 30 s).
+  Nothing about the caller is in a forwarded header, because **Workers Logs
+  record every request header, a forwarded request's too**
+  (`$workers.event.request.headers.*`). Don't put an id in a header the
+  Worker sets.
+- **Forwarding, Buddies**: the DO gets the internal headers it already trusts
+  (`x-buddies-session-account` and
   `x-buddies-payload`, built from the ticket's inbox id) plus `tokenExp`
-  (epoch ms) in `x-ww-sync-expires-at` / `x-buddies-session-expires-at`,
+  (epoch ms) in `x-buddies-session-expires-at`,
   and the ticket's hash in `x-ww-live-ticket`. The Worker drops
   `Sec-WebSocket-Protocol` and `Authorization`, so the ticket never reaches
-  the DO, overwrites a client's `x-ww-slot-id` or `x-buddies-payload` with
+  the DO, overwrites a client's `x-buddies-payload` with
   the ticket's id, and drops a client's copy of the expiry and ticket
   headers on the native path.
 - **101**: carries `Sec-WebSocket-Protocol: ww.v1` (a browser fails the
@@ -1960,13 +1968,16 @@ iCloud and Google Drive; each device uses exactly one. Code in
 
 | Route | What |
 | --- | --- |
-| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt, photos }` |
-| `POST /accounts/v1/sync/put` | Bearer, live session; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`?, `x-ww-reseal`? → `{ ok, etag, size, updatedAt, seq }` |
-| `POST /accounts/v1/sync/list` | Bearer, `{}` → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
+| `GET /accounts/v1/sync` | Bearer; `{ ok, enabled, entitled, entitlement, supporter, supporterCheckFailed?, requestedAt, photos, changes }` |
+| `POST /accounts/v1/sync/put` | Bearer, live session; raw blob, `x-ww-slot-id`, `x-ww-sha256`, `Content-Length`, `If-Match`?, `x-ww-reseal`?, `x-ww-covers-sequence`? → `{ ok, etag, size, updatedAt, seq, floorSequence }` |
+| `POST /accounts/v1/sync/list` | Bearer, `{}`, `x-ww-sync-changes: 1`? → `{ ok, seq, slots: [{ slotId, etag, size, updatedAt, platform, live }] }` |
 | `POST /accounts/v1/sync/get` | Bearer, `{ slotId }` → the blob, `ETag`, `x-ww-updated-at` |
 | `POST /accounts/v1/sync/delete` | Bearer, live session; `{ slotId }` or `{}` (every slot) → `{ ok, seq }` |
 | `POST /accounts/v1/sync/request` | Bearer; `{ requested: true, payload, signature }` (self-signed, op `sync/request`) or `{ requested: false }` → `{ ok, requestedAt }` |
-| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed` |
+| `POST /accounts/v1/sync/changes/put` | Bearer; `{ slotId, changeId, blob }` → `{ ok, sequence, tailCount, tailBytes, snapshotReaders, changedAt }` |
+| `POST /accounts/v1/sync/changes/list` | Bearer; `{ slotId, afterSequence }` → `{ ok, sequence, slots: [{ slotId, etag, size, updatedAt, platform, floorSequence, changedAt }], changes: [{ sequence, slotId, changeId, keyEpoch, createdAt, blob }], more, snapshotReaders, requestedAt, photos }` |
+| `POST /accounts/v1/sync/changes/reseal` | Bearer, live session; `{ sequence, changeId, blob }` → `{ ok, sequence }` |
+| `GET /accounts/v1/sync/live` | Bearer WebSocket, `x-ww-slot-id` (browsers: [subprotocol](#browser-live-sockets)): `hello`, then `changed`; after the device sends `{ type: "sync", afterSequence }`, also `sync` and `change` |
 | `POST /accounts/v1/live/ticket` | Bearer `{ socket, id }` → `{ ticket, expiresAt }`: a browser's 30-second [live socket ticket](#browser-live-sockets) |
 | `POST /accounts/v1/sync/photos/put` | Bearer; raw blob, `x-ww-photo-name`, `x-ww-sha256`, `x-ww-photo-meta`, `Content-Length`, `x-ww-slot-id`? → `{ ok, name, size, sha256, createdAt, existed, usage }` |
 | `POST /accounts/v1/sync/photos/list` | Bearer, `{ cursor? }` → `{ ok, photos: [{ name, size, sha256, createdAt, meta }], cursor, usage }` |
@@ -1991,6 +2002,77 @@ iCloud and Google Drive; each device uses exactly one. Code in
   comes frees it after 2 minutes, and the daily alarm deletes any object no
   slot names. A delete (one slot or all) deletes the objects, then the rows,
   and tells every socket.
+- **Record changes** (witness-work ADR 0060): a slot's snapshot is its
+  **base**, and a device sends each edit as a small sealed **change**
+  (`sync/changes/put`), kept in the DO's `change` table under the account's
+  next `seq` until the device folds it into its base. The new routes call
+  that number `sequence`.
+  - **The write path is one DO call**: the token, the switches (edge-cached
+    KV), the body, then `putChange`. No D1 and no R2. Keep it that way: the
+    baseline that led to this design showed each D1 read adds about 250 ms
+    at p50 and over a second at p95. The entitlement needs no read because
+    the access token carries the session's capabilities (`cap`, set at open
+    and refresh; a token without it reads the session as before).
+  - **What replaces `requireLiveSession` there**: the DO keeps the account's
+    key epoch (`meta.key_epoch`: the rekey route tells it through
+    `closeForKeyChange({ keyEpoch })`, and it takes the highest `kep` on any
+    valid token) and the sessions that ended (`ended_session`, for 16
+    minutes: a token's life and the skew). A token from before a key change
+    is 401 `unauthorized` with `reason: "key_changed"`, an ended session's
+    is 401. **Every route that ends a session calls `noteSessionsEnded`**
+    (`src/accounts/sync.ts`): sign-out and revoke name the session; a
+    session open, which may end the oldest past the cap, names none, and
+    the DO then checks every socket's session against D1. A lost notice is
+    bounded at a token's 15 minutes, and a change only adds to a tail. Base
+    puts, deletes and re-seals keep `requireLiveSession`.
+  - **A change**: unpadded base64url in JSON, a whole number of 256-byte
+    blocks (the app pads, so the size doesn't say which kind of record
+    changed), at most 256 KiB. The slot needs a base (409 `no_slot`). The
+    same `changeId` again answers the first put's sequence.
+  - **Folding** (`sync/put` with `x-ww-covers-sequence: N`): the slot's
+    changes up to `N` are deleted and `N` becomes its `floor_sequence`. A
+    put without the header (every app from before changes) deletes the
+    whole tail and sets the floor to the put's own `seq`. A re-seal keeps
+    the tail and the floor. Only the device can fold: the server can't read
+    a change.
+  - **Catching up** (`sync/changes/list`, or `{ type: "sync",
+    afterSequence }` on the socket): every slot with its floor, and the
+    other slots' changes after the cursor, a page at a time (256 KiB of
+    sealed bytes or 500 changes, then `more`). A device reads a base only
+    when the floor is past its cursor. The answer carries `requestedAt` and
+    `photos`, so a launch needn't call `GET /sync`.
+  - **The socket carries changes** to a socket that asked for a catch-up,
+    never to another. Each socket is bound to its session (the Worker
+    forwards it in `x-ww-sync-session`, with the token's `kep` and expiry)
+    and closes with `4006 "session_ended"` when the session ends. It gets
+    changes only while its session was confirmed live in the last 15
+    minutes: the opening token counts until it expires, and after that the
+    DO reads D1 in the background (`#confirmLive`), never while a writer
+    waits, then sends `changed` so the device catches up.
+  - **Older apps** read and write only snapshots. A `sync/list` without
+    `x-ww-sync-changes: 1` notes the caller's session (`snapshot_reader`,
+    at most hourly), and `snapshotReaders` is true while any session was
+    noted in the last 14 days: devices then also write their base a few
+    seconds after a change. A session stops counting when it reads changes
+    (a catch-up, or a list with the header) or ends, so an account is done
+    with this as soon as its last device has updated.
+  - **Switch**: KV `sync:changes` (`true`/`on`; absent → `SYNC_CHANGES`:
+    dev `"true"`, prod `"false"`). Off: `sync/changes/*` and the socket's
+    catch-up answer `changes_disabled`, and devices publish whole
+    snapshots. `GET /sync` and `GET /app/v1/config` (`sync.changes`) say
+    it. The snapshot routes never depend on it.
+  - **Limits** (`SYNC_CHANGE_LIMITS`): 200 changes and 1 MiB a tail (409
+    `tail_full`: fold, then send again), 60 changes a slot a minute and
+    3,000 an account a rolling day (`change_rate`, 429 with `Retry-After`).
+    Put and re-seal count in the Buddies write edge tier, list in the read
+    tier.
+  - **Retention** counts a change as a write (`slot.changed_at`), and a
+    catch-up marks the caller's slot as seen at most daily
+    (`slot.seen_at`), which counts too. The Cloud Sync request counts a
+    change as "this phone has written". A slot's tail is deleted with it.
+  - **Re-sealing** (`sync/changes/reseal`): after a key change, one
+    change's bytes under the new key. Sequence, slot and time stay, and no
+    socket is told. Live session, 7 days, as `x-ww-reseal`.
 - **Switches** (KV in `NOTES_KV`, edge-cached 60 s): `sync:enabled`
   (`true`/`on`, absent → `SYNC_ENABLED`: dev `"true"`, prod `"false"`) and
   `sync:entitlement` (`supporter` makes it a Supporter benefit again, anything
@@ -2111,7 +2193,9 @@ iCloud and Google Drive; each device uses exactly one. Code in
 - **Suspended** accounts keep syncing (nothing reaches another person).
 - **Privacy**: ciphertext only; the server can't read a device name or any
   data. Never log or report slot ids, account ids, session ids, sizes,
-  bodies, or tokens. The socket carries only change notices.
+  bodies, or tokens. The socket carries change notices, and sealed changes
+  to a socket whose session is known live (ADR 0060). The change routes put
+  their ids in the JSON body, not in headers.
 
 ```bash
 # Turn Cloud Sync on (prod starts off; before the app release that defaults to it)
@@ -2126,6 +2210,11 @@ wrangler kv key delete --binding NOTES_KV sync:enabled
 wrangler kv key delete --binding NOTES_KV sync:entitlement
 # Add --env dev to each for the dev worker.
 node scripts/r2-lifecycle.mjs ww-account-sync --check   # read-only bucket check
+# Record changes on (prod starts off; after the app release that sends them),
+# off (devices publish whole snapshots), and back to the SYNC_CHANGES var
+wrangler kv key put --binding NOTES_KV sync:changes true
+wrangler kv key put --binding NOTES_KV sync:changes false
+wrangler kv key delete --binding NOTES_KV sync:changes
 # Photo puts off (reads and deletes keep working), and back to the var
 wrangler kv key put --binding NOTES_KV sync:photos off
 wrangler kv key delete --binding NOTES_KV sync:photos

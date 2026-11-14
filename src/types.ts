@@ -342,6 +342,13 @@ export interface Environment {
   SYNC_PHOTOS?: string;
 
   /**
+   * Record changes' switch fallback when KV `sync:changes` is absent
+   * (witness-work ADR 0060): `"true"` (or `"on"`) on, anything else (or
+   * unset) off.
+   */
+  SYNC_CHANGES?: string;
+
+  /**
    * An account's photo storage limit in bytes, when a positive integer; else
    * 2,000,000,000. For tests and trying the full state on a local or dev worker.
    */

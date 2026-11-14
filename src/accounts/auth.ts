@@ -39,6 +39,10 @@ export interface AccountAuth {
   accountId: string
   sessionId: string
   platform: SessionPlatform
+  /** The token's key epoch (`kep`); absent on a caller a live ticket names. */
+  keyEpoch?: number
+  /** The session's capabilities, on a token that carries them (`cap`). */
+  capabilities?: readonly string[]
 }
 
 export type AccountAuthError =
@@ -186,6 +190,8 @@ export const authenticateAccount = async (
     accountId: claims.accountId,
     sessionId: claims.sessionId,
     platform: claims.platform,
+    keyEpoch: claims.keyEpoch,
+    ...(claims.capabilities ? { capabilities: claims.capabilities } : {}),
   }
   if (options.requireLiveSession) {
     if (!c.env.ACCOUNTS_DB) return refuse('disabled')

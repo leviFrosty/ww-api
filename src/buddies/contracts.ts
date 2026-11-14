@@ -259,8 +259,22 @@ export const BUDDIES_ERROR_STATUS = {
    * `Retry-After`: only the User freeing space fixes it.
    */
   storage_full: 429,
-  /** A Cloud Sync `photos/put` on an account with no slot. */
+  /**
+   * A Cloud Sync `photos/put` on an account with no slot, or a
+   * `sync/changes/put` for a slot with no base (the device puts its base
+   * first).
+   */
   no_slot: 409,
+  /**
+   * The record changes switch is off (`sync:changes`, witness-work ADR
+   * 0060): the device publishes whole snapshots.
+   */
+  changes_disabled: 503,
+  /**
+   * A `sync/changes/put` for a slot whose tail is full: the device writes
+   * its base (`sync/put` with `x-ww-covers-sequence`), then sends again.
+   */
+  tail_full: 409,
   /**
    * A passkey ceremony didn't verify (witness-work
    * `docs/passkeys-protocol.md`); `reason` says which check failed.

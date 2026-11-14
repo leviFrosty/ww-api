@@ -1,6 +1,10 @@
 import type { AppContext, Environment } from './types'
 import { parseMinAppVersion } from './notesImport/config'
-import { entitlementForApp, syncSwitches } from './accounts/syncSwitch'
+import {
+  entitlementForApp,
+  isSyncChangesOn,
+  syncSwitches,
+} from './accounts/syncSwitch'
 import { webSignupAvailable } from './accounts/webSignup'
 import { turnstileSiteKey } from './accounts/turnstile'
 
@@ -94,14 +98,20 @@ export const requestRegion = (
  * present, null when unknown.
  */
 export const handleAppConfigRequest = async (c: AppContext) => {
-  const [minAppVersion, switches, webSignupEnabled] = await Promise.all([
-    resolveAppMinVersion(c.env),
-    syncSwitches(c.env),
-    webSignupAvailable(c.env),
-  ])
+  const [minAppVersion, switches, webSignupEnabled, changesOn] =
+    await Promise.all([
+      resolveAppMinVersion(c.env),
+      syncSwitches(c.env),
+      webSignupAvailable(c.env),
+      isSyncChangesOn(c.env),
+    ])
+  const enabled =
+    switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null
   const sync = {
-    enabled:
-      switches.enabled && c.env.ACCOUNT_SYNC != null && c.env.ACCOUNTS_DB != null,
+    enabled,
+    // Whether devices send record changes (witness-work ADR 0060); off, they
+    // publish whole snapshots.
+    changes: enabled && changesOn,
     // Apps that never send the capability see `supporter`, so they never
     // turn Cloud Sync on by themselves (witness-work ADR 0040 §2).
     entitlement: entitlementForApp(

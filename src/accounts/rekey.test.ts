@@ -999,4 +999,61 @@ describe('Cloud Sync', () => {
     })
     expect(late.status).toBe(403)
   })
+
+  it('re-seals another device’s record change, and refuses a token from before the change', async () => {
+    await h.kv.put('sync:changes', 'true')
+    const s = await phone()
+    const other = await phone(s.key)
+    const theirs = slot()
+    expect((await put(other, theirs)).status).toBe(200)
+    const changeId = b64u(randomBytes(16))
+    const change = await send(
+      'POST',
+      '/sync/changes/put',
+      { slotId: theirs, changeId, blob: b64u(randomBytes(512)) },
+      bearer(other.accessToken)
+    )
+    expect(change.status).toBe(200)
+    const { sequence } = change.body
+    const reseal = (caller: Pick<Caller, 'accessToken'>, fields: Record<string, unknown>) =>
+      send('POST', '/sync/changes/reseal', fields, bearer(caller.accessToken))
+
+    const resealed = b64u(randomBytes(512))
+    // No key change yet.
+    const never = await reseal(s, { sequence, changeId, blob: resealed })
+    expect([never.status, never.body.code]).toEqual([403, 'forbidden'])
+
+    const { caller } = await rekey(await fresh(s))
+    // The rekey told the sync index: a token from before it adds nothing.
+    const stale = await send(
+      'POST',
+      '/sync/changes/put',
+      { slotId: theirs, changeId: b64u(randomBytes(16)), blob: b64u(randomBytes(512)) },
+      bearer(other.accessToken)
+    )
+    expect(stale.status).toBe(401)
+    expect(stale.body.reason).toBe('key_changed')
+    // And neither does one whose session it ended, with a re-seal.
+    expect((await reseal(other, { sequence, changeId, blob: resealed })).status).toBe(401)
+
+    const done = await reseal(caller, { sequence, changeId, blob: resealed })
+    expect(done.status).toBe(200)
+    expect(done.body).toEqual({ ok: true, sequence })
+    const read = await send(
+      'POST',
+      '/sync/changes/list',
+      { slotId: slot(), afterSequence: 0 },
+      bearer(caller.accessToken)
+    )
+    expect(read.body.changes).toEqual([
+      { sequence, slotId: theirs, changeId, keyEpoch: 1, createdAt: START, blob: resealed },
+    ])
+    // The same sequence: nobody's cursor moves.
+    expect(read.body.sequence).toBe(sequence)
+
+    const gone = await reseal(caller, { sequence: sequence + 9, changeId, blob: resealed })
+    expect([gone.status, gone.body.code]).toEqual([404, 'not_found'])
+    const bad = await reseal(caller, { sequence, changeId, blob: b64u(randomBytes(100)) })
+    expect(bad.status).toBe(400)
+  })
 })

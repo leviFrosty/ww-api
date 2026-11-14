@@ -68,6 +68,9 @@ describe('requireAccount', () => {
       accountId: session.accountId,
       sessionId: session.sessionId,
       platform: 'dev',
+      keyEpoch: 0,
+      // The session sent none; the token says so (`cap`).
+      capabilities: [],
     })
   })
 

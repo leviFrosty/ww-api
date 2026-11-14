@@ -7,6 +7,7 @@ import { LIVE_EXPIRED_CLOSE } from '../liveSubprotocol'
 
 const SECOND_MS = 1_000
 const MINUTE_MS = 60 * SECOND_MS
+const HOUR_MS = 60 * MINUTE_MS
 const DAY_MS = 24 * 60 * MINUTE_MS
 const MIB = 1_024 * 1_024
 
@@ -69,25 +70,153 @@ export const SYNC_HEADERS = {
   sha256: 'x-ww-sha256',
   updatedAt: 'x-ww-updated-at',
   /**
-   * The verified account on a live upgrade the Worker forwards to the DO.
-   * Set only by the Worker, from a valid token; any client copy is dropped.
+   * A live upgrade's admission, on the request the Worker forwards to the DO:
+   * a random one-use id `admitLive` gave it. Who the socket is for (the
+   * account, the session, the slot, the expiry) goes to the DO in that call,
+   * never in a header: Workers Logs record every request header, the
+   * forwarded request's too. Set only by the Worker.
    */
-  account: 'x-ww-sync-account',
-  /**
-   * A browser socket's token expiry (epoch ms) on the upgrade the Worker
-   * forwards; the DO closes the socket then. Set only by the Worker; any
-   * client copy is dropped, so a native socket never has one.
-   */
-  expiresAt: 'x-ww-sync-expires-at',
+  admission: 'x-ww-sync-admission',
   /**
    * `1` on a `sync/put` that re-seals a slot under a new account key (ADR
    * 0039): the slot keeps its session, platform, and `updatedAt`.
    */
   reseal: 'x-ww-reseal',
+  /**
+   * On a `sync/put` that folds the slot's tail into its base (witness-work
+   * ADR 0060 §5): the sequence of the slot's last change the base includes.
+   * The slot's changes up to it are deleted and it becomes the slot's floor.
+   * Without it the whole tail goes and every device reads the base.
+   */
+  coversSequence: 'x-ww-covers-sequence',
+  /**
+   * `1` on a `sync/list` from an app that reads record changes. A list
+   * without it is a session that reads only snapshots (`snapshotReaders`),
+   * until that session reads changes or ends.
+   */
+  readsChanges: 'x-ww-sync-changes',
 } as const
 
-/** Live socket messages: change notices only, never data. */
-export type SyncLiveMessage = { type: 'hello' | 'changed'; seq: number }
+/**
+ * Record changes (witness-work ADR 0060): a device sends each edit as a
+ * small sealed change, kept in the account's Durable Object until the
+ * device folds it into its base.
+ */
+export const SYNC_CHANGE_LIMITS = {
+  /** One sealed change. A larger set of edits is published as the base. */
+  blobBytes: 256 * 1_024,
+  /** A sealed change is padded to a multiple of this, so its size says little. */
+  blockBytes: 256,
+  /** Changes a slot's tail holds; the device folds them into its base at 50. */
+  tailChanges: 200,
+  /** Bytes a slot's tail holds. 20 slots are 20 MiB at the very most. */
+  tailBytes: MIB,
+  /**
+   * Changes a slot a minute. The app sends at most one every 2 s while edits
+   * keep coming (30), so twice that only stops a runaway client.
+   */
+  slotChangesPerMinute: 60,
+  /** Changes an account a rolling day: an hour of typing on a device is ~1,800. */
+  accountChangesPerDay: 3_000,
+  /** Sealed bytes a catch-up page holds before it says `more`; always one change. */
+  pageBytes: 256 * 1_024,
+  /** Changes a catch-up page holds. */
+  pageChanges: 500,
+  /** A session that listed without reading changes counts toward `snapshotReaders` this long. */
+  snapshotReaderMs: 14 * DAY_MS,
+  /** A session's snapshot-only list is noted at most this often. */
+  snapshotReaderNoteMs: HOUR_MS,
+  /** A catch-up marks the caller's slot as seen at most this often (retention). */
+  seenNoteMs: DAY_MS,
+  /**
+   * A socket gets changes while its session was confirmed live within this:
+   * an access token's life, so a socket reads no longer than its token could.
+   */
+  liveConfirmMs: 15 * MINUTE_MS,
+  /** An ended session is refused this long: its last token's life, and the skew. */
+  endedSessionMs: 16 * MINUTE_MS,
+  /** A socket message a device sends (`sync`) is at most this long. */
+  messageChars: 256,
+  /** A live upgrade follows its admission within this. */
+  admissionMs: 30 * SECOND_MS,
+} as const
+
+/** A change's id: 16 random bytes the device made, base64url. */
+export const SYNC_CHANGE_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/
+
+export const isSyncChangeId = (value: unknown): value is string =>
+  typeof value === 'string' && SYNC_CHANGE_ID_PATTERN.test(value)
+
+/**
+ * The byte length of a sealed change in unpadded base64url, or null when it
+ * isn't one: not base64url, empty, over `blobBytes`, or not a whole number
+ * of `blockBytes` blocks.
+ */
+export const sealedChangeBytes = (blob: unknown): number | null => {
+  if (typeof blob !== 'string' || !/^[A-Za-z0-9_-]+$/.test(blob)) return null
+  if (blob.length % 4 === 1) return null
+  const bytes = Math.floor((blob.length * 3) / 4)
+  const { blobBytes, blockBytes } = SYNC_CHANGE_LIMITS
+  return bytes > 0 && bytes <= blobBytes && bytes % blockBytes === 0
+    ? bytes
+    : null
+}
+
+/** A change as a catch-up and the live socket give it. */
+export type SyncChangeView = {
+  sequence: number
+  slotId: string
+  changeId: string
+  /** The key epoch of the session that sealed it (or re-sealed it). */
+  keyEpoch: number
+  createdAt: number
+  /** The sealed change, unpadded base64url. */
+  blob: string
+}
+
+/** A slot in a catch-up: `sync/list`'s, less `live`, plus the tail's facts. */
+export type SyncSlotCatchUp = {
+  slotId: string
+  etag: string
+  size: number
+  updatedAt: number
+  platform: string | null
+  /** A device whose cursor is behind this reads the slot's base. */
+  floorSequence: number
+  /** The slot's last base put or change. */
+  changedAt: number
+}
+
+/** What a device missed since `afterSequence` (ADR 0060 §4). */
+export type SyncCatchUp = {
+  /** The account's sequence: the device's cursor once it merged all of this. */
+  sequence: number
+  slots: SyncSlotCatchUp[]
+  /** Other slots' changes after `afterSequence`, oldest first. */
+  changes: SyncChangeView[]
+  /** More changes follow: ask again from the last one's sequence. */
+  more: boolean
+  /** A device read only snapshots lately: also write the base after a change. */
+  snapshotReaders: boolean
+  /** The account's standing Cloud Sync request (`GET /sync`'s). */
+  requestedAt: number | null
+  /** Whether photo puts are on (`GET /sync`'s). */
+  photos: boolean
+}
+
+/** What a device sends on the live socket: a catch-up from its cursor. */
+export type SyncLiveRequest = { type: 'sync'; afterSequence: number }
+
+/**
+ * Live socket messages. `hello` and `changed` are notices with the account's
+ * `seq`. A socket that asked for a catch-up (`SyncLiveRequest`) also gets
+ * each other slot's change as it's put, sealed (ADR 0060 §6).
+ */
+export type SyncLiveMessage =
+  | { type: 'hello' | 'changed'; seq: number }
+  | { type: 'change'; change: SyncChangeView }
+  | ({ type: 'sync' } & SyncCatchUp)
+  | { type: 'error'; error: 'changes_disabled' | 'unavailable' | 'bad_request' }
 
 export const SYNC_LIVE_CLOSE = {
   replaced: { code: 4000, reason: 'replaced' },
@@ -98,6 +227,8 @@ export const SYNC_LIVE_CLOSE = {
    * and the device that changed it reconnects with its new token.
    */
   keyChanged: { code: 4005, reason: 'key_changed' },
+  /** The socket's session ended (signed out, revoked, replaced). */
+  sessionEnded: { code: 4006, reason: 'session_ended' },
 } as const
 
 /** `If-Match`: a quoted ETag, or `*` (the slot exists). */

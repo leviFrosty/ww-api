@@ -379,7 +379,7 @@ const handleRekey = guarded('account/rekey', async (c) => {
   // Every socket closes; the caller reconnects with the token below.
   if (c.env.ACCOUNT_SYNC_INDEX) {
     try {
-      await syncIndex(c.env, accountId).closeForKeyChange()
+      await syncIndex(c.env, accountId).closeForKeyChange({ keyEpoch: newEpoch })
     } catch (error) {
       console.error('accounts: closing sync sockets failed')
       captureFailure(error, 'account/rekey sockets')
