@@ -60,52 +60,6 @@ export const getKeyRecord = async (
   return raw == null ? null : parseKeyRecord(raw)
 }
 
-export interface LegacyDeviceKeyMatch {
-  keyId: string
-  record: DeviceKeyRecord
-}
-
-/**
- * Scan every legacy key page for records pinned to an install UUID. The caller
- * decides whether zero, one, or multiple matches are safe for its operation.
- */
-export const listKeyRecordsForUuid = async (
-  kv: AppAttestKv,
-  uuid: string
-): Promise<LegacyDeviceKeyMatch[]> => {
-  const matches: LegacyDeviceKeyMatch[] = []
-  const seenCursors = new Set<string>()
-  let cursor: string | undefined
-
-  do {
-    const page = await kv.list({
-      prefix: 'key:',
-      ...(cursor == null ? {} : { cursor }),
-    })
-    for (const key of page.keys) {
-      if (!key.name.startsWith('key:')) {
-        throw new Error('legacy App Attest key listing returned wrong prefix')
-      }
-      const keyId = key.name.slice('key:'.length)
-      if (!keyId) throw new Error('legacy App Attest key id is empty')
-      const raw = await kv.get(key.name)
-      if (raw == null) throw new Error('listed legacy App Attest key is missing')
-      const record = parseKeyRecord(raw)
-      if (!record) throw new Error('listed legacy App Attest key is malformed')
-      if (record.uuid === uuid) matches.push({ keyId, record })
-    }
-    if (page.list_complete) break
-    if (!page.cursor) throw new Error('legacy App Attest key listing omitted cursor')
-    if (seenCursors.has(page.cursor)) {
-      throw new Error('legacy App Attest key listing repeated cursor')
-    }
-    seenCursors.add(page.cursor)
-    cursor = page.cursor
-  } while (true)
-
-  return matches
-}
-
 export const putKeyRecord = (
   kv: AppAttestKv,
   keyId: string,

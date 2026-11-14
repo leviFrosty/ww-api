@@ -867,73 +867,27 @@ describe('App Attest lifecycle module', () => {
     expect(test.kv.store.get(`uuidOwner:${UUID}`)).toBe(KEY_A)
   })
 
-  it('rejects ownerless collisions after assertion or enrollment proves a presented key', async () => {
-    const assertion = await harness()
-    await seedLegacyKey(assertion, 1, KEY_A)
-    await seedLegacyKey(assertion, 2, KEY_B)
-
-    await expect(
-      assertV2(assertion, {
-        operationId: 'assert-ownerless-collision',
-        keyId: KEY_A,
-        count: 3,
-      })
-    ).rejects.toMatchObject({ reason: 'storage_unavailable', action: 'retry' })
-    expect(assertion.assertionCalls).toHaveLength(1)
-    expect(assertion.state.identity).toBeNull()
-
-    const enrollment = await harness()
-    await seedLegacyKey(enrollment, 1, KEY_A)
-    await seedLegacyKey(enrollment, 2, KEY_B)
-    const challenge = await issue(enrollment, {
-      operation: 'enroll',
-      operationId: 'enroll-ownerless-collision',
-      uuid: UUID,
-      keyId: KEY_A,
-    })
-    await expect(
-      enrollment.lifecycle.register({
-        protocolVersion: 2,
-        operation: 'enroll',
-        operationId: 'enroll-ownerless-collision',
-        uuid: UUID,
-        keyId: KEY_A,
-        challenge: challenge.challenge,
-        assertion: 'count:3',
-        recoveryToken: TOKEN_A,
-      } satisfies V2EnrollRequest)
-    ).rejects.toMatchObject({ reason: 'storage_unavailable', action: 'retry' })
-    expect(enrollment.assertionCalls).toHaveLength(1)
-    expect(enrollment.state.identity).toBeNull()
-  })
-
-  it('scans every legacy-key page before allowing an apparently fresh bind', async () => {
+  it('binds a fresh install without listing the legacy key space', async () => {
     const test = await harness()
-    test.kv.setListPageSize(1)
     await seedLegacyKey(test, 1, '000-unrelated', 'different-uuid')
-    await seedLegacyKey(test, 4, KEY_A)
+    test.kv.failNextList()
 
-    await expect(
-      bind(test, {
-        operationId: 'bind-ownerless-takeover',
-        keyId: KEY_B,
-      }).then(({ result }) => result)
-    ).rejects.toMatchObject({
-      reason: 'recovery_not_enrolled',
-      action: 'enroll_recovery',
+    const { result } = await bind(test, {
+      operationId: 'bind-fresh-no-scan',
+      keyId: KEY_B,
     })
-    expect(test.kv.listCalls).toBeGreaterThan(1)
-    expect(test.kv.store.get(`uuidOwner:${UUID}`)).toBe(KEY_A)
-    expect(test.kv.store.has(`key:${KEY_B}`)).toBe(false)
+    expect(result).toMatchObject({ status: 'bound', recoveryEnrolled: true })
+    expect(test.kv.listCalls).toBe(0)
+    expect(test.kv.store.get(`uuidOwner:${UUID}`)).toBe(KEY_B)
   })
 
-  it('verifies a fresh bind attestation before scanning ownerless legacy keys', async () => {
+  it('verifies a fresh bind attestation before reading legacy keys', async () => {
     const test = await harness()
     await seedLegacyKey(test, 4, KEY_A)
 
     await expect(
       bind(test, {
-        operationId: 'bind-invalid-before-scan',
+        operationId: 'bind-invalid-before-legacy-read',
         keyId: KEY_B,
         attestation: 'invalid-attestation',
       }).then(({ result }) => result)
@@ -941,37 +895,7 @@ describe('App Attest lifecycle module', () => {
       reason: 'attestation_invalid',
       action: 'none',
     })
-    expect(test.kv.listCalls).toBe(0)
     expect(test.state.identity).toBeNull()
-  })
-
-  it('fails closed when ownerless legacy records collide or cannot be listed', async () => {
-    const collision = await harness()
-    await seedLegacyKey(collision, 1, KEY_A)
-    await seedLegacyKey(collision, 2, KEY_B)
-
-    await expect(
-      bind(collision, {
-        operationId: 'bind-ownerless-collision',
-        keyId: KEY_B,
-      }).then(({ result }) => result)
-    ).rejects.toMatchObject({
-      reason: 'storage_unavailable',
-      action: 'retry',
-    })
-
-    const unavailable = await harness()
-    unavailable.kv.failNextList()
-    await expect(
-      bind(unavailable, {
-        operationId: 'bind-ownerless-list-error',
-        keyId: KEY_B,
-      }).then(({ result }) => result)
-    ).rejects.toMatchObject({
-      reason: 'storage_unavailable',
-      action: 'retry',
-    })
-    expect(unavailable.kv.store.has(`key:${KEY_B}`)).toBe(false)
   })
 
   it('uses the legacy owner index without scanning all keys', async () => {
